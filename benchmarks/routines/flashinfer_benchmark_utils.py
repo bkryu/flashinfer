@@ -178,8 +178,13 @@ routine_cc_to_supported_backends = {
         "8.6": ["fa2", "cudnn"],
         "8.9": ["fa2", "cudnn"],
         "9.0": ["fa2", "fa3", "cudnn"],
+<<<<<<< HEAD
         "10.0": ["fa2", "cudnn", "trtllm-gen", "trtllm-native"],
         "10.3": ["fa2", "cudnn", "trtllm-gen", "trtllm-native"],
+=======
+        "10.0": ["fa2", "cudnn", "trtllm-gen", "trtllm-gen-native", "fa4"],
+        "10.3": ["fa2", "cudnn", "trtllm-gen", "trtllm-gen-native", "fa4"],
+>>>>>>> 93586b3 (Benchmark script can now handle FA4 for prefill)
         "12.0": ["fa2", "cudnn"],
     },
     "BatchPrefillWithRaggedKVCacheWrapper": {
@@ -189,8 +194,8 @@ routine_cc_to_supported_backends = {
         "8.6": ["fa2", "cudnn"],
         "8.9": ["fa2", "cudnn"],
         "9.0": ["fa2", "fa3", "cudnn"],
-        "10.0": ["fa2", "cudnn", "cutlass", "trtllm-native"],
-        "10.3": ["fa2", "cudnn", "cutlass", "trtllm-native"],
+        "10.0": ["fa2", "cudnn", "cutlass", "trtllm-native", "fa4"],
+        "10.3": ["fa2", "cudnn", "cutlass", "trtllm-native", "fa4"],
         "12.0": ["fa2", "cudnn"],
     },
     "BatchMLAPagedAttentionWrapper": {

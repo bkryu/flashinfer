@@ -87,6 +87,7 @@ def parse_attention_args(line, parser):
             "fa2",
             "fa2_tc",
             "fa3",
+            "fa4",
             "cudnn",
             "cutlass",
             "trtllm-gen",
@@ -735,6 +736,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")
+    if "fa4" in backends:
+        import flash_attn.cute.interface as flash_attn_interface
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -897,6 +900,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     scale = float(1.0 / (head_dim_qk**0.5))
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
+    cu_seqlens_q = (
+        torch.cat(
+            [torch.zeros(1, dtype=torch.int32), actual_seq_lens_q.view(-1).cumsum(0)]
+        )
+        .to(torch.int32)
+        .to(device)
+    )
+
     if args.verbose >= 2:
         print(f"[VVERBOSE] {kv_cache.shape = }")
         print(f"[VVERBOSE] {kv_cache.stride() = }")
@@ -953,6 +964,9 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         v_fp8 = (v_data / v_scale).to(kv_dtype)
         kv_cache = torch.cat([k_fp8, v_fp8], dim=1)
 
+    k_cache_fa4 = torch.swapaxes(k_cache, 1, 2)
+    v_cache_fa4 = torch.swapaxes(v_cache, 1, 2)
+
     def run_backend_wrapper(backend):
         if backend in ["fa2", "fa3", "trtllm-gen"]:
             return backend_wrappers[backend].run(
@@ -991,6 +1005,16 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 cum_seq_lens_q=qo_indptr,
                 cum_seq_lens_kv=kv_indptr,
             )
+        elif backend == "fa4":
+            return flash_attn_interface.flash_attn_varlen_func(
+                q,
+                k_cache_fa4,
+                v_cache_fa4,
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_k=actual_seq_lens_kv_device.view(-1),
+                page_table=block_tables,
+                causal=causal,
+            )[0]
         else:
             print(f"[ERROR] Backend {backend} not supported")
             return res
@@ -1218,6 +1242,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
+    if "fa4" in backends:
+        import flash_attn.cute.interface as flash_attn_interface
 
     # Check for layer-specific constraints
     layer_not_supported = False
@@ -1357,6 +1383,27 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     scale = float(1.0 / (head_dim_qk**0.5))
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
+    cu_seqlens_q = (
+        torch.cat(
+            [torch.zeros(1, dtype=torch.int32), actual_seq_lens_q.view(-1).cumsum(0)]
+        )
+        .to(torch.int32)
+        .to(device)
+    )
+    cu_seqlens_kv = (
+        torch.cat(
+            [
+                torch.zeros(
+                    1,
+                    dtype=torch.int32,
+                ),
+                actual_seq_lens_kv.view(-1).cumsum(0),
+            ]
+        )
+        .to(torch.int32)
+        .to(device)
+    )
+
     if args.verbose >= 2:
         print(f"[VVERBOSE] {k.shape = }")
         print(f"[VVERBOSE] {v.shape = }")
@@ -1444,6 +1491,15 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 enable_pdl=False,
                 is_causal=causal,
                 return_lse=True,
+            )[0]
+        elif backend == "fa4":
+            return flash_attn_interface.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_kv,
+                causal=causal,
             )[0]
         else:
             print(f"[ERROR] Backend {backend} not supported")
