@@ -576,9 +576,7 @@ def testBmmFp8(args):
     backends = args.backends
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
-    autotune_supported_backends = [
-        "cutlass",
-    ]
+    autotune_supported_backends = ["cutlass", "cudnn"]
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
