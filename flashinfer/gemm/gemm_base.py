@@ -1519,7 +1519,6 @@ def _cudnn_gemm_fp8_runner():
                 a.device,
             )
             num_plans = graph.get_execution_plan_count()
-            print(f"num_plans: {num_plans}")
             return list(range(num_plans))
 
         def forward(
