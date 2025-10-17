@@ -35,8 +35,10 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
     if input_dtype == torch.float8_e5m2 or mat2_dtype == torch.float8_e5m2:
         if backend == "cutlass":
             pytest.skip("Invalid combination: cutlass does not support e5m2")
-    if auto_tuning and backend != "cutlass":
-        pytest.skip("Invalid combination: auto_tuning only supported for cutlass")
+    if auto_tuning and backend not in ["cutlass", "cudnn"]:
+        pytest.skip(
+            "Invalid combination: auto_tuning only supported for cutlass and cudnn"
+        )
 
     input = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
     input_fp8, input_inv_s = to_float8(input, dtype=input_dtype)

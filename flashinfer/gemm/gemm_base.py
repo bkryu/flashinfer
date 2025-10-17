@@ -1337,7 +1337,15 @@ def execute_cudnn_gemm_fp4_graph(
 
 @functools.cache
 def build_cudnn_gemm_with_per_tensor_q_graph(
-    a_shape, a_stride, b_shape, b_stride, a_type, b_type, o_type, device
+    a_shape,
+    a_stride,
+    b_shape,
+    b_stride,
+    a_type,
+    b_type,
+    o_type,
+    device,
+    tactic: int = -1,
 ):
     """Build a cuDNN graph for GEMM with per-tensor quantization.
 
@@ -1411,13 +1419,16 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
-        graph.build_plans()
+        if tactic != -1:
+            graph.build_plan_at_index(tactic)
+        else:
+            graph.build_plans()
 
         return graph
 
 
 def execute_cudnn_gemm_with_per_tensor_q_graph(
-    graph, a, b, a_scale, b_scale, c_final, workspace
+    graph, a, b, a_scale, b_scale, c_final, workspace, tactic: int = -1
 ):
     variant_pack = {
         UIDs.A_UID.value: a,
@@ -1435,7 +1446,12 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(
             graph.get_workspace_size(), device=a.device, dtype=torch.uint8
         )
 
-    graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    if tactic == -1:
+        graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    else:
+        graph.execute_plan_at_index(
+            variant_pack, workspace, tactic, handle=cudnn_handle
+        )
 
 
 def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
@@ -1459,6 +1475,7 @@ def _cudnn_gemm_fp8(
     b_scale: torch.Tensor,
     out: Optional[torch.Tensor],
     torch_out_dtype: torch.dtype,
+    tactic: int = -1,
 ):
     _check_cudnn_availability()
 
@@ -1471,10 +1488,11 @@ def _cudnn_gemm_fp8(
         _torch_data_type_to_cudnn_data_type(b.dtype),
         _torch_data_type_to_cudnn_data_type(torch_out_dtype),
         a.device,
+        tactic=tactic,
     )
 
     execute_cudnn_gemm_with_per_tensor_q_graph(
-        graph, a, b, a_scale, b_scale, out, workspace
+        graph, a, b, a_scale, b_scale, out, workspace, tactic=tactic
     )
     return out
 
@@ -1487,7 +1505,22 @@ def _cudnn_gemm_fp8_runner():
             profile: OptimizationProfile,
         ) -> List[int]:
             # cudnn has heuristic for fp8 gemm, so we only need to use the default tactic
-            return [0]
+            a, b, scale_a, scale_b, out, workspace_buffer = inputs
+            _check_cudnn_availability()
+
+            graph = build_cudnn_gemm_with_per_tensor_q_graph(
+                a.shape,
+                a.stride(),
+                b.shape,
+                b.stride(),
+                _torch_data_type_to_cudnn_data_type(a.dtype),
+                _torch_data_type_to_cudnn_data_type(b.dtype),
+                _torch_data_type_to_cudnn_data_type(out.dtype),
+                a.device,
+            )
+            num_plans = graph.get_execution_plan_count()
+            print(f"num_plans: {num_plans}")
+            return list(range(num_plans))
 
         def forward(
             self,
@@ -1497,7 +1530,9 @@ def _cudnn_gemm_fp8_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, scale_a, scale_b, out, workspace_buffer = inputs
-            _cudnn_gemm_fp8(workspace_buffer, a, b, scale_a, scale_b, out, out.dtype)
+            _cudnn_gemm_fp8(
+                workspace_buffer, a, b, scale_a, scale_b, out, out.dtype, tactic
+            )
             return out
 
     return CudnnFp8GemmRunner()
