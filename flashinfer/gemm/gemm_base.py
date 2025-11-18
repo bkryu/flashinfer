@@ -22,6 +22,7 @@ from typing import List, Literal, Optional, Tuple
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
 
+from ..api_logging import flashinfer_api_log
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -564,6 +565,7 @@ def get_tgv_gemm_sm10x_module(
     )
 
 
+@flashinfer_api_log
 def tgv_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -909,6 +911,7 @@ class SegmentGEMMWrapper:
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
 
+    @flashinfer_api_log
     def run(
         self,
         x: torch.Tensor,
@@ -1567,6 +1570,7 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
+@flashinfer_api_log
 def mm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1835,6 +1839,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
+@flashinfer_api_log
 @backend_requirement(
     {
         "cudnn": _cudnn_gemm_fp4_requirement,  # Each backend has its own requirement function
@@ -2083,6 +2088,7 @@ def _heuristic_func_bmm_fp8(
     return heuristic_backends
 
 
+@flashinfer_api_log
 @backend_requirement(
     {
         "cudnn": _cudnn_bmm_fp8_requirement,
@@ -2183,6 +2189,7 @@ def bmm_fp8(
     return out
 
 
+@flashinfer_api_log
 def gemm_fp8_nt_groupwise(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2491,6 +2498,7 @@ def get_trtllm_fp4_gemm_module():
     )
 
 
+@flashinfer_api_log
 def gemm_fp8_nt_blockscaled(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2519,6 +2527,7 @@ def gemm_fp8_nt_blockscaled(
     )
 
 
+@flashinfer_api_log
 def group_gemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (cum_m, k)
     b: torch.Tensor,  # (batch_size, n, k)
@@ -2681,6 +2690,7 @@ def group_gemm_fp8_nt_groupwise(
     return out
 
 
+@flashinfer_api_log
 def group_gemm_mxfp8_mxfp4_nt_groupwise(
     a: torch.Tensor,  # (cum_m, k)
     b: torch.Tensor,  # (batch_size, n, k // 2)
@@ -2848,6 +2858,7 @@ def get_deepgemm_sm100_module():
     return module
 
 
+@flashinfer_api_log
 def group_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (m, k)
     b: torch.Tensor,  # (batch_size, n, k)
@@ -2978,6 +2989,7 @@ def group_deepgemm_fp8_nt_groupwise(
     return out
 
 
+@flashinfer_api_log
 def batch_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (batch_size, m, k)
     b: torch.Tensor,  # (batch_size, n, k)
