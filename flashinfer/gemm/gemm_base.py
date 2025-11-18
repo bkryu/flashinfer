@@ -1839,7 +1839,6 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@flashinfer_api_log
 @backend_requirement(
     {
         "cudnn": _cudnn_gemm_fp4_requirement,  # Each backend has its own requirement function
@@ -1848,6 +1847,7 @@ def _cutlass_gemm_fp4_requirement(
     },
     common_check=_check_mm_fp4_problem_size,  # Shape checks common to all backends
 )
+@flashinfer_api_log
 def mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2088,7 +2088,6 @@ def _heuristic_func_bmm_fp8(
     return heuristic_backends
 
 
-@flashinfer_api_log
 @backend_requirement(
     {
         "cudnn": _cudnn_bmm_fp8_requirement,
@@ -2098,6 +2097,7 @@ def _heuristic_func_bmm_fp8(
     common_check=_check_bmm_fp8_problem_size,
     heuristic_func=_heuristic_func_bmm_fp8,
 )
+@flashinfer_api_log
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
