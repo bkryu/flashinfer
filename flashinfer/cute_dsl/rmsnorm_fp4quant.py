@@ -1945,10 +1945,9 @@ class RMSNormGlobalMaxKernel:
         self.is_fp16 = is_fp16
         self.sm_version = sm_version if sm_version is not None else get_sm_version()
 
-        # For simplicity, use cluster_n=1 for this kernel
-        # The main overhead is memory bandwidth anyway
-        self.cluster_n = 1
-        self.H_per_cta = H
+        # Compute cluster_n dynamically based on shared memory limits
+        self.cluster_n = self._compute_cluster_n(H, dtype, self.sm_version)
+        self.H_per_cta = H // self.cluster_n
 
         # Compute thread configuration
         self.threads_per_row = self._compute_threads_per_row(self.H_per_cta)
@@ -1965,6 +1964,56 @@ class RMSNormGlobalMaxKernel:
             // self.threads_per_row,
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
+
+    @staticmethod
+    def _compute_cluster_n(H: int, dtype: cutlass.Numeric, sm_version: int) -> int:
+        """Compute optimal cluster size based on H and device shared memory.
+
+        Dynamically determines the minimum cluster_n that fits within the
+        device's shared memory limit, making it compatible with different
+        GPU architectures (e.g., SM100 with 228KB vs SM120 with 128KB).
+        """
+        if sm_version < 90:
+            return 1
+
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        max_smem_bytes = props.shared_memory_per_block_optin
+        elem_size = dtype.width // 8
+
+        for cluster_n in [1, 2, 4, 8, 16]:
+            if H % cluster_n != 0:
+                continue
+            smem_needed = RMSNormGlobalMaxKernel._estimate_smem_bytes(
+                H, cluster_n, elem_size
+            )
+            if smem_needed <= max_smem_bytes:
+                return cluster_n
+
+        return 16
+
+    @staticmethod
+    def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:
+        """Estimate shared memory bytes needed for given configuration."""
+        H_per_cta = H // cluster_n
+        threads_per_row = RMSNormGlobalMaxKernel._compute_threads_per_row(H_per_cta)
+        num_threads = RMSNormGlobalMaxKernel._compute_num_threads(H_per_cta)
+        rows_per_block = num_threads // threads_per_row
+        warps_per_row = max(threads_per_row // 32, 1)
+
+        vec_size = COPY_BITS // 8 // elem_size
+        num_vec_blocks = max(
+            1, (H_per_cta // vec_size + threads_per_row - 1) // threads_per_row
+        )
+        cols_per_tile = vec_size * num_vec_blocks * threads_per_row
+
+        tile_bytes = rows_per_block * cols_per_tile * elem_size
+
+        if cluster_n == 1:
+            # 1 tile: sX + reduction buffer
+            return tile_bytes + rows_per_block * warps_per_row * 4
+        else:
+            # 1 tile: sX + larger reduction buffer for cluster + mbarrier
+            return tile_bytes + rows_per_block * warps_per_row * cluster_n * 4 + 8
 
     @staticmethod
     def _compute_threads_per_row(H_per_cta: int) -> int:
@@ -2007,10 +2056,19 @@ class RMSNormGlobalMaxKernel:
 
     def _smem_size_in_bytes(self) -> int:
         """Calculate shared memory requirement."""
+        elem_size = self.dtype.width // 8
         # Input tile for X
-        tile_bytes = self.rows_per_block * self.cols_per_tile * (self.dtype.width // 8)
-        # Reduction buffer
-        reduction_bytes = self.rows_per_block * self.warps_per_row * 4
+        tile_bytes = self.rows_per_block * self.cols_per_tile * elem_size
+
+        if self.cluster_n == 1:
+            # Reduction buffer for single CTA
+            reduction_bytes = self.rows_per_block * self.warps_per_row * 4
+        else:
+            # Larger reduction buffer for cluster + mbarrier
+            reduction_bytes = (
+                self.rows_per_block * self.warps_per_row * self.cluster_n * 4 + 8
+            )
+
         return tile_bytes + reduction_bytes
 
     @cute.jit
@@ -2046,8 +2104,11 @@ class RMSNormGlobalMaxKernel:
         )
 
         self.kernel(mX, mW, mY, mGlobalMax, M, eps).launch(
-            grid=[cute.ceil_div(M, self.rows_per_block), 1, 1],
+            grid=[cute.ceil_div(M, self.rows_per_block), self.cluster_n, 1],
             block=[self.num_threads, 1, 1],
+            cluster=[1, self.cluster_n, 1]
+            if cutlass.const_expr(self.cluster_n > 1)
+            else None,
             smem=self._smem_size_in_bytes(),
             stream=stream,
         )
@@ -2073,6 +2134,12 @@ class RMSNormGlobalMaxKernel:
         warps_per_row = self.warps_per_row
         vec_size = self.vec_size
         num_vec_blocks = self.num_vec_blocks
+        cluster_n = self.cluster_n
+
+        if cutlass.const_expr(cluster_n > 1):
+            cluster_y = cute.arch.block_idx()[1]
+        else:
+            cluster_y = cutlass.const_expr(0)
 
         lane_in_row = tidx % threads_per_row
         row_in_block = tidx // threads_per_row
@@ -2096,16 +2163,34 @@ class RMSNormGlobalMaxKernel:
             cute.make_ordered_layout((rows_per_block, cols_per_tile), order=(1, 0)),
             byte_alignment=16,
         )
-        reduction_buffer = smem.allocate_tensor(
-            Float32,
-            cute.make_layout((rows_per_block, warps_per_row)),
-            byte_alignment=4,
-        )
+
+        if cutlass.const_expr(cluster_n == 1):
+            reduction_buffer = smem.allocate_tensor(
+                Float32,
+                cute.make_layout((rows_per_block, warps_per_row)),
+                byte_alignment=4,
+            )
+            mbar_ptr = None
+        else:
+            reduction_buffer = smem.allocate_tensor(
+                Float32,
+                cute.make_layout((rows_per_block, (warps_per_row, cluster_n))),
+                byte_alignment=4,
+            )
+            mbar_ptr = smem.allocate_array(Int64, num_elems=1)
+
+        # Initialize cluster
+        if cutlass.const_expr(cluster_n > 1):
+            if tidx == 0:
+                cute.arch.mbarrier_init(mbar_ptr, 1)
+            cute.arch.mbarrier_init_fence()
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
 
         # Create identity tensor for coordinate tracking
         idX = cute.make_identity_tensor(mX.shape)
-        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
-        cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
+        gX = cute.local_tile(mX, tiler_mn, (bidx, cluster_y))
+        cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
 
         # Create TiledCopy for async load
         copy_atom_load_async = cute.make_copy_atom(
@@ -2147,15 +2232,19 @@ class RMSNormGlobalMaxKernel:
             cute.ReductionOp.ADD,
             threads_per_row,
             reduction_buffer,
-            None,  # No mbarrier for cluster_n=1
-            1,  # cluster_n
+            mbar_ptr,
+            cluster_n,
             Float32(0.0),
         )
 
         mean_sq = sum_sq / H
         rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
 
-        cute.arch.barrier()
+        if cutlass.const_expr(cluster_n > 1):
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+        else:
+            cute.arch.barrier()
 
         # Phase 3: Compute RMSNorm and store, tracking max_abs
         actual_row_idx = bidx * rows_per_block + row_in_block
@@ -2270,7 +2359,11 @@ class RMSNormGlobalMaxKernel:
             _ = atomic_max_global_u32(global_max_addr, thread_max_abs_u32)
 
         # Signal dependent kernel
-        cute.arch.barrier()
+        if cutlass.const_expr(self.cluster_n > 1):
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+        else:
+            cute.arch.barrier()
         if tidx == 0:
             griddepcontrol_launch_dependents()
 
