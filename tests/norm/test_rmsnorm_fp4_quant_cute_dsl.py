@@ -40,12 +40,19 @@ def llama_rms_norm(x, w, eps=1e-6):
 
 
 def dequantize_fp4_output(
-    y_fp4: torch.Tensor, block_scale: torch.Tensor, block_size: int
+    y_fp4: torch.Tensor,
+    block_scale: torch.Tensor,
+    block_size: int,
+    global_scale: torch.Tensor | None = None,
 ):
     """
     Dequantize packed FP4 tensor using the associated block scales.
 
     Handles both 2D inputs shaped [B, H/2] and 3D inputs shaped [B, S, H/2].
+
+    If global_scale is provided, the result is divided by global_scale to reverse
+    the global scaling applied during quantization:
+        original_value = (fp4_value * block_scale) / global_scale
     """
     y_fp4_float = cast_from_fp4(y_fp4)
     if y_fp4_float.dim() == 2:
@@ -58,7 +65,10 @@ def dequantize_fp4_output(
             scales = torch.pow(2.0, block_scale.int() - 127).unsqueeze(-1)
         else:
             scales = block_scale.float().unsqueeze(-1)
-        return (y_fp4_float * scales).reshape(b, hidden_size)
+        result = (y_fp4_float * scales).reshape(b, hidden_size)
+        if global_scale is not None:
+            result = result / global_scale.item()
+        return result
     elif y_fp4_float.dim() == 3:
         b, s, hidden_size = y_fp4_float.shape
         assert hidden_size % block_size == 0
@@ -67,7 +77,10 @@ def dequantize_fp4_output(
             scales = torch.pow(2.0, block_scale.int() - 127).unsqueeze(-1)
         else:
             scales = block_scale.float().unsqueeze(-1)
-        return (y_fp4_float * scales).reshape(b, s, hidden_size)
+        result = (y_fp4_float * scales).reshape(b, s, hidden_size)
+        if global_scale is not None:
+            result = result / global_scale.item()
+        return result
     else:
         raise ValueError(f"Unsupported FP4 output rank: {y_fp4_float.dim()}")
 
@@ -105,8 +118,8 @@ blackwell_required = pytest.mark.skipif(
 
 @cute_dsl_available
 @blackwell_required
-class TestRMSNormFP4QuantCuteDSL:
-    """Tests for CuTe-DSL RMSNorm + FP4 Quantization."""
+class TestRMSNormNVFP4QuantCuteDSL:
+    """Tests for CuTe-DSL RMSNorm + NVFP4 Quantization (block_size=16, E4M3 scales, global_scale)."""
 
     @pytest.mark.parametrize(
         "batch_size", [1, 4, 16, 32, 7, 13, 33, 100, 128, 8192, 16384]
@@ -116,12 +129,12 @@ class TestRMSNormFP4QuantCuteDSL:
     )
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("eps", [1e-5, 1e-6])
-    def test_rmsnorm_fp4quant_2d(self, batch_size, hidden_size, dtype, eps):
-        """Test fused RMSNorm + FP4 quantization with 2D input."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+    def test_rmsnorm_nvfp4quant_2d(self, batch_size, hidden_size, dtype, eps):
+        """Test fused RMSNorm + NVFP4 quantization with 2D input."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
 
         torch.manual_seed(42)
-        block_size = 16
+        block_size = 16  # Fixed for NVFP4
 
         # Create input tensors
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
@@ -139,22 +152,35 @@ class TestRMSNormFP4QuantCuteDSL:
         )
 
         # Run fused kernel
-        rmsnorm_fp4quant(x, weight, y_fp4, block_scale, eps=eps, block_size=block_size)
+        _, _, global_scale = rmsnorm_nvfp4quant(x, weight, y_fp4, block_scale, eps=eps)
 
         # Verify output shapes
         assert y_fp4.shape == (batch_size, hidden_size // 2)
         assert block_scale.shape == (batch_size, hidden_size // block_size)
+        assert global_scale.shape == (1,)
 
         # Verify output dtypes
         assert y_fp4.dtype == torch.uint8
         assert block_scale.dtype == torch.float8_e4m3fn
+        assert global_scale.dtype == torch.float32
 
         # Reference computation
         ref_rmsnorm = llama_rms_norm(x, weight, eps=eps)
 
+        # Verify global_scale is computed correctly: FP8_MAX * FP4_MAX / max_abs
+        expected_global_scale = 448.0 * 6.0 / ref_rmsnorm.abs().max().item()
+        assert global_scale.item() > 0, "global_scale should be positive"
+        torch.testing.assert_close(
+            global_scale,
+            torch.tensor([expected_global_scale], dtype=torch.float32, device="cuda"),
+            rtol=0.01,
+            atol=1.0,
+        )
+
         # Dequantize FP4 output for value-level comparison
+        # Note: global_scale must be applied during dequantization to reverse the scaling
         # Tolerance based on separate FP4 roundtrip test (rtol=0.3, atol=0.5)
-        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size, global_scale)
         torch.testing.assert_close(
             y_dequant,
             ref_rmsnorm.float(),
@@ -166,12 +192,12 @@ class TestRMSNormFP4QuantCuteDSL:
     @pytest.mark.parametrize("seq_len", [16, 64, 128, 37, 99])
     @pytest.mark.parametrize("hidden_size", [128, 256, 1536, 4096, 8192])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_rmsnorm_fp4quant_3d(self, batch_size, seq_len, hidden_size, dtype):
-        """Test fused RMSNorm + FP4 quantization with 3D input."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+    def test_rmsnorm_nvfp4quant_3d(self, batch_size, seq_len, hidden_size, dtype):
+        """Test fused RMSNorm + NVFP4 quantization with 3D input."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
 
         torch.manual_seed(42)
-        block_size = 16
+        block_size = 16  # Fixed for NVFP4
         eps = 1e-5
 
         # Create input tensors
@@ -191,22 +217,33 @@ class TestRMSNormFP4QuantCuteDSL:
         )
 
         # Run fused kernel
-        rmsnorm_fp4quant(x, weight, y_fp4, block_scale, eps=eps, block_size=block_size)
+        _, _, global_scale = rmsnorm_nvfp4quant(x, weight, y_fp4, block_scale, eps=eps)
 
         # Verify output shapes
         assert y_fp4.shape == (batch_size, seq_len, hidden_size // 2)
         assert block_scale.shape == (batch_size, seq_len, hidden_size // block_size)
+        assert global_scale.shape == (1,)
 
         # Verify output dtypes
         assert y_fp4.dtype == torch.uint8
         assert block_scale.dtype == torch.float8_e4m3fn
+        assert global_scale.dtype == torch.float32
 
         # Reference computation
         ref_rmsnorm = llama_rms_norm(x, weight, eps=eps)
 
+        # Verify global_scale is computed correctly: FP8_MAX * FP4_MAX / max_abs
+        expected_global_scale = 448.0 * 6.0 / ref_rmsnorm.abs().max().item()
+        torch.testing.assert_close(
+            global_scale,
+            torch.tensor([expected_global_scale], dtype=torch.float32, device="cuda"),
+            rtol=0.01,
+            atol=1.0,
+        )
+
         # Dequantize FP4 output for value-level comparison
-        # Tolerance based on separate FP4 roundtrip test (rtol=0.3, atol=0.5)
-        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        # Note: global_scale must be applied during dequantization to reverse the scaling
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size, global_scale)
         torch.testing.assert_close(
             y_dequant,
             ref_rmsnorm.float(),
@@ -224,10 +261,10 @@ class TestRMSNormFP4QuantCuteDSL:
     @pytest.mark.parametrize("dtype", [torch.float16])
     def test_large_batch(self, batch_size, hidden_size, dtype):
         """Test with large batch sizes."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
 
         torch.manual_seed(42)
-        block_size = 16
+        block_size = 16  # Fixed for NVFP4
         eps = 1e-6
 
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
@@ -244,11 +281,13 @@ class TestRMSNormFP4QuantCuteDSL:
         )
 
         # Should complete without error
-        rmsnorm_fp4quant(x, weight, y_fp4, block_scale, eps=eps, block_size=block_size)
+        _, _, global_scale = rmsnorm_nvfp4quant(x, weight, y_fp4, block_scale, eps=eps)
 
         # Reference computation (sample first 10 rows for speed)
         ref_rmsnorm = llama_rms_norm(x[:10], weight, eps=eps)
-        y_dequant = dequantize_fp4_output(y_fp4[:10], block_scale[:10], block_size)
+        y_dequant = dequantize_fp4_output(
+            y_fp4[:10], block_scale[:10], block_size, global_scale
+        )
 
         torch.testing.assert_close(
             y_dequant,
@@ -260,18 +299,18 @@ class TestRMSNormFP4QuantCuteDSL:
 
 @cute_dsl_available
 @blackwell_required
-class TestRMSNormFP4QuantMXFP4:
-    """Tests for MXFP4 format (block_size=32, UE8M0 scales)."""
+class TestRMSNormMXFP4QuantCuteDSL:
+    """Tests for MXFP4 format (block_size=32, UE8M0 scales, no global_scale)."""
 
     @pytest.mark.parametrize("batch_size", [1, 4, 16, 7, 25, 128, 8192])
     @pytest.mark.parametrize("hidden_size", [128, 256, 512, 1536, 2048, 4096])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_mxfp4_basic(self, batch_size, hidden_size, dtype):
         """Test MXFP4 format (block_size=32, UE8M0 scales)."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_mxfp4quant
 
         torch.manual_seed(42)
-        block_size = 32  # MXFP4
+        block_size = 32  # Fixed for MXFP4
         eps = 1e-6
 
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
@@ -285,57 +324,56 @@ class TestRMSNormFP4QuantMXFP4:
             batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
         )
 
-        rmsnorm_fp4quant(
+        # MXFP4 doesn't use global_scale
+        y_fp4_out, block_scale_out = rmsnorm_mxfp4quant(
             x,
             weight,
             y_fp4,
             block_scale,
             eps=eps,
-            block_size=block_size,
-            scale_format="ue8m0",
         )
 
         # Verify output shapes
-        assert y_fp4.shape == (batch_size, hidden_size // 2)
-        assert block_scale.shape == (batch_size, hidden_size // block_size)
-        assert y_fp4.dtype == torch.uint8
-        assert block_scale.dtype == torch.uint8
+        assert y_fp4_out.shape == (batch_size, hidden_size // 2)
+        assert block_scale_out.shape == (batch_size, hidden_size // block_size)
+        assert y_fp4_out.dtype == torch.uint8
+        assert block_scale_out.dtype == torch.uint8
 
         # Reference computation
         ref_rmsnorm = llama_rms_norm(x, weight, eps=eps)
 
-        # Dequantize FP4 output
+        # Dequantize FP4 output (no global_scale for MXFP4)
         # MXFP4 uses power-of-2 scales which can introduce more quantization error
-        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        y_dequant = dequantize_fp4_output(y_fp4_out, block_scale_out, block_size)
         torch.testing.assert_close(
             y_dequant,
             ref_rmsnorm.float(),
-            rtol=0.3,
+            rtol=0.4,
             atol=0.7,
         )
 
 
 @cute_dsl_available
 @blackwell_required
-class TestSeparateFlashInferComparison:
-    """Tests comparing CuTe-DSL fused kernel output against reference RMSNorm."""
+class TestNVFP4VsReference:
+    """Tests comparing CuTe-DSL NVFP4 fused kernel output against reference RMSNorm."""
 
     @pytest.mark.parametrize("batch_size", [4, 16, 128, 512, 8192])
     @pytest.mark.parametrize("hidden_size", [256, 512, 1024, 1536, 4096, 8192])
     @pytest.mark.parametrize("dtype", [torch.float16])
-    def test_fused_vs_separate(self, batch_size, hidden_size, dtype):
+    def test_nvfp4_vs_reference(self, batch_size, hidden_size, dtype):
         """
-        Compare CuTe-DSL fused output with reference RMSNorm.
+        Compare CuTe-DSL NVFP4 fused output with reference RMSNorm.
 
         We compare the dequantized output against the reference RMSNorm,
         rather than comparing bitwise with separate fp4_quantize (which uses
         different scaling approaches).
         """
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
         from flashinfer.norm import rmsnorm
 
         torch.manual_seed(42)
-        block_size = 16
+        block_size = 16  # Fixed for NVFP4
         eps = 1e-6
 
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
@@ -351,8 +389,8 @@ class TestSeparateFlashInferComparison:
             device="cuda",
             dtype=torch.float8_e4m3fn,
         )
-        rmsnorm_fp4quant(
-            x, weight, y_fp4_fused, block_scale_fused, eps=eps, block_size=block_size
+        _, _, global_scale = rmsnorm_nvfp4quant(
+            x, weight, y_fp4_fused, block_scale_fused, eps=eps
         )
 
         # Reference: RMSNorm only
@@ -361,10 +399,12 @@ class TestSeparateFlashInferComparison:
         # Verify output shapes
         assert y_fp4_fused.shape == (batch_size, hidden_size // 2)
         assert block_scale_fused.shape == (batch_size, hidden_size // block_size)
+        assert global_scale.shape == (1,)
+        assert global_scale.dtype == torch.float32
 
         # Dequantize fused output and compare to reference
         y_fused_dequant = dequantize_fp4_output(
-            y_fp4_fused, block_scale_fused, block_size
+            y_fp4_fused, block_scale_fused, block_size, global_scale
         )
 
         # Value-level comparison against reference RMSNorm output
@@ -391,10 +431,10 @@ class TestLargeHiddenSize:
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_large_hidden_nvfp4(self, batch_size, hidden_size, dtype):
         """Test NVFP4 format with large hidden sizes (cluster sync path)."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
 
         torch.manual_seed(42)
-        block_size = 16
+        block_size = 16  # Fixed for NVFP4
         eps = 1e-6
 
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
@@ -411,19 +451,21 @@ class TestLargeHiddenSize:
         )
 
         # Run kernel
-        rmsnorm_fp4quant(x, weight, y_fp4, block_scale, eps=eps, block_size=block_size)
+        _, _, global_scale = rmsnorm_nvfp4quant(x, weight, y_fp4, block_scale, eps=eps)
 
         # Verify output shapes
         assert y_fp4.shape == (batch_size, hidden_size // 2)
         assert block_scale.shape == (batch_size, hidden_size // block_size)
+        assert global_scale.shape == (1,)
         assert y_fp4.dtype == torch.uint8
         assert block_scale.dtype == torch.float8_e4m3fn
+        assert global_scale.dtype == torch.float32
 
         # Sample first few rows for value comparison (full dequant is slow)
         num_check = min(10, batch_size)
         ref_rmsnorm = llama_rms_norm(x[:num_check], weight, eps=eps)
         y_dequant = dequantize_fp4_output(
-            y_fp4[:num_check], block_scale[:num_check], block_size
+            y_fp4[:num_check], block_scale[:num_check], block_size, global_scale
         )
 
         torch.testing.assert_close(
@@ -438,10 +480,10 @@ class TestLargeHiddenSize:
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_large_hidden_mxfp4(self, batch_size, hidden_size, dtype):
         """Test MXFP4 format with large hidden sizes (cluster sync path)."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_mxfp4quant
 
         torch.manual_seed(42)
-        block_size = 32  # MXFP4
+        block_size = 32  # Fixed for MXFP4
         eps = 1e-6
 
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
@@ -454,28 +496,26 @@ class TestLargeHiddenSize:
             batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
         )
 
-        # Run kernel
-        rmsnorm_fp4quant(
+        # Run kernel (MXFP4 doesn't use global_scale)
+        y_fp4_out, block_scale_out = rmsnorm_mxfp4quant(
             x,
             weight,
             y_fp4,
             block_scale,
             eps=eps,
-            block_size=block_size,
-            scale_format="ue8m0",
         )
 
         # Verify output shapes
-        assert y_fp4.shape == (batch_size, hidden_size // 2)
-        assert block_scale.shape == (batch_size, hidden_size // block_size)
-        assert y_fp4.dtype == torch.uint8
-        assert block_scale.dtype == torch.uint8
+        assert y_fp4_out.shape == (batch_size, hidden_size // 2)
+        assert block_scale_out.shape == (batch_size, hidden_size // block_size)
+        assert y_fp4_out.dtype == torch.uint8
+        assert block_scale_out.dtype == torch.uint8
 
         # Sample first few rows for value comparison (full dequant is slow)
         num_check = min(10, batch_size)
         ref_rmsnorm = llama_rms_norm(x[:num_check], weight, eps=eps)
         y_dequant = dequantize_fp4_output(
-            y_fp4[:num_check], block_scale[:num_check], block_size
+            y_fp4_out[:num_check], block_scale_out[:num_check], block_size
         )
 
         torch.testing.assert_close(
@@ -535,9 +575,9 @@ class TestSwizzledScaleFactors:
         Test that swizzled output, when unswizzled, matches the non-swizzled output.
         Uses NVFP4 format (block_size=16, E4M3 scales).
         """
-        from flashinfer.cute_dsl import rmsnorm_fp4quant
+        from flashinfer.cute_dsl import rmsnorm_nvfp4quant
 
-        block_size = 16
+        block_size = 16  # Fixed for NVFP4
         torch.manual_seed(42)
 
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
@@ -567,20 +607,18 @@ class TestSwizzledScaleFactors:
         )
 
         # Run kernels
-        rmsnorm_fp4quant(
+        _, _, global_scale_ref = rmsnorm_nvfp4quant(
             x,
             weight,
             y_fp4_ref,
             block_scale_ref,
-            block_size=block_size,
             is_sf_swizzled_layout=False,
         )
-        rmsnorm_fp4quant(
+        _, _, global_scale_swizzled = rmsnorm_nvfp4quant(
             x,
             weight,
             y_fp4_swizzled,
             block_scale_swizzled,
-            block_size=block_size,
             is_sf_swizzled_layout=True,
         )
 
@@ -597,6 +635,9 @@ class TestSwizzledScaleFactors:
             block_scale_unswizzled.view(torch.uint8), block_scale_ref.view(torch.uint8)
         )
 
+        # Global scales should be identical
+        torch.testing.assert_close(global_scale_ref, global_scale_swizzled)
+
     @pytest.mark.parametrize("batch_size", [1, 16, 128, 256])
     @pytest.mark.parametrize("hidden_size", [512, 1024, 2048, 4096])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -605,9 +646,9 @@ class TestSwizzledScaleFactors:
         Test that swizzled output, when unswizzled, matches the non-swizzled output.
         Uses MXFP4 format (block_size=32, UE8M0 scales).
         """
-        from flashinfer.cute_dsl import rmsnorm_fp4quant
+        from flashinfer.cute_dsl import rmsnorm_mxfp4quant
 
-        block_size = 32
+        block_size = 32  # Fixed for MXFP4
         torch.manual_seed(42)
 
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
@@ -633,71 +674,81 @@ class TestSwizzledScaleFactors:
             swizzled_size, device="cuda", dtype=torch.uint8
         )
 
-        # Run kernels
-        rmsnorm_fp4quant(
+        # Run kernels (MXFP4 doesn't use global_scale)
+        y_fp4_ref_out, block_scale_ref_out = rmsnorm_mxfp4quant(
             x,
             weight,
             y_fp4_ref,
             block_scale_ref,
-            block_size=block_size,
             is_sf_swizzled_layout=False,
         )
-        rmsnorm_fp4quant(
+        y_fp4_swizzled_out, block_scale_swizzled_out = rmsnorm_mxfp4quant(
             x,
             weight,
             y_fp4_swizzled,
             block_scale_swizzled,
-            block_size=block_size,
             is_sf_swizzled_layout=True,
         )
 
         # Unswizzle and compare
         block_scale_unswizzled = unswizzle_sf(
-            block_scale_swizzled, batch_size, hidden_size, block_size
+            block_scale_swizzled_out, batch_size, hidden_size, block_size
         )
 
         # FP4 values should be identical
-        torch.testing.assert_close(y_fp4_swizzled, y_fp4_ref)
+        torch.testing.assert_close(y_fp4_swizzled_out, y_fp4_ref_out)
 
         # Scale factors should match after unswizzling
-        torch.testing.assert_close(block_scale_unswizzled, block_scale_ref)
+        torch.testing.assert_close(block_scale_unswizzled, block_scale_ref_out)
 
 
 @cute_dsl_available
 @blackwell_required
 class TestAutoAllocation:
-    """Tests for automatic output tensor allocation when y_fp4 and block_scale are None."""
+    """Tests for automatic output tensor allocation when y_fp4, block_scale, and global_scale are None."""
 
     @pytest.mark.parametrize("batch_size", [1, 16, 128])
     @pytest.mark.parametrize("hidden_size", [256, 1024, 4096])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_auto_allocation_2d_nvfp4(self, batch_size, hidden_size, dtype):
         """Test auto-allocation with 2D input and NVFP4 format."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
 
         torch.manual_seed(42)
-        block_size = 16
+        block_size = 16  # Fixed for NVFP4
         eps = 1e-6
 
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
-        # Call without providing y_fp4 and block_scale
-        y_fp4, block_scale = rmsnorm_fp4quant(x, weight, eps=eps, block_size=block_size)
+        # Call without providing y_fp4, block_scale, and global_scale
+        y_fp4, block_scale, global_scale = rmsnorm_nvfp4quant(x, weight, eps=eps)
 
         # Verify output shapes
         assert y_fp4.shape == (batch_size, hidden_size // 2)
         assert block_scale.shape == (batch_size, hidden_size // block_size)
+        assert global_scale.shape == (1,)
 
         # Verify output dtypes
         assert y_fp4.dtype == torch.uint8
         assert block_scale.dtype == torch.float8_e4m3fn
+        assert global_scale.dtype == torch.float32
 
         # Reference computation
         ref_rmsnorm = llama_rms_norm(x, weight, eps=eps)
 
+        # Verify global_scale is computed correctly: FP8_MAX * FP4_MAX / max_abs
+        expected_global_scale = 448.0 * 6.0 / ref_rmsnorm.abs().max().item()
+        assert global_scale.item() > 0, "global_scale should be positive"
+        torch.testing.assert_close(
+            global_scale,
+            torch.tensor([expected_global_scale], dtype=torch.float32, device="cuda"),
+            rtol=0.01,
+            atol=1.0,
+        )
+
         # Dequantize and verify values
-        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size, global_scale)
         torch.testing.assert_close(
             y_dequant,
             ref_rmsnorm.float(),
@@ -711,31 +762,42 @@ class TestAutoAllocation:
     @pytest.mark.parametrize("dtype", [torch.float16])
     def test_auto_allocation_3d_nvfp4(self, batch_size, seq_len, hidden_size, dtype):
         """Test auto-allocation with 3D input and NVFP4 format."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
 
         torch.manual_seed(42)
-        block_size = 16
+        block_size = 16  # Fixed for NVFP4
         eps = 1e-6
 
         x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
-        # Call without providing y_fp4 and block_scale
-        y_fp4, block_scale = rmsnorm_fp4quant(x, weight, eps=eps, block_size=block_size)
+        # Call without providing y_fp4, block_scale, and global_scale
+        y_fp4, block_scale, global_scale = rmsnorm_nvfp4quant(x, weight, eps=eps)
 
         # Verify output shapes
         assert y_fp4.shape == (batch_size, seq_len, hidden_size // 2)
         assert block_scale.shape == (batch_size, seq_len, hidden_size // block_size)
+        assert global_scale.shape == (1,)
 
         # Verify output dtypes
         assert y_fp4.dtype == torch.uint8
         assert block_scale.dtype == torch.float8_e4m3fn
+        assert global_scale.dtype == torch.float32
 
         # Reference computation
         ref_rmsnorm = llama_rms_norm(x, weight, eps=eps)
 
+        # Verify global_scale is computed correctly: FP8_MAX * FP4_MAX / max_abs
+        expected_global_scale = 448.0 * 6.0 / ref_rmsnorm.abs().max().item()
+        torch.testing.assert_close(
+            global_scale,
+            torch.tensor([expected_global_scale], dtype=torch.float32, device="cuda"),
+            rtol=0.01,
+            atol=1.0,
+        )
+
         # Dequantize and verify values
-        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size, global_scale)
         torch.testing.assert_close(
             y_dequant,
             ref_rmsnorm.float(),
@@ -748,19 +810,17 @@ class TestAutoAllocation:
     @pytest.mark.parametrize("dtype", [torch.float16])
     def test_auto_allocation_mxfp4(self, batch_size, hidden_size, dtype):
         """Test auto-allocation with MXFP4 format (block_size=32, UE8M0 scales)."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_mxfp4quant
 
         torch.manual_seed(42)
-        block_size = 32
+        block_size = 32  # Fixed for MXFP4
         eps = 1e-6
 
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
-        # Call without providing y_fp4 and block_scale
-        y_fp4, block_scale = rmsnorm_fp4quant(
-            x, weight, eps=eps, block_size=block_size, scale_format="ue8m0"
-        )
+        # Call without providing y_fp4 and block_scale (MXFP4 doesn't use global_scale)
+        y_fp4, block_scale = rmsnorm_mxfp4quant(x, weight, eps=eps)
 
         # Verify output shapes
         assert y_fp4.shape == (batch_size, hidden_size // 2)
@@ -773,7 +833,7 @@ class TestAutoAllocation:
         # Reference computation
         ref_rmsnorm = llama_rms_norm(x, weight, eps=eps)
 
-        # Dequantize and verify values
+        # Dequantize and verify values (no global_scale for MXFP4)
         y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
         torch.testing.assert_close(
             y_dequant,
@@ -785,20 +845,20 @@ class TestAutoAllocation:
     @pytest.mark.parametrize("batch_size", [16, 128])
     @pytest.mark.parametrize("hidden_size", [512, 1024])
     @pytest.mark.parametrize("dtype", [torch.float16])
-    def test_auto_allocation_swizzled(self, batch_size, hidden_size, dtype):
-        """Test auto-allocation with swizzled scale factor layout."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+    def test_auto_allocation_swizzled_nvfp4(self, batch_size, hidden_size, dtype):
+        """Test auto-allocation with swizzled scale factor layout (NVFP4)."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
 
         torch.manual_seed(42)
-        block_size = 16
+        block_size = 16  # Fixed for NVFP4
         eps = 1e-6
 
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
-        # Call without providing y_fp4 and block_scale, with swizzled layout
-        y_fp4, block_scale = rmsnorm_fp4quant(
-            x, weight, eps=eps, block_size=block_size, is_sf_swizzled_layout=True
+        # Call without providing y_fp4, block_scale, and global_scale, with swizzled layout
+        y_fp4, block_scale, global_scale = rmsnorm_nvfp4quant(
+            x, weight, eps=eps, is_sf_swizzled_layout=True
         )
 
         # Verify output shapes
@@ -809,10 +869,12 @@ class TestAutoAllocation:
         num_k_tiles = (hidden_size + factor - 1) // factor
         expected_swizzled_size = num_m_tiles * num_k_tiles * 32 * 4 * 4
         assert block_scale.shape == (expected_swizzled_size,)
+        assert global_scale.shape == (1,)
 
         # Verify output dtypes
         assert y_fp4.dtype == torch.uint8
         assert block_scale.dtype == torch.float8_e4m3fn
+        assert global_scale.dtype == torch.float32
 
         # Unswizzle and compare with non-swizzled version
         y_fp4_ref = torch.empty(
@@ -824,8 +886,8 @@ class TestAutoAllocation:
             device="cuda",
             dtype=torch.float8_e4m3fn,
         )
-        rmsnorm_fp4quant(
-            x, weight, y_fp4_ref, block_scale_ref, eps=eps, block_size=block_size
+        _, _, global_scale_ref = rmsnorm_nvfp4quant(
+            x, weight, y_fp4_ref, block_scale_ref, eps=eps
         )
 
         # FP4 values should be identical
@@ -839,14 +901,17 @@ class TestAutoAllocation:
             block_scale_unswizzled.view(torch.uint8), block_scale_ref.view(torch.uint8)
         )
 
+        # Global scales should be identical
+        torch.testing.assert_close(global_scale, global_scale_ref)
+
     @pytest.mark.parametrize("batch_size", [16, 128])
     @pytest.mark.parametrize("hidden_size", [512, 1024])
-    def test_auto_allocation_matches_preallocated(self, batch_size, hidden_size):
-        """Test that auto-allocation produces same results as pre-allocated tensors."""
-        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+    def test_auto_allocation_matches_preallocated_nvfp4(self, batch_size, hidden_size):
+        """Test that auto-allocation produces same results as pre-allocated tensors (NVFP4)."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
 
         torch.manual_seed(42)
-        block_size = 16
+        block_size = 16  # Fixed for NVFP4
         eps = 1e-6
         dtype = torch.float16
 
@@ -863,13 +928,14 @@ class TestAutoAllocation:
             device="cuda",
             dtype=torch.float8_e4m3fn,
         )
-        rmsnorm_fp4quant(
-            x, weight, y_fp4_pre, block_scale_pre, eps=eps, block_size=block_size
+        global_scale_pre = torch.empty(1, dtype=torch.float32, device="cuda")
+        _, _, _ = rmsnorm_nvfp4quant(
+            x, weight, y_fp4_pre, block_scale_pre, global_scale_pre, eps=eps
         )
 
         # Auto-allocated version
-        y_fp4_auto, block_scale_auto = rmsnorm_fp4quant(
-            x, weight, eps=eps, block_size=block_size
+        y_fp4_auto, block_scale_auto, global_scale_auto = rmsnorm_nvfp4quant(
+            x, weight, eps=eps
         )
 
         # Results should be identical
@@ -877,6 +943,40 @@ class TestAutoAllocation:
         torch.testing.assert_close(
             block_scale_auto.view(torch.uint8), block_scale_pre.view(torch.uint8)
         )
+        torch.testing.assert_close(global_scale_auto, global_scale_pre)
+
+    @pytest.mark.parametrize("batch_size", [16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 1024])
+    def test_auto_allocation_matches_preallocated_mxfp4(self, batch_size, hidden_size):
+        """Test that auto-allocation produces same results as pre-allocated tensors (MXFP4)."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_mxfp4quant
+
+        torch.manual_seed(42)
+        block_size = 32  # Fixed for MXFP4
+        eps = 1e-6
+        dtype = torch.float16
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Pre-allocated version
+        y_fp4_pre = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+        )
+        block_scale_pre = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.uint8,
+        )
+        _, _ = rmsnorm_mxfp4quant(x, weight, y_fp4_pre, block_scale_pre, eps=eps)
+
+        # Auto-allocated version
+        y_fp4_auto, block_scale_auto = rmsnorm_mxfp4quant(x, weight, eps=eps)
+
+        # Results should be identical
+        torch.testing.assert_close(y_fp4_auto, y_fp4_pre)
+        torch.testing.assert_close(block_scale_auto, block_scale_pre)
 
 
 if __name__ == "__main__":

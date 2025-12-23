@@ -181,6 +181,231 @@ def st_global_u64(base_ptr: Int64, value: Uint64, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_global_f32(base_ptr: Int64, value: Float32, *, loc=None, ip=None):
+    """Store 32-bit float to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Float32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def ld_global_f32(base_ptr: Int64, *, loc=None, ip=None) -> Float32:
+    """Load 32-bit float from global memory."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+            "ld.global.f32 $0, [$1];",
+            "=f,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def st_global_v4_u32(
+    base_ptr: Int64,
+    v0: Uint32,
+    v1: Uint32,
+    v2: Uint32,
+    v3: Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store 128 bits (4 x uint32) to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+            Uint32(v2).ir_value(loc=loc, ip=ip),
+            Uint32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v4.u32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def fabs_f32(val: Float32, *, loc=None, ip=None) -> Float32:
+    """Compute absolute value of float32."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(val).ir_value(loc=loc, ip=ip)],
+            "abs.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def fmax_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """Compute max of two float32 values."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "max.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def float2_to_half2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
+    """Convert two float32 values to packed half2 (uint32)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.f16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def float2_to_bfloat2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
+    """Convert two float32 values to packed bfloat16x2 (uint32)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def atomic_max_global_u32(
+    base_ptr: Int64, value: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Atomically update global memory with max(current, value) for uint32.
+
+    Uses atom.global.max.u32 which is supported on all architectures.
+    For positive floats, we use float-as-uint trick since IEEE754 preserves order.
+    Returns the old value (which we ignore).
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(base_ptr).ir_value(loc=loc, ip=ip),
+                Uint32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.global.max.u32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def float_as_uint(value: Float32, *, loc=None, ip=None) -> Uint32:
+    """Reinterpret float32 bits as uint32.
+
+    For positive floats, IEEE754 representation preserves ordering when
+    interpreted as unsigned integers, so atomicMax(uint32) can be used
+    to find max of positive floats.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def uint_as_float(value: Uint32, *, loc=None, ip=None) -> Float32:
+    """Reinterpret uint32 bits as float32."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(value).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def griddepcontrol_launch_dependents(*, loc=None, ip=None):
+    """Signal dependent kernels to launch (PDL).
+
+    Issuing this instruction hints a dependent kernel to launch earlier.
+    Used for overlapping kernel launches with computation.
+    """
+    llvm.inline_asm(
+        None,
+        [],
+        "griddepcontrol.launch_dependents;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def griddepcontrol_wait(*, loc=None, ip=None):
+    """Wait for the previous kernel's grid to finish (PDL).
+
+    This instruction blocks until the previous grid has completed
+    and all memory operations are flushed.
+    """
+    llvm.inline_asm(
+        None,
+        [],
+        "griddepcontrol.wait;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def get_ptr_as_int64(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -> Int64:
     """Get the memory address of tensor[offset] as Int64."""
     elem_ptr = tensor.iterator + Int32(offset)
@@ -1693,6 +1918,896 @@ class RMSNormFP4QuantKernel:
 
 
 # =============================================================================
+# Kernel 1: RMSNorm + Global Max (for two-kernel approach with global_scale)
+# =============================================================================
+
+
+class RMSNormGlobalMaxKernel:
+    """
+    Kernel 1 of two-kernel approach: RMSNorm + Find Global Max.
+
+    This kernel:
+    1. Computes RMSNorm: y = x * rstd * w
+    2. Stores y to intermediate buffer
+    3. Atomically updates global_max with max(|y|)
+    4. Signals dependent kernel via griddepcontrol.launch_dependents()
+    """
+
+    def __init__(
+        self,
+        dtype: cutlass.Numeric,
+        H: int,
+        is_fp16: bool,
+        sm_version: int | None = None,
+    ):
+        self.dtype = dtype
+        self.H = H
+        self.is_fp16 = is_fp16
+        self.sm_version = sm_version if sm_version is not None else get_sm_version()
+
+        # For simplicity, use cluster_n=1 for this kernel
+        # The main overhead is memory bandwidth anyway
+        self.cluster_n = 1
+        self.H_per_cta = H
+
+        # Compute thread configuration
+        self.threads_per_row = self._compute_threads_per_row(self.H_per_cta)
+        self.num_threads = self._compute_num_threads(self.H_per_cta)
+        self.rows_per_block = self.num_threads // self.threads_per_row
+        self.warps_per_row = max(self.threads_per_row // 32, 1)
+
+        # Vectorization parameters
+        elem_bytes = dtype.width // 8
+        self.vec_size = COPY_BITS // 8 // elem_bytes
+        self.num_vec_blocks = max(
+            1,
+            (self.H_per_cta // self.vec_size + self.threads_per_row - 1)
+            // self.threads_per_row,
+        )
+        self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
+
+    @staticmethod
+    def _compute_threads_per_row(H_per_cta: int) -> int:
+        """Compute optimal threads per row based on H per CTA."""
+        if H_per_cta <= 64:
+            return 8
+        elif H_per_cta <= 128:
+            return 16
+        elif H_per_cta <= 3072:
+            return 32
+        elif H_per_cta <= 6144:
+            return 64
+        elif H_per_cta <= 16384:
+            return 128
+        else:
+            return 256
+
+    @staticmethod
+    def _compute_num_threads(H_per_cta: int) -> int:
+        """Compute total threads per block based on H per CTA."""
+        return 128 if H_per_cta <= 16384 else 256
+
+    @staticmethod
+    def _make_tv_layout(
+        threads_per_row: int,
+        rows_per_block: int,
+        vec_size: int,
+        num_vec_blocks: int,
+    ) -> tuple:
+        """Create Thread-Value layout for coalesced vectorized memory access."""
+        shape = (
+            (threads_per_row, rows_per_block),
+            (vec_size, num_vec_blocks),
+        )
+        stride = (
+            (vec_size * rows_per_block, 1),
+            (rows_per_block, rows_per_block * vec_size * threads_per_row),
+        )
+        return shape, stride
+
+    def _smem_size_in_bytes(self) -> int:
+        """Calculate shared memory requirement."""
+        # Input tile for X
+        tile_bytes = self.rows_per_block * self.cols_per_tile * (self.dtype.width // 8)
+        # Reduction buffer
+        reduction_bytes = self.rows_per_block * self.warps_per_row * 4
+        return tile_bytes + reduction_bytes
+
+    @cute.jit
+    def __call__(
+        self,
+        x_ptr: cute.Pointer,
+        w_ptr: cute.Pointer,
+        y_ptr: cute.Pointer,  # Output: RMSNorm result (same dtype as input)
+        global_max_ptr: cute.Pointer,  # Output: global max (float32)
+        M: Int32,
+        eps: Float32,
+        stream: cuda.CUstream,
+    ):
+        """Host function to launch the kernel."""
+        H = self.H
+
+        mX = cute.make_tensor(
+            x_ptr,
+            layout=cute.make_ordered_layout((M, H), order=(1, 0)),
+        )
+        mW = cute.make_tensor(
+            w_ptr,
+            layout=cute.make_layout((H,)),
+        )
+        # Y has same layout as X (stores RMSNorm output in input dtype)
+        mY = cute.make_tensor(
+            y_ptr,
+            layout=cute.make_ordered_layout((M, H), order=(1, 0)),
+        )
+        mGlobalMax = cute.make_tensor(
+            global_max_ptr,
+            layout=cute.make_layout((1,)),
+        )
+
+        self.kernel(mX, mW, mY, mGlobalMax, M, eps).launch(
+            grid=[cute.ceil_div(M, self.rows_per_block), 1, 1],
+            block=[self.num_threads, 1, 1],
+            smem=self._smem_size_in_bytes(),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mX: cute.Tensor,
+        mW: cute.Tensor,
+        mY: cute.Tensor,
+        mGlobalMax: cute.Tensor,
+        M: Int32,
+        eps: Float32,
+    ):
+        """Device kernel: RMSNorm + store + global max."""
+        bidx = cute.arch.block_idx()[0]
+        tidx = cute.arch.thread_idx()[0]
+        H = self.H
+        is_fp16 = self.is_fp16
+        rows_per_block = self.rows_per_block
+        cols_per_tile = self.cols_per_tile
+        threads_per_row = self.threads_per_row
+        warps_per_row = self.warps_per_row
+        vec_size = self.vec_size
+        num_vec_blocks = self.num_vec_blocks
+
+        lane_in_row = tidx % threads_per_row
+        row_in_block = tidx // threads_per_row
+
+        # Create layouts using compile-time constants
+        tv_shape = (
+            (threads_per_row, rows_per_block),
+            (vec_size, num_vec_blocks),
+        )
+        tv_stride = (
+            (vec_size * rows_per_block, 1),
+            (rows_per_block, rows_per_block * vec_size * threads_per_row),
+        )
+        tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
+        tiler_mn = (rows_per_block, cols_per_tile)
+
+        # Allocate shared memory using static shapes
+        smem = cutlass.utils.SmemAllocator()
+        sX = smem.allocate_tensor(
+            mX.element_type,
+            cute.make_ordered_layout((rows_per_block, cols_per_tile), order=(1, 0)),
+            byte_alignment=16,
+        )
+        reduction_buffer = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((rows_per_block, warps_per_row)),
+            byte_alignment=4,
+        )
+
+        # Create identity tensor for coordinate tracking
+        idX = cute.make_identity_tensor(mX.shape)
+        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
+        cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
+
+        # Create TiledCopy for async load
+        copy_atom_load_async = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(),
+            mX.element_type,
+            num_bits_per_copy=COPY_BITS,
+        )
+        tiled_copy_load = cute.make_tiled_copy(
+            copy_atom_load_async, tv_layout, tiler_mn
+        )
+        thr_copy_X = tiled_copy_load.get_slice(tidx)
+
+        # Partition tensors
+        tXgX = thr_copy_X.partition_S(gX)
+        tXsX = thr_copy_X.partition_D(sX)
+        tXcX = thr_copy_X.partition_S(cX)
+
+        # Register fragments
+        tXrX = cute.make_fragment_like(tXgX)
+
+        # Create predicate tensor
+        tXpX = predicate_k(tXcX, limit=H)
+
+        row_coord = tXcX[(0, 0), 0, 0]
+        row_in_bounds = row_coord[0] < M
+
+        # Phase 1: Load X to shared memory
+        if row_in_bounds:
+            cute.copy(copy_atom_load_async, tXgX, tXsX, pred=tXpX)
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+
+        # Phase 2: Compute sum of squares
+        cute.autovec_copy(tXsX, tXrX)
+        x = tXrX.load().to(Float32)
+        x_sq = x * x
+        sum_sq = row_reduce(
+            x_sq,
+            cute.ReductionOp.ADD,
+            threads_per_row,
+            reduction_buffer,
+            None,  # No mbarrier for cluster_n=1
+            1,  # cluster_n
+            Float32(0.0),
+        )
+
+        mean_sq = sum_sq / H
+        rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
+
+        cute.arch.barrier()
+
+        # Phase 3: Compute RMSNorm and store, tracking max_abs
+        actual_row_idx = bidx * rows_per_block + row_in_block
+
+        if actual_row_idx < M:
+            # Get pointer to global_max for atomic updates
+            global_max_addr = get_ptr_as_int64(mGlobalMax, Int32(0))
+
+            # Track thread-local max
+            thread_max_abs = Float32(0.0)
+
+            # Process elements in blocks of vec_size (8 elements for FP16)
+            num_vec_per_thread = (H + threads_per_row * self.vec_size - 1) // (
+                threads_per_row * self.vec_size
+            )
+
+            for vec_iter in range(num_vec_per_thread):
+                vec_idx = lane_in_row + vec_iter * threads_per_row
+                col_start = vec_idx * self.vec_size
+
+                if col_start < H:
+                    # Load X and W vectors
+                    x_ptr = get_ptr_as_int64(mX, actual_row_idx * H + col_start)
+                    w_ptr_addr = get_ptr_as_int64(mW, col_start)
+
+                    x0, x1, x2, x3 = ld_global_v4_u32(x_ptr)
+
+                    w0, w1, w2, w3 = ld_global_v4_u32(w_ptr_addr)
+
+                    # Compute y = x * rstd * w
+                    if cutlass.const_expr(is_fp16):
+                        # Half2 operations
+                        y0_h2 = half2_mul(x0, w0)
+                        y1_h2 = half2_mul(x1, w1)
+                        y2_h2 = half2_mul(x2, w2)
+                        y3_h2 = half2_mul(x3, w3)
+
+                        # Scale by rstd and convert to float
+                        y0, y1 = half2_to_float2_scaled(y0_h2, rstd)
+                        y2, y3 = half2_to_float2_scaled(y1_h2, rstd)
+                        y4, y5 = half2_to_float2_scaled(y2_h2, rstd)
+                        y6, y7 = half2_to_float2_scaled(y3_h2, rstd)
+
+                        # Track max abs
+                        abs0 = fabs_f32(y0)
+                        abs1 = fabs_f32(y1)
+                        abs2 = fabs_f32(y2)
+                        abs3 = fabs_f32(y3)
+                        abs4 = fabs_f32(y4)
+                        abs5 = fabs_f32(y5)
+                        abs6 = fabs_f32(y6)
+                        abs7 = fabs_f32(y7)
+
+                        local_max = fmax_f32(abs0, abs1)
+                        local_max = fmax_f32(local_max, abs2)
+                        local_max = fmax_f32(local_max, abs3)
+                        local_max = fmax_f32(local_max, abs4)
+                        local_max = fmax_f32(local_max, abs5)
+                        local_max = fmax_f32(local_max, abs6)
+                        local_max = fmax_f32(local_max, abs7)
+                        thread_max_abs = fmax_f32(thread_max_abs, local_max)
+
+                        # Convert back to half and store
+                        y_h2_0 = float2_to_half2(y0, y1)
+                        y_h2_1 = float2_to_half2(y2, y3)
+                        y_h2_2 = float2_to_half2(y4, y5)
+                        y_h2_3 = float2_to_half2(y6, y7)
+
+                        y_ptr = get_ptr_as_int64(mY, actual_row_idx * H + col_start)
+                        st_global_v4_u32(y_ptr, y_h2_0, y_h2_1, y_h2_2, y_h2_3)
+                    else:
+                        # BFloat16 operations
+                        y0_h2 = bfloat2_mul(x0, w0)
+                        y1_h2 = bfloat2_mul(x1, w1)
+                        y2_h2 = bfloat2_mul(x2, w2)
+                        y3_h2 = bfloat2_mul(x3, w3)
+
+                        y0, y1 = bfloat2_to_float2_scaled(y0_h2, rstd)
+                        y2, y3 = bfloat2_to_float2_scaled(y1_h2, rstd)
+                        y4, y5 = bfloat2_to_float2_scaled(y2_h2, rstd)
+                        y6, y7 = bfloat2_to_float2_scaled(y3_h2, rstd)
+
+                        abs0 = fabs_f32(y0)
+                        abs1 = fabs_f32(y1)
+                        abs2 = fabs_f32(y2)
+                        abs3 = fabs_f32(y3)
+                        abs4 = fabs_f32(y4)
+                        abs5 = fabs_f32(y5)
+                        abs6 = fabs_f32(y6)
+                        abs7 = fabs_f32(y7)
+
+                        local_max = fmax_f32(abs0, abs1)
+                        local_max = fmax_f32(local_max, abs2)
+                        local_max = fmax_f32(local_max, abs3)
+                        local_max = fmax_f32(local_max, abs4)
+                        local_max = fmax_f32(local_max, abs5)
+                        local_max = fmax_f32(local_max, abs6)
+                        local_max = fmax_f32(local_max, abs7)
+                        thread_max_abs = fmax_f32(thread_max_abs, local_max)
+
+                        y_h2_0 = float2_to_bfloat2(y0, y1)
+                        y_h2_1 = float2_to_bfloat2(y2, y3)
+                        y_h2_2 = float2_to_bfloat2(y4, y5)
+                        y_h2_3 = float2_to_bfloat2(y6, y7)
+
+                        y_ptr = get_ptr_as_int64(mY, actual_row_idx * H + col_start)
+                        st_global_v4_u32(y_ptr, y_h2_0, y_h2_1, y_h2_2, y_h2_3)
+
+            # Atomic update global max using uint32 reinterpretation
+            # For positive floats, IEEE754 preserves ordering when treated as uint
+            thread_max_abs_u32 = float_as_uint(thread_max_abs)
+            _ = atomic_max_global_u32(global_max_addr, thread_max_abs_u32)
+
+        # Signal dependent kernel
+        cute.arch.barrier()
+        if tidx == 0:
+            griddepcontrol_launch_dependents()
+
+
+# =============================================================================
+# Kernel 2: Global Scale + Quantize (for two-kernel approach with global_scale)
+# =============================================================================
+
+
+class GlobalScaleQuantizeKernel:
+    """
+    Kernel 2 of two-kernel approach: Apply Global Scale + Quantize.
+
+    This kernel:
+    1. Waits for Kernel 1 via griddepcontrol.wait()
+    2. Computes global_scale = FP8_MAX * FP4_MAX / global_max
+    3. Loads RMSNorm output from buffer
+    4. Applies global_scale and computes per-block scales
+    5. Quantizes to FP4 and stores
+    """
+
+    def __init__(
+        self,
+        dtype: cutlass.Numeric,
+        H: int,
+        block_size: int,
+        output_swizzled: bool,
+        is_fp16: bool,
+        sm_version: int | None = None,
+        scale_format: str | None = None,
+    ):
+        self.dtype = dtype
+        self.H = H
+        self.block_size = block_size
+        self.output_swizzled = output_swizzled
+        self.is_fp16 = is_fp16
+        self.sm_version = sm_version if sm_version is not None else get_sm_version()
+
+        if scale_format is None:
+            self.scale_format = "ue8m0" if block_size == 32 else "e4m3"
+        else:
+            self.scale_format = scale_format
+
+        assert block_size in (16, 32), f"block_size must be 16 or 32, got {block_size}"
+
+        # Use simple configuration for this kernel
+        self.cluster_n = 1
+        self.threads_per_row = 32
+        self.num_threads = 128
+        self.rows_per_block = self.num_threads // self.threads_per_row
+
+        self.num_sf_blocks_per_row = H // block_size
+
+        if output_swizzled:
+            num_col_vecs = H // block_size
+            self.num_k_tiles = (num_col_vecs + 3) // 4
+            self.k_tile_stride = 512
+
+    def _smem_size_in_bytes(self) -> int:
+        """Minimal shared memory for reduction."""
+        return 128  # Small buffer for reductions if needed
+
+    @cute.jit
+    def __call__(
+        self,
+        y_in_ptr: cute.Pointer,  # Input: RMSNorm output (input dtype)
+        global_max_ptr: cute.Pointer,  # Input: global max (float32)
+        global_scale_ptr: cute.Pointer,  # Output: global scale (float32)
+        y_fp4_ptr: cute.Pointer,  # Output: quantized FP4
+        scale_ptr: cute.Pointer,  # Output: block scales
+        M: Int32,
+        stream: cuda.CUstream,
+    ):
+        """Host function to launch the kernel."""
+        H = self.H
+
+        mYIn = cute.make_tensor(
+            y_in_ptr,
+            layout=cute.make_ordered_layout((M, H), order=(1, 0)),
+        )
+        mGlobalMax = cute.make_tensor(
+            global_max_ptr,
+            layout=cute.make_layout((1,)),
+        )
+        mGlobalScale = cute.make_tensor(
+            global_scale_ptr,
+            layout=cute.make_layout((1,)),
+        )
+        mYFP4 = cute.make_tensor(
+            y_fp4_ptr,
+            layout=cute.make_ordered_layout((M, H // 2), order=(1, 0)),
+        )
+
+        if cutlass.const_expr(self.output_swizzled):
+            num_m_tiles = (M + Int32(127)) // Int32(128)
+            swizzled_size = num_m_tiles * Int32(self.num_k_tiles * self.k_tile_stride)
+            mS = cute.make_tensor(
+                scale_ptr,
+                layout=cute.make_layout((swizzled_size,), stride=(Int32(1),)),
+            )
+        else:
+            mS = cute.make_tensor(
+                scale_ptr,
+                layout=cute.make_ordered_layout(
+                    (M, self.num_sf_blocks_per_row), order=(1, 0)
+                ),
+            )
+
+        self.kernel(mYIn, mGlobalMax, mGlobalScale, mYFP4, mS, M).launch(
+            grid=[cute.ceil_div(M, self.rows_per_block), 1, 1],
+            block=[self.num_threads, 1, 1],
+            smem=self._smem_size_in_bytes(),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mYIn: cute.Tensor,
+        mGlobalMax: cute.Tensor,
+        mGlobalScale: cute.Tensor,
+        mYFP4: cute.Tensor,
+        mS: cute.Tensor,
+        M: Int32,
+    ):
+        """Device kernel: Apply global scale + quantize."""
+        bidx = cute.arch.block_idx()[0]
+        tidx = cute.arch.thread_idx()[0]
+        H = self.H
+        block_size = self.block_size
+        num_sf_blocks_per_row = self.num_sf_blocks_per_row
+        is_fp16 = self.is_fp16
+        rows_per_block = self.rows_per_block
+        threads_per_row = self.threads_per_row
+
+        lane_in_row = tidx % threads_per_row
+        row_in_block = tidx // threads_per_row
+
+        # Wait for Kernel 1 to complete
+        griddepcontrol_wait()
+
+        # Thread 0 computes and stores global_scale
+        global_max_addr = get_ptr_as_int64(mGlobalMax, Int32(0))
+        global_scale_addr = get_ptr_as_int64(mGlobalScale, Int32(0))
+
+        # Read global_max (stored as uint32 for atomic max compatibility)
+        # Convert back to float - this works because we used float-as-uint for positive values
+        global_max_val = ld_global_f32(global_max_addr)
+
+        # Compute global_scale = FP8_MAX * FP4_MAX / global_max
+        # Clamp to avoid division by zero
+        fp8_fp4_product = Float32(FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
+        global_max_clamped = fmax_f32(global_max_val, Float32(1e-12))
+        global_scale = fp8_fp4_product * rcp_approx_ftz(global_max_clamped)
+
+        # Store global_scale (only thread 0)
+        if tidx == 0:
+            st_global_f32(global_scale_addr, global_scale)
+
+        # Precompute for quantization
+        fp4_max_rcp = rcp_approx_ftz(Float32(FLOAT4_E2M1_MAX))
+
+        actual_row_idx = bidx * rows_per_block + row_in_block
+
+        if actual_row_idx < M:
+            # Process scale factor blocks assigned to this thread
+            num_sf_per_thread = (
+                num_sf_blocks_per_row + threads_per_row - 1
+            ) // threads_per_row
+
+            for sf_iter in range(num_sf_per_thread):
+                sf_idx = lane_in_row + sf_iter * threads_per_row
+
+                if sf_idx < num_sf_blocks_per_row:
+                    block_start = sf_idx * block_size
+
+                    if cutlass.const_expr(block_size == 16):
+                        # Load 16 elements from Y buffer
+                        y_ptr0 = get_ptr_as_int64(
+                            mYIn, actual_row_idx * H + block_start
+                        )
+                        y_ptr1 = get_ptr_as_int64(
+                            mYIn, actual_row_idx * H + block_start + Int32(8)
+                        )
+
+                        y0, y1, y2, y3 = ld_global_v4_u32(y_ptr0)
+                        y4, y5, y6, y7 = ld_global_v4_u32(y_ptr1)
+
+                        # Convert to float and apply global_scale
+                        if cutlass.const_expr(is_fp16):
+                            v0, v1 = half2_to_float2_scaled(y0, global_scale)
+                            v2, v3 = half2_to_float2_scaled(y1, global_scale)
+                            v4, v5 = half2_to_float2_scaled(y2, global_scale)
+                            v6, v7 = half2_to_float2_scaled(y3, global_scale)
+                            v8, v9 = half2_to_float2_scaled(y4, global_scale)
+                            v10, v11 = half2_to_float2_scaled(y5, global_scale)
+                            v12, v13 = half2_to_float2_scaled(y6, global_scale)
+                            v14, v15 = half2_to_float2_scaled(y7, global_scale)
+
+                            # Max-abs for per-block scale
+                            abs0_h2 = habs2(y0)
+                            abs1_h2 = habs2(y1)
+                            abs2_h2 = habs2(y2)
+                            abs3_h2 = habs2(y3)
+                            abs4_h2 = habs2(y4)
+                            abs5_h2 = habs2(y5)
+                            abs6_h2 = habs2(y6)
+                            abs7_h2 = habs2(y7)
+
+                            max01_h2 = hmax2(abs0_h2, abs1_h2)
+                            max23_h2 = hmax2(abs2_h2, abs3_h2)
+                            max45_h2 = hmax2(abs4_h2, abs5_h2)
+                            max67_h2 = hmax2(abs6_h2, abs7_h2)
+                            max0123_h2 = hmax2(max01_h2, max23_h2)
+                            max4567_h2 = hmax2(max45_h2, max67_h2)
+                            max_h2 = hmax2(max0123_h2, max4567_h2)
+                            max_abs_block = hmax_to_f32(max_h2) * global_scale
+                        else:
+                            v0, v1 = bfloat2_to_float2_scaled(y0, global_scale)
+                            v2, v3 = bfloat2_to_float2_scaled(y1, global_scale)
+                            v4, v5 = bfloat2_to_float2_scaled(y2, global_scale)
+                            v6, v7 = bfloat2_to_float2_scaled(y3, global_scale)
+                            v8, v9 = bfloat2_to_float2_scaled(y4, global_scale)
+                            v10, v11 = bfloat2_to_float2_scaled(y5, global_scale)
+                            v12, v13 = bfloat2_to_float2_scaled(y6, global_scale)
+                            v14, v15 = bfloat2_to_float2_scaled(y7, global_scale)
+
+                            abs0_h2 = bfloat2_habs2(y0)
+                            abs1_h2 = bfloat2_habs2(y1)
+                            abs2_h2 = bfloat2_habs2(y2)
+                            abs3_h2 = bfloat2_habs2(y3)
+                            abs4_h2 = bfloat2_habs2(y4)
+                            abs5_h2 = bfloat2_habs2(y5)
+                            abs6_h2 = bfloat2_habs2(y6)
+                            abs7_h2 = bfloat2_habs2(y7)
+
+                            max01_h2 = bfloat2_hmax2(abs0_h2, abs1_h2)
+                            max23_h2 = bfloat2_hmax2(abs2_h2, abs3_h2)
+                            max45_h2 = bfloat2_hmax2(abs4_h2, abs5_h2)
+                            max67_h2 = bfloat2_hmax2(abs6_h2, abs7_h2)
+                            max0123_h2 = bfloat2_hmax2(max01_h2, max23_h2)
+                            max4567_h2 = bfloat2_hmax2(max45_h2, max67_h2)
+                            max_h2 = bfloat2_hmax2(max0123_h2, max4567_h2)
+                            max_abs_block = bfloat2_hmax_to_f32(max_h2) * global_scale
+
+                        # Compute per-block scale
+                        scale_float = max_abs_block * fp4_max_rcp
+                        scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
+
+                        scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
+                        scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
+                        inv_scale = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
+
+                        # Store scale
+                        if cutlass.const_expr(self.output_swizzled):
+                            inner_k_idx = sf_idx % Int32(4)
+                            inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
+                            outer_m_idx = actual_row_idx % Int32(32)
+                            k_tile_idx = sf_idx // Int32(4)
+                            m_tile_idx = actual_row_idx // Int32(128)
+                            m_tile_stride = self.num_k_tiles * self.k_tile_stride
+                            swizzled_offset = (
+                                m_tile_idx * m_tile_stride
+                                + k_tile_idx * self.k_tile_stride
+                                + outer_m_idx * Int32(16)
+                                + inner_m_idx * Int32(4)
+                                + inner_k_idx
+                            )
+                            mS[swizzled_offset] = scale_fp8
+                        else:
+                            mS[actual_row_idx, sf_idx] = scale_fp8
+
+                        # Quantize
+                        q0 = v0 * inv_scale
+                        q1 = v1 * inv_scale
+                        q2 = v2 * inv_scale
+                        q3 = v3 * inv_scale
+                        q4 = v4 * inv_scale
+                        q5 = v5 * inv_scale
+                        q6 = v6 * inv_scale
+                        q7 = v7 * inv_scale
+                        q8 = v8 * inv_scale
+                        q9 = v9 * inv_scale
+                        q10 = v10 * inv_scale
+                        q11 = v11 * inv_scale
+                        q12 = v12 * inv_scale
+                        q13 = v13 * inv_scale
+                        q14 = v14 * inv_scale
+                        q15 = v15 * inv_scale
+
+                        packed_lo = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
+                        packed_hi = cvt_e2m1x8_f32(q8, q9, q10, q11, q12, q13, q14, q15)
+                        packed64 = (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+
+                        out_offset = block_start // 2
+                        out_ptr = get_ptr_as_int64(
+                            mYFP4, actual_row_idx * (H // 2) + out_offset
+                        )
+                        st_global_u64(out_ptr, packed64)
+
+                    else:
+                        # block_size == 32: Process in 2 chunks
+                        # Similar to block_size==16 but with 32 elements
+                        # For brevity, handle this case with UE8M0 scale format
+                        y_ptr0_c0 = get_ptr_as_int64(
+                            mYIn, actual_row_idx * H + block_start
+                        )
+                        y_ptr1_c0 = get_ptr_as_int64(
+                            mYIn, actual_row_idx * H + block_start + Int32(8)
+                        )
+                        y_ptr0_c1 = get_ptr_as_int64(
+                            mYIn, actual_row_idx * H + block_start + Int32(16)
+                        )
+                        y_ptr1_c1 = get_ptr_as_int64(
+                            mYIn, actual_row_idx * H + block_start + Int32(24)
+                        )
+
+                        y0_c0, y1_c0, y2_c0, y3_c0 = ld_global_v4_u32(y_ptr0_c0)
+                        y4_c0, y5_c0, y6_c0, y7_c0 = ld_global_v4_u32(y_ptr1_c0)
+                        y0_c1, y1_c1, y2_c1, y3_c1 = ld_global_v4_u32(y_ptr0_c1)
+                        y4_c1, y5_c1, y6_c1, y7_c1 = ld_global_v4_u32(y_ptr1_c1)
+
+                        if cutlass.const_expr(is_fp16):
+                            # Chunk 0
+                            v0_c0, v1_c0 = half2_to_float2_scaled(y0_c0, global_scale)
+                            v2_c0, v3_c0 = half2_to_float2_scaled(y1_c0, global_scale)
+                            v4_c0, v5_c0 = half2_to_float2_scaled(y2_c0, global_scale)
+                            v6_c0, v7_c0 = half2_to_float2_scaled(y3_c0, global_scale)
+                            v8_c0, v9_c0 = half2_to_float2_scaled(y4_c0, global_scale)
+                            v10_c0, v11_c0 = half2_to_float2_scaled(y5_c0, global_scale)
+                            v12_c0, v13_c0 = half2_to_float2_scaled(y6_c0, global_scale)
+                            v14_c0, v15_c0 = half2_to_float2_scaled(y7_c0, global_scale)
+
+                            # Chunk 1
+                            v0_c1, v1_c1 = half2_to_float2_scaled(y0_c1, global_scale)
+                            v2_c1, v3_c1 = half2_to_float2_scaled(y1_c1, global_scale)
+                            v4_c1, v5_c1 = half2_to_float2_scaled(y2_c1, global_scale)
+                            v6_c1, v7_c1 = half2_to_float2_scaled(y3_c1, global_scale)
+                            v8_c1, v9_c1 = half2_to_float2_scaled(y4_c1, global_scale)
+                            v10_c1, v11_c1 = half2_to_float2_scaled(y5_c1, global_scale)
+                            v12_c1, v13_c1 = half2_to_float2_scaled(y6_c1, global_scale)
+                            v14_c1, v15_c1 = half2_to_float2_scaled(y7_c1, global_scale)
+
+                            # Max-abs across both chunks
+                            abs0_c0 = habs2(y0_c0)
+                            abs1_c0 = habs2(y1_c0)
+                            abs2_c0 = habs2(y2_c0)
+                            abs3_c0 = habs2(y3_c0)
+                            abs4_c0 = habs2(y4_c0)
+                            abs5_c0 = habs2(y5_c0)
+                            abs6_c0 = habs2(y6_c0)
+                            abs7_c0 = habs2(y7_c0)
+
+                            abs0_c1 = habs2(y0_c1)
+                            abs1_c1 = habs2(y1_c1)
+                            abs2_c1 = habs2(y2_c1)
+                            abs3_c1 = habs2(y3_c1)
+                            abs4_c1 = habs2(y4_c1)
+                            abs5_c1 = habs2(y5_c1)
+                            abs6_c1 = habs2(y6_c1)
+                            abs7_c1 = habs2(y7_c1)
+
+                            max_c0 = hmax2(
+                                hmax2(
+                                    hmax2(
+                                        hmax2(abs0_c0, abs1_c0), hmax2(abs2_c0, abs3_c0)
+                                    ),
+                                    hmax2(
+                                        hmax2(abs4_c0, abs5_c0), hmax2(abs6_c0, abs7_c0)
+                                    ),
+                                ),
+                                hmax2(
+                                    hmax2(
+                                        hmax2(abs0_c1, abs1_c1), hmax2(abs2_c1, abs3_c1)
+                                    ),
+                                    hmax2(
+                                        hmax2(abs4_c1, abs5_c1), hmax2(abs6_c1, abs7_c1)
+                                    ),
+                                ),
+                            )
+                            max_abs_block = hmax_to_f32(max_c0) * global_scale
+                        else:
+                            # BFloat16
+                            v0_c0, v1_c0 = bfloat2_to_float2_scaled(y0_c0, global_scale)
+                            v2_c0, v3_c0 = bfloat2_to_float2_scaled(y1_c0, global_scale)
+                            v4_c0, v5_c0 = bfloat2_to_float2_scaled(y2_c0, global_scale)
+                            v6_c0, v7_c0 = bfloat2_to_float2_scaled(y3_c0, global_scale)
+                            v8_c0, v9_c0 = bfloat2_to_float2_scaled(y4_c0, global_scale)
+                            v10_c0, v11_c0 = bfloat2_to_float2_scaled(
+                                y5_c0, global_scale
+                            )
+                            v12_c0, v13_c0 = bfloat2_to_float2_scaled(
+                                y6_c0, global_scale
+                            )
+                            v14_c0, v15_c0 = bfloat2_to_float2_scaled(
+                                y7_c0, global_scale
+                            )
+
+                            v0_c1, v1_c1 = bfloat2_to_float2_scaled(y0_c1, global_scale)
+                            v2_c1, v3_c1 = bfloat2_to_float2_scaled(y1_c1, global_scale)
+                            v4_c1, v5_c1 = bfloat2_to_float2_scaled(y2_c1, global_scale)
+                            v6_c1, v7_c1 = bfloat2_to_float2_scaled(y3_c1, global_scale)
+                            v8_c1, v9_c1 = bfloat2_to_float2_scaled(y4_c1, global_scale)
+                            v10_c1, v11_c1 = bfloat2_to_float2_scaled(
+                                y5_c1, global_scale
+                            )
+                            v12_c1, v13_c1 = bfloat2_to_float2_scaled(
+                                y6_c1, global_scale
+                            )
+                            v14_c1, v15_c1 = bfloat2_to_float2_scaled(
+                                y7_c1, global_scale
+                            )
+
+                            abs0_c0 = bfloat2_habs2(y0_c0)
+                            abs1_c0 = bfloat2_habs2(y1_c0)
+                            abs2_c0 = bfloat2_habs2(y2_c0)
+                            abs3_c0 = bfloat2_habs2(y3_c0)
+                            abs4_c0 = bfloat2_habs2(y4_c0)
+                            abs5_c0 = bfloat2_habs2(y5_c0)
+                            abs6_c0 = bfloat2_habs2(y6_c0)
+                            abs7_c0 = bfloat2_habs2(y7_c0)
+
+                            abs0_c1 = bfloat2_habs2(y0_c1)
+                            abs1_c1 = bfloat2_habs2(y1_c1)
+                            abs2_c1 = bfloat2_habs2(y2_c1)
+                            abs3_c1 = bfloat2_habs2(y3_c1)
+                            abs4_c1 = bfloat2_habs2(y4_c1)
+                            abs5_c1 = bfloat2_habs2(y5_c1)
+                            abs6_c1 = bfloat2_habs2(y6_c1)
+                            abs7_c1 = bfloat2_habs2(y7_c1)
+
+                            max_c0 = bfloat2_hmax2(
+                                bfloat2_hmax2(
+                                    bfloat2_hmax2(
+                                        bfloat2_hmax2(abs0_c0, abs1_c0),
+                                        bfloat2_hmax2(abs2_c0, abs3_c0),
+                                    ),
+                                    bfloat2_hmax2(
+                                        bfloat2_hmax2(abs4_c0, abs5_c0),
+                                        bfloat2_hmax2(abs6_c0, abs7_c0),
+                                    ),
+                                ),
+                                bfloat2_hmax2(
+                                    bfloat2_hmax2(
+                                        bfloat2_hmax2(abs0_c1, abs1_c1),
+                                        bfloat2_hmax2(abs2_c1, abs3_c1),
+                                    ),
+                                    bfloat2_hmax2(
+                                        bfloat2_hmax2(abs4_c1, abs5_c1),
+                                        bfloat2_hmax2(abs6_c1, abs7_c1),
+                                    ),
+                                ),
+                            )
+                            max_abs_block = bfloat2_hmax_to_f32(max_c0) * global_scale
+
+                        # Compute UE8M0 scale
+                        scale_float = max_abs_block * fp4_max_rcp
+                        scale_ue8m0 = cvt_f32_to_ue8m0(scale_float)
+                        scale_exp = Uint8(scale_ue8m0 & Uint32(0xFF))
+
+                        # Store scale
+                        if cutlass.const_expr(self.output_swizzled):
+                            inner_k_idx = sf_idx % Int32(4)
+                            inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
+                            outer_m_idx = actual_row_idx % Int32(32)
+                            k_tile_idx = sf_idx // Int32(4)
+                            m_tile_idx = actual_row_idx // Int32(128)
+                            m_tile_stride = self.num_k_tiles * self.k_tile_stride
+                            swizzled_offset = (
+                                m_tile_idx * m_tile_stride
+                                + k_tile_idx * self.k_tile_stride
+                                + outer_m_idx * Int32(16)
+                                + inner_m_idx * Int32(4)
+                                + inner_k_idx
+                            )
+                            mS[swizzled_offset] = scale_exp
+                        else:
+                            mS[actual_row_idx, sf_idx] = scale_exp
+
+                        inv_scale = ue8m0_to_output_scale(scale_ue8m0)
+
+                        # Quantize chunk 0
+                        q0 = v0_c0 * inv_scale
+                        q1 = v1_c0 * inv_scale
+                        q2 = v2_c0 * inv_scale
+                        q3 = v3_c0 * inv_scale
+                        q4 = v4_c0 * inv_scale
+                        q5 = v5_c0 * inv_scale
+                        q6 = v6_c0 * inv_scale
+                        q7 = v7_c0 * inv_scale
+                        q8 = v8_c0 * inv_scale
+                        q9 = v9_c0 * inv_scale
+                        q10 = v10_c0 * inv_scale
+                        q11 = v11_c0 * inv_scale
+                        q12 = v12_c0 * inv_scale
+                        q13 = v13_c0 * inv_scale
+                        q14 = v14_c0 * inv_scale
+                        q15 = v15_c0 * inv_scale
+
+                        packed_lo = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
+                        packed_hi = cvt_e2m1x8_f32(q8, q9, q10, q11, q12, q13, q14, q15)
+                        packed64 = (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+                        out_offset = block_start // 2
+                        out_ptr = get_ptr_as_int64(
+                            mYFP4, actual_row_idx * (H // 2) + out_offset
+                        )
+                        st_global_u64(out_ptr, packed64)
+
+                        # Quantize chunk 1
+                        q0 = v0_c1 * inv_scale
+                        q1 = v1_c1 * inv_scale
+                        q2 = v2_c1 * inv_scale
+                        q3 = v3_c1 * inv_scale
+                        q4 = v4_c1 * inv_scale
+                        q5 = v5_c1 * inv_scale
+                        q6 = v6_c1 * inv_scale
+                        q7 = v7_c1 * inv_scale
+                        q8 = v8_c1 * inv_scale
+                        q9 = v9_c1 * inv_scale
+                        q10 = v10_c1 * inv_scale
+                        q11 = v11_c1 * inv_scale
+                        q12 = v12_c1 * inv_scale
+                        q13 = v13_c1 * inv_scale
+                        q14 = v14_c1 * inv_scale
+                        q15 = v15_c1 * inv_scale
+
+                        packed_lo = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
+                        packed_hi = cvt_e2m1x8_f32(q8, q9, q10, q11, q12, q13, q14, q15)
+                        packed64 = (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+                        out_offset = (block_start + 16) // 2
+                        out_ptr = get_ptr_as_int64(
+                            mYFP4, actual_row_idx * (H // 2) + out_offset
+                        )
+                        st_global_u64(out_ptr, packed64)
+
+
+# =============================================================================
 # PyTorch API Functions - Streamlined with Pointer-based Compilation
 # =============================================================================
 
@@ -1786,27 +2901,183 @@ def _get_compiled_kernel(
     return tensor_api
 
 
+@functools.cache
+def _get_compiled_kernels_with_global_scale(
+    hidden_size: int,
+    block_size: int,
+    is_fp16: bool,
+    sm_version: int,
+    scale_format: str,
+    is_sf_swizzled_layout: bool,
+) -> Tuple[Callable, Callable]:
+    """
+    Get compiled kernel closures for two-kernel approach with global_scale.
+
+    Returns a tuple of (kernel1_api, kernel2_api):
+    - kernel1: RMSNorm + find global max
+    - kernel2: Apply global scale + quantize
+    """
+    cutlass_dtype = cutlass.Float16 if is_fp16 else cutlass.BFloat16
+
+    # Kernel 1: RMSNorm + Global Max
+    def get_kernel1_pointers(tensors):
+        if tensors is None:
+            return [
+                make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
+            ]
+        x, w, y, global_max = tensors
+        return [
+            make_ptr(
+                cutlass_dtype, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            ),
+            make_ptr(
+                cutlass_dtype, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            ),
+            make_ptr(
+                cutlass_dtype, y.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            ),
+            make_ptr(
+                cutlass.Float32,
+                global_max.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            ),
+        ]
+
+    kernel1_obj = RMSNormGlobalMaxKernel(
+        dtype=cutlass_dtype,
+        H=hidden_size,
+        is_fp16=is_fp16,
+        sm_version=sm_version,
+    )
+
+    compiled_kernel1 = cute.compile(
+        kernel1_obj,
+        *get_kernel1_pointers(None),
+        Int32(1),
+        Float32(1e-6),
+        cutlass_torch.current_stream(),
+    )
+
+    def kernel1_api(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        y_buffer: torch.Tensor,
+        global_max: torch.Tensor,
+        M: int,
+        eps: float,
+    ) -> None:
+        compiled_kernel1(
+            *get_kernel1_pointers([x, w, y_buffer, global_max]),
+            Int32(M),
+            Float32(eps),
+            cutlass_torch.current_stream(),
+        )
+
+    # Kernel 2: Global Scale + Quantize
+    def get_kernel2_pointers(tensors):
+        if tensors is None:
+            return [
+                make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
+                make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
+                make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+            ]
+        y_in, global_max, global_scale, y_fp4, scale = tensors
+        return [
+            make_ptr(
+                cutlass_dtype, y_in.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            ),
+            make_ptr(
+                cutlass.Float32,
+                global_max.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            ),
+            make_ptr(
+                cutlass.Float32,
+                global_scale.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            ),
+            make_ptr(
+                cutlass.Uint8,
+                y_fp4.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Uint8,
+                scale.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+        ]
+
+    kernel2_obj = GlobalScaleQuantizeKernel(
+        dtype=cutlass_dtype,
+        H=hidden_size,
+        block_size=block_size,
+        output_swizzled=is_sf_swizzled_layout,
+        is_fp16=is_fp16,
+        sm_version=sm_version,
+        scale_format=scale_format,
+    )
+
+    compiled_kernel2 = cute.compile(
+        kernel2_obj,
+        *get_kernel2_pointers(None),
+        Int32(1),
+        cutlass_torch.current_stream(),
+    )
+
+    def kernel2_api(
+        y_buffer: torch.Tensor,
+        global_max: torch.Tensor,
+        global_scale: torch.Tensor,
+        y_fp4: torch.Tensor,
+        block_scale: torch.Tensor,
+        M: int,
+    ) -> None:
+        compiled_kernel2(
+            *get_kernel2_pointers(
+                [y_buffer, global_max, global_scale, y_fp4, block_scale]
+            ),
+            Int32(M),
+            cutlass_torch.current_stream(),
+        )
+
+    return kernel1_api, kernel2_api
+
+
 @flashinfer_api
-def rmsnorm_fp4quant(
+def rmsnorm_mxfp4quant(
     input: torch.Tensor,
     weight: torch.Tensor,
     y_fp4: torch.Tensor | None = None,
     block_scale: torch.Tensor | None = None,
     eps: float = 1e-6,
-    block_size: int = 16,
-    scale_format: str | None = None,
     is_sf_swizzled_layout: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Fused RMS normalization with FP4 quantization using CuTe-DSL.
+    Fused RMS normalization with MXFP4 quantization using CuTe-DSL.
 
-    Computes: ``y = RMSNorm(input) * weight``, then quantizes ``y`` to FP4.
+    Computes: ``y = RMSNorm(input) * weight``, then quantizes ``y`` to FP4
+    with per-block UE8M0 (power-of-2) scale factors.
+
+    This uses a single-kernel approach optimized for MXFP4 format which uses
+    block_size=32 and UE8M0 scale factors. No global scale is needed for MXFP4.
 
     Parameters
     ----------
     input : torch.Tensor
         Input tensor, shape ``(batch_size, hidden_size)`` or ``(batch_size, seq_len, hidden_size)``.
         Must be ``torch.float16`` or ``torch.bfloat16``.
+        ``hidden_size`` must be divisible by 32.
     weight : torch.Tensor
         Weight tensor for RMSNorm, shape ``(hidden_size,)``.
         Must have the same dtype as input.
@@ -1816,34 +3087,20 @@ def rmsnorm_fp4quant(
         Shape must be ``(batch_size, hidden_size // 2)`` or matching 3D input.
         If ``None``, will be allocated automatically.
     block_scale : torch.Tensor, optional
-        Output tensor for per-block scale factors.
+        Output tensor for per-block UE8M0 scale factors.
 
         - If ``is_sf_swizzled_layout=False`` (default): row-major layout with shape
-          ``(batch_size, hidden_size // block_size)`` or matching 3D input.
+          ``(batch_size, hidden_size // 32)`` or matching 3D input.
         - If ``is_sf_swizzled_layout=True``: swizzled layout for efficient tensor core
-          access, with shape ``(batch_size * hidden_size // block_size,)`` flattened.
-          The swizzle pattern uses 128x4 tiles where scales are arranged as:
-          ``[m_tile][k_tile][outer_m (32)][inner_m (4)][inner_k (4)]``.
+          access.
 
-        Dtype should be ``torch.float8_e4m3fn`` for E4M3 format or ``torch.uint8``
-        for UE8M0 format. If ``None``, will be allocated automatically.
+        Dtype should be ``torch.uint8`` for UE8M0 format.
+        If ``None``, will be allocated automatically.
     eps : float
         Epsilon for numerical stability in RMSNorm. Default is ``1e-6``.
-    block_size : int
-        Number of elements per quantization block. Default is ``16``.
-
-        - ``16``: NVFP4 format with E4M3 scale factors
-        - ``32``: MXFP4 format with UE8M0 scale factors
-    scale_format : str, optional
-        Scale factor format: ``"e4m3"`` or ``"ue8m0"``.
-        If ``None``, auto-selects based on ``block_size``:
-        ``"e4m3"`` for block_size=16, ``"ue8m0"`` for block_size=32.
     is_sf_swizzled_layout : bool
         If ``True``, output scale factors in swizzled layout optimized for
-        tensor core GEMM operations. The swizzle uses 128x4 tiles with the pattern:
-        ``[m_tile_idx * k_tiles * 512 + k_tile_idx * 512 + outer_m * 16 + inner_m * 4 + inner_k]``
-        where ``outer_m = row % 32``, ``inner_m = (row % 128) // 32``, etc.
-        Default is ``False`` (row-major layout).
+        tensor core GEMM operations. Default is ``False`` (row-major layout).
 
     Returns
     -------
@@ -1851,15 +3108,18 @@ def rmsnorm_fp4quant(
         A tuple of ``(y_fp4, block_scale)``:
 
         - ``y_fp4``: Quantized FP4 values packed as uint8.
-        - ``block_scale``: Per-block scale factors.
+        - ``block_scale``: Per-block UE8M0 scale factors as uint8.
 
     Notes
     -----
     - Requires SM100+ (Blackwell) for FP4 quantization PTX intrinsics.
-    - For block_size=16 (NVFP4): uses E4M3 scale factors (max value 448.0).
-    - For block_size=32 (MXFP4): uses UE8M0 scale factors (power-of-2 scales).
+    - Uses MXFP4 format: block_size=32, UE8M0 (power-of-2) scale factors.
     - FP4 E2M1 format has a max representable value of 6.0.
+    - Single-kernel approach for optimal performance.
     """
+    block_size = 32  # Fixed for MXFP4
+    scale_format = "ue8m0"
+
     # Handle 2D vs 3D input
     is_3d = input.dim() == 3
     if is_3d:
@@ -1871,15 +3131,13 @@ def rmsnorm_fp4quant(
     batch_size, hidden_size = input_2d.shape
     dtype = input.dtype
 
-    assert hidden_size % block_size == 0, "hidden_size must be divisible by block_size"
-    assert hidden_size >= 64, "hidden_size must be >= 64"
-    assert block_size in [16, 32], "block_size must be 16 or 32"
-
-    # Determine data type and scale format
-    is_fp16 = dtype == torch.float16
-    actual_scale_format = (
-        scale_format if scale_format else ("ue8m0" if block_size == 32 else "e4m3")
+    assert hidden_size % block_size == 0, (
+        "hidden_size must be divisible by 32 for MXFP4"
     )
+    assert hidden_size >= 64, "hidden_size must be >= 64"
+
+    # Determine data type
+    is_fp16 = dtype == torch.float16
     sm_version = get_sm_version(input.device)
 
     # Allocate output tensors if not provided
@@ -1894,32 +3152,27 @@ def rmsnorm_fp4quant(
             )
 
     if block_scale is None:
-        # Determine scale dtype based on format
-        scale_dtype = (
-            torch.uint8 if actual_scale_format == "ue8m0" else torch.float8_e4m3fn
-        )
         num_sf_blocks_per_row = hidden_size // block_size
 
         if is_sf_swizzled_layout:
-            # Swizzled layout: flattened with 128x4 tile pattern
             num_m_tiles = (batch_size + 127) // 128
             num_k_tiles = (num_sf_blocks_per_row + 3) // 4
             k_tile_stride = 512
             swizzled_size = num_m_tiles * num_k_tiles * k_tile_stride
             block_scale = torch.empty(
-                (swizzled_size,), dtype=scale_dtype, device=input.device
+                (swizzled_size,), dtype=torch.uint8, device=input.device
             )
         else:
             if is_3d:
                 block_scale = torch.empty(
                     (B, S, num_sf_blocks_per_row),
-                    dtype=scale_dtype,
+                    dtype=torch.uint8,
                     device=input.device,
                 )
             else:
                 block_scale = torch.empty(
                     (batch_size, num_sf_blocks_per_row),
-                    dtype=scale_dtype,
+                    dtype=torch.uint8,
                     device=input.device,
                 )
 
@@ -1933,16 +3186,18 @@ def rmsnorm_fp4quant(
         y_fp4_2d = y_fp4
         block_scale_2d = block_scale
 
-    # Get cached tensor_api and call it directly
-    tensor_api = _get_compiled_kernel(
+    # Get compiled kernel (original 1-kernel approach)
+    kernel_api = _get_compiled_kernel(
         hidden_size,
         block_size,
         is_fp16,
         sm_version,
-        actual_scale_format,
+        scale_format,
         is_sf_swizzled_layout,
     )
-    tensor_api(
+
+    # Launch kernel
+    kernel_api(
         input_2d.contiguous(),
         weight.contiguous(),
         y_fp4_2d,
@@ -1954,8 +3209,266 @@ def rmsnorm_fp4quant(
     return y_fp4, block_scale
 
 
+@flashinfer_api
+def rmsnorm_nvfp4quant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    y_fp4: torch.Tensor | None = None,
+    block_scale: torch.Tensor | None = None,
+    global_scale: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    is_sf_swizzled_layout: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fused RMS normalization with NVFP4 quantization using CuTe-DSL.
+
+    Computes: ``y = RMSNorm(input) * weight``, applies global scaling,
+    then quantizes ``y`` to FP4 with per-block E4M3 scale factors.
+
+    This uses a two-kernel approach with PDL (Programmatic Dependent Launch):
+    1. Pass 1: Compute RMSNorm, find global max across all elements
+    2. Pass 2: Apply global scale, compute per-block scales, quantize to FP4
+
+    The global scale lifts the per-block E4M3 scales into their optimal dynamic range.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor, shape ``(batch_size, hidden_size)`` or ``(batch_size, seq_len, hidden_size)``.
+        Must be ``torch.float16`` or ``torch.bfloat16``.
+        ``hidden_size`` must be divisible by 16.
+    weight : torch.Tensor
+        Weight tensor for RMSNorm, shape ``(hidden_size,)``.
+        Must have the same dtype as input.
+    y_fp4 : torch.Tensor, optional
+        Output tensor for quantized values in FP4_E2M1 format, packed as uint8.
+        Two FP4 values are packed into each uint8 byte.
+        Shape must be ``(batch_size, hidden_size // 2)`` or matching 3D input.
+        If ``None``, will be allocated automatically.
+    block_scale : torch.Tensor, optional
+        Output tensor for per-block E4M3 scale factors.
+
+        - If ``is_sf_swizzled_layout=False`` (default): row-major layout with shape
+          ``(batch_size, hidden_size // 16)`` or matching 3D input.
+        - If ``is_sf_swizzled_layout=True``: swizzled layout for efficient tensor core
+          access.
+
+        Dtype should be ``torch.float8_e4m3fn`` for E4M3 format.
+        If ``None``, will be allocated automatically.
+    global_scale : torch.Tensor, optional
+        Output tensor for the global scale factor, shape ``(1,)`` with dtype ``torch.float32``.
+        The global scale is computed as ``FP8_MAX * FP4_MAX / max_abs(rmsnorm_output)``.
+        If ``None``, will be allocated automatically.
+    eps : float
+        Epsilon for numerical stability in RMSNorm. Default is ``1e-6``.
+    is_sf_swizzled_layout : bool
+        If ``True``, output scale factors in swizzled layout optimized for
+        tensor core GEMM operations. Default is ``False`` (row-major layout).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        A tuple of ``(y_fp4, block_scale, global_scale)``:
+
+        - ``y_fp4``: Quantized FP4 values packed as uint8.
+        - ``block_scale``: Per-block E4M3 scale factors.
+        - ``global_scale``: Global scale factor as a scalar tensor of shape ``(1,)``.
+
+    Notes
+    -----
+    - Requires SM100+ (Blackwell) for FP4 quantization PTX intrinsics.
+    - Uses NVFP4 format: block_size=16, E4M3 scale factors (max value 448.0).
+    - FP4 E2M1 format has a max representable value of 6.0.
+    - Uses PDL for efficient kernel pipelining between the two passes.
+    - Global scale = FP8_MAX * FP4_MAX / max_abs = 448.0 * 6.0 / max_abs
+    """
+    block_size = 16  # Fixed for NVFP4
+    scale_format = "e4m3"
+
+    # Handle 2D vs 3D input
+    is_3d = input.dim() == 3
+    if is_3d:
+        B, S, H = input.shape
+        input_2d = input.view(B * S, H).contiguous()
+    else:
+        input_2d = input
+
+    batch_size, hidden_size = input_2d.shape
+    dtype = input.dtype
+
+    assert hidden_size % block_size == 0, (
+        "hidden_size must be divisible by 16 for NVFP4"
+    )
+    assert hidden_size >= 64, "hidden_size must be >= 64"
+
+    # Determine data type
+    is_fp16 = dtype == torch.float16
+    sm_version = get_sm_version(input.device)
+
+    # Allocate output tensors if not provided
+    if y_fp4 is None:
+        if is_3d:
+            y_fp4 = torch.empty(
+                (B, S, hidden_size // 2), dtype=torch.uint8, device=input.device
+            )
+        else:
+            y_fp4 = torch.empty(
+                (batch_size, hidden_size // 2), dtype=torch.uint8, device=input.device
+            )
+
+    if block_scale is None:
+        num_sf_blocks_per_row = hidden_size // block_size
+
+        if is_sf_swizzled_layout:
+            num_m_tiles = (batch_size + 127) // 128
+            num_k_tiles = (num_sf_blocks_per_row + 3) // 4
+            k_tile_stride = 512
+            swizzled_size = num_m_tiles * num_k_tiles * k_tile_stride
+            block_scale = torch.empty(
+                (swizzled_size,), dtype=torch.float8_e4m3fn, device=input.device
+            )
+        else:
+            if is_3d:
+                block_scale = torch.empty(
+                    (B, S, num_sf_blocks_per_row),
+                    dtype=torch.float8_e4m3fn,
+                    device=input.device,
+                )
+            else:
+                block_scale = torch.empty(
+                    (batch_size, num_sf_blocks_per_row),
+                    dtype=torch.float8_e4m3fn,
+                    device=input.device,
+                )
+
+    if global_scale is None:
+        global_scale = torch.empty(1, dtype=torch.float32, device=input.device)
+
+    # Get 2D views for kernel
+    if is_3d:
+        y_fp4_2d = y_fp4.view(B * S, -1)
+        block_scale_2d = (
+            block_scale.view(B * S, -1) if not is_sf_swizzled_layout else block_scale
+        )
+    else:
+        y_fp4_2d = y_fp4
+        block_scale_2d = block_scale
+
+    # Allocate intermediate buffer for RMSNorm output (same dtype as input)
+    y_buffer = torch.empty_like(input_2d)
+
+    # Allocate global_max (initialized to 0 for atomic max)
+    global_max = torch.zeros(1, dtype=torch.float32, device=input.device)
+
+    # Get compiled kernels (2-kernel approach with global scale)
+    kernel1_api, kernel2_api = _get_compiled_kernels_with_global_scale(
+        hidden_size,
+        block_size,
+        is_fp16,
+        sm_version,
+        scale_format,
+        is_sf_swizzled_layout,
+    )
+
+    # Launch kernel 1: RMSNorm + find global max
+    kernel1_api(
+        input_2d.contiguous(),
+        weight.contiguous(),
+        y_buffer,
+        global_max,
+        batch_size,
+        eps,
+    )
+
+    # Launch kernel 2: Apply global scale + quantize
+    kernel2_api(
+        y_buffer,
+        global_max,
+        global_scale,
+        y_fp4_2d,
+        block_scale_2d.view(torch.uint8),
+        batch_size,
+    )
+
+    return y_fp4, block_scale, global_scale
+
+
+# Keep rmsnorm_fp4quant as a convenience wrapper that routes to the appropriate implementation
+@flashinfer_api
+def rmsnorm_fp4quant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    y_fp4: torch.Tensor | None = None,
+    block_scale: torch.Tensor | None = None,
+    global_scale: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    block_size: int = 16,
+    scale_format: str | None = None,
+    is_sf_swizzled_layout: bool = False,
+) -> (
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor]
+):
+    """
+    Fused RMS normalization with FP4 quantization using CuTe-DSL.
+
+    This is a convenience wrapper that routes to the appropriate implementation:
+    - ``block_size=16`` (NVFP4): Uses :func:`rmsnorm_nvfp4quant` with global scale
+    - ``block_size=32`` (MXFP4): Uses :func:`rmsnorm_mxfp4quant` without global scale
+
+    For new code, prefer using the specific APIs directly:
+    - :func:`rmsnorm_nvfp4quant` for NVFP4 format
+    - :func:`rmsnorm_mxfp4quant` for MXFP4 format
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor, shape ``(batch_size, hidden_size)`` or ``(batch_size, seq_len, hidden_size)``.
+    weight : torch.Tensor
+        Weight tensor for RMSNorm, shape ``(hidden_size,)``.
+    y_fp4 : torch.Tensor, optional
+        Output tensor for quantized FP4 values. If ``None``, allocated automatically.
+    block_scale : torch.Tensor, optional
+        Output tensor for per-block scale factors. If ``None``, allocated automatically.
+    global_scale : torch.Tensor, optional
+        Output tensor for global scale (NVFP4 only). If ``None``, allocated automatically.
+    eps : float
+        Epsilon for numerical stability in RMSNorm. Default is ``1e-6``.
+    block_size : int
+        Quantization block size: ``16`` for NVFP4, ``32`` for MXFP4. Default is ``16``.
+    scale_format : str, optional
+        Scale factor format (auto-selected based on block_size if not specified).
+    is_sf_swizzled_layout : bool
+        Whether to use swizzled scale factor layout. Default is ``False``.
+
+    Returns
+    -------
+    Tuple
+        For NVFP4 (block_size=16): ``(y_fp4, block_scale, global_scale)``
+        For MXFP4 (block_size=32): ``(y_fp4, block_scale)``
+    """
+    if block_size == 32:
+        # MXFP4 - use 1-kernel approach, no global scale
+        y_fp4_out, block_scale_out = rmsnorm_mxfp4quant(
+            input, weight, y_fp4, block_scale, eps, is_sf_swizzled_layout
+        )
+        # For backwards compatibility, return a dummy global_scale if caller expects it
+        if global_scale is not None:
+            global_scale.fill_(1.0)
+            return y_fp4_out, block_scale_out, global_scale
+        return y_fp4_out, block_scale_out
+    else:
+        # NVFP4 - use 2-kernel approach with global scale
+        return rmsnorm_nvfp4quant(
+            input, weight, y_fp4, block_scale, global_scale, eps, is_sf_swizzled_layout
+        )
+
+
 __all__ = [
     "RMSNormFP4QuantKernel",
+    "RMSNormGlobalMaxKernel",
+    "GlobalScaleQuantizeKernel",
     "get_sm_version",
     "rmsnorm_fp4quant",
+    "rmsnorm_mxfp4quant",
+    "rmsnorm_nvfp4quant",
 ]

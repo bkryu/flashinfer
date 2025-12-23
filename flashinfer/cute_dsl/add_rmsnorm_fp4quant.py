@@ -373,6 +373,66 @@ def ue8m0_to_output_scale(ue8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
 
 
 # =============================================================================
+# Atomic Operations and Bit Manipulation for Global Max
+# =============================================================================
+
+
+@dsl_user_op
+def atomic_max_global_u32(
+    base_ptr: Int64, value: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Atomically update global memory with max(current, value) for uint32.
+    Returns the old value.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.u32(),
+            [
+                Int64(base_ptr).ir_value(loc=loc, ip=ip),
+                Uint32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.global.max.u32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def float_as_uint(val: Float32, *, loc=None, ip=None) -> Uint32:
+    """Reinterpret float32 as uint32."""
+    return Uint32(
+        llvm.inline_asm(
+            T.u32(),
+            [Float32(val).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def uint_as_float(val: Uint32, *, loc=None, ip=None) -> Float32:
+    """Reinterpret uint32 as float32."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(val).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+# =============================================================================
 # Half2 SIMD Intrinsics
 # =============================================================================
 
@@ -2387,8 +2447,365 @@ def add_rmsnorm_fp4quant(
     return y_fp4, block_scale
 
 
+@flashinfer_api
+def add_rmsnorm_mxfp4quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    y_fp4: torch.Tensor | None = None,
+    block_scale: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    is_sf_swizzled_layout: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused Add + RMS normalization + MXFP4 quantization using CuTe-DSL.
+
+    Computes: ``h = input + residual``, then ``y = RMSNorm(h) * weight``,
+    and finally quantizes ``y`` to FP4 with per-block UE8M0 (power-of-2) scale factors.
+
+    This uses a single-kernel approach optimized for MXFP4 format which uses
+    block_size=32 and UE8M0 scale factors. No global scale is needed for MXFP4.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor, shape ``(batch_size, hidden_size)`` or ``(batch_size, seq_len, hidden_size)``.
+        Must be ``torch.float16`` or ``torch.bfloat16``.
+        ``hidden_size`` must be divisible by 32.
+    residual : torch.Tensor
+        Residual tensor to add to input. Must have the same shape and dtype as ``input``.
+    weight : torch.Tensor
+        Weight tensor for RMSNorm, shape ``(hidden_size,)``.
+        Must have the same dtype as input.
+    y_fp4 : torch.Tensor, optional
+        Output tensor for quantized values in FP4_E2M1 format, packed as uint8.
+        Two FP4 values are packed into each uint8 byte.
+        Shape must be ``(batch_size, hidden_size // 2)`` or matching 3D input.
+        If ``None``, will be allocated automatically.
+    block_scale : torch.Tensor, optional
+        Output tensor for per-block UE8M0 scale factors.
+
+        - If ``is_sf_swizzled_layout=False`` (default): row-major layout with shape
+          ``(batch_size, hidden_size // 32)`` or matching 3D input.
+        - If ``is_sf_swizzled_layout=True``: swizzled layout for efficient tensor core
+          access.
+
+        Dtype should be ``torch.uint8`` for UE8M0 format.
+        If ``None``, will be allocated automatically.
+    eps : float
+        Epsilon for numerical stability in RMSNorm. Default is ``1e-6``.
+    is_sf_swizzled_layout : bool
+        If ``True``, output scale factors in swizzled layout optimized for
+        tensor core GEMM operations. Default is ``False`` (row-major layout).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        A tuple of ``(y_fp4, block_scale)``:
+
+        - ``y_fp4``: Quantized FP4 values packed as uint8.
+        - ``block_scale``: Per-block UE8M0 scale factors as uint8.
+
+    Notes
+    -----
+    - Requires SM100+ (Blackwell) for FP4 quantization PTX intrinsics.
+    - Uses MXFP4 format: block_size=32, UE8M0 (power-of-2) scale factors.
+    - FP4 E2M1 format has a max representable value of 6.0.
+    - Single-kernel approach for optimal performance.
+    """
+    block_size = 32  # Fixed for MXFP4
+    scale_format = "ue8m0"
+
+    is_3d = input.dim() == 3
+    if is_3d:
+        B, S, H = input.shape
+        input_2d = input.view(B * S, H).contiguous()
+        residual_2d = residual.view(B * S, H).contiguous()
+    else:
+        input_2d = input
+        residual_2d = residual
+
+    batch_size, hidden_size = input_2d.shape
+    dtype = input.dtype
+
+    assert hidden_size % block_size == 0, (
+        "hidden_size must be divisible by 32 for MXFP4"
+    )
+    assert hidden_size >= 64, "hidden_size must be >= 64"
+
+    is_fp16 = dtype == torch.float16
+    sm_version = get_sm_version(input.device)
+
+    # Allocate output tensors if not provided
+    if y_fp4 is None:
+        if is_3d:
+            y_fp4 = torch.empty(
+                (B, S, hidden_size // 2), dtype=torch.uint8, device=input.device
+            )
+        else:
+            y_fp4 = torch.empty(
+                (batch_size, hidden_size // 2), dtype=torch.uint8, device=input.device
+            )
+
+    if block_scale is None:
+        num_sf_blocks_per_row = hidden_size // block_size
+
+        if is_sf_swizzled_layout:
+            num_m_tiles = (batch_size + 127) // 128
+            num_k_tiles = (num_sf_blocks_per_row + 3) // 4
+            k_tile_stride = 512
+            swizzled_size = num_m_tiles * num_k_tiles * k_tile_stride
+            block_scale = torch.empty(
+                (swizzled_size,), dtype=torch.uint8, device=input.device
+            )
+        else:
+            if is_3d:
+                block_scale = torch.empty(
+                    (B, S, num_sf_blocks_per_row),
+                    dtype=torch.uint8,
+                    device=input.device,
+                )
+            else:
+                block_scale = torch.empty(
+                    (batch_size, num_sf_blocks_per_row),
+                    dtype=torch.uint8,
+                    device=input.device,
+                )
+
+    # Get 2D views for kernel
+    if is_3d:
+        y_fp4_2d = y_fp4.view(B * S, -1)
+        block_scale_2d = (
+            block_scale.view(B * S, -1) if not is_sf_swizzled_layout else block_scale
+        )
+    else:
+        y_fp4_2d = y_fp4
+        block_scale_2d = block_scale
+
+    # Get compiled kernel (original 1-kernel approach)
+    tensor_api = _get_compiled_kernel(
+        hidden_size,
+        block_size,
+        is_fp16,
+        sm_version,
+        scale_format,
+        is_sf_swizzled_layout,
+    )
+    tensor_api(
+        input_2d.contiguous(),
+        residual_2d.contiguous(),
+        weight.contiguous(),
+        y_fp4_2d,
+        block_scale_2d.view(torch.uint8),
+        batch_size,
+        eps,
+    )
+
+    return y_fp4, block_scale
+
+
+@flashinfer_api
+def add_rmsnorm_nvfp4quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    y_fp4: torch.Tensor | None = None,
+    block_scale: torch.Tensor | None = None,
+    global_scale: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    is_sf_swizzled_layout: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fused Add + RMS normalization + NVFP4 quantization using CuTe-DSL.
+
+    Computes: ``h = input + residual``, then ``y = RMSNorm(h) * weight``,
+    applies global scaling, then quantizes ``y`` to FP4 with per-block E4M3 scale factors.
+
+    This uses a two-pass approach to compute global_scale:
+    1. Pass 1: Compute Add + RMSNorm, find global max across all elements
+    2. Pass 2: Apply global scale, compute per-block scales, quantize to FP4
+
+    The global scale lifts the per-block E4M3 scales into their optimal dynamic range.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor, shape ``(batch_size, hidden_size)`` or ``(batch_size, seq_len, hidden_size)``.
+        Must be ``torch.float16`` or ``torch.bfloat16``.
+        ``hidden_size`` must be divisible by 16.
+    residual : torch.Tensor
+        Residual tensor to add to input. Must have the same shape and dtype as ``input``.
+    weight : torch.Tensor
+        Weight tensor for RMSNorm, shape ``(hidden_size,)``.
+        Must have the same dtype as input.
+    y_fp4 : torch.Tensor, optional
+        Output tensor for quantized values in FP4_E2M1 format, packed as uint8.
+        Two FP4 values are packed into each uint8 byte.
+        Shape must be ``(batch_size, hidden_size // 2)`` or matching 3D input.
+        If ``None``, will be allocated automatically.
+    block_scale : torch.Tensor, optional
+        Output tensor for per-block E4M3 scale factors.
+
+        - If ``is_sf_swizzled_layout=False`` (default): row-major layout with shape
+          ``(batch_size, hidden_size // 16)`` or matching 3D input.
+        - If ``is_sf_swizzled_layout=True``: swizzled layout for efficient tensor core
+          access.
+
+        Dtype should be ``torch.float8_e4m3fn`` for E4M3 format.
+        If ``None``, will be allocated automatically.
+    global_scale : torch.Tensor, optional
+        Output tensor for the global scale factor, shape ``(1,)`` with dtype ``torch.float32``.
+        The global scale is computed as ``FP8_MAX * FP4_MAX / max_abs(rmsnorm_output)``.
+        If ``None``, will be allocated automatically.
+    eps : float
+        Epsilon for numerical stability in RMSNorm. Default is ``1e-6``.
+    is_sf_swizzled_layout : bool
+        If ``True``, output scale factors in swizzled layout optimized for
+        tensor core GEMM operations. Default is ``False`` (row-major layout).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        A tuple of ``(y_fp4, block_scale, global_scale)``:
+
+        - ``y_fp4``: Quantized FP4 values packed as uint8.
+        - ``block_scale``: Per-block E4M3 scale factors.
+        - ``global_scale``: Global scale factor as a scalar tensor of shape ``(1,)``.
+
+    Notes
+    -----
+    - Requires SM100+ (Blackwell) for FP4 quantization PTX intrinsics.
+    - Uses NVFP4 format: block_size=16, E4M3 scale factors (max value 448.0).
+    - FP4 E2M1 format has a max representable value of 6.0.
+    - Global scale = FP8_MAX * FP4_MAX / max_abs = 448.0 * 6.0 / max_abs
+    """
+    # Import from rmsnorm_fp4quant to reuse the 2-kernel infrastructure
+    from .rmsnorm_fp4quant import _get_compiled_kernels_with_global_scale
+
+    block_size = 16  # Fixed for NVFP4
+    scale_format = "e4m3"
+
+    is_3d = input.dim() == 3
+    if is_3d:
+        B, S, H = input.shape
+        input_2d = input.view(B * S, H).contiguous()
+        residual_2d = residual.view(B * S, H).contiguous()
+    else:
+        input_2d = input
+        residual_2d = residual
+
+    batch_size, hidden_size = input_2d.shape
+    dtype = input.dtype
+
+    assert hidden_size % block_size == 0, (
+        "hidden_size must be divisible by 16 for NVFP4"
+    )
+    assert hidden_size >= 64, "hidden_size must be >= 64"
+
+    is_fp16 = dtype == torch.float16
+    sm_version = get_sm_version(input.device)
+
+    # Allocate output tensors if not provided
+    if y_fp4 is None:
+        if is_3d:
+            y_fp4 = torch.empty(
+                (B, S, hidden_size // 2), dtype=torch.uint8, device=input.device
+            )
+        else:
+            y_fp4 = torch.empty(
+                (batch_size, hidden_size // 2), dtype=torch.uint8, device=input.device
+            )
+
+    if block_scale is None:
+        num_sf_blocks_per_row = hidden_size // block_size
+
+        if is_sf_swizzled_layout:
+            num_m_tiles = (batch_size + 127) // 128
+            num_k_tiles = (num_sf_blocks_per_row + 3) // 4
+            k_tile_stride = 512
+            swizzled_size = num_m_tiles * num_k_tiles * k_tile_stride
+            block_scale = torch.empty(
+                (swizzled_size,), dtype=torch.float8_e4m3fn, device=input.device
+            )
+        else:
+            if is_3d:
+                block_scale = torch.empty(
+                    (B, S, num_sf_blocks_per_row),
+                    dtype=torch.float8_e4m3fn,
+                    device=input.device,
+                )
+            else:
+                block_scale = torch.empty(
+                    (batch_size, num_sf_blocks_per_row),
+                    dtype=torch.float8_e4m3fn,
+                    device=input.device,
+                )
+
+    if global_scale is None:
+        global_scale = torch.empty(1, dtype=torch.float32, device=input.device)
+
+    # Get 2D views for kernel
+    if is_3d:
+        y_fp4_2d = y_fp4.view(B * S, -1)
+        block_scale_2d = (
+            block_scale.view(B * S, -1) if not is_sf_swizzled_layout else block_scale
+        )
+    else:
+        y_fp4_2d = y_fp4
+        block_scale_2d = block_scale
+
+    # For NVFP4 with global_scale, we use a two-pass approach:
+    # 1. Compute add + rmsnorm and store intermediate result, find global max
+    # 2. Apply global scale and quantize
+    #
+    # To reuse infrastructure, we:
+    # 1. First compute h = input + residual
+    # 2. Then use rmsnorm_nvfp4quant's 2-kernel approach
+
+    # Step 1: Compute h = input + residual
+    h_buffer = input_2d + residual_2d
+
+    # Step 2: Allocate intermediate buffers
+    y_buffer = torch.empty_like(h_buffer)
+    global_max = torch.zeros(1, dtype=torch.float32, device=input.device)
+
+    # Step 3: Get compiled kernels for RMSNorm + global scale quantize
+    kernel1_api, kernel2_api = _get_compiled_kernels_with_global_scale(
+        hidden_size,
+        block_size,
+        is_fp16,
+        sm_version,
+        scale_format,
+        is_sf_swizzled_layout,
+    )
+
+    # Launch kernel 1: RMSNorm + find global max
+    kernel1_api(
+        h_buffer.contiguous(),
+        weight.contiguous(),
+        y_buffer,
+        global_max,
+        batch_size,
+        eps,
+    )
+
+    # Launch kernel 2: Apply global scale + quantize
+    kernel2_api(
+        y_buffer,
+        global_max,
+        global_scale,
+        y_fp4_2d,
+        block_scale_2d.view(torch.uint8),
+        batch_size,
+    )
+
+    return y_fp4, block_scale, global_scale
+
+
 __all__ = [
     "AddRMSNormFP4QuantKernel",
     "add_rmsnorm_fp4quant",
+    "add_rmsnorm_mxfp4quant",
+    "add_rmsnorm_nvfp4quant",
     "get_sm_version",
 ]

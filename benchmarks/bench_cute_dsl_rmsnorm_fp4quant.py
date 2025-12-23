@@ -15,7 +15,9 @@ limitations under the License.
 
 Benchmark: Fused RMSNorm + FP4 Quantization using CuTe-DSL Backend
 
-Compares the CuTe-DSL fused kernel against separate RMSNorm + FP4 quantization.
+Compares the CuTe-DSL fused kernel against unfused operations:
+  - Unfused: rmsnorm + global_scale_computation + fp4_quantize (3 separate ops)
+  - Fused: Single kernel that performs all operations together
 
 Usage:
     python bench_cute_dsl_rmsnorm_fp4quant.py
@@ -84,41 +86,31 @@ def compute_bandwidth_gb_s(
     return total_bytes / time_s / 1e9
 
 
-def bench_cute_dsl(batch_size, hidden_size, dtype, block_size=16):
-    """Benchmark CuTe-DSL backend."""
-    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+def bench_cute_dsl_nvfp4(batch_size, hidden_size, dtype):
+    """Benchmark CuTe-DSL NVFP4 backend (block_size=16, E4M3 scales, with global_scale)."""
+    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
 
     eps = 1e-6
+    block_size = 16  # Fixed for NVFP4
 
     x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
     weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
     y_fp4 = torch.empty(batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8)
-
-    # Scale factor dtype depends on format
-    if block_size == 32:
-        block_scale = torch.empty(
-            batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
-        )
-        scale_format = "ue8m0"
-    else:
-        block_scale = torch.empty(
-            batch_size,
-            hidden_size // block_size,
-            device="cuda",
-            dtype=torch.float8_e4m3fn,
-        )
-        scale_format = "e4m3"
+    block_scale = torch.empty(
+        batch_size,
+        hidden_size // block_size,
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
 
     # Benchmark with bench_gpu_time
     times = bench_gpu_time(
-        lambda: rmsnorm_fp4quant(
+        lambda: rmsnorm_nvfp4quant(
             x,
             weight,
             y_fp4,
             block_scale,
             eps=eps,
-            block_size=block_size,
-            scale_format=scale_format,
         ),
         cold_l2_cache=True,
         enable_cupti=True,
@@ -131,10 +123,53 @@ def bench_cute_dsl(batch_size, hidden_size, dtype, block_size=16):
     return np.median(times)
 
 
-def bench_separate_flashinfer(batch_size, hidden_size, dtype, block_size=16):
-    """Benchmark separate FlashInfer operations: rmsnorm + fp4_quantize.
+def bench_cute_dsl_mxfp4(batch_size, hidden_size, dtype):
+    """Benchmark CuTe-DSL MXFP4 backend (block_size=32, UE8M0 scales, no global_scale)."""
+    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_mxfp4quant
 
-    Returns tuple of (rmsnorm_time_ms, fp4_quant_time_ms, total_time_ms)
+    eps = 1e-6
+    block_size = 32  # Fixed for MXFP4
+
+    x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+    weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+    y_fp4 = torch.empty(batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8)
+    block_scale = torch.empty(
+        batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
+    )
+
+    # Benchmark with bench_gpu_time
+    times = bench_gpu_time(
+        lambda: rmsnorm_mxfp4quant(
+            x,
+            weight,
+            y_fp4,
+            block_scale,
+            eps=eps,
+        ),
+        cold_l2_cache=True,
+        enable_cupti=True,
+        use_cuda_graph=False,
+        dry_run_iters=10,
+        repeat_iters=100,
+    )
+
+    # Return median time
+    return np.median(times)
+
+
+FLOAT4_E2M1_MAX = 6.0
+FLOAT8_E4M3_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
+
+
+def bench_unfused_flashinfer(batch_size, hidden_size, dtype, block_size=16):
+    """Benchmark unfused FlashInfer operations: rmsnorm + global_scale + fp4_quantize.
+
+    This measures the complete unfused workflow as a single operation, which includes:
+    1. RMSNorm computation
+    2. Global scale calculation (max_abs reduction)
+    3. FP4 quantization with the computed global scale
+
+    Returns the median time in milliseconds.
     """
     from flashinfer.norm import rmsnorm
     from flashinfer.fp4_quantization import fp4_quantize
@@ -143,49 +178,51 @@ def bench_separate_flashinfer(batch_size, hidden_size, dtype, block_size=16):
 
     x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
     weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
-    y_normed = torch.empty_like(x)
 
-    # Compute global_scale for fp4_quantize (required when sf_use_ue8m0 is false)
-    # Use a fixed scale for benchmarking consistency
-    global_scale = torch.tensor([1.0], device="cuda", dtype=torch.float32)
+    def unfused_rmsnorm_fp4quant():
+        # Step 1: RMSNorm
+        y_normed = rmsnorm(x, weight, eps=eps)
 
-    # Benchmark rmsnorm alone
-    times_rmsnorm = bench_gpu_time(
-        lambda: rmsnorm(x, weight, eps=eps, out=y_normed),
-        cold_l2_cache=True,
-        enable_cupti=True,
-        use_cuda_graph=False,
-        dry_run_iters=10,
-        repeat_iters=100,
-    )
-    t_rmsnorm = np.median(times_rmsnorm)
+        # Step 2: Compute global scale (same as fused kernel)
+        if block_size == 32:
+            # MXFP4: no global scale needed
+            global_scale = None
+        else:
+            # NVFP4: global_scale = FP8_MAX * FP4_MAX / max_abs
+            # fp4_quantize expects global_scale as 1D tensor with shape (1,)
+            max_abs = y_normed.abs().max()
+            global_scale = torch.tensor(
+                [FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / max_abs.item()],
+                device="cuda",
+                dtype=torch.float32,
+            )
 
-    # Run rmsnorm once to get y_normed for fp4_quantize
-    rmsnorm(x, weight, eps=eps, out=y_normed)
-
-    # Benchmark fp4_quantize alone
-    times_fp4 = bench_gpu_time(
-        lambda: fp4_quantize(
+        # Step 3: FP4 quantization
+        y_fp4, block_scale = fp4_quantize(
             y_normed,
-            global_scale=None if block_size == 32 else global_scale,
+            global_scale=global_scale,
             sf_vec_size=block_size,
             sf_use_ue8m0=(block_size == 32),
             is_sf_swizzled_layout=False,
-        ),
+        )
+        return y_fp4, block_scale, global_scale
+
+    # Benchmark the complete unfused workflow
+    times = bench_gpu_time(
+        unfused_rmsnorm_fp4quant,
         cold_l2_cache=True,
         enable_cupti=True,
         use_cuda_graph=False,
         dry_run_iters=10,
         repeat_iters=100,
     )
-    t_fp4 = np.median(times_fp4)
 
-    return t_rmsnorm, t_fp4, t_rmsnorm + t_fp4
+    return np.median(times)
 
 
-def sanity_check_outputs(dtype=torch.float16, block_size=16):
-    """Verify CuTe-DSL output matches separate RMSNorm + fp4_quantize operations."""
-    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+def sanity_check_outputs_nvfp4(dtype=torch.float16):
+    """Verify CuTe-DSL NVFP4 output matches unfused RMSNorm + global_scale + fp4_quantize."""
+    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_nvfp4quant
     from flashinfer.norm import rmsnorm
     from flashinfer.fp4_quantization import fp4_quantize
 
@@ -197,76 +234,322 @@ def sanity_check_outputs(dtype=torch.float16, block_size=16):
     ]
 
     eps = 1e-6
+    block_size = 16  # Fixed for NVFP4
     all_passed = True
 
+    print("  NVFP4 (block_size=16, E4M3 scales, global_scale):")
     for batch_size, hidden_size in test_configs:
         # Create inputs
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
-        # CuTe-DSL path
+        # CuTe-DSL fused path (returns y_fp4, block_scale, global_scale)
         y_fp4_cute = torch.empty(
             batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
         )
-        if block_size == 32:
-            block_scale_cute = torch.empty(
-                batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
-            )
-            scale_format = "ue8m0"
-        else:
-            block_scale_cute = torch.empty(
-                batch_size,
-                hidden_size // block_size,
-                device="cuda",
-                dtype=torch.float8_e4m3fn,
-            )
-            scale_format = "e4m3"
+        block_scale_cute = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
 
-        rmsnorm_fp4quant(
+        _, _, global_scale_cute = rmsnorm_nvfp4quant(
             x,
             weight,
             y_fp4_cute,
             block_scale_cute,
             eps=eps,
-            block_size=block_size,
-            scale_format=scale_format,
         )
 
-        # Separate path
-        y_normed = torch.empty_like(x)
-        rmsnorm(x, weight, eps=eps, out=y_normed)
+        # Unfused path: rmsnorm + global_scale + fp4_quantize
+        y_normed = rmsnorm(x, weight, eps=eps)
 
-        global_scale = torch.tensor(
-            [y_normed.abs().max().item() / 6.0], device="cuda", dtype=torch.float32
+        # NVFP4: compute global_scale = FP8_MAX * FP4_MAX / max_abs
+        # fp4_quantize expects global_scale as 1D tensor with shape (1,)
+        max_abs = y_normed.abs().max()
+        global_scale_unfused = torch.tensor(
+            [FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / max_abs.item()],
+            device="cuda",
+            dtype=torch.float32,
         )
-        y_fp4_sep, block_scale_sep = fp4_quantize(
+
+        y_fp4_unfused, block_scale_unfused = fp4_quantize(
             y_normed,
-            global_scale=None if block_size == 32 else global_scale,
+            global_scale=global_scale_unfused,
             sf_vec_size=block_size,
-            sf_use_ue8m0=(block_size == 32),
+            sf_use_ue8m0=False,
             is_sf_swizzled_layout=False,
         )
 
-        # Compare FP4 outputs - use relaxed criteria since:
-        # 1. FP4 is very low precision (4 bits), small float differences can flip values
-        # 2. Different scale factor computation between fused and separate paths
-        # 3. Different floating-point operation ordering
-        match_count = (y_fp4_cute == y_fp4_sep).sum().item()
+        # Compare FP4 outputs
+        match_count = (y_fp4_cute == y_fp4_unfused).sum().item()
         total_count = y_fp4_cute.numel()
         match_pct = match_count / total_count * 100
 
-        # For FP4, 70% exact match is reasonable given the precision constraints
-        # The important thing is that both produce valid quantized outputs
         if match_pct < 70.0:
             all_passed = False
             print(
-                f"  WARN: ({batch_size}, {hidden_size}) - "
+                f"    WARN: ({batch_size}, {hidden_size}) - "
                 f"FP4 match: {match_pct:.1f}% (expected >= 70%)"
             )
         else:
-            print(f"  OK: ({batch_size}, {hidden_size}) - FP4 match")
+            print(
+                f"    OK: ({batch_size}, {hidden_size}) - FP4 match: {match_pct:.1f}%"
+            )
+
+        # Also verify global_scale is computed correctly
+        gs_diff = abs(global_scale_cute.item() - global_scale_unfused.item())
+        if gs_diff > 1.0:
+            print(
+                f"    WARN: ({batch_size}, {hidden_size}) - "
+                f"global_scale diff: {gs_diff:.4f}"
+            )
 
     return all_passed
+
+
+def sanity_check_outputs_mxfp4(dtype=torch.float16):
+    """Verify CuTe-DSL MXFP4 output matches unfused RMSNorm + fp4_quantize."""
+    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_mxfp4quant
+    from flashinfer.norm import rmsnorm
+    from flashinfer.fp4_quantization import fp4_quantize
+
+    # Test with a few configurations
+    test_configs = [
+        (128, 256),
+        (512, 1024),
+        (1024, 2048),
+    ]
+
+    eps = 1e-6
+    block_size = 32  # Fixed for MXFP4
+    all_passed = True
+
+    print("  MXFP4 (block_size=32, UE8M0 scales, no global_scale):")
+    for batch_size, hidden_size in test_configs:
+        # Create inputs
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # CuTe-DSL fused path (returns y_fp4, block_scale only for MXFP4)
+        y_fp4_cute = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+        )
+        block_scale_cute = torch.empty(
+            batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
+        )
+
+        y_fp4_cute, block_scale_cute = rmsnorm_mxfp4quant(
+            x,
+            weight,
+            y_fp4_cute,
+            block_scale_cute,
+            eps=eps,
+        )
+
+        # Unfused path: rmsnorm + fp4_quantize (no global_scale for MXFP4)
+        y_normed = rmsnorm(x, weight, eps=eps)
+
+        y_fp4_unfused, block_scale_unfused = fp4_quantize(
+            y_normed,
+            global_scale=None,
+            sf_vec_size=block_size,
+            sf_use_ue8m0=True,
+            is_sf_swizzled_layout=False,
+        )
+
+        # Compare FP4 outputs
+        match_count = (y_fp4_cute == y_fp4_unfused).sum().item()
+        total_count = y_fp4_cute.numel()
+        match_pct = match_count / total_count * 100
+
+        if match_pct < 70.0:
+            all_passed = False
+            print(
+                f"    WARN: ({batch_size}, {hidden_size}) - "
+                f"FP4 match: {match_pct:.1f}% (expected >= 70%)"
+            )
+        else:
+            print(
+                f"    OK: ({batch_size}, {hidden_size}) - FP4 match: {match_pct:.1f}%"
+            )
+
+    return all_passed
+
+
+def run_benchmark_nvfp4():
+    """Run NVFP4 benchmark suite."""
+    print()
+    print("-" * 80)
+    print("NVFP4 Benchmark (block_size=16, E4M3 scales, with global_scale)")
+    print("-" * 80)
+
+    dtype = torch.float16
+    block_size = 16  # Fixed for NVFP4
+
+    # Test configurations
+    batch_sizes = [2**i for i in range(10, 17)]  # 1024 to 65536
+    batch_sizes += [1000, 3000, 5000, 10000, 15000, 25000, 60000]
+    batch_sizes = sorted(list(set(batch_sizes)))
+
+    hidden_sizes = [2**j for j in range(11, 16)]  # 2048 to 32768
+    hidden_sizes += [1536]
+    hidden_sizes = sorted(list(set(hidden_sizes)))
+
+    configs = [
+        (batch_size, hidden_size)
+        for batch_size in batch_sizes
+        for hidden_size in hidden_sizes
+    ]
+
+    header = (
+        f"{'Batch':<8} {'Hidden':<8} "
+        f"{'Fused (µs)':<12} {'BW (GB/s)':<10} "
+        f"{'Unfused (µs)':<14} {'Speedup':<10}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    results = []
+
+    for batch_size, hidden_size in configs:
+        # CuTe-DSL fused timing
+        try:
+            t_fused = bench_cute_dsl_nvfp4(batch_size, hidden_size, dtype)
+            t_fused_us = t_fused * 1e3  # ms to µs
+            bw_fused = compute_bandwidth_gb_s(
+                batch_size, hidden_size, block_size, t_fused
+            )
+        except Exception as e:
+            print(f"{batch_size:<8} {hidden_size:<8} ERROR: {e}")
+            continue
+
+        # Unfused FlashInfer timing
+        try:
+            t_unfused = bench_unfused_flashinfer(
+                batch_size, hidden_size, dtype, block_size
+            )
+            t_unfused_us = t_unfused * 1e3
+            speedup = t_unfused / t_fused if t_fused > 0 else 0
+            unfused_str = f"{t_unfused_us:.1f}"
+            speedup_str = f"{speedup:.2f}x"
+        except Exception:
+            t_unfused_us = None
+            unfused_str = "N/A"
+            speedup_str = "N/A"
+            speedup = None
+
+        print(
+            f"{batch_size:<8} {hidden_size:<8} "
+            f"{t_fused_us:<12.1f} {bw_fused:<10.1f} "
+            f"{unfused_str:<14} {speedup_str:<10}"
+        )
+
+        result = {
+            "batch_size": batch_size,
+            "hidden_size": hidden_size,
+            "fused_us": t_fused_us,
+            "fused_bw_gb_s": bw_fused,
+            "unfused_us": t_unfused_us,
+            "speedup": speedup,
+        }
+        results.append(result)
+
+    # Calculate geomean speedup
+    speedups = [r["speedup"] for r in results if r["speedup"] is not None]
+    if speedups:
+        geomean_speedup = gmean(speedups)
+        print(f"\nNVFP4 Geomean speedup vs Unfused: {geomean_speedup:.2f}x")
+
+    return results
+
+
+def run_benchmark_mxfp4():
+    """Run MXFP4 benchmark suite."""
+    print()
+    print("-" * 80)
+    print("MXFP4 Benchmark (block_size=32, UE8M0 scales, no global_scale)")
+    print("-" * 80)
+
+    dtype = torch.float16
+    block_size = 32  # Fixed for MXFP4
+
+    # Test configurations
+    batch_sizes = [2**i for i in range(10, 17)]  # 1024 to 65536
+    batch_sizes += [1000, 3000, 5000, 10000, 15000, 25000, 60000]
+    batch_sizes = sorted(list(set(batch_sizes)))
+
+    hidden_sizes = [2**j for j in range(11, 16)]  # 2048 to 32768
+    hidden_sizes += [1536]
+    hidden_sizes = sorted(list(set(hidden_sizes)))
+
+    configs = [
+        (batch_size, hidden_size)
+        for batch_size in batch_sizes
+        for hidden_size in hidden_sizes
+    ]
+
+    header = (
+        f"{'Batch':<8} {'Hidden':<8} "
+        f"{'Fused (µs)':<12} {'BW (GB/s)':<10} "
+        f"{'Unfused (µs)':<14} {'Speedup':<10}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    results = []
+
+    for batch_size, hidden_size in configs:
+        # CuTe-DSL fused timing
+        try:
+            t_fused = bench_cute_dsl_mxfp4(batch_size, hidden_size, dtype)
+            t_fused_us = t_fused * 1e3  # ms to µs
+            bw_fused = compute_bandwidth_gb_s(
+                batch_size, hidden_size, block_size, t_fused
+            )
+        except Exception as e:
+            print(f"{batch_size:<8} {hidden_size:<8} ERROR: {e}")
+            continue
+
+        # Unfused FlashInfer timing
+        try:
+            t_unfused = bench_unfused_flashinfer(
+                batch_size, hidden_size, dtype, block_size
+            )
+            t_unfused_us = t_unfused * 1e3
+            speedup = t_unfused / t_fused if t_fused > 0 else 0
+            unfused_str = f"{t_unfused_us:.1f}"
+            speedup_str = f"{speedup:.2f}x"
+        except Exception:
+            t_unfused_us = None
+            unfused_str = "N/A"
+            speedup_str = "N/A"
+            speedup = None
+
+        print(
+            f"{batch_size:<8} {hidden_size:<8} "
+            f"{t_fused_us:<12.1f} {bw_fused:<10.1f} "
+            f"{unfused_str:<14} {speedup_str:<10}"
+        )
+
+        result = {
+            "batch_size": batch_size,
+            "hidden_size": hidden_size,
+            "fused_us": t_fused_us,
+            "fused_bw_gb_s": bw_fused,
+            "unfused_us": t_unfused_us,
+            "speedup": speedup,
+        }
+        results.append(result)
+
+    # Calculate geomean speedup
+    speedups = [r["speedup"] for r in results if r["speedup"] is not None]
+    if speedups:
+        geomean_speedup = gmean(speedups)
+        print(f"\nMXFP4 Geomean speedup vs Unfused: {geomean_speedup:.2f}x")
+
+    return results
 
 
 def run_benchmark():
@@ -282,120 +565,30 @@ def run_benchmark():
         raise RuntimeError("Blackwell GPU (SM100+) required for FP4 quantization")
 
     dtype = torch.float16
-    block_size = 16
 
-    # Sanity check: verify CuTe-DSL output matches separate operations
+    # Sanity check: verify fused kernel output matches unfused operations
     print()
-    print("Running sanity check...")
-    if sanity_check_outputs(dtype, block_size):
-        print(
-            "✓ Confirmed: CuTe-DSL output is equivalent to RMSNorm + fp4_quantization"
-        )
+    print("Running sanity checks...")
+    nvfp4_passed = sanity_check_outputs_nvfp4(dtype)
+    mxfp4_passed = sanity_check_outputs_mxfp4(dtype)
+
+    if nvfp4_passed and mxfp4_passed:
+        print("\n✓ Confirmed: Fused kernels output is equivalent to unfused operations")
     else:
-        print("✗ Warning: Some outputs did not match closely")
-    print()
+        print("\n✗ Warning: Some outputs did not match closely")
 
-    # Test configurations
-    # sweep batch_size from 1024 to 65536 (powers of 2)
-    # and hidden_size from 2048 to 32768 (powers of 2)
-    # Add some non-powers-of-2 batch sizes for more realism/variance.
-    batch_sizes = [2**i for i in range(10, 17)]  # 1024 to 65536
-    batch_sizes += [1000, 3000, 5000, 10000, 15000, 25000, 60000]  # non-powers-of-2
-    batch_sizes = sorted(list(set(batch_sizes)))  # deduplicate and sort
+    # Run NVFP4 benchmark
+    nvfp4_results = run_benchmark_nvfp4()
 
-    hidden_sizes = [2**j for j in range(11, 16)]  # 2048 to 32768
-    hidden_sizes += [1536]
-    hidden_sizes = sorted(list(set(hidden_sizes)))  # deduplicate and sort
-
-    configs = [
-        (batch_size, hidden_size)
-        for batch_size in batch_sizes
-        for hidden_size in hidden_sizes
-    ]
+    # Run MXFP4 benchmark
+    mxfp4_results = run_benchmark_mxfp4()
 
     print()
-    header = (
-        f"{'Batch':<8} {'Hidden':<8} "
-        f"{'CuTe-DSL (µs)':<14} {'BW (GB/s)':<10} "
-        f"{'RMSNorm (µs)':<13} {'FP4Q (µs)':<11} {'Separate (µs)':<14} "
-        f"{'vs Separate':<12}"
-    )
-    print(header)
-    print("-" * len(header))
-
-    results = []
-
-    for batch_size, hidden_size in configs:
-        # CuTe-DSL timing
-        try:
-            t_cute = bench_cute_dsl(batch_size, hidden_size, dtype, block_size)
-            t_cute_us = t_cute * 1e3  # ms to µs
-            bw_cute = compute_bandwidth_gb_s(
-                batch_size, hidden_size, block_size, t_cute
-            )
-        except Exception as e:
-            print(f"{batch_size:<8} {hidden_size:<8} ERROR: {e}")
-            continue
-
-        # Separate FlashInfer timing
-        try:
-            t_rmsnorm, t_fp4, t_separate = bench_separate_flashinfer(
-                batch_size, hidden_size, dtype, block_size
-            )
-            t_rmsnorm_us = t_rmsnorm * 1e3  # ms to µs
-            t_fp4_us = t_fp4 * 1e3  # ms to µs
-            t_separate_us = t_separate * 1e3  # ms to µs
-            speedup_sep = t_separate / t_cute if t_cute > 0 else 0
-            rmsnorm_str = f"{t_rmsnorm_us:.1f}"
-            fp4_str = f"{t_fp4_us:.1f}"
-            separate_str = f"{t_separate_us:.1f}"
-            speedup_sep_str = f"{speedup_sep:.2f}x"
-        except Exception:
-            t_rmsnorm_us = None
-            t_fp4_us = None
-            t_separate_us = None
-            rmsnorm_str = "N/A"
-            fp4_str = "N/A"
-            separate_str = "N/A"
-            speedup_sep_str = "N/A"
-            speedup_sep = None
-
-        print(
-            f"{batch_size:<8} {hidden_size:<8} "
-            f"{t_cute_us:<14.1f} {bw_cute:<10.1f} "
-            f"{rmsnorm_str:<13} {fp4_str:<11} {separate_str:<14} "
-            f"{speedup_sep_str:<12}"
-        )
-
-        result = {
-            "batch_size": batch_size,
-            "hidden_size": hidden_size,
-            "cute_dsl_us": t_cute_us,
-            "cute_dsl_bw_gb_s": bw_cute,
-            "rmsnorm_us": t_rmsnorm_us,
-            "fp4_quant_us": t_fp4_us,
-            "separate_us": t_separate_us,
-            "speedup_vs_separate": speedup_sep,
-        }
-        results.append(result)
-
-    print()
-    print("=" * 80)
-
-    # Calculate and print geomean speedup
-    speedups = [
-        r["speedup_vs_separate"]
-        for r in results
-        if r["speedup_vs_separate"] is not None
-    ]
-
-    if speedups:
-        geomean_speedup = gmean(speedups)
-        print(f"Geomean speedup vs Separate (2 kernels): {geomean_speedup:.2f}x")
-
     print("=" * 80)
     print("Benchmark Complete")
     print("=" * 80)
+
+    return {"nvfp4": nvfp4_results, "mxfp4": mxfp4_results}
 
 
 if __name__ == "__main__":
