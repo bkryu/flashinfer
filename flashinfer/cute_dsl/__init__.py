@@ -36,6 +36,28 @@ if is_cute_dsl_available():
         AddRMSNormFP4QuantKernel,
     )
 
+    # Bitonic Top-K + Softmax
+    from .sort_utils import compare_and_swap
+    from .sorting_networks import optimal_sort, networks
+    from .bitonic_sort_utils import (
+        bitonic_merge,
+        bitonic_sort,
+        bitonic_topk_merge,
+        bitonic_topk,
+    )
+    from .bitonic_topk_softmax import (
+        bitonic_topk_softmax,
+        BitonicTopKSoftmaxKernel,
+        MAX_K,
+        MAX_N,
+    )
+
+    # Count & Cumsum for MoE routing
+    from .count_cumsum import (
+        count_cumsum,
+        CountCumsumKernel,
+    )
+
 __all__ = [
     # Utils (always available)
     "is_cute_dsl_available",
@@ -56,4 +78,21 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # Sorting primitives
+        "compare_and_swap",
+        "optimal_sort",
+        "networks",
+        # Bitonic sort utilities
+        "bitonic_merge",
+        "bitonic_sort",
+        "bitonic_topk_merge",
+        "bitonic_topk",
+        # Bitonic Top-K + Softmax
+        "bitonic_topk_softmax",
+        "BitonicTopKSoftmaxKernel",
+        "MAX_K",
+        "MAX_N",
+        # Count & Cumsum for MoE routing
+        "count_cumsum",
+        "CountCumsumKernel",
     ]

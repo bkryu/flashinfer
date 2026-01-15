@@ -17,13 +17,16 @@ limitations under the License.
 import ctypes
 import functools
 import importlib.util
-from typing import Union
+from typing import Optional, Union
 
 import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
+import cutlass.cute as cute
 import torch
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 def is_cute_dsl_available() -> bool:
@@ -221,3 +224,350 @@ def make_ptr(
         )
 
     return _Pointer(address_value, dtype, mem_space, assumed_align=assumed_align)
+
+
+# =============================================================================
+# Device Info Utilities (from cute-dsl-zoo)
+# =============================================================================
+
+
+@functools.lru_cache(maxsize=16)
+def get_sm_version(device: Optional[Union[int, torch.device, str]] = None) -> int:
+    """Get the SM (compute capability) version of a CUDA device.
+
+    Parameters
+    ----------
+    device : int, torch.device, str, or None
+        Device to query. If None, uses current device.
+
+    Returns
+    -------
+    int
+        SM version as integer (e.g., 80 for SM80/Ampere, 90 for SM90/Hopper,
+        100 for SM100/Blackwell).
+
+    Example
+    -------
+    >>> sm = get_sm_version()
+    >>> if sm >= 100:
+    ...     print("Running on Blackwell!")
+    """
+    if not torch.cuda.is_available():
+        return 80  # Default fallback
+    props = torch.cuda.get_device_properties(device)
+    return props.major * 10 + props.minor
+
+
+def get_l2_cache_size(device: Optional[Union[int, torch.device]] = None) -> int:
+    """Get L2 cache size in bytes for a CUDA device.
+
+    Parameters
+    ----------
+    device : int or torch.device, optional
+        CUDA device. Default is current device.
+
+    Returns
+    -------
+    int
+        L2 cache size in bytes.
+
+    Example
+    -------
+    >>> l2_size = get_l2_cache_size()
+    >>> print(f"L2 cache: {l2_size / 1024 / 1024:.1f} MB")
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return props.L2_cache_size
+
+
+def get_shared_memory_per_block(
+    device: Optional[Union[int, torch.device]] = None,
+) -> int:
+    """Get maximum shared memory per block (with optin) for a CUDA device.
+
+    Parameters
+    ----------
+    device : int or torch.device, optional
+        CUDA device. Default is current device.
+
+    Returns
+    -------
+    int
+        Maximum shared memory per block in bytes.
+
+    Example
+    -------
+    >>> smem = get_shared_memory_per_block()
+    >>> print(f"Max shared memory: {smem / 1024:.0f} KB")
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    # Use shared_memory_per_block_optin if available (newer GPUs)
+    return getattr(
+        props,
+        "shared_memory_per_block_optin",
+        getattr(props, "shared_memory_per_block", 49152),
+    )
+
+
+# =============================================================================
+# Math Utilities (from TRT-LLM)
+# =============================================================================
+
+
+def is_power_of_2(x: int) -> bool:
+    """Check if a number is a power of 2.
+
+    Parameters
+    ----------
+    x : int
+        The number to check.
+
+    Returns
+    -------
+    bool
+        True if x is a positive power of 2.
+    """
+    return x > 0 and (x & (x - 1)) == 0
+
+
+@dsl_user_op
+def fmin(
+    a: Union[float, cutlass.Float32],
+    b: Union[float, cutlass.Float32],
+    *,
+    nan: bool = False,
+    loc=None,
+    ip=None,
+) -> cutlass.Float32:
+    """Compute the minimum of two float32 values using PTX fmin.
+
+    Parameters
+    ----------
+    a : float or cutlass.Float32
+        First operand.
+    b : float or cutlass.Float32
+        Second operand.
+    nan : bool, optional
+        If True, propagate NaN values. Default is False.
+
+    Returns
+    -------
+    cutlass.Float32
+        The minimum value.
+    """
+    return cutlass.Float32(
+        nvvm.fmin(
+            T.f32(),
+            cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            nan=nan,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def sigmoid_f32(
+    a: Union[float, cutlass.Float32], fastmath: bool = False
+) -> Union[float, cutlass.Float32]:
+    """Compute the sigmoid of the input value.
+
+    sigmoid(x) = 1 / (1 + exp(-x))
+
+    Parameters
+    ----------
+    a : float or cutlass.Float32
+        Input value.
+    fastmath : bool, optional
+        Use fast math approximations. Default is False.
+
+    Returns
+    -------
+    float or cutlass.Float32
+        The sigmoid of the input.
+    """
+    return cute.arch.rcp_approx(1.0 + cute.math.exp(-a, fastmath=fastmath))
+
+
+def silu_f32(
+    a: Union[float, cutlass.Float32], fastmath: bool = False
+) -> Union[float, cutlass.Float32]:
+    """Compute the SiLU (Sigmoid Linear Unit) activation.
+
+    silu(x) = x * sigmoid(x)
+
+    Parameters
+    ----------
+    a : float or cutlass.Float32
+        Input value.
+    fastmath : bool, optional
+        Use fast math approximations. Default is False.
+
+    Returns
+    -------
+    float or cutlass.Float32
+        The SiLU of the input.
+    """
+    return a * sigmoid_f32(a, fastmath=fastmath)
+
+
+# =============================================================================
+# Atomic Operations (from TRT-LLM)
+# =============================================================================
+
+
+@dsl_user_op
+def vectorized_atomic_add_bf16x8(
+    rOut_epi_packed, scatter_out_offset, loc=None, ip=None
+):
+    """Perform a vectorized atomic add of 8 bf16 values (packed as 4 bf16x2).
+
+    This uses PTX red.global.v4.bf16x2.add instruction for efficient
+    scatter-accumulate operations in MoE kernels.
+
+    Parameters
+    ----------
+    rOut_epi_packed : tensor
+        Register tensor with 4 packed bf16x2 values.
+    scatter_out_offset : pointer
+        Output pointer with scatter offset applied.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            llvm.bitcast(T.i32(), rOut_epi_packed[0, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[1, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[2, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
+        ],
+        "red.global.v4.bf16x2.add.noftz [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def vectorized_atomic_add_fp32x2(
+    rOut_epi_packed, scatter_out_offset, loc=None, ip=None
+):
+    """Perform a vectorized atomic add of 2 fp32 values.
+
+    This uses PTX red.global.v2.f32.add instruction.
+
+    Parameters
+    ----------
+    rOut_epi_packed : tensor
+        Register tensor with 2 fp32 values.
+    scatter_out_offset : pointer
+        Output pointer with scatter offset applied.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            rOut_epi_packed[0].ir_value(),
+            rOut_epi_packed[1].ir_value(),
+        ],
+        "red.global.v2.f32.add [$0], {$1, $2};",
+        "l,f,f",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
+    """Perform a scalar atomic add (supports fp32 and bf16).
+
+    Parameters
+    ----------
+    rOut_epi_packed : value
+        Scalar value to add.
+    scatter_out_offset : pointer
+        Output pointer with scatter offset applied.
+    """
+    if cutlass.const_expr(rOut_epi_packed.dtype == cutlass.Float32):
+        llvm.inline_asm(
+            None,
+            [
+                scatter_out_offset.iterator.llvm_ptr,
+                rOut_epi_packed.ir_value(),
+            ],
+            "red.global.add.f32 [$0], $1;",
+            "l,f",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+    elif cutlass.const_expr(rOut_epi_packed.dtype == cutlass.BFloat16):
+        llvm.inline_asm(
+            None,
+            [
+                scatter_out_offset.iterator.llvm_ptr,
+                llvm.bitcast(T.i16(), rOut_epi_packed.ir_value()),
+            ],
+            "red.add.noftz.bf16 [$0], $1;",
+            "l,h",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+
+# =============================================================================
+# Grid Dependency Control (from TRT-LLM, for Blackwell/SM100)
+# =============================================================================
+
+
+@dsl_user_op
+def griddepcontrol_wait(*, loc=None, ip=None) -> None:
+    """Wait for the previous kernel's grid to complete.
+
+    This instruction is used to wait for the previous kernel's grid ending
+    (all blocks of the previous kernel have finished and memflushed), i.e.,
+    the instruction after this instruction will not be issued until the previous
+    grid has finished.
+
+    Note: This is a Blackwell (SM100) specific instruction.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="griddepcontrol.wait;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
+    """Hint to launch dependent kernels earlier.
+
+    Issuing the launch_dependents instruction hints a dependent kernel to
+    launch earlier. launch_dependents doesn't impact the functionality but
+    the performance: Launching a dependent kernel too early can compete
+    with current kernels, while launching too late can lead to a long latency.
+
+    Note: This is a Blackwell (SM100) specific instruction.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="griddepcontrol.launch_dependents;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
