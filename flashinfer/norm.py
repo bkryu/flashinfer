@@ -15,13 +15,20 @@ limitations under the License.
 """
 
 import functools
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
 from .api_logging import flashinfer_api
 from .jit.norm import gen_norm_module
 from .utils import device_support_pdl, register_custom_op, register_fake_op
+
+
+def _get_cute_dsl_rmsnorm():
+    """Lazily import CuTe-DSL rmsnorm to avoid import errors when not available."""
+    from .cute_dsl import rmsnorm as cute_dsl_rmsnorm
+
+    return cute_dsl_rmsnorm
 
 
 @functools.cache
@@ -36,6 +43,7 @@ def rmsnorm(
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
@@ -53,19 +61,32 @@ def rmsnorm(
         The output tensor, if specified, the kernel will update this tensor inplace.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_.
+        PDL allows overlapping execution of consecutive kernels in the same stream.
+        If ``None``, PDL is automatically enabled on supported hardware (SM90+).
+    backend: Literal["cuda", "cute-dsl"]
+        The kernel backend to use. Default is ``"cuda"``.
+
+        - ``"cuda"``: Original CUDA kernel, works on all GPUs.
+        - ``"cute-dsl"``: CuTe-DSL kernel with cluster-based reduction for large hidden
+          dimensions. Requires SM90+ (Hopper/Blackwell) and CuTe-DSL to be available.
 
     Returns
     -------
     output: torch.Tensor
         Normalized tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
     """
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(input.device)
-    if out is None:
-        out = torch.empty_like(input)
-    _rmsnorm(out, input, weight, eps, enable_pdl)
-    return out
+    if backend == "cuda":
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
+        if out is None:
+            out = torch.empty_like(input)
+        _rmsnorm(out, input, weight, eps, enable_pdl)
+        return out
+    elif backend == "cute-dsl":
+        return _rmsnorm_cute_dsl(out, input, weight, eps, enable_pdl)
+    else:
+        raise ValueError(f"Unknown backend: {backend}. Expected 'cuda' or 'cute-dsl'.")
 
 
 @register_custom_op("flashinfer::rmsnorm", mutates_args=("out",))
@@ -90,6 +111,32 @@ def _rmsnorm_fake(
     enable_pdl: Optional[bool],
 ) -> None:
     pass
+
+
+@register_custom_op("flashinfer::rmsnorm_cute_dsl", mutates_args=("out",))
+def _rmsnorm_cute_dsl(
+    out: Optional[torch.Tensor],
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """CuTe-DSL RMSNorm implementation with cluster-based reduction and PDL support."""
+    cute_dsl_rmsnorm = _get_cute_dsl_rmsnorm()
+    return cute_dsl_rmsnorm(input, weight, output=out, eps=eps, use_pdl=enable_pdl)
+
+
+@register_fake_op("flashinfer::rmsnorm_cute_dsl")
+def _rmsnorm_cute_dsl_fake(
+    out: Optional[torch.Tensor],
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    if out is None:
+        return input.new_empty(input.shape)
+    return out
 
 
 @flashinfer_api

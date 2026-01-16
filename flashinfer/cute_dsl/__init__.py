@@ -35,6 +35,15 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
+    from .rmsnorm import (
+        rmsnorm,
+        RMSNormKernel,
+    )
+    from .reduce import (
+        block_reduce,
+        cluster_reduce,
+        row_reduce,
+    )
 
 __all__ = [
     # Utils (always available)
@@ -56,4 +65,11 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # RMSNorm (standalone)
+        "rmsnorm",
+        "RMSNormKernel",
+        # Reduction utilities
+        "block_reduce",
+        "cluster_reduce",
+        "row_reduce",
     ]
