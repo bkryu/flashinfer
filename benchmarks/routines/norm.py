@@ -219,6 +219,10 @@ def testRmsnorm(args):
             return flashinfer.rmsnorm(
                 input_tensor, weight, eps=eps, enable_pdl=enable_pdl
             )
+        elif backend == "cute-dsl":
+            return flashinfer.rmsnorm(
+                input_tensor, weight, eps=eps, enable_pdl=enable_pdl, backend="cute-dsl"
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
