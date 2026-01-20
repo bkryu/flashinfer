@@ -31,6 +31,13 @@ def _get_cute_dsl_rmsnorm():
     return cute_dsl_rmsnorm
 
 
+def _get_cute_dsl_fused_add_rmsnorm():
+    """Lazily import CuTe-DSL fused_add_rmsnorm to avoid import errors when not available."""
+    from .cute_dsl import add_rmsnorm as cute_dsl_add_rmsnorm
+
+    return cute_dsl_add_rmsnorm
+
+
 @functools.cache
 def get_norm_module():
     return gen_norm_module().build_and_load()
@@ -192,13 +199,13 @@ def _rmsnorm_quant_fake(
 
 
 @flashinfer_api
-@register_custom_op("flashinfer::fused_add_rmsnorm", mutates_args=("input", "residual"))
 def fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
 ) -> None:
     r"""Fused add root mean square normalization.
 
@@ -211,17 +218,51 @@ def fused_add_rmsnorm(
     Parameters
     ----------
     input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
+        Input tensor, shape (batch_size, hidden_size) or (batch_size, seq_len, hidden_size).
+        For 3D input, the tensor is reshaped to 2D internally.
     residual: torch.Tensor
-        Residual tensor, shape (batch_size, hidden_size).
+        Residual tensor, same shape as input.
     weight: torch.Tensor
         Weight tensor, shape (hidden_size,).
     eps: float
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_.
+        PDL allows overlapping execution of consecutive kernels in the same stream.
+        If ``None``, PDL is automatically enabled on supported hardware (SM90+).
+    backend: Literal["cuda", "cute-dsl"]
+        The kernel backend to use. Default is ``"cuda"``.
+
+        - ``"cuda"``: Original CUDA kernel, works on all GPUs.
+        - ``"cute-dsl"``: CuTe-DSL kernel with cluster-based reduction for large hidden
+          dimensions. Requires SM90+ (Hopper/Blackwell) and CuTe-DSL to be available.
     """
+    # Handle 3D input by reshaping to 2D for CUDA backend compatibility
+    # Note: views share storage, so in-place modifications affect the original tensor
+    if input.dim() == 3:
+        batch, seq_len, hidden = input.shape
+        input = input.view(batch * seq_len, hidden)
+        residual = residual.view(batch * seq_len, hidden)
+
+    if backend == "cuda":
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
+        _fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+    elif backend == "cute-dsl":
+        _fused_add_rmsnorm_cute_dsl(input, residual, weight, eps, enable_pdl)
+    else:
+        raise ValueError(f"Unknown backend: {backend}. Expected 'cuda' or 'cute-dsl'.")
+
+
+@register_custom_op("flashinfer::fused_add_rmsnorm", mutates_args=("input", "residual"))
+def _fused_add_rmsnorm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: Optional[bool],
+) -> None:
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
     get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
@@ -232,7 +273,33 @@ def _fused_add_rmsnorm_fake(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-    eps: float = 1e-6,
+    eps: float,
+    enable_pdl: Optional[bool],
+) -> None:
+    pass
+
+
+@register_custom_op(
+    "flashinfer::fused_add_rmsnorm_cute_dsl", mutates_args=("input", "residual")
+)
+def _fused_add_rmsnorm_cute_dsl(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    """CuTe-DSL fused add + RMSNorm implementation with cluster-based reduction."""
+    cute_dsl_add_rmsnorm = _get_cute_dsl_fused_add_rmsnorm()
+    cute_dsl_add_rmsnorm(input, residual, weight, eps=eps, enable_pdl=enable_pdl)
+
+
+@register_fake_op("flashinfer::fused_add_rmsnorm_cute_dsl")
+def _fused_add_rmsnorm_cute_dsl_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
     enable_pdl: Optional[bool] = None,
 ) -> None:
     pass

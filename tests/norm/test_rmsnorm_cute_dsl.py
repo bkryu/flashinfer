@@ -173,7 +173,9 @@ class TestRMSNormCuteDSL:
         hidden_size = 1024
 
         # Test with very small values
-        x_small = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype) * 1e-4
+        x_small = (
+            torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype) * 1e-4
+        )
         w = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
         y_small = rmsnorm(x_small, w)
@@ -219,10 +221,10 @@ class TestRMSNormCuteDSLCluster:
     @pytest.mark.parametrize(
         "hidden_size,expected_cluster",
         [
-            (8192, 1),      # N <= 16K: cluster_n = 1
-            (16384, 1),     # N <= 16K: cluster_n = 1
-            (20480, 2),     # 16K < N <= 32K: cluster_n = 2
-            (32768, 2),     # 16K < N <= 32K: cluster_n = 2
+            (8192, 1),  # N <= 16K: cluster_n = 1
+            (16384, 1),  # N <= 16K: cluster_n = 1
+            (20480, 2),  # 16K < N <= 32K: cluster_n = 2
+            (32768, 2),  # 16K < N <= 32K: cluster_n = 2
         ],
     )
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -231,9 +233,10 @@ class TestRMSNormCuteDSLCluster:
         from flashinfer.cute_dsl.rmsnorm import RMSNormKernel
 
         kernel = RMSNormKernel(
-            dtype={"float16": __import__("cutlass").Float16, "bfloat16": __import__("cutlass").BFloat16}[
-                "float16" if dtype == torch.float16 else "bfloat16"
-            ],
+            dtype={
+                "float16": __import__("cutlass").Float16,
+                "bfloat16": __import__("cutlass").BFloat16,
+            }["float16" if dtype == torch.float16 else "bfloat16"],
             N=hidden_size,
             has_weight=True,
         )
@@ -318,7 +321,9 @@ class TestRMSNormCuteDSLIntegration:
         torch.testing.assert_close(y_contig, y_ref, rtol=1e-2, atol=1e-2)
 
         # Non-contiguous input (strided)
-        x_noncontig = torch.randn(batch_size, hidden_size * 2, device="cuda", dtype=dtype)
+        x_noncontig = torch.randn(
+            batch_size, hidden_size * 2, device="cuda", dtype=dtype
+        )
         x_noncontig = x_noncontig[:, :hidden_size]
         assert not x_noncontig.is_contiguous()
 
@@ -499,4 +504,3 @@ class TestRMSNormUnifiedAPI:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

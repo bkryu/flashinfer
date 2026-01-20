@@ -45,6 +45,8 @@ def run_norm_test(args):
         return testRmsnorm(args)
     elif args.routine == "rmsnorm_quant":
         return testRmsnormQuant(args)
+    elif args.routine == "fused_add_rmsnorm":
+        return testFusedAddRmsnorm(args)
     elif args.routine == "fused_add_rmsnorm_quant":
         return testFusedAddRmsnormQuant(args)
     elif args.routine == "rmsnorm_fp4quant":
@@ -486,6 +488,202 @@ def testRmsnormQuant(args):
                 cur_res["input_dtype"] = str(input_dtype)
                 cur_res["out_dtype"] = str(out_dtype)
                 cur_res["scale"] = scale
+                cur_res["eps"] = eps
+                cur_res["enable_pdl"] = enable_pdl
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testFusedAddRmsnorm(args):
+    """
+    Test fused_add_rmsnorm API with cuda and cute-dsl backends.
+
+    This test:
+    1. Generates random input and residual tensors
+    2. Runs fused_add_rmsnorm (residual += input, then RMSNorm)
+    3. Runs reference check
+    4. Measures performance metrics (memory bandwidth)
+
+    Note: This operation is memory-bandwidth bound, so TB/sec is the primary metric.
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testFusedAddRmsnorm")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]  # Make a copy to avoid modifying the original
+    batch_size = args.batch_size
+    hidden_size = args.hidden_size
+    num_heads = args.num_heads
+    eps = args.eps
+    enable_pdl = args.enable_pdl
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    if input_dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are bfloat16, float16."
+        )
+    ## Done parsing input arguments
+
+    ## Prepare input tensors
+    if num_heads is not None:
+        input_shape = (batch_size, num_heads, hidden_size)
+    else:
+        input_shape = (batch_size, hidden_size)
+
+    input_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+    residual_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_tensor.shape = }")
+        print(f"[VVERBOSE] {input_tensor.dtype = }")
+        print(f"[VVERBOSE] {residual_tensor.shape = }")
+        print(f"[VVERBOSE] {weight.shape = }")
+
+    def run_backend(backend, input_tensor, residual_tensor, weight):
+        if backend == "cuda":
+            flashinfer.fused_add_rmsnorm(
+                input_tensor,
+                residual_tensor,
+                weight,
+                eps=eps,
+                enable_pdl=enable_pdl,
+                backend="cuda",
+            )
+            return input_tensor  # Returns normalized output
+        elif backend == "cute-dsl":
+            flashinfer.fused_add_rmsnorm(
+                input_tensor,
+                residual_tensor,
+                weight,
+                eps=eps,
+                enable_pdl=enable_pdl,
+                backend="cute-dsl",
+            )
+            return input_tensor  # Returns normalized output
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Reference: PyTorch implementation of fused add + RMSNorm
+    has_reference_output = False
+    if run_refcheck:
+        # Clone tensors for reference computation
+        ref_residual = residual_tensor.clone()
+        # Step 1: residual += input
+        ref_residual = ref_residual + input_tensor
+        # Step 2: RMSNorm on residual
+        rms = torch.sqrt(
+            torch.mean(ref_residual.float() ** 2, dim=-1, keepdim=True) + eps
+        )
+        reference_output = (ref_residual.float() / rms * weight.float()).to(input_dtype)
+        has_reference_output = True
+
+    # Storage for timing results and outputs
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        # Create fresh tensors for each backend (both are mutated)
+        cur_input = input_tensor.clone()
+        cur_residual = residual_tensor.clone()
+        if run_refcheck:
+            outputs[cur_backend] = (
+                run_backend(cur_backend, cur_input, cur_residual, weight)
+                .detach()
+                .clone()
+            )
+        # For timing, use fresh tensors each iteration
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(
+                cur_backend,
+                input_tensor.clone(),
+                residual_tensor.clone(),
+                weight,
+            ),
+        )
+
+    tested_backends = list(outputs.keys())
+    tested_outputs = list(outputs.values())
+    if len(tested_backends) > 0:
+        if run_refcheck and has_reference_output:
+            for i in range(len(tested_backends)):
+                (
+                    num_different_elements,
+                    num_elements,
+                    num_different_elements_percentage,
+                ) = is_close_stats(
+                    reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
+                )
+                if num_different_elements > 0:
+                    print(
+                        f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                    )
+                    if not args.allow_output_mismatch:
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
+                        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation for Fused Add + RMSNorm
+            # Read: input tensor + residual tensor + weight tensor
+            # Write: residual tensor (updated) + input tensor (normalized output)
+            num_elements = np.prod(input_shape)
+            problem_bytes = (
+                num_elements * input_dtype.itemsize  # input read
+                + num_elements * input_dtype.itemsize  # residual read
+                + hidden_size * input_dtype.itemsize  # weight read
+                + num_elements * input_dtype.itemsize  # residual write
+                + num_elements * input_dtype.itemsize  # output write (to input tensor)
+            )
+            # Fused add + RMSNorm FLOPS estimate
+            # Per element: add, square, sum reduction, sqrt, divide, multiply
+            problem_flops = num_elements * 6  # rough estimate
+            tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["num_heads"] = num_heads if num_heads else ""
+                cur_res["input_dtype"] = str(input_dtype)
                 cur_res["eps"] = eps
                 cur_res["enable_pdl"] = enable_pdl
                 cur_res["backend"] = backend

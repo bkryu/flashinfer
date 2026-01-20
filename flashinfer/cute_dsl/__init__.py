@@ -39,6 +39,10 @@ if is_cute_dsl_available():
         rmsnorm,
         RMSNormKernel,
     )
+    from .add_rmsnorm import (
+        add_rmsnorm,
+        AddRMSNormKernel,
+    )
     from .reduce import (
         block_reduce,
         cluster_reduce,
@@ -68,6 +72,9 @@ if is_cute_dsl_available():
         # RMSNorm (standalone)
         "rmsnorm",
         "RMSNormKernel",
+        # Add + RMSNorm (standalone)
+        "add_rmsnorm",
+        "AddRMSNormKernel",
         # Reduction utilities
         "block_reduce",
         "cluster_reduce",
