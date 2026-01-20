@@ -20,7 +20,9 @@ import pytest
 import torch
 
 
-def rmsnorm_reference(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
+def rmsnorm_reference(
+    x: torch.Tensor, weight: torch.Tensor | None, eps: float
+) -> torch.Tensor:
     """Reference RMSNorm implementation in PyTorch."""
     # Compute RMS
     variance = x.pow(2).mean(dim=-1, keepdim=True)
@@ -262,7 +264,9 @@ class TestAddRMSNorm:
 class TestAddRMSNormEdgeCases:
     """Tests for edge cases and error handling."""
 
-    @pytest.mark.parametrize("N", [8, 16, 32, 48, 96, 104, 1000])  # Must be divisible by 8 for FP16/BF16
+    @pytest.mark.parametrize(
+        "N", [8, 16, 32, 48, 96, 104, 1000]
+    )  # Must be divisible by 8 for FP16/BF16
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_non_power_of_two_n(self, cuda_device, N, dtype):
         """Test with non-power-of-2 hidden dimensions (but aligned to vec_size)."""
@@ -297,11 +301,17 @@ class TestAddRMSNormEdgeCases:
 
         # Check results
         torch.testing.assert_close(
-            residual_test, residual_ref, atol=1e-2, rtol=1e-2,
+            residual_test,
+            residual_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg=f"Residual mismatch for N={N}",
         )
         torch.testing.assert_close(
-            input_test, output_ref, atol=1e-2, rtol=1e-2,
+            input_test,
+            output_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg=f"Output mismatch for N={N}",
         )
 
@@ -340,11 +350,17 @@ class TestAddRMSNormEdgeCases:
 
         # Check results
         torch.testing.assert_close(
-            residual_test, residual_ref, atol=1e-2, rtol=1e-2,
+            residual_test,
+            residual_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg=f"Residual mismatch for M={M}",
         )
         torch.testing.assert_close(
-            input_test, output_ref, atol=1e-2, rtol=1e-2,
+            input_test,
+            output_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg=f"Output mismatch for M={M}",
         )
 
@@ -381,8 +397,12 @@ class TestAddRMSNormEdgeCases:
 
         # N=100 is not divisible by 8 (vec_size for FP16/BF16)
         N_misaligned_fp16 = 100
-        input_fp16 = torch.randn(M, N_misaligned_fp16, device=cuda_device, dtype=torch.float16)
-        residual_fp16 = torch.randn(M, N_misaligned_fp16, device=cuda_device, dtype=torch.float16)
+        input_fp16 = torch.randn(
+            M, N_misaligned_fp16, device=cuda_device, dtype=torch.float16
+        )
+        residual_fp16 = torch.randn(
+            M, N_misaligned_fp16, device=cuda_device, dtype=torch.float16
+        )
 
         with pytest.raises(ValueError, match="divisible by"):
             add_rmsnorm(input_fp16, residual_fp16)
@@ -390,8 +410,12 @@ class TestAddRMSNormEdgeCases:
         # N=102 is not divisible by 4 (vec_size for FP32)
         # Note: N=100 IS divisible by 4, so use 102 instead
         N_misaligned_fp32 = 102
-        input_fp32 = torch.randn(M, N_misaligned_fp32, device=cuda_device, dtype=torch.float32)
-        residual_fp32 = torch.randn(M, N_misaligned_fp32, device=cuda_device, dtype=torch.float32)
+        input_fp32 = torch.randn(
+            M, N_misaligned_fp32, device=cuda_device, dtype=torch.float32
+        )
+        residual_fp32 = torch.randn(
+            M, N_misaligned_fp32, device=cuda_device, dtype=torch.float32
+        )
 
         with pytest.raises(ValueError, match="divisible by"):
             add_rmsnorm(input_fp32, residual_fp32)
@@ -513,7 +537,9 @@ class TestAddRMSNormCluster:
     """Tests for cluster support (SM90+, large N)."""
 
     @pytest.mark.parametrize("M", [4, 32])
-    @pytest.mark.parametrize("N", [16384, 20480, 32768])  # Large N triggers cluster mode
+    @pytest.mark.parametrize(
+        "N", [16384, 20480, 32768]
+    )  # Large N triggers cluster mode
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_large_n_cluster(self, cuda_device, M, N, dtype):
         """Test numerical correctness with large N (cluster mode on SM90+)."""
@@ -596,11 +622,17 @@ class TestAddRMSNormCluster:
         add_rmsnorm(input_test, residual_test, weight, eps, enable_pdl=False)
 
         torch.testing.assert_close(
-            residual_test, residual_ref, atol=1e-2, rtol=1e-2,
+            residual_test,
+            residual_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg="Residual mismatch with enable_pdl=False",
         )
         torch.testing.assert_close(
-            input_test, output_ref, atol=1e-2, rtol=1e-2,
+            input_test,
+            output_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg="Output mismatch with enable_pdl=False",
         )
 
@@ -610,11 +642,17 @@ class TestAddRMSNormCluster:
         add_rmsnorm(input_test2, residual_test2, weight, eps, enable_pdl=True)
 
         torch.testing.assert_close(
-            residual_test2, residual_ref, atol=1e-2, rtol=1e-2,
+            residual_test2,
+            residual_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg="Residual mismatch with enable_pdl=True",
         )
         torch.testing.assert_close(
-            input_test2, output_ref, atol=1e-2, rtol=1e-2,
+            input_test2,
+            output_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg="Output mismatch with enable_pdl=True",
         )
 
@@ -710,11 +748,17 @@ class TestFusedAddRmsnormUnifiedAPI:
 
         # Check results
         torch.testing.assert_close(
-            residual_test, residual_ref, atol=1e-2, rtol=1e-2,
+            residual_test,
+            residual_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg=f"Residual mismatch for unified API M={M}, N={N}, dtype={dtype}",
         )
         torch.testing.assert_close(
-            input_test, output_ref, atol=1e-2, rtol=1e-2,
+            input_test,
+            output_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg=f"Output mismatch for unified API M={M}, N={N}, dtype={dtype}",
         )
 
@@ -752,11 +796,17 @@ class TestFusedAddRmsnormUnifiedAPI:
 
         # Compare results between backends
         torch.testing.assert_close(
-            residual_cute, residual_cuda, atol=1e-2, rtol=1e-2,
+            residual_cute,
+            residual_cuda,
+            atol=1e-2,
+            rtol=1e-2,
             msg=f"Residual mismatch cuda vs cute-dsl for M={M}, N={N}, dtype={dtype}",
         )
         torch.testing.assert_close(
-            input_cute, input_cuda, atol=1e-2, rtol=1e-2,
+            input_cute,
+            input_cuda,
+            atol=1e-2,
+            rtol=1e-2,
             msg=f"Output mismatch cuda vs cute-dsl for M={M}, N={N}, dtype={dtype}",
         )
 
@@ -814,17 +864,26 @@ class TestFusedAddRmsnormUnifiedAPI:
 
         # Results should be identical
         torch.testing.assert_close(
-            input_default, input_cuda, atol=0, rtol=0,
+            input_default,
+            input_cuda,
+            atol=0,
+            rtol=0,
             msg="Default backend should be identical to explicit backend='cuda'",
         )
         torch.testing.assert_close(
-            residual_default, residual_cuda, atol=0, rtol=0,
+            residual_default,
+            residual_cuda,
+            atol=0,
+            rtol=0,
             msg="Default backend residual should be identical to explicit backend='cuda'",
         )
 
         # Both should match reference
         torch.testing.assert_close(
-            input_default, output_ref, atol=1e-2, rtol=1e-2,
+            input_default,
+            output_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg="Default backend output mismatch with reference",
         )
 
@@ -867,19 +926,26 @@ class TestFusedAddRmsnormUnifiedAPI:
 
         # Verify shape is preserved
         assert input_test.shape == (B, S, N), f"Shape changed: {input_test.shape}"
-        assert residual_test.shape == (B, S, N), f"Residual shape changed: {residual_test.shape}"
+        assert residual_test.shape == (B, S, N), (
+            f"Residual shape changed: {residual_test.shape}"
+        )
 
         # Check results
         torch.testing.assert_close(
-            residual_test, residual_ref, atol=1e-2, rtol=1e-2,
+            residual_test,
+            residual_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg=f"Residual mismatch for 3D input with backend={backend}",
         )
         torch.testing.assert_close(
-            input_test, output_ref, atol=1e-2, rtol=1e-2,
+            input_test,
+            output_ref,
+            atol=1e-2,
+            rtol=1e-2,
             msg=f"Output mismatch for 3D input with backend={backend}",
         )
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

@@ -416,7 +416,9 @@ class AddRMSNormKernel:
         )
 
         # Tiled copies
-        tiled_copy_load = cute.make_tiled_copy(copy_atom_load_async, tv_layout, tiler_mn)
+        tiled_copy_load = cute.make_tiled_copy(
+            copy_atom_load_async, tv_layout, tiler_mn
+        )
         tiled_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn)
         tiled_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn)
 
@@ -736,7 +738,11 @@ def add_rmsnorm(
 
     # Validate alignment for 128-bit vectorized loads
     # FP16/BF16 require N divisible by 8, FP32 requires N divisible by 4
-    vec_size = VEC_SIZE_FP16 if input.dtype in (torch.float16, torch.bfloat16) else VEC_SIZE_FP32
+    vec_size = (
+        VEC_SIZE_FP16
+        if input.dtype in (torch.float16, torch.bfloat16)
+        else VEC_SIZE_FP32
+    )
     if N % vec_size != 0:
         raise ValueError(
             f"Hidden dimension N={N} must be divisible by {vec_size} for {input.dtype} "
@@ -794,9 +800,7 @@ def add_rmsnorm(
                 f"Weight dtype {weight.dtype} must match input dtype {input.dtype}"
             )
         if weight.shape != (N,):
-            raise ValueError(
-                f"Weight shape {weight.shape} must be ({N},)"
-            )
+            raise ValueError(f"Weight shape {weight.shape} must be ({N},)")
         if weight.device != input.device:
             raise ValueError(
                 f"Weight device {weight.device} must match input device {input.device}"
@@ -833,4 +837,3 @@ __all__ = [
     "add_rmsnorm",
     "AddRMSNormKernel",
 ]
-
