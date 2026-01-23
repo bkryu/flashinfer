@@ -21,6 +21,7 @@ import torch
 
 import flashinfer
 from flashinfer.topk import can_implement_filtered_topk
+from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
 
 @pytest.fixture
@@ -41,6 +42,8 @@ def set_topk_algo():
         os.environ.pop("FLASHINFER_TOPK_ALGO", None)
     else:
         os.environ["FLASHINFER_TOPK_ALGO"] = original_value
+
+
 
 
 def compute_topk_accuracy(test_indices, ref_indices, batch_size, k):
@@ -1225,6 +1228,186 @@ def test_algorithms_with_large_k(algo, set_topk_algo):
     assert values.shape == (batch_size, k)
     accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
     assert accuracy >= 0.98, f"Algorithm {algo}: Accuracy {accuracy:.4f} < 0.98"
+
+
+# ===================== CuTe-DSL Backend Tests =====================
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 32])
+@pytest.mark.parametrize("vocab_size", [4096, 32000, 65536])
+@pytest.mark.parametrize("k", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_cute_dsl_backend(batch_size, vocab_size, k, dtype):
+    """Test top_k with cute-dsl backend."""
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    # cute-dsl requires num_cols >= 256 and k <= 2048
+    if vocab_size < 256:
+        pytest.skip("cute-dsl requires vocab_size >= 256")
+    if k > 2048:
+        pytest.skip("cute-dsl requires k <= 2048")
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
+
+    # flashinfer top_k with cute-dsl backend
+    values, indices = flashinfer.top_k(logits, k, backend="cute-dsl")
+
+    # Reference: torch.topk
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    # Check output shapes
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Check dtypes
+    assert values.dtype == dtype
+    assert indices.dtype == torch.int64
+
+    # Verify values match the gathered indices
+    gathered_values = torch.gather(logits, dim=-1, index=indices)
+    torch.testing.assert_close(values, gathered_values)
+
+    # Check accuracy of indices
+    accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
+    min_accuracy = 0.98
+    assert accuracy >= min_accuracy, (
+        f"cute-dsl backend: Accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("vocab_size", [4096, 32000])
+@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_top_k_cute_dsl_sorted(batch_size, vocab_size, k, dtype):
+    """Test top_k with cute-dsl backend and sorted=True."""
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
+
+    # flashinfer top_k with cute-dsl backend and sorted=True
+    values, indices = flashinfer.top_k(logits, k, sorted=True, backend="cute-dsl")
+
+    # Check output shapes
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Verify values are sorted in descending order
+    for i in range(batch_size):
+        row_values = values[i]
+        assert torch.all(row_values[:-1] >= row_values[1:]), (
+            f"Row {i} values not sorted in descending order"
+        )
+
+    # Verify values match the gathered indices
+    gathered_values = torch.gather(logits, dim=-1, index=indices)
+    torch.testing.assert_close(values, gathered_values)
+
+
+def test_top_k_cute_dsl_constraints():
+    """Test that cute-dsl backend raises errors for invalid constraints."""
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    # Test num_cols < 256 (should raise ValueError)
+    small_logits = torch.randn(4, 128, device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match="num_cols >= 256"):
+        flashinfer.top_k(small_logits, k=64, backend="cute-dsl")
+
+    # Test k > 2048 (should raise ValueError)
+    large_logits = torch.randn(4, 32000, device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match="k <= 2048"):
+        flashinfer.top_k(large_logits, k=4096, backend="cute-dsl")
+
+
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_top_k_backend_parameter(backend):
+    """Test top_k with explicit backend parameter."""
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.manual_seed(42)
+    batch_size = 4
+    vocab_size = 32000
+    k = 256
+    dtype = torch.float32
+    device = "cuda"
+
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=dtype)
+
+    # Test with backend parameter
+    values, indices = flashinfer.top_k(logits, k, backend=backend)
+
+    # Reference: torch.topk
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    # Check output shapes
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Check accuracy
+    accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
+    min_accuracy = 0.98
+    assert accuracy >= min_accuracy, (
+        f"Backend {backend}: Accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("vocab_size", [4096, 32000])
+@pytest.mark.parametrize("k", [256, 1024])
+def test_top_k_cuda_vs_cute_dsl(batch_size, vocab_size, k):
+    """Compare cuda and cute-dsl backends produce similar results."""
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=dtype)
+
+    # Get results from both backends
+    cuda_values, cuda_indices = flashinfer.top_k(logits, k, backend="cuda")
+    cute_dsl_values, cute_dsl_indices = flashinfer.top_k(logits, k, backend="cute-dsl")
+
+    # Both should have same shapes
+    assert cuda_values.shape == cute_dsl_values.shape
+    assert cuda_indices.shape == cute_dsl_indices.shape
+
+    # Compare accuracy between backends
+    accuracy = compute_topk_accuracy(
+        cuda_indices.int(), cute_dsl_indices.int(), batch_size, k
+    )
+    min_accuracy = 0.95  # Allow some variance due to tie-breaking
+    assert accuracy >= min_accuracy, (
+        f"cuda vs cute-dsl accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+    # Both backends should produce valid top-k
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    cuda_accuracy = compute_topk_accuracy(
+        cuda_indices.int(), ref_indices.int(), batch_size, k
+    )
+    cute_dsl_accuracy = compute_topk_accuracy(
+        cute_dsl_indices.int(), ref_indices.int(), batch_size, k
+    )
+
+    assert cuda_accuracy >= 0.98, f"cuda accuracy {cuda_accuracy:.4f} < 0.98"
+    assert cute_dsl_accuracy >= 0.98, (
+        f"cute-dsl accuracy {cute_dsl_accuracy:.4f} < 0.98"
+    )
 
 
 if __name__ == "__main__":

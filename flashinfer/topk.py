@@ -21,6 +21,7 @@ from typing import Optional, Tuple
 import torch
 
 from .api_logging import flashinfer_api
+from .cute_dsl.utils import is_cute_dsl_available
 from .jit.topk import gen_topk_module
 from .utils import _get_cache_buf, register_custom_op, register_fake_op
 
@@ -152,73 +153,12 @@ def can_implement_filtered_topk() -> bool:
     return get_topk_module().can_implement_filtered_topk()
 
 
-@flashinfer_api
-def top_k(
+def _top_k_cuda(
     input: torch.Tensor,
     k: int,
     sorted: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Radix-based Top-K selection.
-
-    This function selects the top-k largest elements from each row of the input
-    tensor. It uses an efficient radix-based selection algorithm that is
-    particularly fast for large vocabularies.
-
-    This is designed as a drop-in replacement for ``torch.topk`` with better
-    performance for large tensors (vocab_size > 10000).
-
-    Parameters
-    ----------
-    input : torch.Tensor
-        Input tensor of shape ``(batch_size, d)`` containing the values to select from.
-        Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
-    k : int
-        Number of top elements to select from each row.
-    sorted : bool, optional
-        If True, the returned top-k elements will be sorted in descending order.
-        Default is False (unsorted, which is faster).
-
-    Returns
-    -------
-    values : torch.Tensor
-        Tensor of shape ``(batch_size, k)`` containing the top-k values.
-        Same dtype as input.
-    indices : torch.Tensor
-        Tensor of shape ``(batch_size, k)`` with int64 dtype containing the
-        indices of the top-k elements.
-
-    Note
-    ----
-    - Unlike ``torch.topk``, the default behavior returns unsorted results for
-      better performance. Set ``sorted=True`` if you need sorted output.
-    - The radix-based algorithm is O(n) in vocabulary size, compared to O(n log k)
-      for heap-based methods, making it faster for large vocabularies.
-    - For small vocabularies (< 1000), ``torch.topk`` may be faster.
-
-    Examples
-    --------
-    >>> import torch
-    >>> import flashinfer
-    >>> torch.manual_seed(42)
-    >>> batch_size = 4
-    >>> vocab_size = 32000
-    >>> k = 256
-    >>> logits = torch.randn(batch_size, vocab_size, device="cuda")
-    >>> values, indices = flashinfer.top_k(logits, k)
-    >>> values.shape, indices.shape
-    (torch.Size([4, 256]), torch.Size([4, 256]))
-
-    With sorting enabled (for compatibility with torch.topk):
-
-    >>> values_sorted, indices_sorted = flashinfer.top_k(logits, k, sorted=True)
-    >>> # Values are now in descending order within each row
-
-    See Also
-    --------
-    torch.topk : PyTorch's built-in top-k function
-    sampling.top_k_mask_logits : Top-k masking for logits (sets non-top-k to -inf)
-    sampling.top_k_renorm_probs : Top-k filtering and renormalization for probabilities
-    """
+    """Top-K selection using CUDA JIT backend."""
     batch_size = input.size(0)
     device = input.device
 
@@ -249,6 +189,102 @@ def top_k(
         return sorted_values, sorted_indices
 
     return output_values, indices
+
+
+@flashinfer_api
+def top_k(
+    input: torch.Tensor,
+    k: int,
+    sorted: bool = False,
+    backend: str = "cuda",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Radix-based Top-K selection.
+
+    This function selects the top-k largest elements from each row of the input
+    tensor. It uses an efficient radix-based selection algorithm that is
+    particularly fast for large vocabularies.
+
+    This is designed as a drop-in replacement for ``torch.topk`` with better
+    performance for large tensors (vocab_size > 10000).
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor of shape ``(batch_size, d)`` containing the values to select from.
+        Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
+    k : int
+        Number of top elements to select from each row.
+    sorted : bool, optional
+        If True, the returned top-k elements will be sorted in descending order.
+        Default is False (unsorted, which is faster).
+    backend : str, optional
+        Backend to use for top-k computation. Options:
+        - ``"cuda"``: Use the JIT-compiled CUDA implementation (default).
+        - ``"cute-dsl"``: Use the CuTe-DSL implementation (requires num_cols >= 256, k <= 2048).
+
+    Returns
+    -------
+    values : torch.Tensor
+        Tensor of shape ``(batch_size, k)`` containing the top-k values.
+        Same dtype as input.
+    indices : torch.Tensor
+        Tensor of shape ``(batch_size, k)`` with int64 dtype containing the
+        indices of the top-k elements.
+
+    Note
+    ----
+    - Unlike ``torch.topk``, the default behavior returns unsorted results for
+      better performance. Set ``sorted=True`` if you need sorted output.
+    - The radix-based algorithm is O(n) in vocabulary size, compared to O(n log k)
+      for heap-based methods, making it faster for large vocabularies.
+    - For small vocabularies (< 1000), ``torch.topk`` may be faster.
+    - The ``"cute-dsl"`` backend uses CuTe-DSL and is optimized for SM100+ architectures.
+      It requires ``num_cols >= 256`` and ``k <= 2048``.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> torch.manual_seed(42)
+    >>> batch_size = 4
+    >>> vocab_size = 32000
+    >>> k = 256
+    >>> logits = torch.randn(batch_size, vocab_size, device="cuda")
+    >>> values, indices = flashinfer.top_k(logits, k)
+    >>> values.shape, indices.shape
+    (torch.Size([4, 256]), torch.Size([4, 256]))
+
+    With sorting enabled (for compatibility with torch.topk):
+
+    >>> values_sorted, indices_sorted = flashinfer.top_k(logits, k, sorted=True)
+    >>> # Values are now in descending order within each row
+
+    Using the CuTe-DSL backend:
+
+    >>> values, indices = flashinfer.top_k(logits, k, backend="cute-dsl")
+
+    See Also
+    --------
+    torch.topk : PyTorch's built-in top-k function
+    sampling.top_k_mask_logits : Top-k masking for logits (sets non-top-k to -inf)
+    sampling.top_k_renorm_probs : Top-k filtering and renormalization for probabilities
+    """
+    if backend == "cute-dsl":
+        # Lazy import to avoid circular imports and allow graceful fallback
+        if not is_cute_dsl_available():
+            raise ValueError(
+                "CuTe-DSL backend requested but not available. "
+                "Make sure cutlass package is installed."
+            )
+        from .cute_dsl.filtered_topk import filtered_topk
+
+        return filtered_topk(input, k, sorted=sorted)
+    elif backend == "cuda":
+        return _top_k_cuda(input, k, sorted=sorted)
+    else:
+        raise ValueError(
+            f"Unknown backend: {backend}. Supported backends: 'cuda', 'cute-dsl'"
+        )
 
 
 # Alias for compatibility

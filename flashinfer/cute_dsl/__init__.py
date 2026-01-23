@@ -35,6 +35,11 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
+    from .filtered_topk import (
+        filtered_topk,
+        FilteredTopKKernel,
+        can_use_filtered_topk,
+    )
 
 __all__ = [
     # Utils (always available)
@@ -56,4 +61,8 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # Filtered Top-K
+        "filtered_topk",
+        "FilteredTopKKernel",
+        "can_use_filtered_topk",
     ]
