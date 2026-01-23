@@ -157,6 +157,7 @@ def top_k(
     input: torch.Tensor,
     k: int,
     sorted: bool = False,
+    backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Radix-based Top-K selection.
 
@@ -171,12 +172,19 @@ def top_k(
     ----------
     input : torch.Tensor
         Input tensor of shape ``(batch_size, d)`` containing the values to select from.
-        Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
+        Supported dtypes: ``float32``, ``float16``, ``bfloat16`` (for CUDA backend).
+        Note: CuTe DSL backend only supports ``float32`` and ``bfloat16``.
     k : int
         Number of top elements to select from each row.
     sorted : bool, optional
         If True, the returned top-k elements will be sorted in descending order.
         Default is False (unsorted, which is faster).
+    backend : str, optional
+        Backend implementation to use. Options:
+        - ``"cuda"``: JIT-compiled CUDA kernels (default). Supports float32, float16, bfloat16.
+        - ``"cute-dsl"``: CuTe DSL implementation. Supports float32, bfloat16 only.
+          Uses native BF16 processing (2 radix rounds) for bfloat16 inputs.
+        Default is ``"cuda"``.
 
     Returns
     -------
@@ -194,6 +202,9 @@ def top_k(
     - The radix-based algorithm is O(n) in vocabulary size, compared to O(n log k)
       for heap-based methods, making it faster for large vocabularies.
     - For small vocabularies (< 1000), ``torch.topk`` may be faster.
+    - The ``"cute-dsl"`` backend uses native 16-bit processing for BF16 inputs,
+      requiring only 2 radix rounds instead of 4 for F32, potentially offering
+      better performance for BF16 workloads.
 
     Examples
     --------
@@ -213,12 +224,48 @@ def top_k(
     >>> values_sorted, indices_sorted = flashinfer.top_k(logits, k, sorted=True)
     >>> # Values are now in descending order within each row
 
+    Using the CuTe DSL backend for BF16 inputs:
+
+    >>> logits_bf16 = logits.to(torch.bfloat16)
+    >>> values, indices = flashinfer.top_k(logits_bf16, k, backend="cute-dsl")
+
     See Also
     --------
     torch.topk : PyTorch's built-in top-k function
     sampling.top_k_mask_logits : Top-k masking for logits (sets non-top-k to -inf)
     sampling.top_k_renorm_probs : Top-k filtering and renormalization for probabilities
     """
+    # Validate backend
+    if backend not in ("cuda", "cute-dsl"):
+        raise ValueError(
+            f"Unknown backend: {backend}. Supported backends: 'cuda', 'cute-dsl'"
+        )
+
+    # CuTe DSL backend
+    if backend == "cute-dsl":
+        from .cute_dsl.topk import topk_cute_dsl, STATE_SIZE_INT32, MIN_N_MULTI_CTA
+
+        # Get state buffer for multi-CTA path using FlashInfer's cache pattern
+        N = input.size(-1)
+        M = input.size(0)
+        state_buffer: Optional[torch.Tensor] = None
+        if N > MIN_N_MULTI_CTA:
+            # Allocate state buffer: M rows * STATE_SIZE_INT32 * 4 bytes
+            state_buffer_size = M * STATE_SIZE_INT32 * 4
+            state_buffer = _get_cache_buf(
+                f"radix_topk_cute_dsl_state_{input.device}",
+                state_buffer_size,
+                input.device,
+                zero_init=True,
+            )
+            # Reshape to expected layout
+            state_buffer = state_buffer[: M * STATE_SIZE_INT32].view(
+                M, STATE_SIZE_INT32
+            ).to(torch.int32)
+
+        return topk_cute_dsl(input, k, sorted=sorted, state_buffer=state_buffer)
+
+    # CUDA backend (default)
     batch_size = input.size(0)
     device = input.device
 

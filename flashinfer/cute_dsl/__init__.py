@@ -35,6 +35,16 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
+    from .topk import (
+        topk_cute_dsl,
+        NativeBF16SingleCTA,
+        NativeBF16MultiCTA,
+        FusedSingleCTA,
+        FusedMultiCTA,
+        STATE_SIZE_INT32,
+        MIN_N_MULTI_CTA,
+        MAX_N_SINGLE_CTA,
+    )
 
 __all__ = [
     # Utils (always available)
@@ -56,4 +66,13 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # Top-K Selection
+        "topk_cute_dsl",
+        "NativeBF16SingleCTA",
+        "NativeBF16MultiCTA",
+        "FusedSingleCTA",
+        "FusedMultiCTA",
+        "STATE_SIZE_INT32",
+        "MIN_N_MULTI_CTA",
+        "MAX_N_SINGLE_CTA",
     ]

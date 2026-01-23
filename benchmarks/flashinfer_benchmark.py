@@ -44,6 +44,10 @@ def run_test(args):
         from routines.quantization import run_quantization_test
 
         res = run_quantization_test(args)
+    elif args.routine in benchmark_apis["topk"]:
+        from routines.topk import run_topk_test
+
+        res = run_topk_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -89,7 +93,8 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["moe"])
         + list(benchmark_apis["moe_comm"])
         + list(benchmark_apis["norm"])
-        + list(benchmark_apis["quantization"]),
+        + list(benchmark_apis["quantization"])
+        + list(benchmark_apis["topk"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -199,6 +204,10 @@ def parse_args(line=sys.argv[1:]):
         from routines.quantization import parse_quantization_args
 
         args = parse_quantization_args(line, parser)
+    elif args.routine in benchmark_apis["topk"]:
+        from routines.topk import parse_topk_args
+
+        args = parse_topk_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 

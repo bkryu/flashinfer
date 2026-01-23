@@ -94,6 +94,11 @@ output_column_dict = {
         "do_shuffle",
         "sf_vec_size",
     ],
+    "topk": [
+        "vocab_size",
+        "top_k_value",
+        "sorted",
+    ],
     "general": [
         "batch_size",
         "hidden_size",
@@ -118,6 +123,7 @@ full_output_columns = (
     + output_column_dict["moe_comm"]
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
+    + output_column_dict["topk"]
     + output_column_dict["general"]
 )
 
@@ -156,6 +162,9 @@ benchmark_apis = {
         "mxfp4_quantize",
         "nvfp4_quantize",
         "nvfp4_batched_quantize",
+    ],
+    "topk": [
+        "top_k",
     ],
 }
 
@@ -430,6 +439,19 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+    },
+    # TOP-K SELECTION
+    # cuda backend uses radix-based top-k, cute-dsl uses CuTe DSL kernel
+    # Note: cute-dsl backend does not support float16, only bfloat16 and float32
+    "top_k": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda", "cute-dsl"],
+        "8.6": ["cuda", "cute-dsl"],
+        "8.9": ["cuda", "cute-dsl"],
+        "9.0": ["cuda", "cute-dsl"],
+        "10.0": ["cuda", "cute-dsl"],
+        "10.3": ["cuda", "cute-dsl"],
+        "12.0": ["cuda", "cute-dsl"],
     },
 }
 
