@@ -27,19 +27,23 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 """
-High-performance radix-based filtered top-k kernel in CuTe DSL.
+High-performance radix-based filtered top-k kernel in CuTe DSL
+with **dynamic column count**.
 
-Ported from ``filter_top_k_padded.py`` for integration into FlashInfer.
+Ported from ``filter_top_k_dynamic_col.py`` for integration into FlashInfer.
 
 Supported data types: Float32, Float16, BFloat16.
 
 Constraints:
-* ``num_cols >= vec_size`` (input is padded to be vec_size-aligned).
+* ``num_cols`` can be any value -- no padding required.  The kernel reads
+  the actual column count from ``input.shape[1]`` at runtime and handles
+  alignment internally.
 * ``top_k <= 2048`` and ``top_k`` is even.
 * Input tensor is row-major (data contiguous on the N dimension).
 * Candidates can be stored in SMEM or spill to GMEM.
-* ``num_cols`` is static at compile time (but dynamic at the Python API level
-  via ``@functools.cache``).
+* ``max_num_cols`` (a power-of-2 ceiling of the actual ``num_cols``) is
+  used at compile time for SMEM/thread tuning; a single compiled kernel
+  serves all ``num_cols <= max_num_cols``.
 """
 
 import functools
@@ -75,14 +79,16 @@ def float_as_uint32(float_val):
 
 
 class FilteredTopKKernel:
-    """CuTe DSL radix-based filtered top-k kernel.
+    """CuTe DSL radix-based filtered top-k kernel with dynamic column count.
 
     Parameters
     ----------
     dtype : cutlass.Numeric
         Element data type (Float32, Float16, BFloat16).
-    num_cols : int
-        Number of columns (vocabulary size) -- static at compile time.
+    max_num_cols : int
+        Upper-bound on the number of columns (vocabulary size).  Used at
+        compile time for SMEM sizing and thread-count tuning.  The actual
+        column count is read from ``input.shape[1]`` at runtime.
     top_k : int
         Number of top elements to select (must be even, <= 2048).
     num_copy_bits : int
@@ -95,13 +101,13 @@ class FilteredTopKKernel:
     def __init__(
         self,
         dtype: cutlass.Numeric,
-        num_cols: int,
+        max_num_cols: int,
         top_k: int,
         num_copy_bits: int = 256,
         is_prefill: bool = True,
     ):
         self.dtype = dtype
-        self.num_cols = num_cols
+        self.max_num_cols = max_num_cols
         self.top_k = top_k
         self.num_copy_bits = num_copy_bits
         self.is_prefill = is_prefill
@@ -119,7 +125,7 @@ class FilteredTopKKernel:
             self.num_buffer_smem_input_idx = 1
 
         # 65536 is the max index value for uint16.
-        if cutlass.const_expr(self.num_cols <= 65536):
+        if cutlass.const_expr(self.max_num_cols <= 65536):
             self.index_type = cutlass.Uint16
             if cutlass.const_expr(self.num_buffer_smem_input_idx == 2):
                 self.max_smem_input_size = 32 * 1024
@@ -133,32 +139,29 @@ class FilteredTopKKernel:
                 self.max_smem_input_size = 32 * 1024
 
         if cutlass.const_expr(self.is_prefill):
-            if self.num_cols >= 262144:
+            if self.max_num_cols >= 262144:
                 self.filtered_topk_smem_input_size = 4096
-            elif self.num_cols >= 131072:
+            elif self.max_num_cols >= 131072:
                 self.filtered_topk_smem_input_size = 3072
-            elif self.num_cols >= 65536:
+            elif self.max_num_cols >= 65536:
                 self.filtered_topk_smem_input_size = 2048
-            elif self.num_cols >= 16384:
+            elif self.max_num_cols >= 16384:
                 self.filtered_topk_smem_input_size = 1024
-            elif self.num_cols >= 8192:
+            elif self.max_num_cols >= 8192:
                 self.filtered_topk_smem_input_size = 512
             else:
                 self.filtered_topk_smem_input_size = 256
         else:
             self.filtered_topk_smem_input_size = min(
-                self.max_smem_input_size, self.num_cols
+                self.max_smem_input_size, self.max_num_cols
             )
 
-        if cutlass.const_expr(self.num_cols > self.filtered_topk_smem_input_size):
+        if cutlass.const_expr(self.max_num_cols > self.filtered_topk_smem_input_size):
             self.enable_gmem_store = True
         else:
             self.enable_gmem_store = False
 
         self.vec_size = num_copy_bits // dtype.width
-        assert self.num_cols >= self.vec_size, (
-            f"num_cols must be >= vec_size, but got {self.num_cols} and {self.vec_size}"
-        )
         if cutlass.const_expr(
             dtype not in [cutlass.Float32, cute.BFloat16, cutlass.Float16]
         ):
@@ -168,21 +171,22 @@ class FilteredTopKKernel:
             self.num_threads_per_cta = 512
         else:
             if cutlass.const_expr(dtype == cutlass.Float32):
-                if self.num_cols >= self.vec_size * 1024:
+                if self.max_num_cols >= self.vec_size * 1024:
                     self.num_threads_per_cta = 1024
                 else:
                     if cutlass.const_expr(
-                        self.num_cols > 2048 and self.num_cols < self.vec_size * 1024
+                        self.max_num_cols > 2048
+                        and self.max_num_cols < self.vec_size * 1024
                     ):
                         self.num_threads_per_cta = 512
                     else:
                         self.num_threads_per_cta = 256
             else:
-                if self.num_cols >= 43008:
+                if self.max_num_cols >= 43008:
                     self.num_threads_per_cta = 1024
                 else:
                     if cutlass.const_expr(
-                        self.num_cols > 4096 and self.num_cols < 43008
+                        self.max_num_cols > 4096 and self.max_num_cols < 43008
                     ):
                         self.num_threads_per_cta = 512
                     else:
@@ -427,7 +431,7 @@ class FilteredTopKKernel:
             cute.arch.barrier()
 
     # ------------------------------------------------------------------
-    # Main kernel
+    # Main kernel (dynamic column count -- reads length from input.shape)
     # ------------------------------------------------------------------
 
     @cute.kernel
@@ -440,50 +444,75 @@ class FilteredTopKKernel:
         tiler_mn: cute.Shape,
         copy_atom: cute.CopyAtom,
         tiled_copy: cute.TiledCopy,
-        aligned_size: cutlass.Constexpr,
-        left_size: cutlass.Constexpr,
     ):
-        """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
+        """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm.
+
+        The actual column count (``length``) is read from ``input.shape[1]``
+        at runtime.  Alignment is handled via prologue/epilogue scalar loads.
+        """
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
-        length = self.num_cols
+        # Runtime column count
+        length = input.shape[1]
+
         score = input[bidx, None]
         dst = output_indices[bidx, None]
         if cutlass.const_expr(self.enable_gmem_store):
             buffer = extra_buffer[bidx, None, None]
         dst_values = output_values[bidx, None]
 
-        has_left_part = cutlass.const_expr(self.num_cols % self.vec_size != 0)
+        # --- Runtime alignment handling ---
+        row_start = 0
+        row_ptr = score.iterator + row_start
+        row_addr_u64 = row_ptr.toint()
+
+        align_bytes = self.num_copy_bits // 8  # 256/8 = 32 bytes
+        elem_bytes = self.dtype.width // 8
+
+        misalign = row_addr_u64 % align_bytes
+        fix_bytes = cutlass.Int64(0)
+        if misalign != 0:
+            fix_bytes = align_bytes - misalign
+
+        prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
+
+        remaining = length - prologue_elems
+        aligned_size = (remaining // self.vec_size) * self.vec_size
+        left_size = remaining - aligned_size
+
+        vec_start = row_start + prologue_elems
+        left_start = vec_start + aligned_size
+
         shape = input.shape
 
         idX = cute.make_identity_tensor((shape[0], aligned_size))
+        input_ptr = input.iterator + vec_start
+        input_addr_u64 = input_ptr.toint()
+        input_ptr_aligned = cute.make_ptr(
+            self.dtype, input_addr_u64, assumed_align=align_bytes
+        )
+
         input_tensor = cute.make_tensor(
-            input.iterator,
+            input_ptr_aligned,
             cute.make_layout((shape[0], aligned_size), stride=input.stride),
         )
 
+        # Slice for CTAs
         gX, cX = [
             cute.local_tile(mT, tiler_mn, (bidx, None)) for mT in (input_tensor, idX)
         ]
-
         self.num_sub_tiles = gX.shape[2]
-
         thr_copy = tiled_copy.get_slice(tidx)
 
         tXgX = thr_copy.partition_S(gX)
         tXcX = thr_copy.partition_S(cX)[(0, None), None, None, None]
         tXrX = cute.make_fragment_like(tXgX[None, None, None, 0])
 
-        is_even_N = cutlass.const_expr(self.num_cols % tiler_mn[1] == 0)
-        tXpX = (
-            None
-            if is_even_N
-            else self.predicate_k(thr_copy.partition_S(cX), limit=aligned_size)
-        )
+        tXcX_tile = thr_copy.partition_S(cX)
 
         # Trivial case: length <= top_k
-        if cutlass.const_expr(length <= self.top_k):
+        if length <= self.top_k:
             for i in range(tidx, self.top_k, self.num_threads_per_cta):
                 if i < length:
                     dst[i] = i
@@ -569,22 +598,21 @@ class FilteredTopKKernel:
             vec_size = self.vec_size
 
             for tile_idx in range(self.num_sub_tiles):
-                if cutlass.const_expr(tXpX is not None):
-                    cute.copy(
-                        copy_atom,
-                        tXgX[None, None, None, tile_idx],
-                        tXrX,
-                        pred=tXpX[None, None, None, tile_idx],
-                    )
-                    self._fill_oob(
-                        tXrX,
-                        tXpX[None, None, None, tile_idx],
-                        -tXrX.element_type.inf,
-                    )
-                else:
-                    cute.copy(
-                        copy_atom, tXgX[None, None, None, tile_idx], tXrX, pred=tXpX
-                    )
+                tXpX_tile = self.predicate_tile(
+                    tXcX_tile[None, None, None, tile_idx],
+                    cutlass.Int32(aligned_size),
+                )
+                cute.copy(
+                    copy_atom,
+                    tXgX[None, None, None, tile_idx],
+                    tXrX,
+                    pred=tXpX_tile[None, None, None],
+                )
+                self._fill_oob(
+                    tXrX,
+                    tXpX_tile[None, None, None],
+                    -tXrX.element_type.inf,
+                )
 
                 for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                     bin_val = self.to_coarse_key(tXrX[i])
@@ -593,16 +621,25 @@ class FilteredTopKKernel:
                         val_one,
                     )
 
-            # for left part (left_size)
-            if cutlass.const_expr(has_left_part):
-                for j in range(tidx, left_size, self.num_threads_per_cta):
-                    col_idx = cutlass.Int32(aligned_size + j)
-                    raw = score[col_idx]
-                    bin_val = self.to_coarse_key(raw)
-                    atomicAdd(
-                        s_histogram.iterator + cutlass.Int32(bin_val),
-                        val_one,
-                    )
+            # Prologue scalar loads (for initial misalignment)
+            for j in range(tidx, prologue_elems, self.num_threads_per_cta):
+                col_idx = cutlass.Int32(j)
+                raw = score[col_idx]
+                bin_val = self.to_coarse_key(raw)
+                atomicAdd(
+                    s_histogram.iterator + cutlass.Int32(bin_val),
+                    val_one,
+                )
+
+            # Epilogue scalar loads (leftover after vectorized part)
+            for j in range(tidx, left_size, self.num_threads_per_cta):
+                col_idx = cutlass.Int32(left_start + j)
+                raw = score[col_idx]
+                bin_val = self.to_coarse_key(raw)
+                atomicAdd(
+                    s_histogram.iterator + cutlass.Int32(bin_val),
+                    val_one,
+                )
 
             cute.arch.barrier()
 
@@ -629,22 +666,21 @@ class FilteredTopKKernel:
             if topk_remaining == 0:
                 # Collect indices where bin > threshold
                 for tile_idx in range(self.num_sub_tiles):
-                    if cutlass.const_expr(tXpX is not None):
-                        cute.copy(
-                            copy_atom,
-                            tXgX[None, None, None, tile_idx],
-                            tXrX,
-                            pred=tXpX[None, None, None, tile_idx],
-                        )
-                        self._fill_oob(
-                            tXrX,
-                            tXpX[None, None, None, tile_idx],
-                            -tXrX.element_type.inf,
-                        )
-                    else:
-                        cute.copy(
-                            copy_atom, tXgX[None, None, None, tile_idx], tXrX, pred=tXpX
-                        )
+                    tXpX_tile = self.predicate_tile(
+                        tXcX_tile[None, None, None, tile_idx],
+                        cutlass.Int32(aligned_size),
+                    )
+                    cute.copy(
+                        copy_atom,
+                        tXgX[None, None, None, tile_idx],
+                        tXrX,
+                        pred=tXpX_tile[None, None, None],
+                    )
+                    self._fill_oob(
+                        tXrX,
+                        tXpX_tile[None, None, None],
+                        -tXrX.element_type.inf,
+                    )
 
                     for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                         cur_tXcX = tXcX[None, None, None, tile_idx]
@@ -654,18 +690,27 @@ class FilteredTopKKernel:
                             idx = self.index_type(
                                 cur_tXcX[i // vec_size][1] + i % vec_size
                             )
-                            s_indices[pos] = idx
+                            s_indices[pos] = idx + self.index_type(vec_start)
 
-                # for left part (left_size)
-                if cutlass.const_expr(has_left_part):
-                    for j in range(tidx, left_size, self.num_threads_per_cta):
-                        col_idx = cutlass.Int32(aligned_size + j)
-                        raw = score[col_idx]
-                        bin_val = self.to_coarse_key(raw)
-                        if bin_val < threshold_bin:
-                            pos = atomicAdd(s_counter.iterator, val_one)
-                            idx = self.index_type(col_idx)
-                            s_indices[pos] = idx
+                # Prologue scalar load indices
+                for j in range(tidx, prologue_elems, self.num_threads_per_cta):
+                    col_idx = cutlass.Int32(j)
+                    raw = score[col_idx]
+                    bin_val = self.to_coarse_key(raw)
+                    if bin_val < threshold_bin:
+                        pos = atomicAdd(s_counter.iterator, val_one)
+                        idx = self.index_type(col_idx)
+                        s_indices[pos] = idx
+
+                # Epilogue scalar load indices
+                for j in range(tidx, left_size, self.num_threads_per_cta):
+                    col_idx = cutlass.Int32(left_start + j)
+                    raw = score[col_idx]
+                    bin_val = self.to_coarse_key(raw)
+                    if bin_val < threshold_bin:
+                        pos = atomicAdd(s_counter.iterator, val_one)
+                        idx = self.index_type(col_idx)
+                        s_indices[pos] = idx
 
                 cute.arch.barrier()
 
@@ -678,28 +723,29 @@ class FilteredTopKKernel:
 
                 # Filter and build refinement histogram
                 for tile_idx in range(self.num_sub_tiles):
-                    if cutlass.const_expr(tXpX is not None):
-                        cute.copy(
-                            copy_atom,
-                            tXgX[None, None, None, tile_idx],
-                            tXrX,
-                            pred=tXpX[None, None, None, tile_idx],
-                        )
-                        self._fill_oob(
-                            tXrX,
-                            tXpX[None, None, None, tile_idx],
-                            -tXrX.element_type.inf,
-                        )
-                    else:
-                        cute.copy(
-                            copy_atom, tXgX[None, None, None, tile_idx], tXrX, pred=tXpX
-                        )
+                    tXpX_tile = self.predicate_tile(
+                        tXcX_tile[None, None, None, tile_idx],
+                        cutlass.Int32(aligned_size),
+                    )
+                    cute.copy(
+                        copy_atom,
+                        tXgX[None, None, None, tile_idx],
+                        tXrX,
+                        pred=tXpX_tile[None, None, None],
+                    )
+                    self._fill_oob(
+                        tXrX,
+                        tXpX_tile[None, None, None],
+                        -tXrX.element_type.inf,
+                    )
 
                     for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                         raw_input = tXrX[i]
                         bin_val = self.to_coarse_key(raw_input)
                         cur_tXcX = tXcX[None, None, None, tile_idx]
-                        idx = self.index_type(cur_tXcX[i // vec_size][1] + i % vec_size)
+                        idx = self.index_type(
+                            cur_tXcX[i // vec_size][1] + i % vec_size + vec_start
+                        )
                         if bin_val < threshold_bin:
                             pos = atomicAdd(s_counter.iterator, val_one)
                             s_indices[pos] = idx
@@ -724,39 +770,72 @@ class FilteredTopKKernel:
                                 val_one,
                             )
 
-                # for left part
-                if cutlass.const_expr(has_left_part):
-                    for j in range(tidx, left_size, self.num_threads_per_cta):
-                        col_idx = cutlass.Int32(aligned_size + j)
-                        raw = score[col_idx]
-                        bin_val = self.to_coarse_key(raw)
-                        if bin_val < threshold_bin:
-                            pos = atomicAdd(s_counter.iterator, val_one)
-                            idx = self.index_type(col_idx)
-                            s_indices[pos] = idx
-                        elif bin_val == threshold_bin:
-                            pos = atomicAdd(
-                                s_num_input.iterator + cutlass.Int32(0),
-                                val_one,
-                            )
-                            if cutlass.const_expr(self.enable_gmem_store):
-                                if pos < self.filtered_topk_smem_input_size:
-                                    s_input_idx[0, pos] = self.index_type(col_idx)
-                                else:
-                                    buffer_pos = atomicAdd(
-                                        g_num_input.iterator,
-                                        val_one,
-                                    )
-                                    buffer[0, buffer_pos] = cutlass.Int32(col_idx)
+                # Prologue scalar refinement
+                for j in range(tidx, prologue_elems, self.num_threads_per_cta):
+                    col_idx = cutlass.Int32(j)
+                    raw = score[col_idx]
+                    bin_val = self.to_coarse_key(raw)
+                    if bin_val < threshold_bin:
+                        pos = atomicAdd(s_counter.iterator, val_one)
+                        idx = self.index_type(col_idx)
+                        s_indices[pos] = idx
+                    elif bin_val == threshold_bin:
+                        pos = atomicAdd(
+                            s_num_input.iterator + cutlass.Int32(0),
+                            val_one,
+                        )
+                        if cutlass.const_expr(self.enable_gmem_store):
+                            if pos < self.filtered_topk_smem_input_size:
+                                s_input_idx[0, pos] = self.index_type(col_idx)
                             else:
-                                if pos < self.filtered_topk_smem_input_size:
-                                    s_input_idx[0, pos] = self.index_type(col_idx)
-                            ordered = self.to_ordered(raw)
-                            sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                            atomicAdd(
-                                s_histogram.iterator + cutlass.Int32(sub_bin),
-                                val_one,
-                            )
+                                buffer_pos = atomicAdd(
+                                    g_num_input.iterator,
+                                    val_one,
+                                )
+                                buffer[0, buffer_pos] = cutlass.Int32(col_idx)
+                        else:
+                            if pos < self.filtered_topk_smem_input_size:
+                                s_input_idx[0, pos] = self.index_type(col_idx)
+                        ordered = self.to_ordered(raw)
+                        sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                        atomicAdd(
+                            s_histogram.iterator + cutlass.Int32(sub_bin),
+                            val_one,
+                        )
+
+                # Epilogue scalar refinement
+                for j in range(tidx, left_size, self.num_threads_per_cta):
+                    col_idx = cutlass.Int32(left_start + j)
+                    raw = score[col_idx]
+                    bin_val = self.to_coarse_key(raw)
+                    if bin_val < threshold_bin:
+                        pos = atomicAdd(s_counter.iterator, val_one)
+                        idx = self.index_type(col_idx)
+                        s_indices[pos] = idx
+                    elif bin_val == threshold_bin:
+                        pos = atomicAdd(
+                            s_num_input.iterator + cutlass.Int32(0),
+                            val_one,
+                        )
+                        if cutlass.const_expr(self.enable_gmem_store):
+                            if pos < self.filtered_topk_smem_input_size:
+                                s_input_idx[0, pos] = self.index_type(col_idx)
+                            else:
+                                buffer_pos = atomicAdd(
+                                    g_num_input.iterator,
+                                    val_one,
+                                )
+                                buffer[0, buffer_pos] = cutlass.Int32(col_idx)
+                        else:
+                            if pos < self.filtered_topk_smem_input_size:
+                                s_input_idx[0, pos] = self.index_type(col_idx)
+                        ordered = self.to_ordered(raw)
+                        sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                        atomicAdd(
+                            s_histogram.iterator + cutlass.Int32(sub_bin),
+                            val_one,
+                        )
+
                 fence_acq_rel_cta()
                 cute.arch.barrier()
 
@@ -830,6 +909,7 @@ class FilteredTopKKernel:
                                 idx = s_input_idx[r_idx, i]
                                 idx_int32 = cutlass.Int32(cutlass.Uint32(idx))
                                 raw_input = score[idx_int32]
+                                idx = self.index_type(idx)
                                 bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
                                 if bin_val < threshold:
                                     pos = atomicAdd(s_counter.iterator, val_one)
@@ -858,6 +938,7 @@ class FilteredTopKKernel:
                                             )
                             if cutlass.const_expr(self.enable_gmem_store):
                                 cute.arch.barrier()
+
                                 for i in range(
                                     tidx, cur_g_num_input, self.num_threads_per_cta
                                 ):
@@ -867,6 +948,7 @@ class FilteredTopKKernel:
                                     bin_val = (
                                         self.to_ordered(raw_input) >> offset
                                     ) & 0xFF
+
                                     if bin_val < threshold:
                                         pos = atomicAdd(
                                             s_counter.iterator,
@@ -920,7 +1002,6 @@ class FilteredTopKKernel:
                                                 + cutlass.Int32(sub_bin),
                                                 val_one,
                                             )
-
                             fence_acq_rel_cta()
                             cute.arch.barrier()
 
@@ -967,30 +1048,9 @@ class FilteredTopKKernel:
 
     def _get_tiled_copy(self):
         threads_per_row = self.num_threads_per_cta
-        if cutlass.const_expr(self.dtype == cutlass.Float32):
-            if cutlass.const_expr(self.is_prefill):
-                threshold_elems = 4096
-            else:
-                threshold_elems = 32768
-        elif cutlass.const_expr(
-            self.dtype == cutlass.Float16 or self.dtype == cutlass.BFloat16
-        ):
-            if cutlass.const_expr(self.is_prefill):
-                threshold_elems = 4096
-            else:
-                threshold_elems = 65536
-        else:
-            raise ValueError(f"Unsupported dtype: {self.dtype}")
-
-        # vectorized load part
-        aligned_size = (self.num_cols // self.vec_size) * self.vec_size
-        vecs_per_thread = cute.ceil_div(
-            cute.ceil_div(min(aligned_size, threshold_elems), self.vec_size),
-            threads_per_row,
-        )
         tiler_mn = (
             1,
-            self.vec_size * vecs_per_thread * threads_per_row,
+            self.vec_size * threads_per_row,
         )
 
         copy_atom = cute.make_copy_atom(
@@ -1006,36 +1066,30 @@ class FilteredTopKKernel:
         val_layout = cute.make_layout((1, self.vec_size))
         tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
-        # left scalar load part
-        left_size = self.num_cols - aligned_size
         return (
             copy_atom,
             tiled_copy,
             tiler_mn,
-            aligned_size,
-            left_size,
         )
 
     @cute.jit
-    def predicate_k(self, tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
+    def predicate_tile(self, tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
         tApA = cute.make_fragment(
             cute.make_layout(
                 (
                     cute.size(tAcA, mode=[0, 1]),
                     cute.size(tAcA, mode=[1]),
                     cute.size(tAcA, mode=[2]),
-                    cute.size(tAcA, mode=[3]),
                 ),
-                stride=(cute.size(tAcA, mode=[2]), 0, 1, cute.size(tAcA, mode=[2])),
+                stride=(cute.size(tAcA, mode=[2]), 0, 1),
             ),
             cutlass.Boolean,
         )
         for rest_v in cutlass.range_constexpr(tApA.shape[0]):
             for rest_k in cutlass.range_constexpr(tApA.shape[2]):
-                for rest_t in cutlass.range_constexpr(tApA.shape[3]):
-                    tApA[rest_v, 0, rest_k, rest_t] = cute.elem_less(
-                        tAcA[(0, rest_v), 0, rest_k, rest_t][1], limit
-                    )
+                tApA[rest_v, 0, rest_k] = cute.elem_less(
+                    tAcA[(0, rest_v), 0, rest_k][1], limit
+                )
         return tApA
 
     @cute.jit
@@ -1064,8 +1118,6 @@ class FilteredTopKKernel:
             copy_atom,
             tiled_copy,
             tiler_mn,
-            aligned_size,
-            left_size,
         ) = self._get_tiled_copy()
         self.filtered_topk_kernel(
             input_values,
@@ -1075,8 +1127,6 @@ class FilteredTopKKernel:
             tiler_mn,
             copy_atom,
             tiled_copy,
-            aligned_size,
-            left_size,
         ).launch(
             grid=blocks,
             block=(tiled_copy.size, 1, 1),
@@ -1086,7 +1136,7 @@ class FilteredTopKKernel:
 
 
 # ==========================================================================
-# TVM-FFI compilation wrapper (follows rmsnorm_fp4quant.py pattern)
+# TVM-FFI compilation wrapper
 # ==========================================================================
 
 _TORCH_TO_CUTLASS = {
@@ -1096,10 +1146,22 @@ _TORCH_TO_CUTLASS = {
 }
 
 
+def _bucket_num_cols(num_cols: int) -> int:
+    """Round *num_cols* up to the next power of 2 for kernel caching.
+
+    This keeps the number of unique compiled kernels small (one per
+    power-of-2 bucket) while the kernel itself reads the actual column
+    count from ``input.shape[1]`` at runtime.
+    """
+    if num_cols <= 256:
+        return 256
+    return 1 << (num_cols - 1).bit_length()
+
+
 @functools.cache
 def _get_compiled_kernel(
     torch_dtype: torch.dtype,
-    num_cols: int,
+    max_num_cols: int,
     top_k: int,
     is_prefill: bool,
     num_copy_bits: int = 256,
@@ -1107,7 +1169,9 @@ def _get_compiled_kernel(
     """Return a compiled ``tensor_api`` closure that accepts ``torch.Tensor``
     arguments directly (via TVM-FFI).
 
-    The result is cached by ``(torch_dtype, num_cols, top_k, is_prefill, num_copy_bits)``.
+    The result is cached by ``(torch_dtype, max_num_cols, top_k, is_prefill,
+    num_copy_bits)``.  Because *max_num_cols* is a power-of-2 bucket, a
+    single compiled kernel serves all ``num_cols <= max_num_cols``.
     """
     cutlass_dtype = _TORCH_TO_CUTLASS[torch_dtype]
 
@@ -1116,30 +1180,29 @@ def _get_compiled_kernel(
     else:
         buffer_numbers = 1
 
-    # Pad num_cols to vec_size alignment for vectorised copy.
-    vec_size = num_copy_bits // cutlass_dtype.width
-    num_cols_padded = (num_cols + vec_size - 1) // vec_size * vec_size
-
     kernel_obj = FilteredTopKKernel(
         dtype=cutlass_dtype,
-        num_cols=num_cols,
+        max_num_cols=max_num_cols,
         top_k=top_k,
         num_copy_bits=num_copy_bits,
         is_prefill=is_prefill,
     )
 
-    # Symbolic batch dimension
-    sym_n = cute.sym_int()
+    # Symbolic dimensions -- each independent axis gets its own symbol so
+    # that TVM-FFI does not enforce equality between unrelated shapes.
+    sym_n = cute.sym_int()  # batch / num_rows
+    sym_buf = cute.sym_int()  # buffer_numbers (1 or 2)
+    sym_cols = cute.sym_int(divisibility=32)  # column dimension (dynamic)
 
     input_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (sym_n, num_cols_padded),
+        (sym_n, sym_cols),
         stride_order=(1, 0),
         assumed_align=32,
     )
     buffer_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (sym_n, buffer_numbers, num_cols_padded),
+        (sym_n, sym_buf, sym_cols),
         stride_order=(2, 1, 0),
         assumed_align=32,
     )
@@ -1181,7 +1244,7 @@ def _get_compiled_kernel(
             output_values,
         )
 
-    return tensor_api, buffer_numbers, num_cols_padded
+    return tensor_api, buffer_numbers
 
 
 # ==========================================================================
@@ -1220,22 +1283,13 @@ def cute_dsl_top_k(
     num_rows, num_cols = input.shape
     is_prefill = num_rows > 148
 
-    tensor_api, buffer_numbers, num_cols_padded = _get_compiled_kernel(
-        input.dtype, num_cols, k, is_prefill, num_copy_bits
-    )
+    # Bucket num_cols to the next power of 2 so that distinct vocab sizes
+    # (e.g. 32000, 128256, 128512) share the same compiled kernel.
+    max_num_cols = _bucket_num_cols(num_cols)
 
-    # Pad input if needed so that vectorised copy is aligned.
-    if num_cols_padded != num_cols:
-        padded = torch.full(
-            (num_rows, num_cols_padded),
-            float("-inf"),
-            dtype=input.dtype,
-            device=input.device,
-        )
-        padded[:, :num_cols] = input
-        input_padded = padded
-    else:
-        input_padded = input
+    tensor_api, buffer_numbers = _get_compiled_kernel(
+        input.dtype, max_num_cols, k, is_prefill, num_copy_bits
+    )
 
     # Allocate output & scratch buffers
     output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=input.device)
@@ -1243,11 +1297,11 @@ def cute_dsl_top_k(
     buffer_tensor = torch.zeros(
         num_rows,
         buffer_numbers,
-        num_cols_padded,
+        num_cols,
         dtype=torch.int32,
         device=input.device,
     )
 
-    tensor_api(input_padded, buffer_tensor, output_indices, output_values)
+    tensor_api(input, buffer_tensor, output_indices, output_values)
 
     return output_values, output_indices
