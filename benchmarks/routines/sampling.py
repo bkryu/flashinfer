@@ -180,8 +180,8 @@ def parse_sampling_args(line, parser):
         required=False,
         nargs="+",
         default=["cuda"],
-        choices=["cuda"],
-        help="Kernel backends to test. Default: cuda",
+        choices=["cuda", "cute-dsl"],
+        help="Kernel backends to test. Default: cuda. Use 'cute-dsl' for CuTe DSL top-k backend.",
     )
 
     args = parser.parse_args(line)
@@ -1634,8 +1634,8 @@ def testTopK(args):
         print(f"[VVERBOSE] {top_k = }")
 
     def run_backend(backend, input_tensor):
-        if backend == "cuda":
-            return flashinfer.top_k(input_tensor, top_k)
+        if backend in ("cuda", "cute-dsl"):
+            return flashinfer.top_k(input_tensor, top_k, backend=backend)
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 

@@ -152,11 +152,33 @@ def can_implement_filtered_topk() -> bool:
     return get_topk_module().can_implement_filtered_topk()
 
 
+def _cute_dsl_top_k_dispatch(
+    input: torch.Tensor,
+    k: int,
+    sorted: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch to the CuTe DSL radix-based filtered top-k kernel."""
+    from .sampling.kernels.filter_top_k import cute_dsl_top_k
+
+    output_values, indices_int32 = cute_dsl_top_k(input, k)
+
+    # Convert to int64 for API compatibility
+    indices = indices_int32.long()
+
+    if sorted:
+        sorted_values, sort_indices = torch.sort(output_values, dim=-1, descending=True)
+        sorted_indices = torch.gather(indices, dim=-1, index=sort_indices)
+        return sorted_values, sorted_indices
+
+    return output_values, indices
+
+
 @flashinfer_api
 def top_k(
     input: torch.Tensor,
     k: int,
     sorted: bool = False,
+    backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Radix-based Top-K selection.
 
@@ -177,6 +199,12 @@ def top_k(
     sorted : bool, optional
         If True, the returned top-k elements will be sorted in descending order.
         Default is False (unsorted, which is faster).
+    backend : str, optional
+        Backend to use for the top-k computation:
+
+        - ``"cuda"`` (default): FlashInfer's JIT-compiled CUDA radix-topk kernel.
+        - ``"cute-dsl"``: CuTe DSL radix-based filtered top-k kernel.
+          Requires ``k <= 2048``, ``k`` to be even, and CuTe DSL availability.
 
     Returns
     -------
@@ -213,12 +241,20 @@ def top_k(
     >>> values_sorted, indices_sorted = flashinfer.top_k(logits, k, sorted=True)
     >>> # Values are now in descending order within each row
 
+    Using the CuTe DSL backend:
+
+    >>> values, indices = flashinfer.top_k(logits, k, backend="cute-dsl")
+
     See Also
     --------
     torch.topk : PyTorch's built-in top-k function
     sampling.top_k_mask_logits : Top-k masking for logits (sets non-top-k to -inf)
     sampling.top_k_renorm_probs : Top-k filtering and renormalization for probabilities
     """
+    if backend == "cute-dsl":
+        return _cute_dsl_top_k_dispatch(input, k, sorted)
+
+    # ---- Default "cuda" backend (existing radix-topk) ----
     batch_size = input.size(0)
     device = input.device
 

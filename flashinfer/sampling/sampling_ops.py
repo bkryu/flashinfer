@@ -19,9 +19,9 @@ from types import SimpleNamespace
 from typing import Optional, Tuple, Union
 import torch
 
-from .api_logging import flashinfer_api
-from .jit.sampling import gen_sampling_module
-from .utils import (
+from ..api_logging import flashinfer_api
+from ..jit.sampling import gen_sampling_module
+from ..utils import (
     _get_cache_buf,
     device_support_pdl,
     get_default_generators,

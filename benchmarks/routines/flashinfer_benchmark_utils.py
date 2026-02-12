@@ -634,9 +634,9 @@ routine_cc_to_supported_backends = {
         "8.6": ["cuda"],
         "8.9": ["cuda"],
         "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
+        "10.0": ["cuda", "cute-dsl"],
+        "10.3": ["cuda", "cute-dsl"],
+        "12.0": ["cuda", "cute-dsl"],
     },
     "top_k_page_table_transform": {
         "7.5": ["cuda"],

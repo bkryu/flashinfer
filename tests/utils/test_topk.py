@@ -74,7 +74,8 @@ def verify_topk_correctness(logits, values, indices, k):
 @pytest.mark.parametrize("vocab_size", [32000, 65536, 128512])
 @pytest.mark.parametrize("k", [256, 512, 1024])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_top_k(batch_size, vocab_size, k, dtype):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_top_k(batch_size, vocab_size, k, dtype, backend):
     """Test top_k returns correct values and indices."""
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
@@ -83,7 +84,7 @@ def test_top_k(batch_size, vocab_size, k, dtype):
     logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
 
     # flashinfer top_k
-    values, indices = flashinfer.top_k(logits, k)
+    values, indices = flashinfer.top_k(logits, k, backend=backend)
 
     # Reference: torch.topk
     ref_values, ref_indices = torch.topk(logits, k, dim=-1)
@@ -112,7 +113,8 @@ def test_top_k(batch_size, vocab_size, k, dtype):
 @pytest.mark.parametrize("vocab_size", [32000, 65536])
 @pytest.mark.parametrize("k", [256, 512])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-def test_top_k_sorted(batch_size, vocab_size, k, dtype):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_top_k_sorted(batch_size, vocab_size, k, dtype, backend):
     """Test top_k with sorted=True returns sorted values."""
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
@@ -121,7 +123,7 @@ def test_top_k_sorted(batch_size, vocab_size, k, dtype):
     logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
 
     # flashinfer top_k with sorted=True
-    values, indices = flashinfer.top_k(logits, k, sorted=True)
+    values, indices = flashinfer.top_k(logits, k, sorted=True, backend=backend)
 
     # Reference: torch.topk with sorted=True
     ref_values, ref_indices = torch.topk(logits, k, dim=-1, sorted=True)
@@ -149,13 +151,14 @@ def test_top_k_sorted(batch_size, vocab_size, k, dtype):
 
 @pytest.mark.parametrize("vocab_size", [32000, 65536])
 @pytest.mark.parametrize("k", [256])
-def test_top_k_single_batch(vocab_size, k):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_top_k_single_batch(vocab_size, k, backend):
     """Test top_k with batch_size=1 (common inference case)."""
     torch.manual_seed(42)
     logits = torch.randn(1, vocab_size, device="cuda", dtype=torch.float32)
 
     # flashinfer top_k
-    values, indices = flashinfer.top_k(logits, k)
+    values, indices = flashinfer.top_k(logits, k, backend=backend)
 
     # Reference: torch.topk
     ref_values, ref_indices = torch.topk(logits, k, dim=-1)
@@ -172,13 +175,14 @@ def test_top_k_single_batch(vocab_size, k):
 @pytest.mark.parametrize("batch_size", [64, 128])
 @pytest.mark.parametrize("vocab_size", [65536, 128512])
 @pytest.mark.parametrize("k", [256])
-def test_top_k_large_batch(batch_size, vocab_size, k):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_top_k_large_batch(batch_size, vocab_size, k, backend):
     """Test top_k with large batch sizes (multi-CTA path)."""
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float32)
 
     # flashinfer top_k (should use multi-CTA path for large vocab)
-    values, indices = flashinfer.top_k(logits, k)
+    values, indices = flashinfer.top_k(logits, k, backend=backend)
 
     # Reference: torch.topk
     ref_values, ref_indices = torch.topk(logits, k, dim=-1)
@@ -193,7 +197,8 @@ def test_top_k_large_batch(batch_size, vocab_size, k):
 
 
 @pytest.mark.parametrize("k", [256, 1024, 2048])
-def test_top_k_large_k(k):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_top_k_large_k(k, backend):
     """Test top_k with larger k values."""
     batch_size = 4
     vocab_size = 32000
@@ -205,7 +210,7 @@ def test_top_k_large_k(k):
     logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float32)
 
     # flashinfer top_k
-    values, indices = flashinfer.top_k(logits, k)
+    values, indices = flashinfer.top_k(logits, k, backend=backend)
 
     # Reference: torch.topk
     ref_values, ref_indices = torch.topk(logits, k, dim=-1)
@@ -219,7 +224,8 @@ def test_top_k_large_k(k):
     assert accuracy >= 0.98, f"Accuracy {accuracy:.4f} < 0.98"
 
 
-def test_top_k_vs_torch_topk_compatibility():
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_top_k_vs_torch_topk_compatibility(backend):
     """Test that flashinfer.top_k can be used as a drop-in replacement for torch.topk."""
     batch_size = 4
     vocab_size = 32000
@@ -229,7 +235,7 @@ def test_top_k_vs_torch_topk_compatibility():
     logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float32)
 
     # flashinfer top_k
-    fi_values, fi_indices = flashinfer.top_k(logits, k, sorted=True)
+    fi_values, fi_indices = flashinfer.top_k(logits, k, sorted=True, backend=backend)
 
     # torch.topk
     torch_values, torch_indices = torch.topk(logits, k, dim=-1, sorted=True)
@@ -1229,9 +1235,10 @@ def test_algorithms_with_large_k(algo, set_topk_algo):
 
 if __name__ == "__main__":
     # Basic tests
-    test_top_k(4, 32000, 256, torch.float32)
-    test_top_k_sorted(4, 32000, 256, torch.float32)
-    test_top_k_large_batch(64, 128512, 256)
+    for _backend in ["cuda", "cute-dsl"]:
+        test_top_k(4, 32000, 256, torch.float32, _backend)
+        test_top_k_sorted(4, 32000, 256, torch.float32, _backend)
+        test_top_k_large_batch(64, 128512, 256, _backend)
 
     # Fused transform tests
     print("Testing page table transform...")
