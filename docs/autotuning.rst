@@ -67,6 +67,25 @@ flag:
         --use_128x4_sf_layout --use_nvfp4 \
         --autotune
 
+Config Lookup Priority
+----------------------
+
+When a FlashInfer operation executes, the autotuner resolves the best
+``(runner, tactic)`` by searching these sources in order:
+
+1. **In-memory profiling cache** — results from live autotuning in the current
+   process.
+2. **User-loaded file configs** — loaded via ``load_configs()`` or
+   ``autotune(cache=...)``.
+3. **Bundled package configs** — legacy ``.py`` config files shipped with
+   FlashInfer (only when the ``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1``
+   environment variable is set and tuning mode is off).
+4. **Fallback tactic (−1)** — a safe default that every runner must implement.
+
+The first match wins.  Notably, user-loaded file configs (level 2) are
+**always consulted, even during tuning mode**, so that already-tuned shapes
+from a cache file are never re-profiled.
+
 Config Caching
 --------------
 
@@ -107,11 +126,15 @@ Incremental Tuning
 ^^^^^^^^^^^^^^^^^^
 
 Cache files support incremental updates.  When ``autotune(True, cache=path)``
-exits:
+exits, ``save_configs`` performs the following merge:
 
-1. Previously loaded configs are used as a base.
-2. Newly profiled configs are overlaid (new results take priority for duplicate keys).
-3. The merged result is written back to the same file.
+1. Previously loaded configs (from the file read on entry) are used as a base.
+2. Newly profiled configs are overlaid (new results take priority for duplicate
+   keys).
+3. The file on disk is re-read and merged, so that configs saved by other
+   sessions since entry are also preserved (in-memory results still win on
+   overlap).
+4. The merged result is atomically written back to the same file.
 
 This means you can run multiple tuning sessions -- for example different batch
 sizes or sequence lengths -- and accumulate all configs in a single file:
@@ -174,8 +197,12 @@ of ``(custom_op, runner_class_name, optimization_profile)`` and each value is
 
     {
       "('fp4_gemm', 'CudnnFp4GemmRunner', ...)": ["CudnnFp4GemmRunner", 3],
-      "('fp4_gemm', 'CutlassFp4GemmRunner', ...)": ["CutlassFp4GemmRunner", 1]
+      "('fused_moe', 'CuteDslFusedMoENvfp4Runner', ...)": ["CuteDslFusedMoENvfp4Runner", [128, 2, 1]]
     }
+
+Tactics are typically integers, but some runners use compound tactics (e.g.
+``(tile_size, gemm1_tactic, gemm2_tactic)``).  These are serialized as nested
+JSON arrays and restored to tuples on load.
 
 The file is human-readable and portable.  Because it stores runner class names
 (not positional indices), it is robust to changes in runner ordering across
@@ -226,8 +253,8 @@ Context manager for autotuning with optional file-based caching.
    * - ``True``
      - path
      - Yes (if file exists)
-     - Yes
-     - Tune and persist results
+     - Yes (incremental)
+     - Cache hits skip profiling; misses are tuned and merged back
    * - ``True``
      - ``None``
      - No
@@ -244,42 +271,36 @@ Context manager for autotuning with optional file-based caching.
      - No
      - No-op (default behavior)
 
-``AutoTuner.save_configs``
-^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. code-block:: python
-
-    AutoTuner.get().save_configs(path: str)
-
-Manually save the in-memory profiling cache to a JSON file.
-This is called automatically on exit from ``autotune(True, cache=path)``;
-direct calls are only needed for advanced use cases.
-
-Previously loaded configs (from ``load_configs``) are merged into the output,
-with in-memory profiling results taking priority for overlapping keys.
-
-``AutoTuner.load_configs``
-^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. code-block:: python
-
-    AutoTuner.get().load_configs(path: str)
-
-Manually load configs from a JSON file into the internal lookup table.
-This is called automatically on entry to ``autotune(cache=path)``;
-direct calls are only needed for advanced use cases.
-
-``AutoTuner.clear_cache``
-^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. code-block:: python
-
-    AutoTuner.get().clear_cache()
-
-Clear the in-memory profiling cache **and** any user-loaded file configs.
-
 Multi-Thread / Multi-Process Considerations
 --------------------------------------------
+
+Quick Reference
+^^^^^^^^^^^^^^^
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 15 45
+
+   * - Environment
+     - Safe?
+     - Notes
+   * - Single process
+     - Yes
+     - Fully safe.
+   * - Multi-threaded (single process)
+     - Yes
+     - All state is lock-protected.
+   * - Multi-process, each with its own cache file
+     - Yes
+     - No shared state.
+   * - Multi-process, shared file, **reading only**
+     - Yes
+     - Readers never see partial files.
+   * - Multi-process, shared file, **all writing**
+     - Best-effort
+     - Works under low contention. Under high contention the last writer
+       can overwrite another's results. Use per-rank files for guaranteed
+       correctness.
 
 Thread Safety
 ^^^^^^^^^^^^^
@@ -298,25 +319,31 @@ Multi-Process
 ^^^^^^^^^^^^^
 
 Each process has its own ``AutoTuner`` singleton (separate address space), so
-in-memory state is fully isolated.  The concerns are around the shared cache
-**file**:
+in-memory state is fully isolated.  The only shared resource is the cache
+**file** on disk.
 
-- **Reads are safe.**  ``save_configs`` uses atomic writes (write to a temp
-  file, then ``os.replace``), so a concurrent reader will never see a
-  partially-written file.
-- **Concurrent writes are not coordinated.**  If two processes both save to the
-  same file, the last writer wins and the other's results are lost.
+- **Reads are safe.**  Writes use ``os.replace`` (atomic on local filesystems),
+  so a concurrent reader always sees either the old or new complete file, never
+  a partial one.
+- **Concurrent writes are best-effort.**  Before writing, ``save_configs``
+  re-reads the file from disk and merges any new entries from other processes
+  (in-memory results win on overlap).  This significantly reduces the
+  lost-update window.  However, the read-merge-write sequence is not itself
+  atomic, so two truly simultaneous writers can still race::
 
-If you are tuning with multiple processes (e.g. multi-GPU with ``torchrun``),
-use separate output files per rank and merge them afterwards.
+      Process A                          Process B
+      ─────────                          ─────────
+      1. Read file {X, Y}
+                                         2. Read file {X, Y}
+      3. Merge → {X, Y, Z}
+      4. Write {X, Y, Z}
+                                         5. Merge → {X, Y, W}
+                                            (stale: doesn't see Z)
+                                         6. Write {X, Y, W}
+                                            ← Z is lost
 
-.. note::
-
-   ``save_configs`` re-reads the existing file from disk and merges it with
-   in-memory results before writing, which reduces (but does not eliminate) the
-   window for lost updates when two processes write to the same file.
-
-Merge example:
+**Recommendation:** If you are tuning with multiple processes (e.g. multi-GPU
+with ``torchrun``), use separate output files per rank and merge afterwards:
 
 .. code-block:: python
 

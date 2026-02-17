@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from einops import einsum
 
 import flashinfer
-from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.autotuner import autotune
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.testing.utils import (
     bench_gpu_time,
@@ -679,7 +679,8 @@ def testBmmFp8(args):
                             cur_backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s
                         )
     elif cache_path:
-        AutoTuner.get().load_configs(cache_path)
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -891,7 +892,8 @@ def testBmmMxfp8(args):
                             mat2_scale,
                         )
     elif cache_path:
-        AutoTuner.get().load_configs(cache_path)
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -1154,7 +1156,8 @@ def testMmFp4(args):
                         mat2_inv_s_trtllm,
                     )
     elif cache_path:
-        AutoTuner.get().load_configs(cache_path)
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -1373,7 +1376,8 @@ def testMmMxfp8(args):
                             mat2_scale,
                         )
     elif cache_path:
-        AutoTuner.get().load_configs(cache_path)
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}

@@ -6,7 +6,7 @@ import torch
 
 import flashinfer
 from flashinfer import ActivationType
-from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
@@ -631,7 +631,8 @@ def testTrtllmFp4BlockScaleMoe(args):
                     output2_scale_scalar,
                 )
     elif cache_path:
-        AutoTuner.get().load_configs(cache_path)
+        with autotune(False, cache=cache_path):
+            pass
 
     # Benchmark timing
     times = bench_gpu_time(
@@ -1008,7 +1009,8 @@ def testCutlassFusedMoe(args):
             for _ in range(warmup_iters):
                 run_cutlass(*input_args_for_bench)
     elif cache_path:
-        AutoTuner.get().load_configs(cache_path)
+        with autotune(False, cache=cache_path):
+            pass
 
     # Measure
     times = bench_gpu_time(

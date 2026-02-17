@@ -29,12 +29,19 @@ _nvfp4_cutlass_version = "0.1"
 def _tactic_to_json(tactic):
     """Convert a tactic value to a JSON-compatible format.
 
-    Tuples are converted to lists recursively so that JSON serialization
-    works natively for both simple int tactics and compound tuple tactics
-    (e.g. CuteDSL's (tile_size, gemm1_tactic, gemm2_tactic)).
+    Any iterable (tuples, lists, C++ Array objects from TVM FFI, etc.) is
+    recursively converted to plain Python lists so that ``json.dump`` can
+    serialize them.  Scalars (int, float, bool, None) are returned as-is.
     """
     if isinstance(tactic, (tuple, list)):
         return [_tactic_to_json(v) for v in tactic]
+    # Handle foreign iterable types (e.g. TVM FFI Array<int64_t>) that are
+    # not plain tuple/list but still support iteration.
+    if hasattr(tactic, "__iter__") and not isinstance(tactic, (str, bytes, dict)):
+        return [_tactic_to_json(v) for v in tactic]
+    # Coerce numpy / pybind int types to plain Python int for JSON safety.
+    if isinstance(tactic, int):
+        return int(tactic)
     return tactic
 
 
