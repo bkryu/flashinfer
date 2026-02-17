@@ -308,7 +308,15 @@ in-memory state is fully isolated.  The concerns are around the shared cache
   same file, the last writer wins and the other's results are lost.
 
 If you are tuning with multiple processes (e.g. multi-GPU with ``torchrun``),
-use separate output files per rank and merge them afterwards:
+use separate output files per rank and merge them afterwards.
+
+.. note::
+
+   ``save_configs`` re-reads the existing file from disk and merges it with
+   in-memory results before writing, which reduces (but does not eliminate) the
+   window for lost updates when two processes write to the same file.
+
+Merge example:
 
 .. code-block:: python
 
@@ -321,3 +329,11 @@ use separate output files per rank and merge them afterwards:
 
     with open("configs_merged.json", "w") as f:
         json.dump(merged, f, indent=2, sort_keys=True)
+
+.. warning::
+
+   Atomic file writes rely on ``os.replace()``, which is atomic on local
+   filesystems (ext4, XFS, APFS, NTFS).  On **NFS** mounts, ``os.replace()``
+   is **not guaranteed to be atomic**, so concurrent readers may briefly see
+   incomplete data.  If you store the cache file on NFS, consider writing to a
+   local path first and copying afterwards.

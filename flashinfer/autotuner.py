@@ -300,7 +300,7 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
 
     # Load configs from cache file on entry (if it exists)
     if cache is not None:
-        if os.path.isfile(cache):
+        with contextlib.suppress(FileNotFoundError):
             tuner.load_configs(cache)
 
     # Protect mode flag save/restore so concurrent autotune() contexts
@@ -980,10 +980,21 @@ class AutoTuner:
 
         num_new = len(configs) - num_previous
 
+        # Re-read the file from disk and merge to reduce lost updates when
+        # multiple processes save to the same path.  Entries from this
+        # process take priority over on-disk entries.
+        abs_path = os.path.abspath(path)
+        try:
+            with open(abs_path, "r") as f:
+                disk_configs = json.load(f)
+            disk_configs.update(configs)
+            configs = disk_configs
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass  # file doesn't exist yet or is being replaced -- proceed with what we have
+
         # Atomic write: write to a temp file then replace the target.
         # This prevents readers from seeing a partially-written file and
         # guards against data loss if the process is killed mid-write.
-        abs_path = os.path.abspath(path)
         dir_name = os.path.dirname(abs_path)
         if dir_name:
             os.makedirs(dir_name, exist_ok=True)
