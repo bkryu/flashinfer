@@ -19,6 +19,7 @@ import torch
 from flashinfer.tllm_utils import delay_kernel
 
 from .jit.core import logger
+from .version import __version__ as _flashinfer_version
 
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
 # such as when new kernels or configs are added. In such cases, the tuning configs
@@ -55,6 +56,95 @@ def _json_to_tactic(val):
     if isinstance(val, list):
         return tuple(_json_to_tactic(v) for v in val)
     return val
+
+
+_METADATA_KEY = "_metadata"
+_LAST_UPDATED_KEY = "_last_updated_by"
+
+
+def _get_cublas_version() -> str:
+    """Return the cuBLAS version as ``major.minor.patch``.
+
+    Checks sources in the same priority order as the runtime loader:
+      1. LD_LIBRARY_PATH — probe the actual shared library via ctypes
+         (tries cuBLAS and cuBLASLt .so variants)
+      2. pip package (nvidia-cublas-cu13, nvidia-cublas-cu12, nvidia-cublas)
+      3. CUDA toolkit bundled with PyTorch (torch.version.cuda)
+
+    All sources are normalized to ``major.minor.patch`` so that comparisons
+    across different environments are meaningful.
+    """
+    import ctypes
+    import sys
+
+    # Source 1: probe the actual loaded shared library via ctypes.
+    # This respects LD_LIBRARY_PATH and reports the true runtime version.
+    # We try both cuBLAS and cuBLASLt variants — whichever loads first wins.
+    if sys.platform == "win32":
+        lib_specs = (
+            ("cublas64_13.dll", "cublasGetProperty"),
+            ("cublas64_12.dll", "cublasGetProperty"),
+            ("cublas.dll", "cublasGetProperty"),
+        )
+    else:
+        lib_specs = (
+            ("libcublas.so.13", "cublasGetProperty"),
+            ("libcublasLt.so.13", "cublasLtGetProperty"),
+            ("libcublas.so.12", "cublasGetProperty"),
+            ("libcublasLt.so.12", "cublasLtGetProperty"),
+        )
+    for lib_name, fn_name in lib_specs:
+        try:
+            lib = ctypes.cdll.LoadLibrary(lib_name)
+            fn = getattr(lib, fn_name)
+            major, minor, patch = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+            fn(0, ctypes.byref(major))
+            fn(1, ctypes.byref(minor))
+            fn(2, ctypes.byref(patch))
+            return f"{major.value}.{minor.value}.{patch.value}"
+        except (OSError, AttributeError):
+            continue
+
+    # Source 2: pip-installed nvidia-cublas package.
+    # Pip versions may have 4 components (e.g. 13.2.1.1); truncate to
+    # major.minor.patch to align with the ctypes output.
+    try:
+        import importlib.metadata as _ilm
+
+        for pkg in ("nvidia-cublas-cu13", "nvidia-cublas-cu12", "nvidia-cublas"):
+            try:
+                pip_ver = _ilm.version(pkg)
+                parts = pip_ver.split(".")
+                return ".".join(parts[:3])
+            except _ilm.PackageNotFoundError:
+                continue
+    except ImportError:
+        pass
+
+    # Source 3: CUDA toolkit version from PyTorch (not the cuBLAS version
+    # itself, but the best we can infer when neither source 1 nor 2 works).
+    cuda_ver = getattr(torch.version, "cuda", None)
+    if cuda_ver:
+        return f"cuda-toolkit-{cuda_ver}"
+
+    return "unknown"
+
+
+def _collect_metadata() -> Dict[str, str]:
+    """Collect environment metadata that can affect tactic-to-kernel mappings."""
+    meta: Dict[str, str] = {}
+    meta["flashinfer_version"] = _flashinfer_version
+    meta["cuda_version"] = getattr(torch.version, "cuda", None) or "unknown"
+    meta["cublas_version"] = _get_cublas_version()
+    try:
+        meta["cudnn_version"] = str(torch.backends.cudnn.version())
+    except Exception:
+        meta["cudnn_version"] = "unknown"
+    try:
+        meta["gpu"] = torch.cuda.get_device_name(0)
+    except Exception:
+        meta["gpu"] = "unknown"
+    return meta
 
 
 def get_config_path(is_module: bool):
@@ -326,8 +416,9 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
 
-        # Save configs on exit when tuning with a cache path
-        if cache is not None and tune_mode:
+        # Save configs on exit when tuning with a cache path,
+        # but only if new profiling results were added this session.
+        if cache is not None and tune_mode and tuner._dirty:
             tuner.save_configs(cache)
 
 
@@ -436,6 +527,8 @@ class AutoTuner:
         self._file_configs: Dict[str, Tuple] = {}
         # Track which file config keys have been logged (to avoid per-call spam)
         self._logged_file_hits: Set[Tuple[str, str]] = set()
+        # Set when new profiling results are added; cleared on save.
+        self._dirty = False
 
     @classmethod
     def get(cls):
@@ -661,6 +754,7 @@ class AutoTuner:
                             )
                             # inspect call stack
                             self.profiling_cache[cache_key] = (runner_id, tactic, p)
+                            self._dirty = True
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
                                 + 1
@@ -965,7 +1059,7 @@ class AutoTuner:
             AutoTuner.get().save_configs("/path/to/config.json")
         """
         with self._lock:
-            configs = {}
+            configs: Dict[str, Any] = {}
 
             # Include previously loaded file configs as a base
             for file_key, (runner_name, tactic) in self._file_configs.items():
@@ -987,13 +1081,19 @@ class AutoTuner:
 
         num_new = len(configs) - num_previous
 
+        current_meta = _collect_metadata()
+
         # Re-read the file from disk and merge to reduce lost updates when
         # multiple processes save to the same path.  Entries from this
         # process take priority over on-disk entries.
         abs_path = os.path.abspath(path)
+        original_metadata = None
         try:
             with open(abs_path, "r") as f:
                 disk_configs = json.load(f)
+            # Preserve the original _metadata from disk (the "created by" record).
+            original_metadata = disk_configs.pop(_METADATA_KEY, None)
+            disk_configs.pop(_LAST_UPDATED_KEY, None)
             disk_configs.update(configs)
             configs = disk_configs
         except (FileNotFoundError, json.JSONDecodeError):
@@ -1009,13 +1109,25 @@ class AutoTuner:
             dir=dir_name, suffix=".tmp", prefix=".autotuner_"
         )
         try:
+            # Place metadata first in the output for readability.
+            # _metadata = original "created by" environment (preserved from disk).
+            # _last_updated_by = current environment that performed this save.
+            ordered = {}
+            ordered[_METADATA_KEY] = original_metadata or current_meta
+            ordered[_LAST_UPDATED_KEY] = current_meta
+            for k in sorted(configs):
+                ordered[k] = configs[k]
+
             with os.fdopen(fd, "w") as f:
-                json.dump(configs, f, indent=2, sort_keys=True)
+                json.dump(ordered, f, indent=2)
             os.replace(tmp_path, abs_path)
         except BaseException:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
             raise
+
+        with self._lock:
+            self._dirty = False
 
         logger.info(
             f"[Autotuner]: Saved {len(configs)} configs to {path} "
@@ -1053,6 +1165,28 @@ class AutoTuner:
         with open(path, "r") as f:
             configs = json.load(f)
 
+        # Remove metadata keys so they don't end up in _file_configs.
+        saved_meta = configs.pop(_METADATA_KEY, None)
+        configs.pop(_LAST_UPDATED_KEY, None)
+        # Check original metadata for environment mismatches that could
+        # invalidate tactics.
+        if saved_meta is not None:
+            current_meta = _collect_metadata()
+            mismatches = {
+                k: (saved_meta.get(k), current_meta.get(k))
+                for k in current_meta
+                if saved_meta.get(k) != current_meta.get(k)
+            }
+            if mismatches:
+                details = ", ".join(
+                    f"{k}: saved={old} vs current={new}"
+                    for k, (old, new) in mismatches.items()
+                )
+                logger.warning(
+                    f"[Autotuner]: Cache file {path} was created in a different "
+                    f"environment ({details}). Configs may be suboptimal or invalid."
+                )
+
         with self._lock:
             for key, value in configs.items():
                 runner_name = value[0]
@@ -1067,6 +1201,7 @@ class AutoTuner:
             self.profiling_cache.clear()
             self._file_configs.clear()
             self._logged_file_hits.clear()
+            self._dirty = False
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""

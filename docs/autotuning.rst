@@ -196,9 +196,35 @@ of ``(custom_op, runner_class_name, optimization_profile)`` and each value is
 .. code-block:: json
 
     {
+      "_metadata": {
+        "flashinfer_version": "0.2.2.post1",
+        "cuda_version": "12.8",
+        "cublas_version": "12.8.3",
+        "cudnn_version": "9.8.0",
+        "gpu_name": "NVIDIA B200"
+      },
+      "_last_updated_by": {
+        "flashinfer_version": "0.2.2.post1",
+        "cuda_version": "12.8",
+        "cublas_version": "12.8.3",
+        "cudnn_version": "9.8.0",
+        "gpu_name": "NVIDIA B200"
+      },
       "('fp4_gemm', 'CudnnFp4GemmRunner', ...)": ["CudnnFp4GemmRunner", 3],
       "('fused_moe', 'CuteDslFusedMoENvfp4Runner', ...)": ["CuteDslFusedMoENvfp4Runner", [128, 2, 1]]
     }
+
+The file contains two special metadata keys:
+
+- ``_metadata``: Records the environment that **originally created** the cache
+  file.  This is preserved across subsequent incremental saves, so users can
+  always trace provenance back to the initial tuning session.
+- ``_last_updated_by``: Records the environment that **last wrote** to the
+  cache file.  Updated on every save.
+
+On load, ``_metadata`` is compared against the current environment. A warning
+is logged if mismatches are detected (e.g. different GPU, FlashInfer version,
+or cuBLAS version).
 
 Tactics are typically integers, but some runners use compound tactics (e.g.
 ``(tile_size, gemm1_tactic, gemm2_tactic)``).  These are serialized as nested
