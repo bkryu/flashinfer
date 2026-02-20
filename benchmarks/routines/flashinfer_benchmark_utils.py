@@ -93,6 +93,7 @@ output_column_dict = {
         "filter_apply_order",
         "max_len",
         "num_rows",
+        "indices_only",
     ],
     "rope": [
         "seq_len",

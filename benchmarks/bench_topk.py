@@ -40,12 +40,11 @@ def bench_top_k(
     k: int,
     dtype: torch.dtype = torch.float32,
     compare_sglang: bool = False,
-    compare_cute_dsl: bool = False,
 ) -> dict:
     """Benchmark basic top_k operation."""
     scores = torch.randn(batch_size, seq_len, device="cuda", dtype=dtype)
 
-    # FlashInfer top_k (cuda backend)
+    # FlashInfer top_k
     measurements = bench_gpu_time(
         lambda: flashinfer.top_k(scores, k),
         enable_cupti=True,
@@ -72,22 +71,6 @@ def bench_top_k(
     torch_ms = np.median(measurements)
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
-
-    # CuTe DSL backend comparison (requires k <= 2048 and k even)
-    if compare_cute_dsl and k <= 2048 and k % 2 == 0:
-        try:
-            measurements = bench_gpu_time(
-                lambda: flashinfer.top_k(scores, k, backend="cute-dsl"),
-                enable_cupti=True,
-                dry_run_iters=10,
-                repeat_iters=100,
-            )
-            cute_dsl_ms = np.median(measurements)
-            result["cute_dsl_us"] = cute_dsl_ms * 1e3
-            result["speedup_cute_dsl_vs_cuda"] = fi_ms / cute_dsl_ms
-            result["speedup_cute_dsl_vs_torch"] = torch_ms / cute_dsl_ms
-        except Exception as e:
-            result["cute_dsl_error"] = str(e)
 
     # SGLang comparison (only supports k=2048 and float32)
     if compare_sglang and HAS_SGL_KERNEL and k == 2048 and dtype == torch.float32:
@@ -242,11 +225,6 @@ def main():
         help="Data type: fp32, fp16, or bf16 (default: fp32)",
     )
     parser.add_argument(
-        "--compare-cute-dsl",
-        action="store_true",
-        help="Compare FlashInfer CUDA backend with CuTe DSL backend for top_k",
-    )
-    parser.add_argument(
         "--compare-algorithms",
         action="store_true",
         help="Compare multi-CTA vs filtered algorithms",
@@ -319,22 +297,13 @@ def main():
         print(f"top_k: Basic radix-based top-k selection (dtype={dtype_str})")
         if args.compare_sglang:
             print("NOTE: SGLang only supports k=2048 and float32")
-        if args.compare_cute_dsl:
-            print("NOTE: CuTe DSL backend requires k <= 2048 and k even")
         print("=" * 100)
 
-        header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FI-CUDA':>12} {'torch.topk':>12} {'Speedup':>10}"
-        if args.compare_cute_dsl:
-            header += f" {'FI-CuTeDSL':>12} {'vs CUDA':>10} {'vs torch':>10}"
+        header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'torch.topk':>12} {'Speedup':>10}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
         print(header)
-        sep_len = 70
-        if args.compare_cute_dsl:
-            sep_len += 34
-        if args.compare_sglang:
-            sep_len += 24
-        print("-" * sep_len)
+        print("-" * (70 if not args.compare_sglang else 90))
 
         for batch_size in batch_sizes:
             for seq_len in seq_lens:
@@ -348,24 +317,12 @@ def main():
                             k,
                             dtype,
                             compare_sglang=args.compare_sglang,
-                            compare_cute_dsl=args.compare_cute_dsl,
                         )
                         line = (
                             f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} | "
                             f"{result['flashinfer_us']:>10.2f}us {result['torch_us']:>10.2f}us "
                             f"{result['speedup_vs_torch']:>9.2f}x"
                         )
-                        if args.compare_cute_dsl:
-                            if "cute_dsl_us" in result:
-                                line += (
-                                    f" {result['cute_dsl_us']:>10.2f}us"
-                                    f" {result['speedup_cute_dsl_vs_cuda']:>9.2f}x"
-                                    f" {result['speedup_cute_dsl_vs_torch']:>9.2f}x"
-                                )
-                            elif "cute_dsl_error" in result:
-                                line += " (CuTe DSL error)"
-                            else:
-                                line += f" {'N/A':>10}   {'N/A':>10}   {'N/A':>10}"
                         if "sglang_us" in result:
                             line += f" {result['sglang_us']:>10.2f}us {result['speedup_vs_sglang']:>9.2f}x"
                         elif args.compare_sglang and k == 2048:

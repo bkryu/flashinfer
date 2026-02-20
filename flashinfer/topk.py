@@ -156,11 +156,12 @@ def _cute_dsl_top_k_dispatch(
     input: torch.Tensor,
     k: int,
     sorted: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_values: bool = True,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """Dispatch to the CuTe DSL radix-based filtered top-k kernel."""
     from .sampling.kernels.filter_top_k import cute_dsl_top_k
 
-    output_values, indices_int32 = cute_dsl_top_k(input, k)
+    output_values, indices_int32 = cute_dsl_top_k(input, k, return_values=return_values)
 
     # Convert to int64 for API compatibility
     indices = indices_int32.long()
@@ -169,6 +170,9 @@ def _cute_dsl_top_k_dispatch(
         sorted_values, sort_indices = torch.sort(output_values, dim=-1, descending=True)
         sorted_indices = torch.gather(indices, dim=-1, index=sort_indices)
         return sorted_values, sorted_indices
+
+    if not return_values:
+        return None, indices
 
     return output_values, indices
 
@@ -179,7 +183,8 @@ def top_k(
     k: int,
     sorted: bool = False,
     backend: str = "cuda",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_values: bool = True,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     r"""Radix-based Top-K selection.
 
     This function selects the top-k largest elements from each row of the input
@@ -206,11 +211,18 @@ def top_k(
         - ``"cute-dsl"``: CuTe DSL radix-based filtered top-k kernel.
           Requires ``k <= 2048``, ``k`` to be even, and CuTe DSL availability.
 
+    return_values : bool, optional
+        If True (default), return both top-k values and indices.
+        If False, return ``None`` for values and only compute indices.
+        When using the ``"cute-dsl"`` backend, setting this to False skips
+        the value-gather phase in the kernel, reducing memory bandwidth.
+        Cannot be combined with ``sorted=True``.
+
     Returns
     -------
-    values : torch.Tensor
-        Tensor of shape ``(batch_size, k)`` containing the top-k values.
-        Same dtype as input.
+    values : torch.Tensor or None
+        Tensor of shape ``(batch_size, k)`` containing the top-k values
+        (same dtype as input), or ``None`` when ``return_values=False``.
     indices : torch.Tensor
         Tensor of shape ``(batch_size, k)`` with int64 dtype containing the
         indices of the top-k elements.
@@ -241,20 +253,18 @@ def top_k(
     >>> values_sorted, indices_sorted = flashinfer.top_k(logits, k, sorted=True)
     >>> # Values are now in descending order within each row
 
-    Using the CuTe DSL backend:
-
-    >>> values, indices = flashinfer.top_k(logits, k, backend="cute-dsl")
-
     See Also
     --------
     torch.topk : PyTorch's built-in top-k function
     sampling.top_k_mask_logits : Top-k masking for logits (sets non-top-k to -inf)
     sampling.top_k_renorm_probs : Top-k filtering and renormalization for probabilities
     """
-    if backend == "cute-dsl":
-        return _cute_dsl_top_k_dispatch(input, k, sorted)
+    if sorted and not return_values:
+        raise ValueError("sorted=True requires return_values=True")
 
-    # ---- Default "cuda" backend (existing radix-topk) ----
+    if backend == "cute-dsl":
+        return _cute_dsl_top_k_dispatch(input, k, sorted, return_values)
+
     batch_size = input.size(0)
     device = input.device
 
@@ -267,7 +277,7 @@ def top_k(
         zero_init=True,
     )
 
-    # Allocate output_values for kernel to write directly
+    # The CUDA kernel always computes values (no indices-only path).
     output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
 
     # Get indices using radix-based selection
@@ -283,6 +293,9 @@ def top_k(
         sorted_values, sort_indices = torch.sort(output_values, dim=-1, descending=True)
         sorted_indices = torch.gather(indices, dim=-1, index=sort_indices)
         return sorted_values, sorted_indices
+
+    if not return_values:
+        return None, indices
 
     return output_values, indices
 

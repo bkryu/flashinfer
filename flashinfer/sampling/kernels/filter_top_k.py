@@ -30,8 +30,6 @@
 High-performance radix-based filtered top-k kernel in CuTe DSL
 with **dynamic column count**.
 
-Ported from ``filter_top_k_dynamic_col.py`` for integration into FlashInfer.
-
 Supported data types: Float32, Float16, BFloat16.
 
 Constraints:
@@ -105,15 +103,14 @@ class FilteredTopKKernel:
         top_k: int,
         num_copy_bits: int = 256,
         is_prefill: bool = True,
+        return_val: bool = True,
     ):
         self.dtype = dtype
         self.max_num_cols = max_num_cols
         self.top_k = top_k
         self.num_copy_bits = num_copy_bits
         self.is_prefill = is_prefill
-
-        # Always return values (FlashInfer API contract)
-        self.return_val = True
+        self.return_val = return_val
 
         self.filtered_topk_max_k = 2048
         # 8 bits for radix-based filter.
@@ -168,26 +165,30 @@ class FilteredTopKKernel:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
         if cutlass.const_expr(self.is_prefill):
-            self.num_threads_per_cta = 512
+            if cutlass.const_expr(dtype == cutlass.Float32):
+                if self.max_num_cols >= 8192:
+                    self.num_threads_per_cta = 512
+                else:
+                    self.num_threads_per_cta = 256
+            else:
+                if self.max_num_cols >= self.vec_size * 512:
+                    self.num_threads_per_cta = 512
+                else:
+                    self.num_threads_per_cta = 256
         else:
             if cutlass.const_expr(dtype == cutlass.Float32):
                 if self.max_num_cols >= self.vec_size * 1024:
                     self.num_threads_per_cta = 1024
                 else:
-                    if cutlass.const_expr(
-                        self.max_num_cols > 2048
-                        and self.max_num_cols < self.vec_size * 1024
-                    ):
+                    if self.max_num_cols > 2048:
                         self.num_threads_per_cta = 512
                     else:
                         self.num_threads_per_cta = 256
             else:
-                if self.max_num_cols >= 43008:
+                if self.max_num_cols >= self.vec_size * 1024:
                     self.num_threads_per_cta = 1024
                 else:
-                    if cutlass.const_expr(
-                        self.max_num_cols > 4096 and self.max_num_cols < 43008
-                    ):
+                    if cutlass.const_expr(self.max_num_cols > 4096):
                         self.num_threads_per_cta = 512
                     else:
                         self.num_threads_per_cta = 256
@@ -460,7 +461,8 @@ class FilteredTopKKernel:
         dst = output_indices[bidx, None]
         if cutlass.const_expr(self.enable_gmem_store):
             buffer = extra_buffer[bidx, None, None]
-        dst_values = output_values[bidx, None]
+        if cutlass.const_expr(self.return_val):
+            dst_values = output_values[bidx, None]
 
         # --- Runtime alignment handling ---
         row_start = 0
@@ -516,10 +518,12 @@ class FilteredTopKKernel:
             for i in range(tidx, self.top_k, self.num_threads_per_cta):
                 if i < length:
                     dst[i] = i
-                    dst_values[i] = score[i]
+                    if cutlass.const_expr(self.return_val):
+                        dst_values[i] = score[i]
                 else:
                     dst[i] = -1
-                    dst_values[i] = self.dtype(0.0)
+                    if cutlass.const_expr(self.return_val):
+                        dst_values[i] = self.dtype(0.0)
         else:
             # Shared memory allocation
             smem = utils.SmemAllocator()
@@ -1032,15 +1036,18 @@ class FilteredTopKKernel:
                         index = s_indices[idx + v]
                         index = cutlass.Int32(cutlass.Uint32(index))
                         topk_indices[v, i] = index
-                        topk_vals[v, i] = score[index]
+                        if cutlass.const_expr(self.return_val):
+                            topk_vals[v, i] = score[index]
             # [atom, rest_vec]
             mIndices_store = cute.tiled_divide(dst, (vecsize_out,))
-            mValues_store = cute.tiled_divide(dst_values, (vecsize_out,))
+            if cutlass.const_expr(self.return_val):
+                mValues_store = cute.tiled_divide(dst_values, (vecsize_out,))
             for i in cutlass.range(cute.size(topk_vals.shape, [1]), unroll_full=True):
                 col = i * self.num_threads_per_cta + tidx % self.num_threads_per_cta
                 if col < self.top_k // vecsize_out:
                     cute.autovec_copy(topk_indices[None, i], mIndices_store[None, col])
-                    cute.autovec_copy(topk_vals[None, i], mValues_store[None, col])
+                    if cutlass.const_expr(self.return_val):
+                        cute.autovec_copy(topk_vals[None, i], mValues_store[None, col])
 
     # ------------------------------------------------------------------
     # Tiled copy setup
@@ -1164,14 +1171,15 @@ def _get_compiled_kernel(
     max_num_cols: int,
     top_k: int,
     is_prefill: bool,
+    return_val: bool = True,
     num_copy_bits: int = 256,
 ):
     """Return a compiled ``tensor_api`` closure that accepts ``torch.Tensor``
     arguments directly (via TVM-FFI).
 
     The result is cached by ``(torch_dtype, max_num_cols, top_k, is_prefill,
-    num_copy_bits)``.  Because *max_num_cols* is a power-of-2 bucket, a
-    single compiled kernel serves all ``num_cols <= max_num_cols``.
+    return_val, num_copy_bits)``.  Because *max_num_cols* is a power-of-2
+    bucket, a single compiled kernel serves all ``num_cols <= max_num_cols``.
     """
     cutlass_dtype = _TORCH_TO_CUTLASS[torch_dtype]
 
@@ -1186,6 +1194,7 @@ def _get_compiled_kernel(
         top_k=top_k,
         num_copy_bits=num_copy_bits,
         is_prefill=is_prefill,
+        return_val=return_val,
     )
 
     # Symbolic dimensions -- each independent axis gets its own symbol so
@@ -1256,6 +1265,7 @@ def cute_dsl_top_k(
     input: torch.Tensor,
     k: int,
     num_copy_bits: int = 256,
+    return_values: bool = True,
 ) -> tuple:
     """Run the CuTe DSL radix-based filtered top-k kernel.
 
@@ -1268,11 +1278,15 @@ def cute_dsl_top_k(
         Number of top elements to select per row (must be even, <= 2048).
     num_copy_bits : int
         Bits per vectorised load (default 256).
+    return_values : bool
+        If True, also gather top-k values; if False, skip value gathering
+        for reduced memory bandwidth.
 
     Returns
     -------
-    output_values : torch.Tensor
+    output_values : torch.Tensor or None
         Top-k values, shape ``(num_rows, k)``, same dtype as *input*.
+        ``None`` when ``return_values=False``.
     output_indices : torch.Tensor
         Top-k column indices, shape ``(num_rows, k)``, dtype ``int32``.
     """
@@ -1283,18 +1297,17 @@ def cute_dsl_top_k(
     num_rows, num_cols = input.shape
     is_prefill = num_rows > 148
 
-    # Bucket num_cols to the next power of 2 so that distinct vocab sizes
-    # (e.g. 32000, 128256, 128512) share the same compiled kernel.
     max_num_cols = _bucket_num_cols(num_cols)
 
     tensor_api, buffer_numbers = _get_compiled_kernel(
-        input.dtype, max_num_cols, k, is_prefill, num_copy_bits
+        input.dtype, max_num_cols, k, is_prefill, return_values, num_copy_bits
     )
 
-    # Allocate output & scratch buffers
     output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=input.device)
+    # Always allocate output_values: the compiled kernel expects the tensor
+    # argument even when return_val=False (it simply won't write to it).
     output_values = torch.empty(num_rows, k, dtype=input.dtype, device=input.device)
-    buffer_tensor = torch.zeros(
+    buffer_tensor = torch.empty(
         num_rows,
         buffer_numbers,
         num_cols,
@@ -1304,4 +1317,4 @@ def cute_dsl_top_k(
 
     tensor_api(input, buffer_tensor, output_indices, output_values)
 
-    return output_values, output_indices
+    return (output_values if return_values else None), output_indices

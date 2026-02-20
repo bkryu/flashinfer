@@ -183,6 +183,13 @@ def parse_sampling_args(line, parser):
         choices=["cuda", "cute-dsl"],
         help="Kernel backends to test. Default: cuda. Use 'cute-dsl' for CuTe DSL top-k backend.",
     )
+    parser.add_argument(
+        "--indices_only",
+        action="store_true",
+        default=False,
+        help="For top_k routine: benchmark with return_values=False (indices only). "
+        "The cute-dsl backend skips the value-gather phase, reducing bandwidth.",
+    )
 
     args = parser.parse_args(line)
 
@@ -1614,6 +1621,7 @@ def testTopK(args):
     batch_size = args.batch_size
     vocab_size = args.vocab_size
     top_k = args.top_k
+    indices_only = args.indices_only
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -1624,6 +1632,7 @@ def testTopK(args):
         return res
 
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    return_values = not indices_only
 
     ## Prepare input tensors
     input_tensor = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
@@ -1632,10 +1641,13 @@ def testTopK(args):
         print(f"[VVERBOSE] {input_tensor.shape = }")
         print(f"[VVERBOSE] {input_tensor.dtype = }")
         print(f"[VVERBOSE] {top_k = }")
+        print(f"[VVERBOSE] {indices_only = }")
 
     def run_backend(backend, input_tensor):
         if backend in ("cuda", "cute-dsl"):
-            return flashinfer.top_k(input_tensor, top_k, backend=backend)
+            return flashinfer.top_k(
+                input_tensor, top_k, backend=backend, return_values=return_values
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1645,11 +1657,13 @@ def testTopK(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend, input_tensor)
-            # top_k returns (values, indices) tuple - detach both
-            outputs[cur_backend] = (
-                outputs[cur_backend][0].detach(),
-                outputs[cur_backend][1].detach(),
-            )
+            if indices_only:
+                outputs[cur_backend] = (None, outputs[cur_backend][1].detach())
+            else:
+                outputs[cur_backend] = (
+                    outputs[cur_backend][0].detach(),
+                    outputs[cur_backend][1].detach(),
+                )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1666,35 +1680,57 @@ def testTopK(args):
         ref_values, ref_indices = torch.topk(input_tensor.float(), k=top_k, dim=-1)
 
         for backend, (out_values, out_indices) in outputs.items():
-            # Sort both outputs to compare (FlashInfer returns unsorted by default)
-            ref_sorted, _ = torch.sort(ref_values, dim=-1, descending=True)
-            out_sorted, _ = torch.sort(out_values.float(), dim=-1, descending=True)
-
-            # Check sorted values match
-            num_diff_vals, num_total_vals, pct_diff_vals = is_close_stats(
-                ref_sorted, out_sorted, rtol=1e-3, atol=1e-5
-            )
-
-            # Verify indices point to correct values in original tensor
-            gathered_vals = torch.gather(
-                input_tensor.float(), dim=-1, index=out_indices
-            )
-            idx_vals_match = torch.allclose(
-                gathered_vals, out_values.float(), rtol=1e-3, atol=1e-5
-            )
-
-            if num_diff_vals > 0 or not idx_vals_match:
+            if indices_only:
+                # Indices-only mode: verify indices point to actual top-k elements
+                gathered_vals = torch.gather(
+                    input_tensor.float(), dim=-1, index=out_indices
+                )
+                gathered_sorted, _ = torch.sort(gathered_vals, dim=-1, descending=True)
+                ref_sorted, _ = torch.sort(ref_values, dim=-1, descending=True)
+                num_diff_vals, num_total_vals, pct_diff_vals = is_close_stats(
+                    ref_sorted, gathered_sorted, rtol=1e-3, atol=1e-5
+                )
                 if num_diff_vals > 0:
                     print(
                         f"[REFCHECK] Backend {backend}: {num_diff_vals}/{num_total_vals} "
-                        f"({pct_diff_vals:.2f}%) sorted values differ from PyTorch reference"
+                        f"({pct_diff_vals:.2f}%) gathered values from indices differ from PyTorch reference"
                     )
-                if not idx_vals_match:
-                    print(
-                        f"[REFCHECK] Backend {backend}: indices don't match their values"
-                    )
-                if not args.allow_output_mismatch:
-                    raise AssertionError(f"[ERROR] Backend {backend} output mismatch")
+                    if not args.allow_output_mismatch:
+                        raise AssertionError(
+                            f"[ERROR] Backend {backend} output mismatch"
+                        )
+            else:
+                # Sort both outputs to compare (FlashInfer returns unsorted by default)
+                ref_sorted, _ = torch.sort(ref_values, dim=-1, descending=True)
+                out_sorted, _ = torch.sort(out_values.float(), dim=-1, descending=True)
+
+                # Check sorted values match
+                num_diff_vals, num_total_vals, pct_diff_vals = is_close_stats(
+                    ref_sorted, out_sorted, rtol=1e-3, atol=1e-5
+                )
+
+                # Verify indices point to correct values in original tensor
+                gathered_vals = torch.gather(
+                    input_tensor.float(), dim=-1, index=out_indices
+                )
+                idx_vals_match = torch.allclose(
+                    gathered_vals, out_values.float(), rtol=1e-3, atol=1e-5
+                )
+
+                if num_diff_vals > 0 or not idx_vals_match:
+                    if num_diff_vals > 0:
+                        print(
+                            f"[REFCHECK] Backend {backend}: {num_diff_vals}/{num_total_vals} "
+                            f"({pct_diff_vals:.2f}%) sorted values differ from PyTorch reference"
+                        )
+                    if not idx_vals_match:
+                        print(
+                            f"[REFCHECK] Backend {backend}: indices don't match their values"
+                        )
+                    if not args.allow_output_mismatch:
+                        raise AssertionError(
+                            f"[ERROR] Backend {backend} output mismatch"
+                        )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -1703,10 +1739,13 @@ def testTopK(args):
 
             # Memory bandwidth calculation
             # Read: input (input_dtype)
-            # Write: values (input_dtype) + indices (int64)
+            # Write: values (input_dtype, unless indices_only) + indices (int64)
+            values_write_bytes = (
+                0 if indices_only else batch_size * top_k * input_dtype.itemsize
+            )
             problem_bytes = (
                 batch_size * vocab_size * input_dtype.itemsize  # input read
-                + batch_size * top_k * input_dtype.itemsize  # values write
+                + values_write_bytes  # values write
                 + batch_size * top_k * 8  # indices write (int64)
             )
             tflops = 0  # Memory-bound operation
@@ -1724,6 +1763,7 @@ def testTopK(args):
                 cur_res["vocab_size"] = vocab_size
                 cur_res["top_k"] = top_k
                 cur_res["backend"] = backend
+                cur_res["indices_only"] = indices_only
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

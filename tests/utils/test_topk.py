@@ -149,6 +149,39 @@ def test_top_k_sorted(batch_size, vocab_size, k, dtype, backend):
     assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
 
 
+@pytest.mark.parametrize("batch_size", [1, 16, 64])
+@pytest.mark.parametrize("vocab_size", [32000, 65536, 128512])
+@pytest.mark.parametrize("k", [256, 512, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_top_k_indices_only(batch_size, vocab_size, k, dtype, backend):
+    """Test top_k with return_values=False returns None for values and correct indices."""
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
+
+    values, indices = flashinfer.top_k(logits, k, backend=backend, return_values=False)
+
+    assert values is None, "Expected values to be None when return_values=False"
+    assert indices.shape == (batch_size, k)
+    assert indices.dtype == torch.int64
+
+    # Reference: torch.topk
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    # Verify the returned indices actually point to top-k elements
+    gathered_values = torch.gather(logits, dim=-1, index=indices)
+    assert verify_topk_correctness(logits, gathered_values, indices, k), (
+        "Indices do not point to valid top-k elements"
+    )
+
+    accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
+    min_accuracy = 0.98
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+
 @pytest.mark.parametrize("vocab_size", [32000, 65536])
 @pytest.mark.parametrize("k", [256])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
