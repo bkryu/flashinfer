@@ -9,7 +9,7 @@ FlashInfer includes an autotuner that selects the best kernel implementation
 What Is Autotuning?
 -------------------
 
-Many FlashInfer operations -- GEMM, MoE, and others -- support multiple backend
+Several FlashInfer operations -- GEMM and MoE -- support multiple backend
 implementations (runners).  Each runner may also expose several low-level
 tactics (e.g. tile sizes, pipeline stages).  The best choice depends on the
 hardware, data types, and input shapes of your workload.
@@ -224,13 +224,14 @@ The ``_metadata`` key records the environment that created the cache file
 On load, ``_metadata`` is compared against the current environment.  If any
 field differs (e.g. different GPU, FlashInfer version, or cuBLAS version),
 the **entire cache is skipped** — no configs are loaded, and the file will
-not be overwritten on exit.  This prevents silently using invalid tactics and
-avoids destroying configs tuned for a different environment.  A warning is
-logged with the mismatch details and a suggestion to use a different cache
-path for the current environment.
+not be overwritten on exit; i.e. the autotuner would behave as if the cache
+file input was not provided (cache=None). This prevents silently using invalid
+tactics and avoids destroying configs tuned for a different environment.  A
+warning is logged with the mismatch details and a suggestion to use a
+different cache path for the current environment.
 
-Advanced users can bypass individual checks by editing the JSON file and
-setting a metadata field to ``"*"``.  For example, setting
+Advanced users can bypass individual checks by manually editing the JSON file
+and setting a metadata field to ``"*"``.  For example, setting
 ``"cudnn_version": "*"`` in ``_metadata`` will skip the cuDNN version check
 while still enforcing all other fields.
 
