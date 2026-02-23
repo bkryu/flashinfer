@@ -44,8 +44,10 @@ You can also pass ``tune_mode=True`` explicitly (the default):
     with flashinfer.autotune(True):
         output = flashinfer.gemm.bmm_fp8(A, B, A_scale, B_scale, dtype=out_dtype)
 
+Note that ``flashinfer.autotune()``, ``flashinfer.autotune(True)``, and ``flashinfer.autotune(tune_mode=True)`` are all equivalent.
+
 When ``tune_mode=False``, the context manager enters a no-profiling mode that
-only uses previously cached or loaded configs:
+only uses previously cached or loaded configs. This is equivalent to ``flashinfer.autotune(False)``:
 
 .. code-block:: python
 
@@ -82,7 +84,7 @@ When a FlashInfer operation executes, the autotuner resolves the best
    environment variable is set and tuning mode is off).
 4. **Fallback tactic (−1)** — a safe default that every runner must implement.
 
-The first match wins.  Notably, user-loaded file configs (level 2) are
+Notably, user-loaded file configs (level 2) are
 **always consulted, even during tuning mode**, so that already-tuned shapes
 from a cache file are never re-profiled.
 
@@ -196,22 +198,31 @@ of ``(custom_op, runner_class_name, optimization_profile)`` and each value is
 .. code-block:: json
 
     {
-      "_metadata": {
-        "flashinfer_version": "0.2.2.post1",
-        "cuda_version": "12.8",
-        "cublas_version": "12.8.3",
-        "cudnn_version": "9.8.0",
-        "gpu_name": "NVIDIA B200"
+    "_metadata": {
+        "flashinfer_version": "0.6.3",
+        "cuda_version": "13.0",
+        "cublas_version": "13.2.1",
+        "cudnn_version": "91900",
+        "gpu": "NVIDIA B200"
       },
       "_last_updated_by": {
-        "flashinfer_version": "0.2.2.post1",
-        "cuda_version": "12.8",
-        "cublas_version": "12.8.3",
-        "cudnn_version": "9.8.0",
-        "gpu_name": "NVIDIA B200"
+        "flashinfer_version": "0.6.3",
+        "cuda_version": "13.0",
+        "cublas_version": "13.2.1",
+        "cudnn_version": "91900",
+        "gpu": "NVIDIA B200"
       },
-      "('fp4_gemm', 'CudnnFp4GemmRunner', ...)": ["CudnnFp4GemmRunner", 3],
-      "('fused_moe', 'CuteDslFusedMoENvfp4Runner', ...)": ["CuteDslFusedMoENvfp4Runner", [128, 2, 1]]
+      "('fp4_gemm', 'CudnnFp4GemmRunner', ((4, 7168), (7168, 4608), ...))": [
+        "CudnnFp4GemmRunner",
+        3
+      ],
+      "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((1, 7168), (1, 256), (1, 8), (1, 8), (1, 3584), (1, 448)))": [
+        "MoERunner",
+        [
+          8,
+          34
+        ]
+      ]
     }
 
 The file contains two special metadata keys:
@@ -230,9 +241,8 @@ Tactics are typically integers, but some runners use compound tactics (e.g.
 ``(tile_size, gemm1_tactic, gemm2_tactic)``).  These are serialized as nested
 JSON arrays and restored to tuples on load.
 
-The file is human-readable and portable.  Because it stores runner class names
-(not positional indices), it is robust to changes in runner ordering across
-FlashInfer versions.
+The file is human-readable but not portable. Config ordering is not guaranteed to be
+stable across FlashInfer, CUDA, cuDNN, or cuBLAS versions.
 
 API Reference
 -------------
@@ -337,7 +347,7 @@ The ``AutoTuner`` singleton is protected by a reentrant lock
 mode-flag save/restore in ``autotune()`` -- acquire this lock, so multiple
 threads can safely share the same autotuner instance.
 
-During tuning mode, the lock also serializes GPU profiling, which is the
+During tuning mode, the lock also serializes GPU profiling per process, which is the
 correct behavior since concurrent kernel measurements would interfere with each
 other.
 
@@ -368,8 +378,8 @@ in-memory state is fully isolated.  The only shared resource is the cache
                                          6. Write {X, Y, W}
                                             ← Z is lost
 
-**Recommendation:** If you are tuning with multiple processes (e.g. multi-GPU
-with ``torchrun``), use separate output files per rank and merge afterwards:
+If you are tuning with multiple processes (e.g. multi-GPU
+with ``torchrun``), you could use separate output files per rank and merge them afterwards:
 
 .. code-block:: python
 
