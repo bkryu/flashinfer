@@ -198,14 +198,7 @@ of ``(custom_op, runner_class_name, optimization_profile)`` and each value is
 .. code-block:: json
 
     {
-    "_metadata": {
-        "flashinfer_version": "0.6.3",
-        "cuda_version": "13.0",
-        "cublas_version": "13.2.1",
-        "cudnn_version": "91900",
-        "gpu": "NVIDIA B200"
-      },
-      "_last_updated_by": {
+      "_metadata": {
         "flashinfer_version": "0.6.3",
         "cuda_version": "13.0",
         "cublas_version": "13.2.1",
@@ -225,17 +218,21 @@ of ``(custom_op, runner_class_name, optimization_profile)`` and each value is
       ]
     }
 
-The file contains two special metadata keys:
+The ``_metadata`` key records the environment that created the cache file
+(FlashInfer version, CUDA, cuBLAS, cuDNN, and GPU).
 
-- ``_metadata``: Records the environment that **originally created** the cache
-  file.  This is preserved across subsequent incremental saves, so users can
-  always trace provenance back to the initial tuning session.
-- ``_last_updated_by``: Records the environment that **last wrote** to the
-  cache file.  Updated on every save.
+On load, ``_metadata`` is compared against the current environment.  If any
+field differs (e.g. different GPU, FlashInfer version, or cuBLAS version),
+the **entire cache is skipped** — no configs are loaded, and the file will
+not be overwritten on exit.  This prevents silently using invalid tactics and
+avoids destroying configs tuned for a different environment.  A warning is
+logged with the mismatch details and a suggestion to use a different cache
+path for the current environment.
 
-On load, ``_metadata`` is compared against the current environment. A warning
-is logged if mismatches are detected (e.g. different GPU, FlashInfer version,
-or cuBLAS version).
+Advanced users can bypass individual checks by editing the JSON file and
+setting a metadata field to ``"*"``.  For example, setting
+``"cudnn_version": "*"`` in ``_metadata`` will skip the cuDNN version check
+while still enforcing all other fields.
 
 Tactics are typically integers, but some runners use compound tactics (e.g.
 ``(tile_size, gemm1_tactic, gemm2_tactic)``).  These are serialized as nested

@@ -59,7 +59,6 @@ def _json_to_tactic(val):
 
 
 _METADATA_KEY = "_metadata"
-_LAST_UPDATED_KEY = "_last_updated_by"
 
 
 def _get_cublas_version() -> str:
@@ -395,10 +394,13 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
     """
     tuner = AutoTuner.get()
 
-    # Load configs from cache file on entry (if it exists)
-    if cache is not None:
-        with contextlib.suppress(FileNotFoundError):
-            tuner.load_configs(cache)
+    # Load configs from cache file on entry (if it exists).
+    # cache_valid is False when the file exists but has a metadata mismatch;
+    # in that case we skip saving on exit to avoid overwriting configs from
+    # a different environment.
+    cache_valid = True
+    if cache is not None and os.path.isfile(cache):
+        cache_valid = tuner.load_configs(cache)
 
     # Protect mode flag save/restore so concurrent autotune() contexts
     # on different threads cannot corrupt each other's saved state.
@@ -417,8 +419,9 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
             logger.info("[Autotuner]: Autotuning process ends")
 
         # Save configs on exit when tuning with a cache path,
-        # but only if new profiling results were added this session.
-        if cache is not None and tune_mode and tuner._dirty:
+        # but only if new profiling results were added this session
+        # and the cache file was valid (no environment mismatch).
+        if cache is not None and cache_valid and tune_mode and tuner._dirty:
             tuner.save_configs(cache)
 
 
@@ -1093,7 +1096,6 @@ class AutoTuner:
                 disk_configs = json.load(f)
             # Preserve the original _metadata from disk (the "created by" record).
             original_metadata = disk_configs.pop(_METADATA_KEY, None)
-            disk_configs.pop(_LAST_UPDATED_KEY, None)
             disk_configs.update(configs)
             configs = disk_configs
         except (FileNotFoundError, json.JSONDecodeError):
@@ -1110,11 +1112,8 @@ class AutoTuner:
         )
         try:
             # Place metadata first in the output for readability.
-            # _metadata = original "created by" environment (preserved from disk).
-            # _last_updated_by = current environment that performed this save.
             ordered = {}
             ordered[_METADATA_KEY] = original_metadata or current_meta
-            ordered[_LAST_UPDATED_KEY] = current_meta
             for k in sorted(configs):
                 ordered[k] = configs[k]
 
@@ -1134,11 +1133,15 @@ class AutoTuner:
             f"({num_new} new, {num_previous} from previous config)"
         )
 
-    def load_configs(self, path: str) -> None:
+    def load_configs(self, path: str) -> bool:
         """Load autotuner configs from a JSON file.
 
         Populates the internal config lookup table so that ``search_cache()``
         can return pre-tuned results without re-running autotuning.
+
+        If the file contains ``_metadata`` that does not match the current
+        environment (different FlashInfer version, GPU, cuBLAS, etc.), the
+        entire cache is **skipped** to avoid silently using invalid tactics.
 
         Note:
             This is called automatically on entry to
@@ -1148,6 +1151,10 @@ class AutoTuner:
         Args:
             path: File path to the JSON config file (produced by
                 ``save_configs()``).
+
+        Returns:
+            True if configs were loaded successfully, False if the cache was
+            skipped due to an environment mismatch.
 
         Raises:
             FileNotFoundError: If the config file does not exist.
@@ -1167,15 +1174,15 @@ class AutoTuner:
 
         # Remove metadata keys so they don't end up in _file_configs.
         saved_meta = configs.pop(_METADATA_KEY, None)
-        configs.pop(_LAST_UPDATED_KEY, None)
-        # Check original metadata for environment mismatches that could
-        # invalidate tactics.
+
+        # If the cache was created in a different environment, skip it
+        # entirely to avoid silently using invalid or suboptimal tactics.
         if saved_meta is not None:
             current_meta = _collect_metadata()
             mismatches = {
                 k: (saved_meta.get(k), current_meta.get(k))
                 for k in current_meta
-                if saved_meta.get(k) != current_meta.get(k)
+                if saved_meta.get(k) not in (current_meta.get(k), "*")
             }
             if mismatches:
                 details = ", ".join(
@@ -1184,8 +1191,13 @@ class AutoTuner:
                 )
                 logger.warning(
                     f"[Autotuner]: Cache file {path} was created in a different "
-                    f"environment ({details}). Configs may be suboptimal or invalid."
+                    f"environment ({details}). Ignoring cached configs. "
+                    f"Results will not be saved to this file to avoid "
+                    f"overwriting configs from a different environment. "
+                    f"Use a different cache path to save configs for the "
+                    f"current environment."
                 )
+                return False
 
         with self._lock:
             for key, value in configs.items():
@@ -1194,6 +1206,7 @@ class AutoTuner:
                 self._file_configs[key] = (runner_name, tactic)
 
         logger.info(f"[Autotuner]: Loaded {len(configs)} configs from {path}")
+        return True
 
     def clear_cache(self) -> None:
         """Clear the profiling cache and user-loaded file configs."""
