@@ -4486,7 +4486,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 120, 121])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -4530,6 +4530,7 @@ def _cute_dsl_gemm_fp4_runner(
 
     On SM100: uses the SM100 kernel only.
     On SM103: uses both SM100 kernel and the SM103-specific 3xFP4 kernel.
+    On SM120/SM121: uses the SM120 warp-level MMA kernel.
     The autotuner selects the best (kernel_type, tile, cluster, swap_ab, prefetch,
     use_tma_store) combination.
     """
@@ -4540,6 +4541,15 @@ def _cute_dsl_gemm_fp4_runner(
     )
 
     sm_version = sm_major * 10 + sm_minor
+
+    # SM120/SM121 kernel (warp-level MMA, no tcgen05)
+    Sm120Kernel = None
+    if sm_version in (120, 121):
+        from .kernels.dense_blockscaled_gemm_sm120 import (
+            Sm120BlockScaledDenseGemmKernel,
+        )
+
+        Sm120Kernel = Sm120BlockScaledDenseGemmKernel
 
     # TODO(yunzheq): Re-enable SM103 kernel once cutlass-dsl package includes
     # SM103MmaMXF4Op and compatible PersistentTileSchedulerParams.
@@ -4589,6 +4599,52 @@ def _cute_dsl_gemm_fp4_runner(
             sf_vec_size = 16 if use_nvfp4 else 32
             ab_dtype = cutlass.Float4E2M1FN
             sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
+
+            valid_tactics = []
+
+            # --- SM120/SM121 tactics ---
+            if sm_version in (120, 121) and Sm120Kernel is not None:
+                batch_size = 1
+                # SM120 kernel only supports cluster (1,1) and K-major layouts
+                sm120_mma_tiler_candidates = [
+                    (128, 128),
+                    (256, 128),
+                    (128, 256),
+                    (256, 256),
+                ]
+                for mma_tiler_mn in sm120_mma_tiler_candidates:
+                    for swap_ab in (False, True):
+                        if swap_ab:
+                            kernel_m, kernel_n = n, m
+                        else:
+                            kernel_m, kernel_n = m, n
+                        if not Sm120Kernel.can_implement(
+                            ab_dtype,
+                            sf_dtype,
+                            sf_vec_size,
+                            c_cutlass_dtype,
+                            mma_tiler_mn,
+                            (1, 1),
+                            kernel_m,
+                            kernel_n,
+                            real_k,
+                            batch_size,
+                            "k",
+                            "k",
+                            "m" if swap_ab else "n",
+                        ):
+                            continue
+                        valid_tactics.append(
+                            (
+                                mma_tiler_mn,
+                                (1, 1),
+                                swap_ab,
+                                False,
+                                "sm120",
+                                None,
+                            )
+                        )
+                return valid_tactics
 
             # SM100 tactics (shared enumeration with mxfp8)
             sm100_base = _get_sm100_block_scaled_tactics(
@@ -4681,14 +4737,24 @@ def _cute_dsl_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                tactic = (
-                    _SM100_DEFAULT_MMA_TILER_MN,
-                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                    False,
-                    False,
-                    "sm100",
-                    None,
-                )
+                if sm_version in (120, 121):
+                    tactic = (
+                        (128, 128),
+                        (1, 1),
+                        False,
+                        False,
+                        "sm120",
+                        None,
+                    )
+                else:
+                    tactic = (
+                        _SM100_DEFAULT_MMA_TILER_MN,
+                        _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                        False,
+                        False,
+                        "sm100",
+                        None,
+                    )
 
             (
                 mma_tiler_mn,
@@ -4729,7 +4795,15 @@ def _cute_dsl_gemm_fp4_runner(
                 out_dtype,
             )
 
-            if kernel_type == "sm103" and Sm103Kernel is not None:
+            if kernel_type == "sm120" and Sm120Kernel is not None:
+                make_kernel = lambda: Sm120Kernel(
+                    sf_vec_size,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    use_prefetch,
+                    enable_pdl,
+                )
+            elif kernel_type == "sm103" and Sm103Kernel is not None:
                 make_kernel = lambda: Sm103Kernel(
                     sf_vec_size,
                     mma_tiler_mn,
