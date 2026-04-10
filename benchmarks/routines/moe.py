@@ -1347,32 +1347,70 @@ def testCuteDslFp4BlockScaleMoe(args):
         print(f"[VVERBOSE] w2_weight.shape = {tensors['w2_weight'].shape}")
 
     if sm_major == 12:
-        # SM120/121: use functional API with x_bf16 (kernel fuses quantization)
-        def run_cute_dsl_moe(
-            x, x_sf, token_selected_experts, token_final_scales,
-            w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
-            w2_weight, w2_weight_sf, w2_alpha, x_bf16,
-        ):
-            return cute_dsl_fused_moe_nvfp4(
-                x=x, x_sf=x_sf,
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                w1_weight=w1_weight, w1_weight_sf=w1_weight_sf,
-                w1_alpha=w1_alpha, fc2_input_scale=fc2_input_scale,
-                w2_weight=w2_weight, w2_weight_sf=w2_weight_sf,
-                w2_alpha=w2_alpha,
+        # SM120/121: call launch_sm120_moe directly with pre-allocated workspace
+        # to avoid per-call allocation overhead.
+        from flashinfer.fused_moe.cute_dsl.sm120.dispatch import (
+            launch_sm120_moe,
+            allocate_sm120_static_workspace,
+            allocate_sm120_dynamic_workspace,
+            select_sm120_moe_backend,
+            _get_weight_views as _get_sm120_weight_views,
+        )
+
+        routed_rows = num_tokens * top_k
+        k = hidden_size
+        n = intermediate_size
+
+        # Pre-allocate weight views (once)
+        weight_views = _get_sm120_weight_views(
+            w1_fp4=tensors["w1_weight"],
+            w1_blockscale=tensors["w1_weight_sf"],
+            w2_fp4=tensors["w2_weight"],
+            w2_blockscale=tensors["w2_weight_sf"],
+            w1_alphas=tensors["w1_alpha"],
+            w2_alphas=tensors["w2_alpha"],
+            n=n, k=k,
+        )
+
+        # Pre-allocate workspace (once)
+        backend = select_sm120_moe_backend(num_tokens=num_tokens, num_topk=top_k)
+        if backend == "dynamic":
+            pre_workspace = allocate_sm120_dynamic_workspace(
+                state_E=local_num_experts, weight_E=num_experts,
+                routed_rows=routed_rows, k=k, n=n, num_topk=top_k, device=device,
+            )
+        else:
+            pre_workspace = allocate_sm120_static_workspace(
+                state_E=local_num_experts, weight_E=num_experts,
+                max_rows=max(1, routed_rows), k=k, n=n, num_topk=top_k, device=device,
+            )
+
+        # Pre-allocate output buffer
+        moe_output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+        def run_cute_dsl_moe(x_bf16, token_selected_experts, token_final_scales):
+            return launch_sm120_moe(
+                a=x_bf16,
+                topk_ids=token_selected_experts,
+                topk_weights=token_final_scales,
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
                 num_experts=num_experts, top_k=top_k,
                 num_local_experts=local_num_experts,
-                x_bf16=x_bf16,
+                scatter_output=moe_output,
+                _workspace=pre_workspace,
+                _weight_views=weight_views,
             )
 
         input_args = (
-            tensors["x"], tensors["x_sf"],
-            tensors["token_selected_experts"], tensors["token_final_scales"],
-            tensors["w1_weight"], tensors["w1_weight_sf"], tensors["w1_alpha"],
-            tensors["fc2_input_scale"],
-            tensors["w2_weight"], tensors["w2_weight_sf"], tensors["w2_alpha"],
             tensors["x_bf16"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
         )
     else:
         # SM100/103: use wrapper API (pre-quantized FP4 input)
