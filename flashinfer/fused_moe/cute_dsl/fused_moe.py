@@ -184,6 +184,40 @@ def _moe_core_impl(
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
 
+    # SM120/SM121: dispatch to fused kernel (route+pack+FC1+FC2 in one launch).
+    # Selects static (decode) or dynamic (prefill) based on token count.
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if major == 12:
+        from .sm120.dispatch import launch_sm120_moe
+
+        num_experts_local = num_local_experts if num_local_experts is not None else num_experts
+
+        if moe_output is None:
+            moe_output = torch.empty(
+                (num_tokens, hidden_size),
+                dtype=output_dtype,
+                device=x.device,
+            )
+
+        # SM120 kernel takes bf16 input (it fuses route+pack+quantize internally).
+        # The caller passes x_bf16 through _moe_core_impl's x parameter.
+        return launch_sm120_moe(
+            a=x,  # bf16 [num_tokens, hidden_size]
+            topk_ids=token_selected_experts,
+            topk_weights=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts_local,
+            scatter_output=moe_output,
+        )
+
     # Allocate output if not provided.  The caller (wrapper or functional
     # API) should pass a [:num_tokens] slice of the pre-allocated buffer
     # when using CUDA graphs.  The buffer is zeroed in Step 3 below.
@@ -339,7 +373,7 @@ class CuteDslMoEWrapper:
         ...     output = moe.run(x, x_sf, topk_ids, topk_weights, w1, w1_sf, ...)
     """
 
-    @supported_compute_capability([100, 103])
+    @supported_compute_capability([100, 103, 120, 121])
     @flashinfer_api
     def __init__(
         self,
@@ -680,7 +714,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 120, 121])
 @flashinfer_api
 def cute_dsl_fused_moe_nvfp4(
     x: torch.Tensor,
@@ -703,10 +737,11 @@ def cute_dsl_fused_moe_nvfp4(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
+    x_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run fused MoE computation using CuteDSL NVFP4 kernels.
 
-    Supported architectures: SM100, SM103.
+    Supported architectures: SM100, SM103, SM120, SM121.
 
     This is the simple functional API. For CUDA graph support, use
     `CuteDslMoEWrapper` instead.
@@ -736,6 +771,9 @@ def cute_dsl_fused_moe_nvfp4(
         use_fused_finalize: Use fused finalize. Default: True.
         moe_output: Pre-allocated output buffer.
         aux_stream: Auxiliary CUDA stream.
+        x_bf16: Original bf16 activations [num_tokens, hidden_size]. Required
+            on SM120/SM121 where the kernel fuses quantization internally.
+            Ignored on SM100/SM103.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -751,6 +789,36 @@ def cute_dsl_fused_moe_nvfp4(
             (num_tokens, hidden_size),
             dtype=output_dtype,
             device=x.device,
+        )
+
+    # SM120/SM121: dispatch to fused static kernel (bypasses autotuner)
+    major, _ = torch.cuda.get_device_capability(x.device)
+    if major == 12:
+        if x_bf16 is None:
+            raise ValueError(
+                "SM120/SM121 cute_dsl_fused_moe_nvfp4 requires x_bf16 parameter "
+                "(original bf16 activations). The SM120 kernel fuses quantization "
+                "internally and cannot accept pre-quantized FP4 input."
+            )
+        return _moe_core_impl(
+            x=x_bf16,
+            x_sf=x_sf,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            moe_output=moe_output,
+            output_dtype=output_dtype,
+            enable_pdl=enable_pdl,
         )
 
     tuner = AutoTuner.get()

@@ -1196,7 +1196,9 @@ def _create_cute_dsl_moe_test_data(
     routing_weights, selected_experts = compute_routing(routing_logits, top_k)
     selected_experts = selected_experts.to(torch.int32)
 
-    # GEMM1 weights (gate + up, interleaved for CuteDSL SwiGLU)
+    # GEMM1 weights (gate + up)
+    # SM100/103: interleaved in 64-row groups for CuTe DSL SwiGLU epilogue
+    # SM120/121: non-interleaved [up_0:N, gate_0:N] for b12x fused kernel
     w1_bf16 = (
         torch.randn(
             num_local_experts,
@@ -1207,9 +1209,13 @@ def _create_cute_dsl_moe_test_data(
         )
         / 10
     )
-    w1_bf16_interleaved = _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+    sm_major = torch.cuda.get_device_capability(device)[0]
+    if sm_major == 12:
+        w1_bf16_prepared = w1_bf16  # SM120: non-interleaved
+    else:
+        w1_bf16_prepared = _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_flat = w1_bf16_interleaved.view(
+    w1_flat = w1_bf16_prepared.view(
         num_local_experts * 2 * intermediate_size, hidden_size
     )
     w1_q_flat, w1_sf_flat = fp4_quantize(
@@ -1257,6 +1263,7 @@ def _create_cute_dsl_moe_test_data(
 
     return {
         "x": x_quantized,
+        "x_bf16": x_bf16,
         "x_sf": x_sf,
         "token_selected_experts": selected_experts,
         "token_final_scales": routing_weights,
@@ -1289,9 +1296,10 @@ def testCuteDslFp4BlockScaleMoe(args):
         print("[INFO] Running testCuteDslFp4BlockScaleMoe")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
-    from flashinfer import CuteDslMoEWrapper
+    from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
 
     device = get_device(args)
+    sm_major = torch.cuda.get_device_capability(device)[0]
     if args.generate_repro_command:
         print(
             f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
@@ -1338,57 +1346,69 @@ def testCuteDslFp4BlockScaleMoe(args):
         print(f"[VVERBOSE] w1_weight.shape = {tensors['w1_weight'].shape}")
         print(f"[VVERBOSE] w2_weight.shape = {tensors['w2_weight'].shape}")
 
-    moe = CuteDslMoEWrapper(
-        num_experts=num_experts,
-        top_k=top_k,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        use_cuda_graph=is_cuda_graph_compatible,
-        max_num_tokens=num_tokens,
-        num_local_experts=local_num_experts,
-        local_expert_offset=local_expert_offset,
-    )
+    if sm_major == 12:
+        # SM120/121: use functional API with x_bf16 (kernel fuses quantization)
+        def run_cute_dsl_moe(
+            x, x_sf, token_selected_experts, token_final_scales,
+            w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
+            w2_weight, w2_weight_sf, w2_alpha, x_bf16,
+        ):
+            return cute_dsl_fused_moe_nvfp4(
+                x=x, x_sf=x_sf,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                w1_weight=w1_weight, w1_weight_sf=w1_weight_sf,
+                w1_alpha=w1_alpha, fc2_input_scale=fc2_input_scale,
+                w2_weight=w2_weight, w2_weight_sf=w2_weight_sf,
+                w2_alpha=w2_alpha,
+                num_experts=num_experts, top_k=top_k,
+                num_local_experts=local_num_experts,
+                x_bf16=x_bf16,
+            )
 
-    def run_cute_dsl_moe(
-        x,
-        x_sf,
-        token_selected_experts,
-        token_final_scales,
-        w1_weight,
-        w1_weight_sf,
-        w1_alpha,
-        fc2_input_scale,
-        w2_weight,
-        w2_weight_sf,
-        w2_alpha,
-    ):
-        return moe.run(
-            x=x,
-            x_sf=x_sf,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            w1_weight=w1_weight,
-            w1_weight_sf=w1_weight_sf,
-            w1_alpha=w1_alpha,
-            fc2_input_scale=fc2_input_scale,
-            w2_weight=w2_weight,
-            w2_weight_sf=w2_weight_sf,
-            w2_alpha=w2_alpha,
+        input_args = (
+            tensors["x"], tensors["x_sf"],
+            tensors["token_selected_experts"], tensors["token_final_scales"],
+            tensors["w1_weight"], tensors["w1_weight_sf"], tensors["w1_alpha"],
+            tensors["fc2_input_scale"],
+            tensors["w2_weight"], tensors["w2_weight_sf"], tensors["w2_alpha"],
+            tensors["x_bf16"],
+        )
+    else:
+        # SM100/103: use wrapper API (pre-quantized FP4 input)
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=is_cuda_graph_compatible,
+            max_num_tokens=num_tokens,
+            num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
         )
 
-    input_args = (
-        tensors["x"],
-        tensors["x_sf"],
-        tensors["token_selected_experts"],
-        tensors["token_final_scales"],
-        tensors["w1_weight"],
-        tensors["w1_weight_sf"],
-        tensors["w1_alpha"],
-        tensors["fc2_input_scale"],
-        tensors["w2_weight"],
-        tensors["w2_weight_sf"],
-        tensors["w2_alpha"],
-    )
+        def run_cute_dsl_moe(
+            x, x_sf, token_selected_experts, token_final_scales,
+            w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
+            w2_weight, w2_weight_sf, w2_alpha,
+        ):
+            return moe.run(
+                x=x, x_sf=x_sf,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                w1_weight=w1_weight, w1_weight_sf=w1_weight_sf,
+                w1_alpha=w1_alpha, fc2_input_scale=fc2_input_scale,
+                w2_weight=w2_weight, w2_weight_sf=w2_weight_sf,
+                w2_alpha=w2_alpha,
+            )
+
+        input_args = (
+            tensors["x"], tensors["x_sf"],
+            tensors["token_selected_experts"], tensors["token_final_scales"],
+            tensors["w1_weight"], tensors["w1_weight_sf"], tensors["w1_alpha"],
+            tensors["fc2_input_scale"],
+            tensors["w2_weight"], tensors["w2_weight_sf"], tensors["w2_alpha"],
+        )
 
     # Snapshot active expert count before any kernel execution, since
     # autotune tactic exploration may corrupt input tensors.
