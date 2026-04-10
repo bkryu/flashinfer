@@ -448,11 +448,15 @@ def sm120_make_smem_layout_sfa(
     k_basic_block_shape = (sf_vec_size, mma_nsf)
     k_basic_block_stride = (0, 1)
 
-    assert tile_shape_mnk[0] % blk_mn == 0, (
-        "tile_shape_mnk[0] must be divisible by blk_mn"
+    assert tile_shape_mnk[0] % (blk_mn // 2) == 0, (
+        "tile_shape_mnk[0] must be divisible by 64"
     )
 
-    sSFA_shapeM = (mn_basic_block_shape, tile_shape_mnk[0] // blk_mn)
+    # Scale-factor tiles are quantized in 128-row blocks, so narrower MMA
+    # tiles still allocate one full SF block and consume only the live subset.
+    sfa_tile_m = max(blk_mn, ceil_div(tile_shape_mnk[0], blk_mn) * blk_mn)
+
+    sSFA_shapeM = (mn_basic_block_shape, sfa_tile_m // blk_mn)
     sSF_strideM = (mn_basic_block_stride, blk_elems)
 
     assert tile_shape_mnk[2] % (blk_sf * mma_nsf) == 0, (
@@ -467,7 +471,7 @@ def sm120_make_smem_layout_sfa(
     sSF_strideK = (
         k_basic_block_stride,
         mma_nsf,
-        tile_shape_mnk[0] // blk_mn * blk_elems,
+        sfa_tile_m // blk_mn * blk_elems,
     )
 
     sSFA_shape = (sSFA_shapeM, sSFA_shapeK)
@@ -515,8 +519,8 @@ def sm120_make_smem_layout_sfb(
 
     assert sf_vec_size == 16 or sf_vec_size == 32, "sf_vec_size must be 16 or 32"
 
-    assert tile_shape_mnk[1] % blk_mn == 0, (
-        "tile_shape_mnk[1] must be divisible by blk_mn"
+    assert tile_shape_mnk[1] % (blk_mn // 2) == 0, (
+        "tile_shape_mnk[1] must be divisible by 64"
     )
 
     assert tile_shape_mnk[2] % sf_vec_size == 0, (
@@ -530,7 +534,11 @@ def sm120_make_smem_layout_sfb(
     k_basic_block_shape = (sf_vec_size, mma_nsf)
     k_basic_block_stride = (0, 1)
 
-    sSFB_shapeN = (mn_basic_block_shape, tile_shape_mnk[1] // blk_mn)
+    # Scale-factor tiles are quantized in 128-column blocks, so narrower MMA
+    # tiles still allocate one full SF block and consume only the live subset.
+    sfb_tile_n = max(blk_mn, ceil_div(tile_shape_mnk[1], blk_mn) * blk_mn)
+
+    sSFB_shapeN = (mn_basic_block_shape, sfb_tile_n // blk_mn)
     sSF_strideN = (mn_basic_block_stride, blk_elems)
 
     assert tile_shape_mnk[2] % (blk_sf * mma_nsf) == 0, (
@@ -545,7 +553,7 @@ def sm120_make_smem_layout_sfb(
     sSF_strideK = (
         k_basic_block_stride,
         mma_nsf,
-        tile_shape_mnk[1] // blk_mn * blk_elems,
+        sfb_tile_n // blk_mn * blk_elems,
     )
 
     sSFB_shape = (sSFB_shapeN, sSFB_shapeK)

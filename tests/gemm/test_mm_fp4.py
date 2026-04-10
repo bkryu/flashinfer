@@ -35,7 +35,9 @@ def _test_mm_fp4(
         if compute_capability[0] not in [10, 12]:
             pytest.skip("cute_dsl backend only supports SM100/SM103/SM120/SM121 GPUs.")
         if compute_capability[0] == 12 and not use_nvfp4:
-            pytest.skip("SM120/SM121 cute-dsl warp-level MMA only supports NVFP4 (sf_vec_size=16).")
+            pytest.skip(
+                "SM120/SM121 cute-dsl warp-level MMA only supports NVFP4 (sf_vec_size=16)."
+            )
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
     if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl"]:

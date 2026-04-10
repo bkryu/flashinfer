@@ -190,7 +190,9 @@ def _moe_core_impl(
     if major == 12:
         from .sm120.dispatch import launch_sm120_moe
 
-        num_experts_local = num_local_experts if num_local_experts is not None else num_experts
+        num_experts_local = (
+            num_local_experts if num_local_experts is not None else num_experts
+        )
 
         if moe_output is None:
             moe_output = torch.empty(

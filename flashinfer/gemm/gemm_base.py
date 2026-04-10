@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 from enum import Enum
 from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
@@ -3577,6 +3577,29 @@ _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
 
+def _select_default_sm120_mma_tiler(m, n, sm_count):
+    """Select optimal SM120 tile shape based on problem size and SM count.
+
+    Uses narrower tiles (64x64, 64x128, 128x64) when the default 128x128
+    would leave SMs idle on small-M shapes.
+    """
+    coarse_tile = (128, 128)
+    coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
+        (n + coarse_tile[1] - 1) // coarse_tile[1]
+    )
+    if m <= 128 and coarse_tiles < max(1, sm_count // 2):
+        if n > 1536:
+            return (64, 128)
+        medium_tile = (128, 64)
+        medium_tiles = ((m + medium_tile[0] - 1) // medium_tile[0]) * (
+            (n + medium_tile[1] - 1) // medium_tile[1]
+        )
+        if medium_tiles < max(1, sm_count // 2):
+            return (64, 64)
+        return (128, 64)
+    return (128, 128)
+
+
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
     tile_m, tile_n = tile_mn
     cluster_m, cluster_n = cluster_shape_mn
@@ -4605,12 +4628,13 @@ def _cute_dsl_gemm_fp4_runner(
             # --- SM120/SM121 tactics ---
             if sm_version in (120, 121) and Sm120Kernel is not None:
                 batch_size = 1
-                # SM120 kernel requires tile M,N divisible by 128,
-                # cluster always (1,1), K-major layouts only.
-                # Only (128, 128) is validated — larger tiles produce SF
-                # fragment layouts incompatible with the manual atom
-                # unroll indexing in the kernel mainloop.
+                # SM120 kernel supports tile M,N divisible by 64.
+                # Smaller tiles (64x64, 64x128, 128x64) help when
+                # small-M shapes leave SMs idle with 128x128.
                 sm120_mma_tiler_candidates = [
+                    (64, 64),
+                    (64, 128),
+                    (128, 64),
                     (128, 128),
                 ]
                 # SM120 kernel does not support swap_ab (SF fragment
@@ -4738,8 +4762,11 @@ def _cute_dsl_gemm_fp4_runner(
 
             if tactic is None or tactic == -1:
                 if sm_version in (120, 121):
+                    _sm_count = torch.cuda.get_device_properties(
+                        a.device
+                    ).multi_processor_count
                     tactic = (
-                        (128, 128),
+                        _select_default_sm120_mma_tiler(m, n, _sm_count),
                         (1, 1),
                         False,
                         False,
@@ -4795,6 +4822,7 @@ def _cute_dsl_gemm_fp4_runner(
                 out_dtype,
             )
 
+            make_kernel: Any  # type varies by kernel_type
             if kernel_type == "sm120" and Sm120Kernel is not None:
                 make_kernel = lambda: Sm120Kernel(
                     sf_vec_size,

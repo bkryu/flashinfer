@@ -1450,7 +1450,9 @@ def quantize_and_pack_16_fast(y_f32: cute.Tensor, inv_scale: Float32) -> Uint64:
 
 @cute.jit
 def quantize_block_fp4(
-    values: cute.Tensor, max_abs: Float32, global_scale_val: Float32,
+    values: cute.Tensor,
+    max_abs: Float32,
+    global_scale_val: Float32,
 ) -> Tuple[Uint64, Uint8]:
     """Quantize 16 float32 values to packed FP4 + e4m3 scale byte.
 
@@ -1471,7 +1473,9 @@ def quantize_block_fp4(
 
 @cute.jit
 def quantize_block_fp4_fast(
-    values: cute.Tensor, max_abs: Float32, global_scale_val: Float32,
+    values: cute.Tensor,
+    max_abs: Float32,
+    global_scale_val: Float32,
 ) -> Tuple[Uint64, Uint8]:
     """Fast approximate FP4 block quantization using reciprocal/vector path."""
     scale_u32 = Uint32(0)
@@ -1501,7 +1505,8 @@ def max_abs_16(values: cute.Tensor) -> Float32:
 
 @cute.jit
 def silu_mul_16(
-    gate: cute.Tensor, up: cute.Tensor,
+    gate: cute.Tensor,
+    up: cute.Tensor,
 ) -> cute.Tensor:
     """Fused SiLU(gate) * up for 16 float32 element pairs.
 
@@ -1520,7 +1525,9 @@ def silu_mul_16(
 
 @cute.jit
 def silu_mul_quantize_block_fp4(
-    gate: cute.Tensor, up: cute.Tensor, global_scale_val: Float32,
+    gate: cute.Tensor,
+    up: cute.Tensor,
+    global_scale_val: Float32,
 ) -> Tuple[Uint64, Uint8]:
     """Fused SiLU(gate)*up + FP4 quantize for 16 element pairs."""
     activated = silu_mul_16(gate, up)

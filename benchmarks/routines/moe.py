@@ -1296,7 +1296,7 @@ def testCuteDslFp4BlockScaleMoe(args):
         print("[INFO] Running testCuteDslFp4BlockScaleMoe")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
-    from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
+    from flashinfer import CuteDslMoEWrapper
 
     device = get_device(args)
     sm_major = torch.cuda.get_device_capability(device)[0]
@@ -1369,24 +1369,37 @@ def testCuteDslFp4BlockScaleMoe(args):
             w2_blockscale=tensors["w2_weight_sf"],
             w1_alphas=tensors["w1_alpha"],
             w2_alphas=tensors["w2_alpha"],
-            n=n, k=k,
+            n=n,
+            k=k,
         )
 
         # Pre-allocate workspace (once)
         backend = select_sm120_moe_backend(num_tokens=num_tokens, num_topk=top_k)
         if backend == "dynamic":
             pre_workspace = allocate_sm120_dynamic_workspace(
-                state_E=local_num_experts, weight_E=num_experts,
-                routed_rows=routed_rows, k=k, n=n, num_topk=top_k, device=device,
+                state_E=local_num_experts,
+                weight_E=num_experts,
+                routed_rows=routed_rows,
+                k=k,
+                n=n,
+                num_topk=top_k,
+                device=device,
             )
         else:
             pre_workspace = allocate_sm120_static_workspace(
-                state_E=local_num_experts, weight_E=num_experts,
-                max_rows=max(1, routed_rows), k=k, n=n, num_topk=top_k, device=device,
+                state_E=local_num_experts,
+                weight_E=num_experts,
+                max_rows=max(1, routed_rows),
+                k=k,
+                n=n,
+                num_topk=top_k,
+                device=device,
             )
 
         # Pre-allocate output buffer
-        moe_output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+        moe_output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+        )
 
         def run_cute_dsl_moe(x_bf16, token_selected_experts, token_final_scales):
             return launch_sm120_moe(
@@ -1400,7 +1413,8 @@ def testCuteDslFp4BlockScaleMoe(args):
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
-                num_experts=num_experts, top_k=top_k,
+                num_experts=num_experts,
+                top_k=top_k,
                 num_local_experts=local_num_experts,
                 scatter_output=moe_output,
                 _workspace=pre_workspace,
@@ -1426,26 +1440,44 @@ def testCuteDslFp4BlockScaleMoe(args):
         )
 
         def run_cute_dsl_moe(
-            x, x_sf, token_selected_experts, token_final_scales,
-            w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
-            w2_weight, w2_weight_sf, w2_alpha,
+            x,
+            x_sf,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            fc2_input_scale,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
         ):
             return moe.run(
-                x=x, x_sf=x_sf,
+                x=x,
+                x_sf=x_sf,
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
-                w1_weight=w1_weight, w1_weight_sf=w1_weight_sf,
-                w1_alpha=w1_alpha, fc2_input_scale=fc2_input_scale,
-                w2_weight=w2_weight, w2_weight_sf=w2_weight_sf,
+                w1_weight=w1_weight,
+                w1_weight_sf=w1_weight_sf,
+                w1_alpha=w1_alpha,
+                fc2_input_scale=fc2_input_scale,
+                w2_weight=w2_weight,
+                w2_weight_sf=w2_weight_sf,
                 w2_alpha=w2_alpha,
             )
 
         input_args = (
-            tensors["x"], tensors["x_sf"],
-            tensors["token_selected_experts"], tensors["token_final_scales"],
-            tensors["w1_weight"], tensors["w1_weight_sf"], tensors["w1_alpha"],
+            tensors["x"],
+            tensors["x_sf"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+            tensors["w1_weight"],
+            tensors["w1_weight_sf"],
+            tensors["w1_alpha"],
             tensors["fc2_input_scale"],
-            tensors["w2_weight"], tensors["w2_weight_sf"], tensors["w2_alpha"],
+            tensors["w2_weight"],
+            tensors["w2_weight_sf"],
+            tensors["w2_alpha"],
         )
 
     # Snapshot active expert count before any kernel execution, since
