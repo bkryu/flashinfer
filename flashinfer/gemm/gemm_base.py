@@ -4605,41 +4605,41 @@ def _cute_dsl_gemm_fp4_runner(
             # --- SM120/SM121 tactics ---
             if sm_version in (120, 121) and Sm120Kernel is not None:
                 batch_size = 1
-                # SM120 kernel only supports cluster (1,1) and K-major layouts
+                # SM120 kernel requires tile M,N divisible by 128,
+                # cluster always (1,1), K-major layouts only.
+                # Only (128, 128) is validated — larger tiles produce SF
+                # fragment layouts incompatible with the manual atom
+                # unroll indexing in the kernel mainloop.
                 sm120_mma_tiler_candidates = [
                     (128, 128),
-                    (256, 128),
-                    (128, 256),
-                    (256, 256),
                 ]
+                # SM120 kernel does not support swap_ab (SF fragment
+                # partitioning assumes non-swapped layout).
+                swap_ab = False
                 for mma_tiler_mn in sm120_mma_tiler_candidates:
-                    for swap_ab in (False, True):
-                        if swap_ab:
-                            kernel_m, kernel_n = n, m
-                        else:
-                            kernel_m, kernel_n = m, n
-                        if not Sm120Kernel.can_implement(
-                            ab_dtype,
-                            sf_dtype,
-                            sf_vec_size,
-                            c_cutlass_dtype,
-                            mma_tiler_mn,
-                            (1, 1),
-                            kernel_m,
-                            kernel_n,
-                            real_k,
-                            batch_size,
-                            "k",
-                            "k",
-                            "m" if swap_ab else "n",
-                        ):
-                            continue
+                    if not Sm120Kernel.can_implement(
+                        ab_dtype,
+                        sf_dtype,
+                        sf_vec_size,
+                        c_cutlass_dtype,
+                        mma_tiler_mn,
+                        (1, 1),
+                        m,
+                        n,
+                        real_k,
+                        batch_size,
+                        "k",
+                        "k",
+                        "n",
+                    ):
+                        continue
+                    for use_prefetch in (False, True):
                         valid_tactics.append(
                             (
                                 mma_tiler_mn,
                                 (1, 1),
                                 swap_ab,
-                                False,
+                                use_prefetch,
                                 "sm120",
                                 None,
                             )
