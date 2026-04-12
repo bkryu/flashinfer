@@ -367,7 +367,7 @@ def _get_static_kernel(
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
         mac, cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--opt-level 2 --enable-tvm-ffi --gpu-arch sm_120a",
+        options="--opt-level 2 --enable-tvm-ffi",
     )
 
     result = (compiled, mac)
@@ -811,7 +811,7 @@ def _get_dynamic_kernel(
         scatter_fake, token_map_fake, token_weights_fake,
         1, 1, 1, 1, 1,  # runtime Int32 placeholders
         mac, cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--opt-level 2 --enable-tvm-ffi --gpu-arch sm_120a",
+        options="--opt-level 2 --enable-tvm-ffi",
     )
 
     result = (compiled, mac)
