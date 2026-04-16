@@ -875,8 +875,8 @@ def launch_sm120_static_moe(
         )
         launch_ids = flat_ids
 
-    # Zero scatter output before atomic accumulation
-    scatter_output.zero_()
+    # The kernel zeros scatter_output internally (Phase 0), so no
+    # external .zero_() is needed here.
 
     # With TVM-FFI env stream, the stream is managed automatically.
     # max_active_clusters is still a required positional arg for TVM-FFI.
@@ -1484,7 +1484,7 @@ def launch_sm120_dynamic_moe(
         activation=activation,
     )
 
-    scatter_output.zero_()
+    # The kernel zeros scatter_output internally, so no external .zero_() needed.
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
     # fixed-shape args are Tensor (pass torch tensor directly).
