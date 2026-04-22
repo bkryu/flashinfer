@@ -1,5 +1,9 @@
 from ..api_logging import flashinfer_api
-from flashinfer.jit import gen_dsv3_router_gemm_module, gen_tinygemm2_module
+from flashinfer.jit import (
+    gen_dsv3_router_gemm_module,
+    gen_tinygemm2_module,
+    gen_tinygemm_fp8_module,
+)
 import functools
 from types import SimpleNamespace
 from typing import Optional
@@ -305,7 +309,22 @@ def get_tinygemm2_module():
     ) -> None:
         module.tinygemm2_op(input, weight, bias, out, use_pdl)
 
-    return SimpleNamespace(tinygemm2_op=tinygemm2_op_impl)
+    @register_custom_op(
+        "flashinfer::tinygemm2_nobias_op",
+        mutates_args=["out"],
+    )
+    def tinygemm2_nobias_op_impl(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        use_pdl: bool = False,
+    ) -> None:
+        module.tinygemm2_nobias_op(input, weight, out, use_pdl)
+
+    return SimpleNamespace(
+        tinygemm2_op=tinygemm2_op_impl,
+        tinygemm2_nobias_op=tinygemm2_nobias_op_impl,
+    )
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
@@ -351,5 +370,167 @@ def tinygemm_bf16(
         This kernel requires SM90+ (Hopper or newer).
     """
     if bias is None:
-        bias = torch.zeros(weight.shape[0], dtype=torch.bfloat16, device=input.device)
-    get_tinygemm2_module().tinygemm2_op(input, weight, bias, out, use_pdl)
+        get_tinygemm2_module().tinygemm2_nobias_op(input, weight, out, use_pdl)
+    else:
+        get_tinygemm2_module().tinygemm2_op(input, weight, bias, out, use_pdl)
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _tinygemm_fp8_shape_checks(A, B, A_scale, B_scale, dtype, bias=None, use_pdl=False):
+    if A.dim() != 2:
+        raise ValueError("A must be a 2D tensor")
+    if B.dim() != 2:
+        raise ValueError("B must be a 2D tensor")
+
+    if not A.is_contiguous():
+        raise ValueError("A must be contiguous (row-major)")
+    if B.stride(0) != 1 or B.stride(1) != B.shape[0]:
+        raise ValueError("B must be tightly packed column-major with shape (k, n)")
+
+    if A.shape[1] != B.shape[0]:
+        raise ValueError(
+            f"A.shape[1] ({A.shape[1]}) must equal B.shape[0] ({B.shape[0]})"
+        )
+
+    if A.shape[1] % 128 != 0:
+        raise ValueError(
+            f"A.shape[1] ({A.shape[1]}) must be a multiple of 128 (tile alignment)"
+        )
+    if B.shape[1] % 16 != 0:
+        raise ValueError(
+            f"B.shape[1] ({B.shape[1]}) must be a multiple of 16 (tile alignment)"
+        )
+
+    if A.dtype != torch.float8_e4m3fn:
+        raise ValueError("A must be float8_e4m3fn")
+    if B.dtype != torch.float8_e4m3fn:
+        raise ValueError("B must be float8_e4m3fn")
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("dtype must be torch.float16 or torch.bfloat16")
+
+    for name, scale in (("A_scale", A_scale), ("B_scale", B_scale)):
+        if not isinstance(scale, torch.Tensor):
+            raise ValueError(f"{name} must be a torch.Tensor")
+        if scale.device != A.device:
+            raise ValueError(f"{name} must be on the same device as A")
+        if scale.dtype != torch.float32:
+            raise ValueError(f"{name} must be float32")
+        if scale.numel() != 1:
+            raise ValueError(f"{name} must contain exactly one element")
+        if not scale.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    if bias is not None:
+        if bias.dim() != 1:
+            raise ValueError("bias must be a 1D tensor")
+        if bias.shape[0] != B.shape[1]:
+            raise ValueError(
+                f"bias.shape[0] ({bias.shape[0]}) must equal B.shape[1] ({B.shape[1]})"
+            )
+        if bias.dtype != dtype:
+            raise ValueError(f"bias must match output dtype ({dtype})")
+        if bias.device != A.device:
+            raise ValueError("bias must be on the same device as A")
+        if not bias.is_contiguous():
+            raise ValueError("bias must be contiguous")
+
+    return True
+
+
+@functools.cache
+def get_tinygemm_fp8_module():
+    module = gen_tinygemm_fp8_module().build_and_load()
+
+    @register_custom_op(
+        "flashinfer::tinygemm_fp8_op",
+        mutates_args=["out"],
+    )
+    def tinygemm_fp8_op_impl(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        bias: torch.Tensor,
+        out: torch.Tensor,
+        use_pdl: bool = False,
+    ) -> None:
+        module.tinygemm_fp8_op(A, B, A_scale, B_scale, bias, out, use_pdl)
+
+    @register_custom_op(
+        "flashinfer::tinygemm_fp8_nobias_op",
+        mutates_args=["out"],
+    )
+    def tinygemm_fp8_nobias_op_impl(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        out: torch.Tensor,
+        use_pdl: bool = False,
+    ) -> None:
+        module.tinygemm_fp8_nobias_op(A, B, A_scale, B_scale, out, use_pdl)
+
+    return SimpleNamespace(
+        tinygemm_fp8_op=tinygemm_fp8_op_impl,
+        tinygemm_fp8_nobias_op=tinygemm_fp8_nobias_op_impl,
+    )
+
+
+@backend_requirement({}, common_check=_tinygemm_fp8_shape_checks)
+@flashinfer_api
+def tinygemm_fp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+    use_pdl: bool = False,
+) -> torch.Tensor:
+    r"""Blackwell+ latency-optimized FP8 GEMM with optional bias.
+
+    This kernel is the FP8 counterpart to ``tinygemm_bf16``. It computes
+    ``out = (A @ B) * (A_scale * B_scale) + bias`` using e4m3 inputs and FP32
+    accumulation, then converts to the requested output dtype.
+
+    Parameters
+    ----------
+    A: torch.Tensor
+        Row-major input tensor of shape ``(m, k)``, dtype ``torch.float8_e4m3fn``.
+
+    B: torch.Tensor
+        Column-major weight tensor of shape ``(k, n)``, dtype
+        ``torch.float8_e4m3fn``. A convenient way to build this layout is
+        ``weight_fp8.t()`` from a row-major ``(n, k)`` weight tensor.
+
+    A_scale: torch.Tensor
+        Scalar float32 tensor containing the dequant scale for ``A``.
+
+    B_scale: torch.Tensor
+        Scalar float32 tensor containing the dequant scale for ``B``.
+
+    dtype: torch.dtype
+        Output dtype. Must be ``torch.float16`` or ``torch.bfloat16``.
+
+    bias: Optional[torch.Tensor]
+        Optional bias vector of shape ``(n,)`` with dtype matching ``dtype``.
+
+    use_pdl: bool
+        Enable Programmatic Dependent Launch. As with ``tinygemm_bf16``, only
+        enable this when preceding work on the same stream is also PDL-aware.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape ``(m, n)`` with dtype ``dtype``.
+    """
+    out = torch.empty((A.shape[0], B.shape[1]), device=A.device, dtype=dtype)
+    if bias is None:
+        get_tinygemm_fp8_module().tinygemm_fp8_nobias_op(
+            A, B, A_scale, B_scale, out, use_pdl
+        )
+    else:
+        get_tinygemm_fp8_module().tinygemm_fp8_op(
+            A, B, A_scale, B_scale, bias, out, use_pdl
+        )
+    return out

@@ -61,3 +61,23 @@ def test_group_gemm_fp8_nt_groupwise(m, n, k, mma_sm, group_size):
         f"--routine group_gemm_fp8_nt_groupwise --m {m} --n {n} --k {k} --mma_sm {mma_sm} --group_size {group_size} --no_cuda_graph --refcheck -vv".split()
     )
     flashinfer_benchmark.run_test(args)
+
+
+@pytest.mark.parametrize("m", [1, 8])
+@pytest.mark.parametrize("n", [32, 128])
+@pytest.mark.parametrize("k", [256, 512])
+def test_tinygemm_bf16(m, n, k):
+    args = flashinfer_benchmark.parse_args(
+        f"--routine tinygemm_bf16 --m {m} --n {n} --k {k} --backends tinygemm --no_cuda_graph --refcheck -vv".split()
+    )
+    flashinfer_benchmark.run_test(args)
+
+
+@pytest.mark.parametrize("m", [1, 8])
+@pytest.mark.parametrize("n", [32, 128])
+@pytest.mark.parametrize("k", [256, 512])
+def test_tinygemm_fp8(m, n, k):
+    args = flashinfer_benchmark.parse_args(
+        f"--routine tinygemm_fp8 --m {m} --n {n} --k {k} --backends tinygemm --no_cuda_graph --refcheck -vv".split()
+    )
+    flashinfer_benchmark.run_test(args)

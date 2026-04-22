@@ -35,6 +35,7 @@ from .routergemm import (
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
     tinygemm_bf16 as tinygemm_bf16,
+    tinygemm_fp8 as tinygemm_fp8,
 )
 
 # Import CuTe-DSL kernels if available
@@ -90,6 +91,7 @@ __all__ = [
     "mm_M1_16_K7168_N128",
     "mm_M1_16_K7168_N256",
     "tinygemm_bf16",
+    "tinygemm_fp8",
     "is_cudnn_override_shape_available",
     "build_cudnn_gemm_bf16_graph_override_shape",
     "execute_cudnn_gemm_bf16_graph_override_shape",
