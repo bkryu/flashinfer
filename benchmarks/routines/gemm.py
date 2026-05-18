@@ -24,6 +24,8 @@ from .flashinfer_benchmark_utils import (
 
 
 def run_gemm_test(args):
+    if args.routine == "mm_fp4_w4a16":
+        return testMmFp4W4A16(args)
     """
     Run a gemm test.
 
@@ -152,6 +154,7 @@ def parse_gemm_args(line, parser):
             "cute-dsl",
             "b12x",
             "auto",
+            "torch",
             "tinygemm",
         ],
         help="Kernel backends to test. Default: cudnn",
@@ -1020,6 +1023,120 @@ def testBmmMxfp8(args):
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
+
+
+def _make_fp4_w4a16_weight(k, n, device):
+    codes = torch.randint(0, 16, (k, n), dtype=torch.uint8, device=device)
+    b = ((codes[1::2, :] << 4) | codes[0::2, :]).contiguous()
+    b_descale = (
+        torch.rand((k // 16, n), device=device, dtype=torch.float32) * 0.5 + 0.25
+    ).to(torch.float8_e4m3fn)
+    return codes, b, b_descale
+
+
+def _dequantize_fp4_w4a16_reference(codes, b_descale, alpha=None, block_size=16):
+    e2m1_values = torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
+        dtype=torch.float32,
+        device=codes.device,
+    )
+    weight = e2m1_values[codes.long()]
+    weight = weight * b_descale.to(torch.float32).repeat_interleave(block_size, dim=0)
+    if alpha is not None:
+        weight = weight * alpha.to(torch.float32)
+    return weight
+
+
+def testMmFp4W4A16(args):
+    m, n, k = args.m, args.n, args.k
+    device = torch.device("cuda")
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    supported_backends = ["torch"]
+    backends = args.backends or supported_backends
+    backends = [backend for backend in backends if backend in supported_backends]
+    if not backends:
+        raise ValueError("mm_fp4_w4a16 benchmark currently supports only --backends torch")
+    if k % 16 != 0:
+        raise ValueError("mm_fp4_w4a16 benchmark requires k to be divisible by 16")
+    if input_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("mm_fp4_w4a16 benchmark requires fp16 or bf16 input_dtype")
+    if out_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("mm_fp4_w4a16 benchmark requires fp16 or bf16 out_dtype")
+
+    a = torch.randn((m, k), device=device, dtype=input_dtype)
+    codes, b, b_descale = _make_fp4_w4a16_weight(k, n, device)
+    alpha = torch.ones((n,), device=device, dtype=torch.float32)
+
+    def run_backend(backend):
+        if backend == "torch":
+            return flashinfer.gemm.mm_fp4_w4a16(
+                a,
+                b,
+                b_descale,
+                alpha=alpha,
+                out_dtype=out_dtype,
+                block_size=16,
+            )
+        raise ValueError(f"Unsupported backend: {backend}")
+
+    ref = None
+    if args.refcheck:
+        weight = _dequantize_fp4_w4a16_reference(codes, b_descale, alpha)
+        ref = torch.matmul(a.to(torch.float32), weight).to(out_dtype)
+
+    results = []
+    flops = 2 * m * n * k
+    bytes_accessed = (
+        m * k * torch.tensor([], dtype=input_dtype).element_size()
+        + (k // 2) * n
+        + (k // 16) * n
+        + m * n * torch.tensor([], dtype=out_dtype).element_size()
+    )
+    for backend in backends:
+        if args.refcheck:
+            out = run_backend(backend)
+            torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+        timing = bench_gpu_time(run_backend, input_args=(backend,))
+        median_time = np.median(timing)
+        std_time = np.std(timing)
+        tflops = flops / median_time / 1e9
+        tb_per_sec = bytes_accessed / median_time / 1e9
+        result = {
+            "routine": args.routine,
+            "median_time": median_time,
+            "std_time": std_time,
+            "tflops": tflops,
+            "tb_per_sec": tb_per_sec,
+            "m": m,
+            "n": n,
+            "k": k,
+            "input_dtype": str(input_dtype).split(".")[-1],
+            "out_dtype": str(out_dtype).split(".")[-1],
+            "backend": backend,
+            "case_tag": getattr(args, "case_tag", ""),
+        }
+        print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+        results.append(result)
+    return results
 
 
 def testMmFp4(args):

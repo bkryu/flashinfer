@@ -185,6 +185,7 @@ benchmark_apis = {
         "bmm_fp8",
         "bmm_mxfp8",
         "mm_fp4",
+        "mm_fp4_w4a16",
         "mm_mxfp8",
         "mm_bf16",
         "bmm_bf16",

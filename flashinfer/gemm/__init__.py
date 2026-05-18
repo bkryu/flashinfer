@@ -4,6 +4,7 @@ from .gemm_base import bmm_fp8 as bmm_fp8
 from .gemm_base import bmm_mxfp8 as bmm_mxfp8
 from .gemm_base import mm_bf16 as mm_bf16
 from .gemm_base import mm_fp4 as mm_fp4
+from .gemm_base import mm_fp4_w4a16 as mm_fp4_w4a16
 from .gemm_base import mm_fp8 as mm_fp8
 from .gemm_base import mm_mxfp8 as mm_mxfp8
 from .gemm_base import tgv_gemm_sm100 as tgv_gemm_sm100
@@ -66,6 +67,7 @@ __all__ = [
     "bmm_mxfp8",
     "mm_bf16",
     "mm_fp4",
+    "mm_fp4_w4a16",
     "mm_fp8",
     "mm_mxfp8",
     "tgv_gemm_sm100",

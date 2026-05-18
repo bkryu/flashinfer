@@ -5845,6 +5845,153 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
     ),
 )
 
+_E2M1_TO_FLOAT32_VALUES = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+
+def _check_mm_fp4_w4a16_inputs(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+    block_size: int,
+) -> None:
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    valid_b_dtypes = (torch.uint8,) if fp4_dtype is None else (torch.uint8, fp4_dtype)
+
+    if a.ndim != 2:
+        raise ValueError(f"a must be 2D, got shape {tuple(a.shape)}")
+    if b.ndim != 2:
+        raise ValueError(f"b must be 2D, got shape {tuple(b.shape)}")
+    if b_descale.ndim != 2:
+        raise ValueError(
+            f"b_descale must be 2D, got shape {tuple(b_descale.shape)}"
+        )
+    if a.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"a must be bfloat16 or float16, got {a.dtype}")
+    if b.dtype not in valid_b_dtypes:
+        raise ValueError(f"b must be uint8 or float4_e2m1fn_x2, got {b.dtype}")
+    if b_descale.dtype not in (torch.float8_e4m3fn, torch.uint8):
+        raise ValueError(
+            f"b_descale must be float8_e4m3fn or uint8, got {b_descale.dtype}"
+        )
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"out_dtype must be bfloat16 or float16, got {out_dtype}"
+        )
+    if block_size != 16:
+        raise ValueError(
+            "mm_fp4_w4a16 currently supports block_size=16 only "
+            f"(got {block_size})"
+        )
+
+    m, k = a.shape
+    k_half, n = b.shape
+    if k % 2 != 0:
+        raise ValueError(f"a.shape[1] must be even, got K={k}")
+    if k_half * 2 != k:
+        raise ValueError(
+            "b must have shape [K // 2, N] for a.shape=[M, K]; "
+            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}"
+        )
+    if k % block_size != 0:
+        raise ValueError(f"K must be divisible by block_size={block_size}, got {k}")
+    expected_scale_shape = (k // block_size, n)
+    if tuple(b_descale.shape) != expected_scale_shape:
+        raise ValueError(
+            "b_descale must have shape [K // block_size, N]; "
+            f"expected {expected_scale_shape}, got {tuple(b_descale.shape)}"
+        )
+    if alpha is not None and alpha.numel() not in (1, n):
+        raise ValueError(
+            "alpha must be a scalar tensor or one value per output column; "
+            f"got shape {tuple(alpha.shape)}"
+        )
+    if out is not None:
+        expected_out_shape = (m, n)
+        if tuple(out.shape) != expected_out_shape:
+            raise ValueError(
+                f"out must have shape {expected_out_shape}, got {tuple(out.shape)}"
+            )
+        if out.dtype != out_dtype:
+            raise ValueError(f"out dtype {out.dtype} does not match {out_dtype}")
+
+
+def _dequantize_fp4_w4a16_weight(
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    block_size: int,
+) -> torch.Tensor:
+    b_u8 = b.view(torch.uint8)
+    k_half, n = b_u8.shape
+    k = k_half * 2
+    fp4_codes = torch.empty((k, n), dtype=torch.uint8, device=b_u8.device)
+    fp4_codes[0::2, :] = b_u8 & 0x0F
+    fp4_codes[1::2, :] = (b_u8 >> 4) & 0x0F
+
+    lut = torch.tensor(
+        _E2M1_TO_FLOAT32_VALUES, dtype=torch.float32, device=b_u8.device
+    )
+    b_float = lut[fp4_codes.long()]
+
+    b_scale = b_descale.view(torch.float8_e4m3fn).to(torch.float32)
+    b_float = b_float * b_scale.repeat_interleave(block_size, dim=0)
+    if alpha is not None:
+        alpha_float = alpha.to(device=b_u8.device, dtype=torch.float32)
+        if alpha_float.numel() == 1:
+            b_float = b_float * alpha_float.reshape(())
+        else:
+            b_float = b_float * alpha_float.reshape(1, -1)
+    return b_float
+
+
+@flashinfer_api
+def mm_fp4_w4a16(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+) -> torch.Tensor:
+    r"""Naive FP4 W4A16 matrix multiplication.
+
+    This reference-style implementation dequantizes packed FP4 weights with
+    PyTorch operations and then calls ``torch.matmul``. The packed weight uses
+    K-major layout: ``b.shape == (K // 2, N)``. The low nibble stores the even
+    K element and the high nibble stores the following odd K element.
+    """
+    if out_dtype is None:
+        out_dtype = a.dtype
+    _check_mm_fp4_w4a16_inputs(a, b, b_descale, alpha, out_dtype, out, block_size)
+
+    b_float = _dequantize_fp4_w4a16_weight(b, b_descale, alpha, block_size)
+    result = torch.matmul(a.to(torch.float32), b_float).to(out_dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
 
 @backend_requirement(
     {
