@@ -5874,9 +5874,15 @@ def _check_mm_fp4_w4a16_inputs(
     out: Optional[torch.Tensor],
     block_size: int,
 ) -> None:
-    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-    valid_b_dtypes = (torch.uint8,) if fp4_dtype is None else (torch.uint8, fp4_dtype)
+    """Validate the W4A16 inputs (Option B contract: B is pre-prepared).
 
+    Expected layout:
+      a:         (M, K)              bf16 / fp16
+      b:         (K // 16, N * 2)    int32 (output of prepare_fp4_w4a16_weight)
+      b_descale: (K // 16, N)        float8_e4m3fn or uint8
+      alpha:     (1,)                float32, optional
+      out:       (M, N)              same dtype as out_dtype
+    """
     if a.ndim != 2:
         raise ValueError(f"a must be 2D, got shape {tuple(a.shape)}")
     if b.ndim != 2:
@@ -5887,8 +5893,13 @@ def _check_mm_fp4_w4a16_inputs(
         )
     if a.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"a must be bfloat16 or float16, got {a.dtype}")
-    if b.dtype not in valid_b_dtypes:
-        raise ValueError(f"b must be uint8 or float4_e2m1fn_x2, got {b.dtype}")
+    if b.dtype != torch.int32:
+        raise ValueError(
+            f"b must be int32 (output of prepare_fp4_w4a16_weight); "
+            f"got {b.dtype}.  Call flashinfer.prepare_fp4_w4a16_weight(b_raw) "
+            f"once at model-load time to convert from raw (K//2, N) uint8 "
+            f"packed FP4 to the (K//16, N*2) int32 kernel layout."
+        )
     if b_descale.dtype not in (torch.float8_e4m3fn, torch.uint8):
         raise ValueError(
             f"b_descale must be float8_e4m3fn or uint8, got {b_descale.dtype}"
@@ -5904,26 +5915,37 @@ def _check_mm_fp4_w4a16_inputs(
         )
 
     m, k = a.shape
-    k_half, n = b.shape
-    if k % 2 != 0:
-        raise ValueError(f"a.shape[1] must be even, got K={k}")
-    if k_half * 2 != k:
+    k_tiles, n_packed = b.shape
+    if k % 16 != 0:
         raise ValueError(
-            "b must have shape [K // 2, N] for a.shape=[M, K]; "
+            f"K must be a multiple of 16 (got K={k}).  N from b is "
+            f"{n_packed // 2}; if you have raw (K//2, N) uint8, call "
+            f"prepare_fp4_w4a16_weight(...) first."
+        )
+    if k_tiles * 16 != k:
+        raise ValueError(
+            "b must have shape [K // 16, N * 2] for a.shape=[M, K]; "
             f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}"
         )
-    if k % block_size != 0:
-        raise ValueError(f"K must be divisible by block_size={block_size}, got {k}")
+    if n_packed % 2 != 0:
+        raise ValueError(f"b.shape[1] (= N*2) must be even, got {n_packed}")
+    n = n_packed // 2
+    if n % 64 != 0:
+        raise ValueError(
+            f"N must be a multiple of 64 (cute-DSL kernel tile width), got N={n}"
+        )
     expected_scale_shape = (k // block_size, n)
     if tuple(b_descale.shape) != expected_scale_shape:
         raise ValueError(
             "b_descale must have shape [K // block_size, N]; "
             f"expected {expected_scale_shape}, got {tuple(b_descale.shape)}"
         )
-    if alpha is not None and alpha.numel() not in (1, n):
+    if alpha is not None and alpha.numel() != 1:
         raise ValueError(
-            "alpha must be a scalar tensor or one value per output column; "
-            f"got shape {tuple(alpha.shape)}"
+            "alpha must be a scalar tensor (shape (1,) or scalar); "
+            f"got shape {tuple(alpha.shape)}.  Per-column alpha is not "
+            f"supported -- fold per-column factors into b_descale at "
+            f"model-load time."
         )
     if out is not None:
         expected_out_shape = (m, n)
@@ -5940,28 +5962,144 @@ def _dequantize_fp4_w4a16_weight(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor],
     block_size: int,
+    n: int,
 ) -> torch.Tensor:
-    b_u8 = b.view(torch.uint8)
-    k_half, n = b_u8.shape
-    k = k_half * 2
-    fp4_codes = torch.empty((k, n), dtype=torch.uint8, device=b_u8.device)
-    fp4_codes[0::2, :] = b_u8 & 0x0F
-    fp4_codes[1::2, :] = (b_u8 >> 4) & 0x0F
+    """Reverse prepare + dequant for the ``torch`` backend / refcheck path.
 
+    Takes the prepared (K // 16, N * 2) int32 tensor, unpacks back to
+    (K, N) FP4 codes, then dequants with the FP8 scale and (scalar)
+    alpha.  Vectorised; intended for verification and small-shape
+    fallback only.
+    """
+    from .marlin_repack import unpack_fp4_w4a16_weight
+
+    k = b.shape[0] * 16  # K // 16 rows
+    codes = unpack_fp4_w4a16_weight(b, k, n)
     lut = torch.tensor(
-        _E2M1_TO_FLOAT32_VALUES, dtype=torch.float32, device=b_u8.device
+        _E2M1_TO_FLOAT32_VALUES, dtype=torch.float32, device=b.device
     )
-    b_float = lut[fp4_codes.long()]
-
+    b_float = lut[codes.long()]
     b_scale = b_descale.view(torch.float8_e4m3fn).to(torch.float32)
     b_float = b_float * b_scale.repeat_interleave(block_size, dim=0)
     if alpha is not None:
-        alpha_float = alpha.to(device=b_u8.device, dtype=torch.float32)
-        if alpha_float.numel() == 1:
-            b_float = b_float * alpha_float.reshape(())
-        else:
-            b_float = b_float * alpha_float.reshape(1, -1)
+        b_float = b_float * alpha.to(device=b.device, dtype=torch.float32).reshape(())
     return b_float
+
+
+# Cached scalar-one alpha tensor per device for callers that don't supply alpha.
+_W4A16_ALPHA_ONE_CACHE: dict = {}
+
+
+def _prepare_w4a16_alpha(
+    alpha: Optional[torch.Tensor], device: torch.device
+) -> torch.Tensor:
+    if alpha is None:
+        cached = _W4A16_ALPHA_ONE_CACHE.get(device)
+        if cached is None:
+            cached = torch.tensor([1.0], dtype=torch.float32, device=device)
+            _W4A16_ALPHA_ONE_CACHE[device] = cached
+        return cached
+    if alpha.dim() == 0:
+        return alpha.to(torch.float32).unsqueeze(0)
+    return alpha.to(torch.float32).reshape(1)
+
+
+def _select_w4a16_tile_shape(
+    m: int, n: int, k: int
+) -> Tuple[int, int, int]:
+    """Pick a CTA tile shape for the cute-DSL W4A16 kernel.
+
+    Hardcoded ``(64, 64, 64)`` for now -- the only shape exercised in
+    Phase 2 validation (14/14 correctness, 26.8 us at M=4 N=K=4096).
+    Heuristic to widen this is Phase 3d work.
+    """
+    return (64, 64, 64)
+
+
+_CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE: dict = {}
+
+
+def _get_cute_dsl_w4a16_gemm(
+    tile_shape_mnk: Tuple[int, int, int],
+    a_dtype: torch.dtype,
+    c_dtype: torch.dtype,
+):
+    """Compile (or fetch from cache) the cute-DSL W4A16 GEMM kernel.
+
+    The compiled kernel takes (in order) at call time:
+      mA        : (m, k)              a_dtype (bf16 / fp16)
+      mB        : (k // 16, n * 2)    int32 -- Marlin-packed FP4
+      mB_sf     : (k // 16, n)        uint8 -- FP8-E4M3 scales
+      mC        : (m, n)              c_dtype
+      mAlpha    : (1,)                float32 scalar
+    """
+    cache_key = (tile_shape_mnk, a_dtype, c_dtype)
+    cached = _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    _check_cute_dsl_availability()
+
+    import cutlass
+    import cutlass.cute as cute
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    from .kernels.dense_gemm_w4a16_blackwell import (
+        BlackwellDenseGemmW4A16Kernel,
+    )
+
+    a_cutlass_dtype = getattr(cutlass, _TORCH_TO_CUTLASS_DTYPE_ATTR[a_dtype])
+    c_cutlass_dtype = getattr(cutlass, _TORCH_TO_CUTLASS_DTYPE_ATTR[c_dtype])
+
+    sym_m = cute.sym_int()
+    sym_k = cute.sym_int()
+    sym_n = cute.sym_int()
+    sym_k_tiles = cute.sym_int()
+    sym_n_packed = cute.sym_int()
+
+    a_fake = cute.runtime.make_fake_compact_tensor(
+        a_cutlass_dtype, (sym_m, sym_k), stride_order=(1, 0), assumed_align=16
+    )
+    b_marlin_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (sym_k_tiles, sym_n_packed),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    b_sf_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_k_tiles, sym_n), stride_order=(1, 0), assumed_align=16
+    )
+    c_fake = cute.runtime.make_fake_compact_tensor(
+        c_cutlass_dtype, (sym_m, sym_n), stride_order=(1, 0), assumed_align=16
+    )
+    alpha_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (1,), assumed_align=4
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    gemm = BlackwellDenseGemmW4A16Kernel(
+        acc_dtype=cutlass.Float32, tile_shape_mnk=tile_shape_mnk
+    )
+    max_active_clusters = get_max_active_clusters(1)
+
+    compiled = cute.compile(
+        gemm.wrapper,
+        a_fake,
+        b_marlin_fake,
+        b_sf_fake,
+        c_fake,
+        alpha_fake,
+        1,  # l (batch)
+        max_active_clusters,
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+    _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE[cache_key] = compiled
+    return compiled
+
+
+_W4A16_BACKENDS = ("auto", "cute-dsl", "torch")
 
 
 @flashinfer_api
@@ -5973,19 +6111,76 @@ def mm_fp4_w4a16(
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
+    backend: str = "auto",
 ) -> torch.Tensor:
-    r"""Naive FP4 W4A16 matrix multiplication.
+    r"""FP4 W4A16 matrix multiplication: ``C = A @ dequant(B, B_sf) * alpha``.
 
-    This reference-style implementation dequantizes packed FP4 weights with
-    PyTorch operations and then calls ``torch.matmul``. The packed weight uses
-    K-major layout: ``b.shape == (K // 2, N)``. The low nibble stores the even
-    K element and the high nibble stores the following odd K element.
+    The weight tensor ``b`` must be **pre-prepared** by calling
+    :func:`flashinfer.prepare_fp4_w4a16_weight` once at model-load
+    time.  Re-preparing every call is intentionally not supported -- it
+    is expensive (~ms for LLM-sized weights) relative to the GEMM
+    itself, so the API forces it to be a load-time activity.
+
+    Args:
+        a:          ``(M, K)`` bf16 or fp16 activation tensor.
+        b:          ``(K // 16, N * 2)`` ``int32`` -- output of
+                    :func:`flashinfer.prepare_fp4_w4a16_weight` on the
+                    raw ``(K // 2, N) uint8`` packed FP4 weight.
+        b_descale:  ``(K // 16, N)`` ``float8_e4m3fn`` (or ``uint8``)
+                    per-group FP8-E4M3 scales.
+        alpha:      Optional scalar ``(1,) float32`` global scale.  Per-
+                    column alpha is not supported -- fold it into
+                    ``b_descale`` at model-load time if needed.
+        out_dtype:  ``torch.bfloat16`` or ``torch.float16``.  Defaults
+                    to ``a.dtype``.
+        out:        Optional pre-allocated output tensor.
+        block_size: Must be 16.
+        backend:    ``"auto"`` (cute-DSL on Blackwell, ``torch``
+                    fallback elsewhere), ``"cute-dsl"`` (force the cute
+                    kernel; requires SM100+), or ``"torch"`` (reference
+                    implementation; unpacks ``b`` to raw FP4 and runs
+                    ``torch.matmul`` -- slow, used for validation).
+
+    Returns:
+        ``(M, N)`` tensor of ``out_dtype``.
     """
     if out_dtype is None:
         out_dtype = a.dtype
     _check_mm_fp4_w4a16_inputs(a, b, b_descale, alpha, out_dtype, out, block_size)
 
-    b_float = _dequantize_fp4_w4a16_weight(b, b_descale, alpha, block_size)
+    if backend not in _W4A16_BACKENDS:
+        raise ValueError(
+            f"Unknown backend {backend!r}, expected one of {_W4A16_BACKENDS}"
+        )
+
+    m = a.shape[0]
+    n = b.shape[1] // 2
+    k = a.shape[1]
+
+    selected_backend = backend
+    if selected_backend == "auto":
+        # cute-DSL kernel targets Blackwell (SM100/103/120/121).
+        if is_sm100a_supported(a.device):
+            selected_backend = "cute-dsl"
+        else:
+            major, _ = get_compute_capability(a.device)
+            if major >= 10:
+                selected_backend = "cute-dsl"
+            else:
+                selected_backend = "torch"
+
+    if selected_backend == "cute-dsl":
+        tile_shape_mnk = _select_w4a16_tile_shape(m, n, k)
+        compiled = _get_cute_dsl_w4a16_gemm(tile_shape_mnk, a.dtype, out_dtype)
+        b_sf_u8 = b_descale.view(torch.uint8).contiguous()
+        alpha_for_launch = _prepare_w4a16_alpha(alpha, a.device)
+        if out is None:
+            out = torch.empty((m, n), device=a.device, dtype=out_dtype)
+        compiled(a, b, b_sf_u8, out, alpha_for_launch)
+        return out
+
+    # Torch reference path.
+    b_float = _dequantize_fp4_w4a16_weight(b, b_descale, alpha, block_size, n)
     result = torch.matmul(a.to(torch.float32), b_float).to(out_dtype)
     if out is not None:
         out.copy_(result)

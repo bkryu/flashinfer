@@ -94,10 +94,29 @@ class BlackwellDenseGemmW4A16Kernel:
         self,
         acc_dtype,
         tile_shape_mnk,
+        epi_stage: int = 4,
     ):
+        """W4A16 kernel.
+
+        Args:
+            acc_dtype: accumulator dtype (always Float32 for this kernel).
+            tile_shape_mnk: CTA tile shape.
+            epi_stage: TMA-store pipeline depth.  Default 4 balances
+                cross-tile overlap (epi_stage > 1 lets next-tile compute
+                overlap with this-tile store) against SMEM available for
+                ab_stage (deeper ab_stage hides TMA-load latency, which
+                dominates the small-M shape's stalls).  At M=4 with the
+                default 64-CTA grid on 148 SMs, each SM gets at most
+                one tile, so epi_stage > 1 doesn't help much locally;
+                we keep 2-4 to preserve persistent-scheduler benefits
+                at larger M.
+        """
         self.acc_dtype = acc_dtype
         self.cluster_shape_mnk = (1, 1, 1)
         self.tile_shape_mnk = tuple(tile_shape_mnk)
+        self.epi_stage_target = int(epi_stage)
+        if self.epi_stage_target < 1:
+            raise ValueError(f"epi_stage must be >= 1 (got {epi_stage})")
         self.tiled_mma = None
         self.num_mcast_ctas_a = None
         self.num_mcast_ctas_b = None
@@ -125,9 +144,10 @@ class BlackwellDenseGemmW4A16Kernel:
         self.num_mma_warps = (
             self.atom_layout[0] * self.atom_layout[1] * self.atom_layout[2]
         )
+        self.num_dma_warps = 1
         self.num_threads_per_warp = 32
         self.threads_per_cta = (
-            self.num_mma_warps + 1  # +1 warp for DMA
+            self.num_mma_warps + self.num_dma_warps
         ) * self.num_threads_per_warp
         # SM100/103 expose >= SM120 SMEM/CTA; using sm_120 as the cap means
         # one binary works across all four Blackwell targets without
@@ -194,6 +214,7 @@ class BlackwellDenseGemmW4A16Kernel:
             self.smem_capacity,
             self.occupancy,
             self.GROUP_SIZE,
+            self.epi_stage_target,
         )
 
         if self.ab_stage == 0:
@@ -771,23 +792,17 @@ class BlackwellDenseGemmW4A16Kernel:
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
                 tma_store_pipeline.producer_tail()
-        # DMA warp: warp == num_mma_warps does TMA loads of A and
-        # B_marlin (int32 packed FP4).
+        # DMA warp: warp == num_mma_warps does TMA loads of A,
+        # B_marlin, and B_sf for each K-tile.
         elif warp_idx == self.num_mma_warps:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
 
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
-                # B Marlin is (K // 16, N * 2, L) gmem.  After tma_partition
-                # over modes (tile_K//16, 2*tile_N), the outer dim order is
-                # (outer_K, outer_N, outer_L) -- leave outer_K wildcard
-                # (= k_tile counter), fix outer_N and outer_L.
                 tBmarlin_g_kn = tBmarlin_g[
                     (None, None, tile_coord_mnl[1], tile_coord_mnl[2])
                 ]
-                # B_sf has the same outer dim order as B_marlin after
-                # tma_partition: (outer_K, outer_N, outer_L).
                 tBsf_g_kn = tBsf_g[
                     (None, None, tile_coord_mnl[1], tile_coord_mnl[2])
                 ]
@@ -848,13 +863,13 @@ class BlackwellDenseGemmW4A16Kernel:
         smem_capacity: int,
         occupancy: int,
         group_size: int = 16,
+        epi_stage: int = 4,
     ) -> Tuple[int, int]:
         """Stage budget accounting for A + B (Marlin int32) + B_sf (uint8).
 
         Per (16K x 64N) Marlin block: 128 int32 = 512 bytes.
         Per (group_size K x tile_N N) scale block: tile_N bytes.
         """
-        epi_stage = 8
         c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
         epi_bytes = c_bytes_per_stage * epi_stage
 

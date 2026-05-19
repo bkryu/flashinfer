@@ -5,6 +5,8 @@ from .gemm_base import bmm_mxfp8 as bmm_mxfp8
 from .gemm_base import mm_bf16 as mm_bf16
 from .gemm_base import mm_fp4 as mm_fp4
 from .gemm_base import mm_fp4_w4a16 as mm_fp4_w4a16
+from .marlin_repack import prepare_fp4_w4a16_weight as prepare_fp4_w4a16_weight
+from .marlin_repack import unpack_fp4_w4a16_weight as unpack_fp4_w4a16_weight
 from .gemm_base import mm_fp8 as mm_fp8
 from .gemm_base import mm_mxfp8 as mm_mxfp8
 from .gemm_base import tgv_gemm_sm100 as tgv_gemm_sm100
@@ -68,6 +70,8 @@ __all__ = [
     "mm_bf16",
     "mm_fp4",
     "mm_fp4_w4a16",
+    "prepare_fp4_w4a16_weight",
+    "unpack_fp4_w4a16_weight",
     "mm_fp8",
     "mm_mxfp8",
     "tgv_gemm_sm100",

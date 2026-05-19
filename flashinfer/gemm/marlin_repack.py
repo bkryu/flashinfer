@@ -143,49 +143,88 @@ def prepare_fp4_w4a16_weight(b: torch.Tensor) -> torch.Tensor:
     return out64.to(torch.int32).reshape(k_tiles, n_tiles * _INTS_PER_TILE)
 
 
-# Convenience inverse for round-trip testing.  NOT used by the kernel.
-def _unpack_for_test(b_prepared: torch.Tensor, k: int, n: int) -> torch.Tensor:
-    """Reverse ``prepare_fp4_w4a16_weight`` for unit testing.
+def unpack_fp4_w4a16_weight(b_prepared: torch.Tensor, k: int, n: int) -> torch.Tensor:
+    """Reverse ``prepare_fp4_w4a16_weight``.
 
-    Returns the original ``(K, N)`` per-element FP4 codes as uint8.
+    Recovers the per-element FP4 codes from the kernel-format prepared
+    tensor.  Used by the ``torch`` fallback backend in ``mm_fp4_w4a16``
+    and by tests for round-trip validation.
+
+    Args:
+        b_prepared: ``(K // 16, N * 2)`` ``int32`` tensor produced by
+            ``prepare_fp4_w4a16_weight``.
+        k: Original ``K`` dimension.
+        n: Original ``N`` dimension.
+
+    Returns:
+        ``(K, N)`` ``uint8`` tensor of FP4 codes (each value in [0, 16)).
     """
+    if b_prepared.dtype != torch.int32:
+        raise TypeError(
+            f"b_prepared must be int32 (got {b_prepared.dtype})"
+        )
+    if k % _TILE_K != 0:
+        raise ValueError(f"K must be a multiple of {_TILE_K} (got K={k})")
+    if n % _TILE_N != 0:
+        raise ValueError(f"N must be a multiple of {_TILE_N} (got N={n})")
+
     device = b_prepared.device
     k_tiles = k // _TILE_K
     n_tiles = n // _TILE_N
-    out = torch.empty((k, n), dtype=torch.uint8, device=device)
 
+    # Same per-position maps as prepare_fp4_w4a16_weight.
+    u32_pos = torch.arange(_INTS_PER_TILE, device=device, dtype=torch.long)
+    u32_idx_local = u32_pos % 2
+    lane = (u32_pos // 2) % 32
+    n_warp_idx = u32_pos // 64
+    tc_col = lane // 4
+    tc_row_half = lane % 4
+    base_n = n_warp_idx * 8 + tc_col
+
+    byte_k_half_offset = torch.tensor(
+        [0, 4, 0, 4], device=device, dtype=torch.long
+    )
+    n_offset_stack = torch.stack(
+        [
+            torch.tensor([0, 0, 16, 16], device=device, dtype=torch.long),
+            torch.tensor([32, 32, 48, 48], device=device, dtype=torch.long),
+        ],
+        dim=0,
+    )
+    byte_n_offset = n_offset_stack[u32_idx_local]  # (u32_pos, 4)
+
+    # Where each (k_tile, n_tile, u32_pos, byte_idx) byte lands in the
+    # output (K // 2, N) packed view -- i.e. its source K-half row and
+    # N column.
+    kt = torch.arange(k_tiles, device=device, dtype=torch.long)
+    nt = torch.arange(n_tiles, device=device, dtype=torch.long)
+    k_half_global = (
+        kt[:, None, None, None] * (_TILE_K // 2)
+        + tc_row_half[None, None, :, None]
+        + byte_k_half_offset[None, None, None, :]
+    )
+    n_global = (
+        nt[None, :, None, None] * _TILE_N
+        + base_n[None, None, :, None]
+        + byte_n_offset[None, None, :, :]
+    )
+
+    # Extract the four bytes from each int32 (little-endian).
     b_view = b_prepared.reshape(k_tiles, n_tiles, _INTS_PER_TILE).to(torch.int64)
+    bytes_per_u32 = torch.empty(
+        (k_tiles, n_tiles, _INTS_PER_TILE, 4), dtype=torch.uint8, device=device
+    )
+    for byte_idx in range(4):
+        bytes_per_u32[..., byte_idx] = (
+            (b_view >> (byte_idx * 8)) & 0xFF
+        ).to(torch.uint8)
 
-    for u32_pos in range(_INTS_PER_TILE):
-        u32_idx_local = u32_pos % 2
-        lane = (u32_pos // 2) % 32
-        n_warp_idx = u32_pos // 64
-        tc_col = lane // 4
-        tc_row_half = lane % 4
-        base_n = n_warp_idx * 8 + tc_col
+    # Scatter bytes back to (K // 2, N) packed layout.
+    packed = torch.empty((k // 2, n), dtype=torch.uint8, device=device)
+    packed[k_half_global, n_global] = bytes_per_u32
 
-        for byte_idx in range(4):
-            if u32_idx_local == 0:
-                n_off = (0, 0, 16, 16)[byte_idx]
-            else:
-                n_off = (32, 32, 48, 48)[byte_idx]
-            k_half_in_tile = tc_row_half + (0, 4, 0, 4)[byte_idx]
-
-            byte_val = ((b_view[:, :, u32_pos] >> (byte_idx * 8)) & 0xFF).to(
-                torch.uint8
-            )
-            low_nibble = byte_val & 0x0F
-            high_nibble = (byte_val >> 4) & 0x0F
-
-            k_even = 2 * k_half_in_tile
-            k_odd = k_even + 1
-
-            for kt in range(k_tiles):
-                for nt in range(n_tiles):
-                    out[kt * _TILE_K + k_even, nt * _TILE_N + base_n + n_off] = (
-                        low_nibble[kt, nt]
-                    )
-                    out[kt * _TILE_K + k_odd, nt * _TILE_N + base_n + n_off] = (
-                        high_nibble[kt, nt]
-                    )
-    return out
+    # Split each packed byte into low nibble (= even K) and high nibble (= odd K).
+    codes = torch.empty((k, n), dtype=torch.uint8, device=device)
+    codes[0::2, :] = packed & 0x0F
+    codes[1::2, :] = (packed >> 4) & 0x0F
+    return codes

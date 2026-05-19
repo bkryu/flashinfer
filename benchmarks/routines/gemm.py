@@ -1065,37 +1065,55 @@ def _dequantize_fp4_w4a16_reference(codes, b_descale, alpha=None, block_size=16)
 
 
 def testMmFp4W4A16(args):
+    """Benchmark mm_fp4_w4a16 (Option B contract).
+
+    Pre-prepares the FP4 weight once via flashinfer.prepare_fp4_w4a16_weight,
+    then times only the GEMM call.  ``--backends`` accepts ``torch``
+    (PyTorch reference) and ``cute-dsl`` (Blackwell cute-DSL kernel).
+    Scalar alpha only -- per-column alpha is not supported by either
+    backend (fold it into b_descale at model-load time).
+
+    Constraints (enforced by the kernel partition):
+      * K must be divisible by 16
+      * N must be divisible by 64
+    """
     m, n, k = args.m, args.n, args.k
     device = torch.device("cuda")
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
-    supported_backends = ["torch"]
+    supported_backends = ["torch", "cute-dsl"]
     backends = args.backends or supported_backends
     backends = [backend for backend in backends if backend in supported_backends]
     if not backends:
-        raise ValueError("mm_fp4_w4a16 benchmark currently supports only --backends torch")
+        raise ValueError(
+            f"mm_fp4_w4a16 benchmark supports --backends {supported_backends}"
+        )
     if k % 16 != 0:
         raise ValueError("mm_fp4_w4a16 benchmark requires k to be divisible by 16")
+    if n % 64 != 0:
+        raise ValueError("mm_fp4_w4a16 benchmark requires n to be divisible by 64")
     if input_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("mm_fp4_w4a16 benchmark requires fp16 or bf16 input_dtype")
     if out_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("mm_fp4_w4a16 benchmark requires fp16 or bf16 out_dtype")
 
     a = torch.randn((m, k), device=device, dtype=input_dtype)
-    codes, b, b_descale = _make_fp4_w4a16_weight(k, n, device)
-    alpha = torch.ones((n,), device=device, dtype=torch.float32)
+    codes, b_raw, b_descale = _make_fp4_w4a16_weight(k, n, device)
+    # Pre-prepare once -- this is what users do at model load.  Not timed.
+    b_prepared = flashinfer.prepare_fp4_w4a16_weight(b_raw)
+    # Scalar alpha (the kernel's supported form).
+    alpha = torch.tensor([0.75], device=device, dtype=torch.float32)
 
     def run_backend(backend):
-        if backend == "torch":
-            return flashinfer.gemm.mm_fp4_w4a16(
-                a,
-                b,
-                b_descale,
-                alpha=alpha,
-                out_dtype=out_dtype,
-                block_size=16,
-            )
-        raise ValueError(f"Unsupported backend: {backend}")
+        return flashinfer.gemm.mm_fp4_w4a16(
+            a,
+            b_prepared,
+            b_descale,
+            alpha=alpha,
+            out_dtype=out_dtype,
+            block_size=16,
+            backend=backend,
+        )
 
     ref = None
     if args.refcheck:
@@ -1106,8 +1124,8 @@ def testMmFp4W4A16(args):
     flops = 2 * m * n * k
     bytes_accessed = (
         m * k * torch.tensor([], dtype=input_dtype).element_size()
-        + (k // 2) * n
-        + (k // 16) * n
+        + (k // 2) * n  # FP4 weight in compressed form
+        + (k // 16) * n  # FP8-E4M3 scales
         + m * n * torch.tensor([], dtype=out_dtype).element_size()
     )
     for backend in backends:
