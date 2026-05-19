@@ -6009,11 +6009,25 @@ def _select_w4a16_tile_shape(
 ) -> Tuple[int, int, int]:
     """Pick a CTA tile shape for the cute-DSL W4A16 kernel.
 
-    Hardcoded ``(64, 64, 64)`` for now -- the only shape exercised in
-    Phase 2 validation (14/14 correctness, 26.8 us at M=4 N=K=4096).
-    Heuristic to widen this is Phase 3d work.
+    tile_M choice: the MMA partition uses atom_layout (2,2,1) + permutation
+    (32, 32, 16), so tile_M must be a multiple of 32.  For small batch (M
+    <= 32) we use tile_M=32 -- halves A SMEM and MMA work per CTA vs
+    tile_M=64 (which would waste ~94% of M rows at M=4).  At M=4 N=K=4096
+    this saves ~2.5 us vs tile_M=64 with the same tile_K.
+
+    tile_K choice: when K is a multiple of 128 we use tile_K=128, which
+    halves the K-tile count and amortizes TMA-load + pipeline-barrier
+    overhead -- saves ~1.6 us vs tile_K=64 at the reference shape.  ab_stage
+    stays at 7 for tile_M=32, plenty for overlap.
+
+    Combined ``(32, 64, 128)`` is the locked-in default for M <= 32 and
+    K % 128 == 0; 21.5 us at M=4 N=K=4096.  Falls back to a wider tile
+    for larger M (more rows to amortize across) and to tile_K=64 when K
+    is not a multiple of 128.
     """
-    return (64, 64, 64)
+    tile_m = 32 if m <= 32 else 64
+    tile_k = 128 if k % 128 == 0 else 64
+    return (tile_m, 64, tile_k)
 
 
 _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE: dict = {}
