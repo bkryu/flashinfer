@@ -1,0 +1,1184 @@
+# Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+"""W4A16 dense GEMM for Blackwell (SM100/103/120/121).
+
+Built on top of ``dense_gemm_bf16_blackwell.py`` (faithful port of
+CUTLASS's blackwell_geforce ``dense_gemm.py``) by replacing the B-operand
+path with packed FP4 weights + per-group FP8-E4M3 scales + a global
+alpha.  A and C remain bf16/fp16; the MMA atom and accumulator are
+unchanged.
+
+The B fragment is filled in-register by:
+
+  1. Loading two ``int32`` from ``sB_marlin`` per thread per K-block
+     (deterministic offsets driven by the cute partition; see
+     ``flashinfer/gemm/marlin_repack.py`` for the layout).
+  2. Decoding each ``int32`` via ``cvt.rn.f16x2.e2m1x2`` -> 4 ``fp16x2``
+     (= 8 fp16) using ``fp4_decode_4bytes``.
+  3. Multiplying each pair by its per-group E4M3 scale (gmem-direct
+     load, converted via ``cvt_e4m3_to_f32_via_f16``) and the scalar
+     ``alpha``.
+  4. Casting back to the compute dtype and writing into ``tCrB``.
+
+Everything else (TMA pipeline for A, persistent tile scheduler,
+epilogue) is unchanged from the bf16 base.
+"""
+
+from typing import Tuple, Type
+
+import cuda.bindings.driver as cuda
+
+import cutlass
+import cutlass.cute as cute
+import cutlass.pipeline as pipeline
+import cutlass.utils as utils
+import cutlass.utils.hopper_helpers as sm90_utils
+from cutlass import Float32, Int32, Uint32
+
+from ...cute_dsl.fp4_common import (
+    cvt_e4m3_to_f32_via_f16,
+    f16x2_to_f32x2,
+    fp4_decode_4bytes,
+)
+
+# Marlin packing constants (must match flashinfer/gemm/marlin_repack.py).
+_MARLIN_TILE_K: cutlass.Constexpr = 16
+_MARLIN_TILE_N: cutlass.Constexpr = 64
+_MARLIN_INTS_PER_TILE: cutlass.Constexpr = 128  # 128 int32 per (16K x 64N) block
+
+
+class BlackwellDenseGemmW4A16Kernel:
+    """Warp-MMA dense GEMM for Blackwell, FP4-weight A bf16/fp16 input.
+
+    A: (M, K, L) bf16/fp16.
+    B: (K // 16, N * 2, L) int32 -- Marlin-packed FP4 (see prepare).
+    B_sf: (K // 16, N, L) uint8 -- FP8-E4M3 per-group scales.
+    alpha: (1,) fp32 -- global scalar scale.
+    C: (M, N, L) bf16/fp16; fp32 accumulator cast at write.
+
+    Uses ``MmaF16BF16Op`` (16x8x16) + ``LdMatrix8x8x16bOp.x4`` for A and
+    in-register FP4 decode for B.  Producer/consumer pipeline split with
+    a single DMA warp doing TMA loads of A and B_marlin.  Group size is
+    hardcoded to 16 (= MMA K-block size).
+    """
+
+    GROUP_SIZE: cutlass.Constexpr = 16
+
+    def __init__(
+        self,
+        acc_dtype,
+        tile_shape_mnk,
+    ):
+        self.acc_dtype = acc_dtype
+        self.cluster_shape_mnk = (1, 1, 1)
+        self.tile_shape_mnk = tuple(tile_shape_mnk)
+        self.tiled_mma = None
+        self.num_mcast_ctas_a = None
+        self.num_mcast_ctas_b = None
+        self.is_a_mcast = False
+        self.is_b_mcast = False
+
+        if self.tile_shape_mnk[1] % _MARLIN_TILE_N != 0:
+            raise ValueError(
+                f"W4A16 requires tile_N % {_MARLIN_TILE_N} == 0 "
+                f"(got tile_N={self.tile_shape_mnk[1]})"
+            )
+        if self.tile_shape_mnk[2] % _MARLIN_TILE_K != 0:
+            raise ValueError(
+                f"W4A16 requires tile_K % {_MARLIN_TILE_K} == 0 "
+                f"(got tile_K={self.tile_shape_mnk[2]})"
+            )
+
+        self.occupancy = 1
+        # 2x2 atom layout: 4 MMA warps arranged as 2 M-warps x 2 N-warps.
+        # Matches the upstream Blackwell-Geforce reference; the partition
+        # diagnostic (see scratch_partition_mapping.py) shows mma_n=4
+        # (n_inner=2 via *2 trick x n_outer=2), giving 16 fp16 per thread
+        # per K-block = 2 int32 of FP4 to decode + scale.
+        self.atom_layout = (2, 2, 1)
+        self.num_mma_warps = (
+            self.atom_layout[0] * self.atom_layout[1] * self.atom_layout[2]
+        )
+        self.num_threads_per_warp = 32
+        self.threads_per_cta = (
+            self.num_mma_warps + 1  # +1 warp for DMA
+        ) * self.num_threads_per_warp
+        # SM100/103 expose >= SM120 SMEM/CTA; using sm_120 as the cap means
+        # one binary works across all four Blackwell targets without
+        # over-allocating on the smaller consumer chips.
+        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
+
+        self.ab_stage = None
+        self.epi_stage = None
+
+        self.a_smem_layout_staged = None
+        self.b_smem_layout_staged = None
+        self.epi_smem_layout_staged = None
+        self.epi_tile = None
+
+        self.shared_storage = None
+        self.buffer_align_bytes = 1024
+
+        self.epilog_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=2,
+            num_threads=self.num_mma_warps * self.num_threads_per_warp,
+        )
+        self.load_register_requirement = 40
+        self.mma_register_requirement = 232
+
+    def _setup_attributes(self):
+        self.mma_inst_mnk = (16, 8, 16)
+        op = cute.nvgpu.warp.MmaF16BF16Op(
+            self.a_dtype,
+            self.acc_dtype,
+            self.mma_inst_mnk,
+        )
+        tC = cute.make_layout(self.atom_layout)
+        permutation_mnk = (
+            self.atom_layout[0] * self.mma_inst_mnk[0],
+            # *2 trick: each warp covers two atom-N tiles in one ldmatrix.x4
+            self.atom_layout[1] * self.mma_inst_mnk[1] * 2,
+            self.atom_layout[2] * self.mma_inst_mnk[2],
+        )
+        self.tiled_mma = cute.make_tiled_mma(
+            op,
+            tC,
+            permutation_mnk=permutation_mnk,
+        )
+
+        self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
+
+        self.num_mcast_ctas_a = self.cluster_shape_mnk[1]
+        self.num_mcast_ctas_b = self.cluster_shape_mnk[0]
+        self.is_a_mcast = self.num_mcast_ctas_a > 1
+        self.is_b_mcast = self.num_mcast_ctas_b > 1
+
+        self.epi_tile = sm90_utils.compute_tile_shape_or_override(
+            self.tile_shape_mnk, self.c_dtype, is_cooperative=False
+        )
+
+        # B-side smem is Marlin-packed int32 (4 bytes per logical FP4
+        # pair).  Stage budget uses int32 B + uint8 scales; bf16 phantom
+        # layout is only used by partition_B/make_fragment_B.
+        self.ab_stage, self.epi_stage = self._compute_stages(
+            self.tile_shape_mnk,
+            self.a_dtype,
+            self.epi_tile,
+            self.c_dtype,
+            self.smem_capacity,
+            self.occupancy,
+            self.GROUP_SIZE,
+        )
+
+        if self.ab_stage == 0:
+            raise RuntimeError(
+                "ab_stage == 0: not enough shared memory for this tile shape "
+                f"({self.tile_shape_mnk}) at occupancy {self.occupancy}."
+            )
+
+        (
+            self.a_smem_layout_staged,
+            self.b_marlin_smem_layout_staged,
+            self.b_sf_smem_layout_staged,
+            self.b_bf16_logical_layout,
+            self.epi_smem_layout_staged,
+        ) = self._make_smem_layouts(
+            self.tile_shape_mnk,
+            self.epi_tile,
+            self.a_dtype,
+            self.a_layout,
+            self.b_compute_dtype,
+            self.b_layout_compute,
+            self.ab_stage,
+            self.c_dtype,
+            self.c_layout,
+            self.epi_stage,
+            self.GROUP_SIZE,
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b_marlin: cute.Tensor,
+        b_sf: cute.Tensor,
+        c: cute.Tensor,
+        alpha: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        self.a_dtype = a.element_type
+        self.b_compute_dtype = a.element_type  # MMA B fragment dtype = A dtype
+        self.c_dtype = c.element_type
+
+        self.a_layout = utils.LayoutEnum.from_tensor(a)
+        # B's compute (= post-dequant) view is N-major: matches the ldmatrix
+        # convention that the bf16 kernel uses for B.
+        self.b_layout_compute = utils.LayoutEnum.ROW_MAJOR
+        self.c_layout = utils.LayoutEnum.from_tensor(c)
+
+        if cutlass.const_expr(self.a_dtype.width != 16):
+            raise TypeError(f"a_dtype must be 16-bit (bf16/fp16), got {self.a_dtype}")
+        if cutlass.const_expr(self.a_dtype != self.c_dtype):
+            raise TypeError(
+                f"a_dtype and c_dtype must match, got {self.a_dtype} vs {self.c_dtype}"
+            )
+
+        self._setup_attributes()
+
+        tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
+            a,
+            self.a_smem_layout_staged,
+            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
+            1,
+        )
+
+        # B Marlin TMA: tile is (tile_K // 16, 2 * tile_N) int32.
+        b_marlin_tma_tile = (
+            self.tile_shape_mnk[2] // _MARLIN_TILE_K,
+            2 * self.tile_shape_mnk[1],
+        )
+        tma_atom_b_marlin, tma_tensor_b_marlin = self._make_tma_atoms_and_tensors(
+            b_marlin,
+            self.b_marlin_smem_layout_staged,
+            b_marlin_tma_tile,
+            1,
+        )
+
+        # B scale TMA: tile is (tile_K // group_size, tile_N) uint8.
+        # Small per-tile load -- this replaces ``tile_K // group_size``
+        # gmem-direct loads per thread per K-block in the dequant path.
+        b_sf_tma_tile = (
+            self.tile_shape_mnk[2] // self.GROUP_SIZE,
+            self.tile_shape_mnk[1],
+        )
+        tma_atom_b_sf, tma_tensor_b_sf = self._make_tma_atoms_and_tensors(
+            b_sf,
+            self.b_sf_smem_layout_staged,
+            b_sf_tma_tile,
+            1,
+        )
+
+        tma_atom_c, tma_tensor_c = self._make_tma_store_atoms_and_tensors(
+            c,
+            self.epi_smem_layout_staged,
+            self.epi_tile,
+        )
+
+        tile_sched_params, grid = self._compute_grid(
+            c,
+            self.tile_shape_mnk,
+            max_active_clusters,
+        )
+
+        @cute.struct
+        class SharedStorage:
+            mainloop_pipeline_array_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.ab_stage * 2
+            ]
+            sA: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.a_dtype, cute.cosize(self.a_smem_layout_staged)
+                ],
+                self.buffer_align_bytes,
+            ]
+            sB_marlin: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Int32, cute.cosize(self.b_marlin_smem_layout_staged)
+                ],
+                self.buffer_align_bytes,
+            ]
+            sB_sf: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Uint8, cute.cosize(self.b_sf_smem_layout_staged)
+                ],
+                self.buffer_align_bytes,
+            ]
+            sC: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.c_dtype, cute.cosize(self.epi_smem_layout_staged)
+                ],
+                self.buffer_align_bytes,
+            ]
+
+        self.shared_storage = SharedStorage
+
+        self.kernel(
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b_marlin,
+            tma_tensor_b_marlin,
+            tma_atom_b_sf,
+            tma_tensor_b_sf,
+            tma_atom_c,
+            tma_tensor_c,
+            alpha,
+            self.tiled_mma,
+            self.cta_layout_mnk,
+            self.a_smem_layout_staged,
+            self.b_marlin_smem_layout_staged,
+            self.b_sf_smem_layout_staged,
+            self.b_bf16_logical_layout,
+            self.epi_smem_layout_staged,
+            tile_sched_params,
+        ).launch(
+            grid=grid,
+            block=[self.threads_per_cta, 1, 1],
+            cluster=[1, 1, 1],
+            stream=stream,
+        )
+        return
+
+    @cute.kernel
+    def kernel(
+        self,
+        tma_atom_a: cute.CopyAtom,
+        mA_mkl: cute.Tensor,
+        tma_atom_b_marlin: cute.CopyAtom,
+        mB_marlin_kn: cute.Tensor,
+        tma_atom_b_sf: cute.CopyAtom,
+        mB_sf_kn: cute.Tensor,
+        tma_atom_c: cute.CopyAtom,
+        mC_mnl: cute.Tensor,
+        mAlpha: cute.Tensor,
+        tiled_mma: cute.TiledMma,
+        cta_layout_mnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout,
+        b_marlin_smem_layout_staged: cute.Layout,
+        b_sf_smem_layout_staged: cute.Layout,
+        b_bf16_logical_layout: cute.ComposedLayout,
+        epi_smem_layout_staged: cute.ComposedLayout,
+        tile_sched_params: utils.PersistentTileSchedulerParams,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.warp_idx()
+        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+        # Prefetch TMA descriptors from warp 0.
+        if warp_idx == 0:
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b_marlin)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b_sf)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
+
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
+        cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
+
+        a_mcast_mask = cute.make_layout_image_mask(
+            cta_layout_mnk, cluster_coord_mnk, mode=1
+        )
+        b_mcast_mask = cute.make_layout_image_mask(
+            cta_layout_mnk, cluster_coord_mnk, mode=0
+        )
+        a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
+        b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
+
+        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
+        b_marlin_smem_layout = cute.slice_(b_marlin_smem_layout_staged, (None, None, 0))
+        b_sf_smem_layout = cute.slice_(b_sf_smem_layout_staged, (None, None, 0))
+        tma_copy_bytes = (
+            cute.size_in_bytes(self.a_dtype, a_smem_layout)
+            + cute.size_in_bytes(cutlass.Int32, b_marlin_smem_layout)
+            + cute.size_in_bytes(cutlass.Uint8, b_sf_smem_layout)
+        )
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(self.shared_storage)
+
+        mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
+
+        mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread
+        )
+        mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
+        consumer_arrive_cnt = mcast_size * self.num_mma_warps
+        mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, consumer_arrive_cnt
+        )
+
+        cta_layout_vmnk = cute.make_layout((1, *cta_layout_mnk.shape))
+        mainloop_pipeline = pipeline.PipelineTmaAsync.create(
+            num_stages=self.ab_stage,
+            producer_group=mainloop_pipeline_producer_group,
+            consumer_group=mainloop_pipeline_consumer_group,
+            tx_count=tma_copy_bytes,
+            barrier_storage=mainloop_pipeline_array_ptr,
+            cta_layout_vmnk=cta_layout_vmnk,
+        )
+
+        if cute.size(self.cluster_shape_mnk) > 1:
+            cute.arch.cluster_arrive_relaxed()
+
+        sA = storage.sA.get_tensor(
+            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
+        )
+        # Both B-side tensors are plain (non-swizzled) staged layouts.
+        sB_marlin = storage.sB_marlin.get_tensor(b_marlin_smem_layout_staged)
+        sB_sf = storage.sB_sf.get_tensor(b_sf_smem_layout_staged)
+        sC = storage.sC.get_tensor(
+            epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
+        )
+
+        gA_mkl = cute.local_tile(
+            mA_mkl,
+            cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+            (None, None, None),
+        )
+        # B Marlin: (K // 16, N * 2, L); tile = (tile_K // 16, 2 * tile_N).
+        b_marlin_tile_shape = (
+            self.tile_shape_mnk[2] // _MARLIN_TILE_K,
+            2 * self.tile_shape_mnk[1],
+        )
+        gB_marlin_kn = cute.local_tile(
+            mB_marlin_kn,
+            b_marlin_tile_shape,
+            (None, None, None),
+        )
+        # Scales: (K // 16, N, L); per-tile slice has shape
+        # (tile_K // group_size, tile_N) = (tile_K // 16, tile_N).  Dequant
+        # indexes directly per K-block + per N-coord.
+        gB_sf_kn = cute.local_tile(
+            mB_sf_kn,
+            (self.tile_shape_mnk[2] // self.GROUP_SIZE, self.tile_shape_mnk[1]),
+            (None, None, None),
+        )
+        gC_mnl = cute.local_tile(
+            mC_mnl,
+            cute.slice_(self.tile_shape_mnk, (None, None, 0)),
+            (None, None, None),
+        )
+
+        thr_mma = tiled_mma.get_slice(tidx)
+
+        # TMA partition for A: (m, k) -> per-CTA partition.
+        a_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
+        a_cta_crd = cluster_coord_mnk[1]
+        tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_a,
+            a_cta_crd,
+            a_cta_layout,
+            cute.group_modes(sA, 0, 2),
+            cute.group_modes(gA_mkl, 0, 2),
+        )
+
+        # TMA partition for B (Marlin int32).
+        b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
+        b_cta_crd = cluster_coord_mnk[0]
+        tBmarlin_s, tBmarlin_g = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_b_marlin,
+            b_cta_crd,
+            b_cta_layout,
+            cute.group_modes(sB_marlin, 0, 2),
+            cute.group_modes(gB_marlin_kn, 0, 2),
+        )
+
+        # TMA partition for B_sf (uint8 scales).  Shares the b_cta_crd
+        # (no N multicast since cluster_shape_mnk = (1,1,1)).
+        tBsf_s, tBsf_g = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_b_sf,
+            b_cta_crd,
+            b_cta_layout,
+            cute.group_modes(sB_sf, 0, 2),
+            cute.group_modes(gB_sf_kn, 0, 2),
+        )
+
+        # B partition uses a phantom bf16 layout on top of the sB_marlin
+        # int32 storage (recast pointer + bf16 logical layout).  This
+        # gives ``partition_B``/``make_fragment_B`` the right fragment
+        # shape; the data is never read through this view -- we always
+        # decode FP4 ourselves.
+        sB_phantom = cute.make_tensor(
+            cute.recast_ptr(sB_marlin.iterator, dtype=self.b_compute_dtype),
+            b_bf16_logical_layout,
+        )
+        tCsA = thr_mma.partition_A(sA)
+        tCsB_phantom = thr_mma.partition_B(sB_phantom)
+        tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
+        tCrB = tiled_mma.make_fragment_B(tCsB_phantom[None, None, None, 0])
+
+        tCgC = thr_mma.partition_C(gC_mnl)
+        acc_shape = tCgC.shape[:3]
+        accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+
+        if cute.size(self.cluster_shape_mnk) > 1:
+            cute.arch.cluster_wait()
+        else:
+            pipeline.sync(barrier_id=1)
+
+        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+
+        tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+        work_tile = tile_sched.initial_work_tile_info()
+
+        mainloop_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.ab_stage
+        )
+        mainloop_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.ab_stage
+        )
+
+        # MMA warp group: warps [0, num_mma_warps) compute.
+        if warp_idx < self.num_mma_warps:
+            cute.arch.setmaxregister_increase(self.mma_register_requirement)
+
+            num_k_blocks = cute.size(tCrA, mode=[2])
+
+            # ldmatrix is only for A.  B is filled in-register from sB_marlin
+            # via FP4 decode + per-group scale.
+            atom_copy_ldmatrix_A = cute.make_copy_atom(
+                cute.nvgpu.warp.LdMatrix8x8x16bOp(self.a_layout.is_m_major_a(), 4),
+                self.a_dtype,
+            )
+            smem_tiled_copy_A = cute.make_tiled_copy_A(atom_copy_ldmatrix_A, tiled_mma)
+            thr_copy_ldmatrix_A = smem_tiled_copy_A.get_slice(tidx)
+            tCsA_copy_view = thr_copy_ldmatrix_A.partition_S(sA)
+            tCrA_copy_view = thr_copy_ldmatrix_A.retile(tCrA)
+
+            alpha_val = Float32(mAlpha[Int32(0)])
+
+            while work_tile.is_valid_tile:
+                tile_coord_mnl = work_tile.tile_idx
+                gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
+                accumulators.fill(0.0)
+
+                mainloop_consumer_state.reset_count()
+
+                peek_ab_full_status = cutlass.Boolean(1)
+                if mainloop_consumer_state.count < k_tile_cnt:
+                    peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
+                        mainloop_consumer_state
+                    )
+
+                mainloop_pipeline.consumer_wait(
+                    mainloop_consumer_state, peek_ab_full_status
+                )
+                tCsA_p = tCsA_copy_view[None, None, None, mainloop_consumer_state.index]
+                cute.copy(
+                    smem_tiled_copy_A,
+                    tCsA_p[None, None, 0],
+                    tCrA_copy_view[None, None, 0],
+                )
+                self._dequant_b_to_register(
+                    sB_marlin,
+                    sB_sf,
+                    tCrB,
+                    alpha_val,
+                    tidx,
+                    mainloop_consumer_state.index,
+                    mainloop_consumer_state.count,
+                    0,
+                )
+
+                for k_tile in range(0, k_tile_cnt - 1, 1, unroll=1):
+                    for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                        k_block_next = (
+                            0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
+                        )
+
+                        if k_block_idx == num_k_blocks - 1:
+                            mainloop_pipeline.consumer_release(mainloop_consumer_state)
+                            mainloop_consumer_state.advance()
+
+                            peek_ab_full_status = cutlass.Boolean(1)
+                            peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
+                                mainloop_consumer_state
+                            )
+
+                            tCsA_p = tCsA_copy_view[
+                                None, None, None, mainloop_consumer_state.index
+                            ]
+                            mainloop_pipeline.consumer_wait(
+                                mainloop_consumer_state, peek_ab_full_status
+                            )
+
+                        cute.copy(
+                            smem_tiled_copy_A,
+                            tCsA_p[None, None, k_block_next],
+                            tCrA_copy_view[None, None, k_block_next],
+                        )
+                        self._dequant_b_to_register(
+                            sB_marlin,
+                            sB_sf,
+                            tCrB,
+                            alpha_val,
+                            tidx,
+                            mainloop_consumer_state.index,
+                            mainloop_consumer_state.count,
+                            k_block_next,
+                        )
+                        cute.gemm(
+                            tiled_mma,
+                            accumulators,
+                            tCrA[None, None, k_block_idx],
+                            tCrB[None, None, k_block_idx],
+                            accumulators,
+                        )
+                # Hoist out last k_tile (no further loads after the last k_block)
+                for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                    k_block_next = (
+                        0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
+                    )
+
+                    if k_block_idx == num_k_blocks - 1:
+                        mainloop_pipeline.consumer_release(mainloop_consumer_state)
+                        mainloop_consumer_state.advance()
+
+                    if k_block_next > 0:
+                        cute.copy(
+                            smem_tiled_copy_A,
+                            tCsA_p[None, None, k_block_next],
+                            tCrA_copy_view[None, None, k_block_next],
+                        )
+                        self._dequant_b_to_register(
+                            sB_marlin,
+                            sB_sf,
+                            tCrB,
+                            alpha_val,
+                            tidx,
+                            mainloop_consumer_state.index,
+                            mainloop_consumer_state.count,
+                            k_block_next,
+                        )
+                    cute.gemm(
+                        tiled_mma,
+                        accumulators,
+                        tCrA[None, None, k_block_idx],
+                        tCrB[None, None, k_block_idx],
+                        accumulators,
+                    )
+
+                # Epilogue: accumulator -> smem -> gmem via R2S (StMatrix.x4)
+                # + TMA bulk store.
+                copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
+                    self.c_layout,
+                    elem_ty_d=self.c_dtype,
+                    elem_ty_acc=self.acc_dtype,
+                )
+
+                copy_atom_C = cute.make_copy_atom(
+                    cute.nvgpu.warp.StMatrix8x8x16bOp(
+                        self.c_layout.is_m_major_c(),
+                        4,
+                    ),
+                    self.c_dtype,
+                )
+
+                tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+
+                tiled_copy_r2s = cute.make_tiled_copy_S(
+                    copy_atom_r2s,
+                    tiled_copy_C_Atom,
+                )
+
+                thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+                tRS_sD = thr_copy_r2s.partition_D(sC)
+                tRS_rAcc = tiled_copy_r2s.retile(accumulators)
+
+                rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
+                tRS_rD_layout = cute.make_layout(rD_shape[:3])
+                tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
+                size_tRS_rD = cute.size(tRS_rD)
+
+                sepi_for_tma_partition = cute.group_modes(sC, 0, 2)
+                tcgc_for_tma_partition = cute.zipped_divide(gC_mnl_slice, self.epi_tile)
+
+                bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_c,
+                    0,
+                    cute.make_layout(1),
+                    sepi_for_tma_partition,
+                    tcgc_for_tma_partition,
+                )
+
+                epi_tile_num = cute.size(tcgc_for_tma_partition, mode=[1])
+                epi_tile_shape = tcgc_for_tma_partition.shape[1]
+                epi_tile_layout = cute.make_layout(
+                    epi_tile_shape, stride=(1, epi_tile_shape[0])
+                )
+
+                tma_store_producer_group = pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    self.num_mma_warps * self.num_threads_per_warp,
+                )
+                tma_store_pipeline = pipeline.PipelineTmaStore.create(
+                    num_stages=self.epi_stage,
+                    producer_group=tma_store_producer_group,
+                )
+
+                for epi_idx in cutlass.range_constexpr(epi_tile_num):
+                    for epi_v in cutlass.range_constexpr(size_tRS_rD):
+                        tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v]
+
+                    tRS_rD_out = cute.make_rmem_tensor(
+                        tRS_rD_layout.shape, self.c_dtype
+                    )
+                    acc_vec = tRS_rD.load()
+                    tRS_rD_out.store(acc_vec.to(self.c_dtype))
+
+                    epi_buffer = epi_idx % cute.size(tRS_sD, mode=[3])
+                    cute.copy(
+                        tiled_copy_r2s,
+                        tRS_rD_out,
+                        tRS_sD[(None, None, None, epi_buffer)],
+                    )
+
+                    cute.arch.fence_proxy(
+                        "async.shared",
+                        space="cta",
+                    )
+                    self.epilog_sync_barrier.arrive_and_wait()
+
+                    gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+                    if warp_idx == 0:
+                        cute.copy(
+                            tma_atom_c,
+                            bSG_sD[(None, epi_buffer)],
+                            bSG_gD[(None, gmem_coord)],
+                        )
+                        tma_store_pipeline.producer_commit()
+                        tma_store_pipeline.producer_acquire()
+
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+                tma_store_pipeline.producer_tail()
+        # DMA warp: warp == num_mma_warps does TMA loads of A and
+        # B_marlin (int32 packed FP4).
+        elif warp_idx == self.num_mma_warps:
+            cute.arch.setmaxregister_decrease(self.load_register_requirement)
+
+            while work_tile.is_valid_tile:
+                tile_coord_mnl = work_tile.tile_idx
+                tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
+                # B Marlin is (K // 16, N * 2, L) gmem.  After tma_partition
+                # over modes (tile_K//16, 2*tile_N), the outer dim order is
+                # (outer_K, outer_N, outer_L) -- leave outer_K wildcard
+                # (= k_tile counter), fix outer_N and outer_L.
+                tBmarlin_g_kn = tBmarlin_g[
+                    (None, None, tile_coord_mnl[1], tile_coord_mnl[2])
+                ]
+                # B_sf has the same outer dim order as B_marlin after
+                # tma_partition: (outer_K, outer_N, outer_L).
+                tBsf_g_kn = tBsf_g[
+                    (None, None, tile_coord_mnl[1], tile_coord_mnl[2])
+                ]
+
+                mainloop_producer_state.reset_count()
+
+                for k_tile in range(0, k_tile_cnt, 1, unroll=1):
+                    mainloop_pipeline.producer_acquire(mainloop_producer_state)
+
+                    tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
+                    tAsA_pipe = tAsA[(None, mainloop_producer_state.index)]
+
+                    tBmarlin_g_k = tBmarlin_g_kn[(None, mainloop_producer_state.count)]
+                    tBmarlin_s_pipe = tBmarlin_s[(None, mainloop_producer_state.index)]
+
+                    tBsf_g_k = tBsf_g_kn[(None, mainloop_producer_state.count)]
+                    tBsf_s_pipe = tBsf_s[(None, mainloop_producer_state.index)]
+
+                    barrier_ptr = mainloop_pipeline.producer_get_barrier(
+                        mainloop_producer_state
+                    )
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_k,
+                        tAsA_pipe,
+                        tma_bar_ptr=barrier_ptr,
+                        mcast_mask=a_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_b_marlin,
+                        tBmarlin_g_k,
+                        tBmarlin_s_pipe,
+                        tma_bar_ptr=barrier_ptr,
+                        mcast_mask=b_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_b_sf,
+                        tBsf_g_k,
+                        tBsf_s_pipe,
+                        tma_bar_ptr=barrier_ptr,
+                        mcast_mask=b_mcast_mask,
+                    )
+                    mainloop_pipeline.producer_commit(mainloop_producer_state)
+                    mainloop_producer_state.advance()
+
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+
+            mainloop_pipeline.producer_tail(mainloop_producer_state)
+        return
+
+    @staticmethod
+    def _compute_stages(
+        tile_shape_mnk: Tuple[int, int, int],
+        a_dtype: Type[cutlass.Numeric],
+        epi_tile: Tuple[int, int],
+        c_dtype: Type[cutlass.Numeric],
+        smem_capacity: int,
+        occupancy: int,
+        group_size: int = 16,
+    ) -> Tuple[int, int]:
+        """Stage budget accounting for A + B (Marlin int32) + B_sf (uint8).
+
+        Per (16K x 64N) Marlin block: 128 int32 = 512 bytes.
+        Per (group_size K x tile_N N) scale block: tile_N bytes.
+        """
+        epi_stage = 8
+        c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
+        epi_bytes = c_bytes_per_stage * epi_stage
+
+        a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
+        a_bytes_per_stage = cute.size(a_shape) * a_dtype.width // 8
+
+        # B side: Marlin int32, 128 int32 per (16K x 64N) block.
+        marlin_blocks_per_tile = (
+            (tile_shape_mnk[2] // _MARLIN_TILE_K)
+            * (tile_shape_mnk[1] // _MARLIN_TILE_N)
+        )
+        b_marlin_bytes_per_stage = marlin_blocks_per_tile * _MARLIN_INTS_PER_TILE * 4
+
+        # Scale tile: 1 byte per (K-group, N).  Small compared to B_marlin.
+        b_sf_bytes_per_stage = (
+            (tile_shape_mnk[2] // group_size) * tile_shape_mnk[1]
+        )
+
+        ab_bytes_per_stage = (
+            a_bytes_per_stage + b_marlin_bytes_per_stage + b_sf_bytes_per_stage
+        )
+        mbar_helpers_bytes = 1024
+
+        ab_stage = (
+            (smem_capacity - occupancy * 1024) // occupancy
+            - mbar_helpers_bytes
+            - epi_bytes
+        ) // ab_bytes_per_stage
+        return ab_stage, epi_stage
+
+    @staticmethod
+    def _make_smem_layouts(
+        tile_shape_mnk: Tuple[int, int, int],
+        epi_tile: Tuple[int, int],
+        a_dtype: Type[cutlass.Numeric],
+        a_layout: cute.Layout,
+        b_compute_dtype: Type[cutlass.Numeric],
+        b_layout_compute: cute.Layout,
+        ab_stage: int,
+        c_dtype: Type[cutlass.Numeric],
+        c_layout: cute.Layout,
+        epi_stage: int,
+        group_size: int,
+    ):
+        """Returns (sA, sB_marlin, sB_sf, b_bf16_phantom, sC) layouts.
+
+        ``sB_marlin_layout`` is a plain (non-swizzled) staged int32 layout
+        ``(tile_K // 16, 2 * tile_N, ab_stage)``.
+
+        ``sB_sf_layout`` is a plain staged uint8 layout
+        ``(tile_K // group_size, tile_N, ab_stage)`` -- one byte per
+        (K-group, N) cell.  Loaded via TMA once per K-tile, read from
+        SMEM in the dequant inner loop (replaces the gmem-direct path).
+
+        ``b_bf16_logical_layout`` is the phantom bf16 layout used only by
+        ``partition_B`` / ``make_fragment_B`` for fragment-shape
+        determination -- there is no real bf16 SMEM allocation.
+        """
+        a_smem_layout_staged = sm90_utils.make_smem_layout_a(
+            a_layout,
+            tile_shape_mnk,
+            a_dtype,
+            ab_stage,
+        )
+
+        # sB_marlin: (tile_K // 16) rows x (2 * tile_N) int32 cols x stage.
+        b_marlin_smem_layout_staged = cute.make_ordered_layout(
+            (
+                tile_shape_mnk[2] // _MARLIN_TILE_K,
+                2 * tile_shape_mnk[1],
+                ab_stage,
+            ),
+            order=(1, 0, 2),
+        )
+
+        # sB_sf: (tile_K // group_size) rows x tile_N uint8 cols x stage.
+        # Order (1, 0, 2) -> N innermost (= contiguous load lane), K next,
+        # stage outermost.  Matches the gmem layout.
+        b_sf_smem_layout_staged = cute.make_ordered_layout(
+            (
+                tile_shape_mnk[2] // group_size,
+                tile_shape_mnk[1],
+                ab_stage,
+            ),
+            order=(1, 0, 2),
+        )
+
+        # bf16 phantom layout for partition_B / make_fragment_B.
+        b_bf16_logical_layout = sm90_utils.make_smem_layout_b(
+            b_layout_compute,
+            tile_shape_mnk,
+            b_compute_dtype,
+            ab_stage,
+        )
+
+        epi_smem_layout_staged = sm90_utils.make_smem_layout_epi(
+            c_dtype,
+            c_layout,
+            epi_tile,
+            epi_stage,
+        )
+        return (
+            a_smem_layout_staged,
+            b_marlin_smem_layout_staged,
+            b_sf_smem_layout_staged,
+            b_bf16_logical_layout,
+            epi_smem_layout_staged,
+        )
+
+    @staticmethod
+    def _compute_grid(
+        c: cute.Tensor,
+        tile_shape_mnk: Tuple[int, int, int],
+        max_active_clusters: cutlass.Constexpr,
+    ):
+        c_shape = cute.slice_(tile_shape_mnk, (None, None, 0))
+        gc = cute.zipped_divide(c, tiler=c_shape)
+        num_ctas_mnl = gc[(0, (None, None, None))].shape
+        cluster_shape_mnl = (1, 1, 1)
+        tile_sched_params = utils.PersistentTileSchedulerParams(
+            num_ctas_mnl, cluster_shape_mnl
+        )
+        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+            tile_sched_params, max_active_clusters
+        )
+        return tile_sched_params, grid
+
+    @staticmethod
+    def _make_tma_store_atoms_and_tensors(
+        tensor_c: cute.Tensor,
+        epi_smem_layout_staged: cute.ComposedLayout,
+        epi_tile: Tuple[int, int],
+    ) -> Tuple[cute.CopyAtom, cute.Tensor]:
+        epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
+        tma_atom_c, tma_tensor_c = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
+            tensor_c,
+            epi_smem_layout,
+            epi_tile,
+        )
+        return tma_atom_c, tma_tensor_c
+
+    @staticmethod
+    def _make_tma_atoms_and_tensors(
+        tensor: cute.Tensor,
+        smem_layout_staged: cute.ComposedLayout,
+        smem_tile: Tuple[int, int],
+        mcast_dim: int,
+    ) -> Tuple[cute.CopyAtom, cute.Tensor]:
+        op = (
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+            if mcast_dim == 1
+            else cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp()
+        )
+        smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
+        tma_atom, tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            op,
+            tensor,
+            smem_layout,
+            smem_tile,
+            num_multicast=mcast_dim,
+        )
+        return tma_atom, tma_tensor
+
+    @cute.jit
+    def _dequant_b_to_register(
+        self,
+        sB_marlin: cute.Tensor,
+        sB_sf: cute.Tensor,
+        tCrB: cute.Tensor,
+        alpha_val: Float32,
+        tidx: Int32,
+        stage_idx: Int32,
+        k_tile_idx: Int32,
+        k_block_idx: cutlass.Constexpr,
+    ):
+        """Decode 2 int32 per thread per K-block into 16 fp16 fragment slots.
+
+        Per the partition diagnostic for atom_layout (2,2,1) + *2 on N
+        (see ``scratch_partition_mapping.py``):
+
+          tc_row     = (lane % 4) * 2          in {0, 2, 4, 6}
+          tc_col     = lane // 4               in [0, 8)
+          n_warp_idx = warp_idx // 2           in {0, 1}
+          base_n    = n_warp_idx * 8 + tc_col  in [0, 16)
+
+        Each thread covers:
+          K = {tc_row, tc_row+1, tc_row+8, tc_row+9}
+          N = {base_n, base_n+16, base_n+32, base_n+48}
+
+        Two int32s per K-block per thread; sB_marlin offsets:
+          u32_0 @ sB_marlin[k_block_idx, n_warp_idx * 64 + lane * 2 + 0, stage]
+          u32_1 @ sB_marlin[k_block_idx, n_warp_idx * 64 + lane * 2 + 1, stage]
+
+        Byte layout inside each int32 (see ``flashinfer/gemm/marlin_repack.py``):
+          u32_0:
+            byte 0: K=tc_row,    tc_row+1 at N=base_n        -> (mma_i=0,1, nn=0)
+            byte 1: K=tc_row+8,  tc_row+9 at N=base_n        -> (mma_i=2,3, nn=0)
+            byte 2: K=tc_row,    tc_row+1 at N=base_n+16     -> (mma_i=0,1, nn=1)
+            byte 3: K=tc_row+8,  tc_row+9 at N=base_n+16     -> (mma_i=2,3, nn=1)
+          u32_1 mirrors with N=base_n+32 and N=base_n+48 (nn=2, nn=3).
+        """
+        lane = tidx % Int32(32)
+        warp = tidx // Int32(32)
+        n_warp_idx = warp // Int32(2)
+        tc_col = lane // Int32(4)
+        base_n_in_tile = n_warp_idx * Int32(8) + tc_col
+
+        u32_pos_base = n_warp_idx * Int32(64) + lane * Int32(2)
+        u32_0 = Uint32(sB_marlin[k_block_idx, u32_pos_base, stage_idx])
+        u32_1 = Uint32(sB_marlin[k_block_idx, u32_pos_base + Int32(1), stage_idx])
+
+        # fp4_decode_4bytes returns 4 fp16x2 registers (= 8 fp16) per int32.
+        # Byte order is little-endian: h_a/_b/_c/_d <- bytes 0/1/2/3 of u32.
+        h0_a, h0_b, h0_c, h0_d = fp4_decode_4bytes(u32_0)
+        h1_a, h1_b, h1_c, h1_d = fp4_decode_4bytes(u32_1)
+
+        # Per-group FP8-E4M3 scale loads (gmem-direct in Phase 2; smem-cache
+        # comes in Phase 4).  4 distinct N positions per K-block per thread.
+        # K-group index == k_block_idx because GROUP_SIZE == MMA K-block size.
+        # sB_sf is staged in smem: (k_sf_inner, n_inner, ab_stage).  Index
+        # the current pipeline stage with stage_idx -- the DMA warp loads
+        # scales together with A and B_marlin, so reading at this stage
+        # is safe after the mainloop consumer wait.
+        sf_byte_0 = Uint32(
+            sB_sf[k_block_idx, base_n_in_tile + Int32(0), stage_idx]
+        )
+        sf_byte_1 = Uint32(
+            sB_sf[k_block_idx, base_n_in_tile + Int32(16), stage_idx]
+        )
+        sf_byte_2 = Uint32(
+            sB_sf[k_block_idx, base_n_in_tile + Int32(32), stage_idx]
+        )
+        sf_byte_3 = Uint32(
+            sB_sf[k_block_idx, base_n_in_tile + Int32(48), stage_idx]
+        )
+        scale_n0 = cvt_e4m3_to_f32_via_f16(sf_byte_0) * alpha_val
+        scale_n1 = cvt_e4m3_to_f32_via_f16(sf_byte_1) * alpha_val
+        scale_n2 = cvt_e4m3_to_f32_via_f16(sf_byte_2) * alpha_val
+        scale_n3 = cvt_e4m3_to_f32_via_f16(sf_byte_3) * alpha_val
+
+        # Apply scales and write to fragment slots.  We unpack each
+        # fp16x2 into two fp32, multiply by its N-group scale, and cast
+        # back to the compute dtype (bf16 or fp16).
+        def _write_pair(h2, scale, mma_i_low, nn):
+            f_lo, f_hi = f16x2_to_f32x2(h2)
+            tCrB[mma_i_low, nn, k_block_idx] = (f_lo * scale).to(self.b_compute_dtype)
+            tCrB[mma_i_low + 1, nn, k_block_idx] = (f_hi * scale).to(self.b_compute_dtype)
+
+        # u32_0: nn=0 (N=base_n) and nn=1 (N=base_n+16)
+        _write_pair(h0_a, scale_n0, 0, 0)  # K=tc_row, tc_row+1; mma_i=0,1
+        _write_pair(h0_b, scale_n0, 2, 0)  # K=tc_row+8, tc_row+9; mma_i=2,3
+        _write_pair(h0_c, scale_n1, 0, 1)
+        _write_pair(h0_d, scale_n1, 2, 1)
+        # u32_1: nn=2 (N=base_n+32) and nn=3 (N=base_n+48)
+        _write_pair(h1_a, scale_n2, 0, 2)
+        _write_pair(h1_b, scale_n2, 2, 2)
+        _write_pair(h1_c, scale_n3, 0, 3)
+        _write_pair(h1_d, scale_n3, 2, 3)
+
+    # ------------------------------------------------------------------
+    # TVM-FFI entry: takes (m, k) A, (k//16, n*2) B (Marlin int32),
+    # (k//16, n) B_sf (E4M3), (m, n) C, (1,) alpha, with explicit batch L.
+    # Re-wraps each input with explicit (m, k, l) / (k_tiles, n2, l) /
+    # (k_sf, n, l) / (m, n, l) layouts the kernel mainloop expects.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def wrapper(
+        self,
+        mA: cute.Tensor,
+        mB_marlin: cute.Tensor,
+        mB_sf: cute.Tensor,
+        mC: cute.Tensor,
+        mAlpha: cute.Tensor,
+        l: cutlass.Constexpr,
+        max_active_clusters: cutlass.Constexpr,
+        current_stream,
+    ):
+        """W4A16 wrapper for the FlashInfer compile interface.
+
+        Args:
+            mA:        (m, k) input tensor A, bf16 or fp16.
+            mB_marlin: (k // 16, n * 2) int32 -- Marlin-packed FP4.
+            mB_sf:     (k // 16, n) uint8 -- FP8-E4M3 per-group scales.
+            mC:        (m, n) output tensor C, bf16 or fp16.
+            mAlpha:    (1,) fp32 global scale.
+            l: batch dimension (Constexpr); typically 1.
+            max_active_clusters: Constexpr from get_max_active_clusters(1).
+            current_stream: CUDA stream (TVM-FFI fake stream).
+        """
+        m = cute.size(mA, mode=[0])
+        k = cute.size(mA, mode=[1])
+        n = cute.size(mC, mode=[1])
+        k_tiles = k // _MARLIN_TILE_K
+        n_packed = 2 * n
+        k_sf_groups = k // self.GROUP_SIZE
+
+        a_tensor = cute.make_tensor(
+            mA.iterator,
+            layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
+        )
+        b_marlin_tensor = cute.make_tensor(
+            mB_marlin.iterator,
+            layout=cute.make_ordered_layout(
+                (k_tiles, n_packed, l), order=(1, 0, 2)
+            ),
+        )
+        b_sf_tensor = cute.make_tensor(
+            mB_sf.iterator,
+            layout=cute.make_ordered_layout(
+                (k_sf_groups, n, l), order=(1, 0, 2)
+            ),
+        )
+        c_tensor = cute.make_tensor(
+            mC.iterator,
+            layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
+        )
+
+        self(
+            a_tensor,
+            b_marlin_tensor,
+            b_sf_tensor,
+            c_tensor,
+            mAlpha,
+            max_active_clusters,
+            current_stream,
+        )
