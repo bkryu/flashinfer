@@ -106,6 +106,7 @@ from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp4_w4a16 as mm_fp4_w4a16
+from .gemm import mm_fp4_w4a16_native as mm_fp4_w4a16_native
 from .gemm import prepare_fp4_w4a16_weight as prepare_fp4_w4a16_weight
 from .gemm import unpack_fp4_w4a16_weight as unpack_fp4_w4a16_weight
 from .gemm import mm_fp8 as mm_fp8

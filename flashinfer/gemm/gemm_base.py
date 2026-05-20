@@ -6136,6 +6136,297 @@ def _get_cute_dsl_w4a16_gemm(
 _W4A16_BACKENDS = ("auto", "cute-dsl", "torch")
 
 
+# ----------------------------------------------------------------------
+# mm_fp4-native W4A16 path (accepts mm_fp4-format inputs, no host repack)
+# ----------------------------------------------------------------------
+
+_CUTE_DSL_MM_FP4_W4A16_MMFP4_KERNEL_CACHE: dict = {}
+
+
+def _select_w4a16_mmfp4_tile_shape(
+    m: int, n: int, k: int
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """Pick CTA tile + atom_layout for the mm_fp4-native W4A16 kernel.
+
+    M-adaptive, mirroring the Marlin variant's strategy:
+      * M <= 16 and K % 128 == 0:  ``(16, 64, 128) + (1, 2, 1)``.
+        Halves M-waste vs tile_M=32 at small M (75% wasted at M=4 instead
+        of 87.5%), and the 1-M-warp layout avoids the duplicate-dequant
+        the (2, 2, 1) atom suffers from.
+      * M <= 32:  ``(32, 64, tile_k) + (2, 2, 1)``.
+      * M > 32:   ``(64, 64, tile_k) + (2, 2, 1)``.
+
+    tile_K choice:
+      * K % 128 == 0: tile_K = 128 (halves K-tile count; fewer barriers).
+      * K %  64 == 0: tile_K =  64 (minimum supported by the SF SMEM
+                                    alignment; one swizzle K-block per tile).
+
+    K must be a multiple of 64 (= 4 * GROUP_SIZE) so each K-tile spans
+    an integer number of 128x4 SF blocks.
+    """
+    if k % 64 != 0:
+        raise ValueError(
+            f"mm_fp4-native W4A16 requires K % 64 == 0 (got K={k}). "
+            f"Use the Marlin variant (flashinfer.mm_fp4_w4a16) instead."
+        )
+    tile_k = 128 if k % 128 == 0 else 64
+    if m <= 16 and tile_k == 128:
+        return ((16, 64, 128), (1, 2, 1))
+    if m <= 32:
+        return ((32, 64, tile_k), (2, 2, 1))
+    return ((64, 64, tile_k), (2, 2, 1))
+
+
+def _get_cute_dsl_w4a16_mmfp4_gemm(
+    tile_shape_mnk: Tuple[int, int, int],
+    a_dtype: torch.dtype,
+    c_dtype: torch.dtype,
+    atom_layout: Tuple[int, int, int] = (2, 2, 1),
+):
+    """Compile (or fetch from cache) the cute-DSL mm_fp4-native W4A16 kernel.
+
+    Compiled signature (call-time):
+      mA        : (m, k)              a_dtype (bf16 / fp16)
+      mB        : (n, k // 2)         uint8 -- raw FP4 (= mat2_fp4)
+      mB_sf     : 1-D byte buffer of the 128x4-swizzled SF tensor
+      mC        : (m, n)              c_dtype
+      mAlpha    : (1,)                float32 scalar
+    """
+    atom_layout = tuple(atom_layout)
+    cache_key = (tile_shape_mnk, a_dtype, c_dtype, atom_layout)
+    cached = _CUTE_DSL_MM_FP4_W4A16_MMFP4_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    _check_cute_dsl_availability()
+
+    import cutlass
+    import cutlass.cute as cute
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    from .kernels.dense_gemm_w4a16_mmfp4_blackwell import (
+        BlackwellDenseGemmW4A16MmFp4Kernel,
+    )
+
+    a_cutlass_dtype = getattr(cutlass, _TORCH_TO_CUTLASS_DTYPE_ATTR[a_dtype])
+    c_cutlass_dtype = getattr(cutlass, _TORCH_TO_CUTLASS_DTYPE_ATTR[c_dtype])
+
+    sym_m = cute.sym_int()
+    sym_k = cute.sym_int()
+    sym_n = cute.sym_int()
+    sym_k_half = cute.sym_int()
+    sym_sf_numel = cute.sym_int()
+
+    a_fake = cute.runtime.make_fake_compact_tensor(
+        a_cutlass_dtype, (sym_m, sym_k), stride_order=(1, 0), assumed_align=16
+    )
+    # B is (N, K/2) uint8 -- (mat2_fp4 from nvfp4_quantize), K stride-1.
+    b_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_n, sym_k_half), stride_order=(1, 0), assumed_align=16
+    )
+    # SF is a 1-D byte buffer (the kernel re-views as (N_blocks, K_sf_blocks, 512)).
+    b_sf_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_sf_numel,), assumed_align=16
+    )
+    c_fake = cute.runtime.make_fake_compact_tensor(
+        c_cutlass_dtype, (sym_m, sym_n), stride_order=(1, 0), assumed_align=16
+    )
+    alpha_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (1,), assumed_align=4
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    gemm = BlackwellDenseGemmW4A16MmFp4Kernel(
+        acc_dtype=cutlass.Float32,
+        tile_shape_mnk=tile_shape_mnk,
+        atom_layout=atom_layout,
+    )
+    max_active_clusters = get_max_active_clusters(1)
+
+    compiled = cute.compile(
+        gemm.wrapper,
+        a_fake,
+        b_fake,
+        b_sf_fake,
+        c_fake,
+        alpha_fake,
+        1,  # l (batch)
+        max_active_clusters,
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+    _CUTE_DSL_MM_FP4_W4A16_MMFP4_KERNEL_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _check_mm_fp4_w4a16_native_inputs(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+    block_size: int,
+) -> None:
+    """Validate mm_fp4-native W4A16 inputs.
+
+    Expected layout (= same format mm_fp4 takes, no host repack):
+      a:         (M, K)             bf16 / fp16
+      b:         (N, K // 2)        uint8 -- raw FP4 (= mat2_fp4 from
+                                    nvfp4_quantize), K stride-1.
+      b_descale: 1-D byte buffer of length round_up(N, 128) *
+                                    round_up(K // 16, 4), uint8 -- 128x4
+                                    swizzled FP8-E4M3 (= mat2_inv_s).
+                                    Accepts 2-D `(N_pad, K_sf_pad)` too,
+                                    we flatten via .view(-1).contiguous().
+      alpha:     scalar fp32, optional.
+      out:       (M, N), same dtype as out_dtype.
+    """
+    if a.ndim != 2:
+        raise ValueError(f"a must be 2D, got shape {tuple(a.shape)}")
+    if b.ndim != 2:
+        raise ValueError(f"b must be 2D, got shape {tuple(b.shape)}")
+    if a.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"a must be bfloat16 or float16, got {a.dtype}")
+    if b.dtype != torch.uint8:
+        raise ValueError(
+            f"b must be uint8 (raw FP4); got {b.dtype}.  Pass the output of "
+            f"flashinfer.nvfp4_quantize(weight, ..., do_shuffle=False) directly."
+        )
+    if b_descale.dtype not in (torch.float8_e4m3fn, torch.uint8):
+        raise ValueError(
+            f"b_descale must be float8_e4m3fn or uint8, got {b_descale.dtype}"
+        )
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"out_dtype must be bfloat16 or float16, got {out_dtype}"
+        )
+    if block_size != 16:
+        raise ValueError(
+            "mm_fp4_w4a16_native currently supports block_size=16 only "
+            f"(got {block_size})"
+        )
+
+    m, k = a.shape
+    n, k_half = b.shape
+    if k_half * 2 != k:
+        raise ValueError(
+            f"b.shape[1] (={k_half}) must equal a.shape[1]/2 (={k // 2}); "
+            f"a={tuple(a.shape)}, b={tuple(b.shape)}"
+        )
+    if k % 64 != 0:
+        raise ValueError(
+            f"K must be a multiple of 64 for mm_fp4-native (got K={k}); "
+            f"the SF SMEM tile aligns to 4 K-groups (= 64 K positions)."
+        )
+    if n % 64 != 0:
+        raise ValueError(
+            f"N must be a multiple of 64 (cute-DSL kernel tile width), got N={n}"
+        )
+    if n % 128 != 0:
+        raise ValueError(
+            f"N must be a multiple of 128 for the 128x4 SF swizzle "
+            f"(got N={n}).  Pad weights at load time if needed."
+        )
+
+    # SF must hold round_up(N, 128) * round_up(K/16, 4) bytes.
+    sf_n_pad = ((n + 127) // 128) * 128
+    sf_ksf_pad = ((k // 16) + 3) // 4 * 4
+    expected_sf_bytes = sf_n_pad * sf_ksf_pad
+    if b_descale.numel() != expected_sf_bytes:
+        raise ValueError(
+            f"b_descale must have {expected_sf_bytes} bytes "
+            f"(= round_up(N,128) * round_up(K/16,4)); got {b_descale.numel()}."
+        )
+    if alpha is not None and alpha.numel() != 1:
+        raise ValueError(
+            "alpha must be a scalar tensor (shape (1,) or scalar); "
+            f"got shape {tuple(alpha.shape)}."
+        )
+    if out is not None:
+        expected_out_shape = (m, n)
+        if tuple(out.shape) != expected_out_shape:
+            raise ValueError(
+                f"out shape must be {expected_out_shape}, got {tuple(out.shape)}"
+            )
+        if out.dtype != out_dtype:
+            raise ValueError(
+                f"out dtype must be {out_dtype}, got {out.dtype}"
+            )
+
+
+@flashinfer_api
+def mm_fp4_w4a16_native(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+) -> torch.Tensor:
+    r"""FP4 W4A16 GEMM consuming mm_fp4's input format.  No host-side repack.
+
+    Unlike :func:`mm_fp4_w4a16` (which requires the Marlin-tied
+    ``(K//16, N*2)`` int32 weight from
+    :func:`prepare_fp4_w4a16_weight`), this function accepts B + SF in
+    the exact format ``flashinfer.nvfp4_quantize(...,
+    sfLayout=layout_128x4)`` produces:
+
+      - ``b``:         ``(N, K // 2)`` uint8 packed FP4
+                       (= ``mat2_fp4`` from ``nvfp4_quantize``).
+      - ``b_descale``: 1-D byte buffer (uint8 or float8_e4m3fn) of the
+                       128x4-swizzled SF tensor.  Pass
+                       ``mat2_inv_s.view(-1).contiguous()`` or just
+                       ``mat2_inv_s`` -- a 2-D `(N_pad, K_sf_pad)`
+                       tensor is flattened internally.
+      - ``alpha``:     Optional ``(1,) float32``.  For nvfp4-quantized
+                       weights, use ``1 / global_sf_B``.
+      - ``out_dtype``: ``torch.bfloat16`` or ``torch.float16``.  Defaults
+                       to ``a.dtype``.
+
+    Currently SM100+ only (cute-DSL kernel, requires
+    ``is_sm100a_supported``).  No torch reference fallback yet -- if you
+    need CPU validation, dequantize manually then use ``torch.mm``.
+
+    Returns:
+        ``(M, N)`` tensor of ``out_dtype``.
+    """
+    if out_dtype is None:
+        out_dtype = a.dtype
+    _check_mm_fp4_w4a16_native_inputs(
+        a, b, b_descale, alpha, out_dtype, out, block_size
+    )
+
+    if not is_sm100a_supported(a.device):
+        major, _ = get_compute_capability(a.device)
+        if major < 10:
+            raise NotImplementedError(
+                "mm_fp4_w4a16_native currently requires SM100+ (Blackwell). "
+                "For SM<100, use mm_fp4_w4a16 with the Marlin repack path."
+            )
+
+    m, k = a.shape
+    n = b.shape[0]
+    tile_shape_mnk, atom_layout = _select_w4a16_mmfp4_tile_shape(m, n, k)
+    compiled = _get_cute_dsl_w4a16_mmfp4_gemm(
+        tile_shape_mnk, a.dtype, out_dtype, atom_layout
+    )
+
+    # No A padding -- the kernel uses TMA OOB clipping for M < tile_M
+    # (zero-fills rows beyond the tensor extent) and the epilogue uses
+    # m_actual = a.shape[0] to write only the valid output rows.  This
+    # matches the Marlin variant's behavior and avoids a per-call
+    # torch.zeros allocation in the hot path.
+    b_sf_flat = b_descale.view(torch.uint8).reshape(-1).contiguous()
+    alpha_for_launch = _prepare_w4a16_alpha(alpha, a.device)
+    if out is None:
+        out = torch.empty((m, n), device=a.device, dtype=out_dtype)
+    compiled(a, b, b_sf_flat, out, alpha_for_launch)
+    return out
+
+
 @flashinfer_api
 def mm_fp4_w4a16(
     a: torch.Tensor,

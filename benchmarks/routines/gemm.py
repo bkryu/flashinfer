@@ -26,6 +26,8 @@ from .flashinfer_benchmark_utils import (
 def run_gemm_test(args):
     if args.routine == "mm_fp4_w4a16":
         return testMmFp4W4A16(args)
+    if args.routine == "mm_fp4_w4a16_native":
+        return testMmFp4W4A16Native(args)
     """
     Run a gemm test.
 
@@ -1134,6 +1136,167 @@ def testMmFp4W4A16(args):
             torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
         timing = bench_gpu_time(run_backend, input_args=(backend,))
+        median_time = np.median(timing)
+        std_time = np.std(timing)
+        tflops = flops / median_time / 1e9
+        tb_per_sec = bytes_accessed / median_time / 1e9
+        result = {
+            "routine": args.routine,
+            "median_time": median_time,
+            "std_time": std_time,
+            "tflops": tflops,
+            "tb_per_sec": tb_per_sec,
+            "m": m,
+            "n": n,
+            "k": k,
+            "input_dtype": str(input_dtype).split(".")[-1],
+            "out_dtype": str(out_dtype).split(".")[-1],
+            "backend": backend,
+            "case_tag": getattr(args, "case_tag", ""),
+        }
+        print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+        results.append(result)
+    return results
+
+
+# E2M1 codebook used by the torch reference for mm_fp4_w4a16_native.
+_E2M1_TO_FLOAT32_NATIVE = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
+
+def _unswizzle_sf_128x4_native(
+    sf_swizzled: torch.Tensor, n: int, k_sf: int
+) -> torch.Tensor:
+    """Reverse the 128x4 SF swizzle to a linear (n, k_sf) uint8 tensor."""
+    sf_flat = sf_swizzled.contiguous().view(-1)
+    num_sf_tiles_k = k_sf // 4
+    m_idx = torch.arange(n, device=sf_swizzled.device)
+    k_idx = torch.arange(k_sf, device=sf_swizzled.device)
+    m_grid, k_grid = torch.meshgrid(m_idx, k_idx, indexing="ij")
+    dst = (
+        ((m_grid // 128) * num_sf_tiles_k + k_grid // 4) * 512
+        + (m_grid % 32) * 16
+        + ((m_grid % 128) // 32) * 4
+        + (k_grid % 4)
+    )
+    return sf_flat[dst]
+
+
+def _dequant_fp4_native_to_float(
+    b_fp4: torch.Tensor,  # (N, K/2) uint8
+    b_sf_swizzled: torch.Tensor,
+) -> torch.Tensor:
+    """Reference dequant for the mm_fp4-native B+SF format: code * sf."""
+    device = b_fp4.device
+    n, k_half = b_fp4.shape
+    k = k_half * 2
+    low = (b_fp4 & 0x0F).to(torch.long)
+    high = (b_fp4 >> 4).to(torch.long)
+    lut = _E2M1_TO_FLOAT32_NATIVE.to(device)
+    codes = torch.empty((n, k), dtype=torch.float32, device=device)
+    codes[:, 0::2] = lut[low]
+    codes[:, 1::2] = lut[high]
+
+    b_sf_un = _unswizzle_sf_128x4_native(b_sf_swizzled, n, k // 16)
+    sf_f32 = b_sf_un.view(torch.float8_e4m3fn).float()
+    sf_broadcast = sf_f32.repeat_interleave(16, dim=-1)
+    return codes * sf_broadcast
+
+
+def testMmFp4W4A16Native(args):
+    """Benchmark mm_fp4_w4a16_native (mm_fp4-layout contract, no host repack).
+
+    Inputs are produced by ``flashinfer.nvfp4_quantize(... sfLayout=
+    layout_128x4)`` -- same format as ``flashinfer.mm_fp4``'s B operand.
+    Two backends:
+
+      - ``torch``: PyTorch reference (dequantize + matmul, fp32 accumulator).
+      - ``cute-dsl``: the new in-register mm_fp4-native kernel
+        (``flashinfer.mm_fp4_w4a16_native``).
+
+    Constraints (enforced by the kernel partition):
+      * N must be divisible by 128 (128x4 SF swizzle alignment)
+      * K must be divisible by 64 (= 4 * GROUP_SIZE, SF SMEM tile alignment)
+    """
+    m, n, k = args.m, args.n, args.k
+    device = torch.device("cuda")
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    supported_backends = ["torch", "cute-dsl"]
+    backends = args.backends or supported_backends
+    backends = [backend for backend in backends if backend in supported_backends]
+    if not backends:
+        raise ValueError(
+            f"mm_fp4_w4a16_native benchmark supports --backends {supported_backends}"
+        )
+    if k % 64 != 0:
+        raise ValueError(
+            "mm_fp4_w4a16_native benchmark requires k % 64 == 0"
+        )
+    if n % 128 != 0:
+        raise ValueError(
+            "mm_fp4_w4a16_native benchmark requires n % 128 == 0"
+        )
+    if input_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "mm_fp4_w4a16_native benchmark requires fp16 or bf16 input_dtype"
+        )
+    if out_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "mm_fp4_w4a16_native benchmark requires fp16 or bf16 out_dtype"
+        )
+
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=input_dtype) * 0.5
+    w = torch.randn((n, k), device=device, dtype=input_dtype) * 0.1
+    g_b = (448 * 6) / w.float().abs().nan_to_num().max()
+    w_fp4, w_sf = flashinfer.nvfp4_quantize(
+        w, g_b, sfLayout=flashinfer.SfLayout.layout_128x4,
+        do_shuffle=False, backend="cute-dsl",
+    )
+    # alpha = 1 / g_b recovers the original A @ B^T when B is nvfp4-quantized.
+    alpha = torch.tensor(
+        [1.0 / g_b.item()], device=device, dtype=torch.float32
+    )
+
+    def run_cute_dsl():
+        return flashinfer.gemm.mm_fp4_w4a16_native(
+            a, w_fp4, w_sf,
+            alpha=alpha, out_dtype=out_dtype, block_size=16,
+        )
+
+    def run_torch():
+        weight = _dequant_fp4_native_to_float(w_fp4, w_sf)
+        return (
+            a.float() @ weight.T * alpha.float()
+        ).to(out_dtype)
+
+    runners = {"cute-dsl": run_cute_dsl, "torch": run_torch}
+
+    ref = None
+    if args.refcheck:
+        # Use torch as the gold reference (fp32 dequant + matmul).
+        ref = run_torch()
+
+    results = []
+    flops = 2 * m * n * k
+    bytes_accessed = (
+        m * k * torch.tensor([], dtype=input_dtype).element_size()
+        + (k // 2) * n
+        + (k // 16) * n
+        + m * n * torch.tensor([], dtype=out_dtype).element_size()
+    )
+    for backend in backends:
+        runner = runners[backend]
+        if args.refcheck:
+            out = runner()
+            # bf16 accumulator slack -- match the unit test tolerance.
+            torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+        timing = bench_gpu_time(runner)
         median_time = np.median(timing)
         std_time = np.std(timing)
         tflops = flops / median_time / 1e9

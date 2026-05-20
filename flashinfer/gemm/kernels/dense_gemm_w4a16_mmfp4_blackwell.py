@@ -26,28 +26,35 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""W4A16 dense GEMM for Blackwell (SM100/103/120/121).
+"""W4A16 dense GEMM for Blackwell (SM100/103/120/121) -- mm_fp4 layout.
 
-Built on top of ``dense_gemm_bf16_blackwell.py`` (faithful port of
-CUTLASS's blackwell_geforce ``dense_gemm.py``) by replacing the B-operand
-path with packed FP4 weights + per-group FP8-E4M3 scales + a global
-alpha.  A and C remain bf16/fp16; the MMA atom and accumulator are
-unchanged.
+Sibling of ``dense_gemm_w4a16_blackwell.py`` (the Marlin-repack variant)
+that consumes the SAME input format as ``flashinfer.gemm.mm_fp4`` -- no
+host-side weight repack:
 
-The B fragment is filled in-register by:
+  - B:    ``(N, K/2)`` uint8 packed FP4.  Byte at offset n*K/2+k_half
+          carries FP4 code K=2*k_half (low nibble) + K=2*k_half+1
+          (high nibble).  K is stride-1; N stride = K/2.
+  - B_sf: 1-D byte buffer holding the 128x4-swizzled FP8-E4M3 SF.
+          Address per (n, k_sf) is::
+              ((n/128) * (K_sf/4) + k_sf/4) * 512
+              + (n%32)*16 + ((n%128)/32)*4 + (k_sf%4)
+  - alpha: ``(1,) float32`` scalar.
 
-  1. Loading two ``int32`` from ``sB_marlin`` per thread per K-block
-     (deterministic offsets driven by the cute partition; see
-     ``flashinfer/gemm/marlin_repack.py`` for the layout).
-  2. Decoding each ``int32`` via ``cvt.rn.f16x2.e2m1x2`` -> 4 ``fp16x2``
-     (= 8 fp16) using ``fp4_decode_4bytes``.
-  3. Multiplying each pair by its per-group E4M3 scale (gmem-direct
-     load, converted via ``cvt_e4m3_to_f32_via_f16``) and the scalar
-     ``alpha``.
-  4. Casting back to the compute dtype and writing into ``tCrB``.
+Architecture matches the sibling Marlin kernel exactly: per-thread,
+per-K-block, in-register FP4 decode -> bf16 -> write straight to
+``tCrB``.  No bf16 SMEM materialization (this is what kept the b12x
+variant pinned at ~70 us on B200).
 
-Everything else (TMA pipeline for A, persistent tile scheduler,
-epilogue) is unchanged from the bf16 base.
+Only two things change vs the Marlin sibling:
+
+  1. B TMA loads raw uint8 ``(tile_N, tile_K/2)`` bytes into sB_raw
+     instead of Marlin-tied int32.  ldmatrix is NOT used on B; the
+     dequant function reads raw bytes per-thread from sB_raw.
+  2. SF is gmem-direct (not TMA'd to SMEM); each thread computes its
+     SF address via the 128x4 swizzle formula and issues ld.global.nc.u8.
+     (The Marlin kernel TMA's a linear SF tile; we can't reuse that
+     here because the on-disk SF is already swizzled.)
 """
 
 from typing import Optional, Tuple, Type
@@ -59,12 +66,13 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 
 from ...cute_dsl.fp4_common import (
     cvt_e4m3_to_f32_via_f16,
     f16x2_to_f32x2,
     fp4_decode_4bytes,
+    fp4_decode_2,
     get_smem_ptr_as_int32,
     half2_mul,
     ld_shared_v2_u32,
@@ -100,13 +108,54 @@ def f16x2_pack_broadcast(v: Float32, *, loc=None, ip=None) -> Uint32:
 
 
 
-# Marlin packing constants (must match flashinfer/gemm/marlin_repack.py).
-_MARLIN_TILE_K: cutlass.Constexpr = 16
-_MARLIN_TILE_N: cutlass.Constexpr = 64
-_MARLIN_INTS_PER_TILE: cutlass.Constexpr = 128  # 128 int32 per (16K x 64N) block
+# mm_fp4 input constants.
+_FP4_PER_BYTE: cutlass.Constexpr = 2     # two FP4 codes packed per uint8
+_TILE_N_MULT: cutlass.Constexpr = 64     # tile_N must be multiple of 64
+_TILE_K_MULT: cutlass.Constexpr = 16     # = GROUP_SIZE (one SF byte per K-block)
+
+# 128x4 SF swizzle constants.
+_SF_BLOCK_BYTES: cutlass.Constexpr = 512  # bytes per (128 N x 4 K_sf) block
+_SF_BLOCK_N: cutlass.Constexpr = 128
+_SF_BLOCK_KSF: cutlass.Constexpr = 4
 
 
-class BlackwellDenseGemmW4A16Kernel:
+# 1-byte gmem load through non-coherent cache (for per-thread SF reads).
+@dsl_user_op
+def _ld_global_nc_u8(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+            "ld.global.nc.u8 $0, [$1];",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+# 1-byte SMEM load.
+@dsl_user_op
+def _ld_shared_u8(smem_addr: Int32, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.u8 $0, [$1];",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+class BlackwellDenseGemmW4A16MmFp4Kernel:
     """Warp-MMA dense GEMM for Blackwell, FP4-weight A bf16/fp16 input.
 
     A: (M, K, L) bf16/fp16.
@@ -219,14 +268,14 @@ class BlackwellDenseGemmW4A16Kernel:
         self.is_a_mcast = False
         self.is_b_mcast = False
 
-        if self.tile_shape_mnk[1] % _MARLIN_TILE_N != 0:
+        if self.tile_shape_mnk[1] % _TILE_N_MULT != 0:
             raise ValueError(
-                f"W4A16 requires tile_N % {_MARLIN_TILE_N} == 0 "
+                f"W4A16 requires tile_N % {_TILE_N_MULT} == 0 "
                 f"(got tile_N={self.tile_shape_mnk[1]})"
             )
-        if self.tile_shape_mnk[2] % _MARLIN_TILE_K != 0:
+        if self.tile_shape_mnk[2] % _TILE_K_MULT != 0:
             raise ValueError(
-                f"W4A16 requires tile_K % {_MARLIN_TILE_K} == 0 "
+                f"W4A16 requires tile_K % {_TILE_K_MULT} == 0 "
                 f"(got tile_K={self.tile_shape_mnk[2]})"
             )
 
@@ -329,7 +378,7 @@ class BlackwellDenseGemmW4A16Kernel:
 
         (
             self.a_smem_layout_staged,
-            self.b_marlin_smem_layout_staged,
+            self.b_raw_smem_layout_staged,
             self.b_sf_smem_layout_staged,
             self.b_bf16_logical_layout,
             self.epi_smem_layout_staged,
@@ -351,8 +400,8 @@ class BlackwellDenseGemmW4A16Kernel:
     def __call__(
         self,
         a: cute.Tensor,
-        b_marlin: cute.Tensor,
-        b_sf: cute.Tensor,
+        b: cute.Tensor,             # (N, K/2) uint8 raw FP4
+        b_sf: cute.Tensor,          # 1-D byte buffer, 128x4-swizzled FP8 SF
         c: cute.Tensor,
         alpha: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
@@ -363,8 +412,8 @@ class BlackwellDenseGemmW4A16Kernel:
         self.c_dtype = c.element_type
 
         self.a_layout = utils.LayoutEnum.from_tensor(a)
-        # B's compute (= post-dequant) view is N-major: matches the ldmatrix
-        # convention that the bf16 kernel uses for B.
+        # B's compute (= post-dequant) view is N-major (matches the
+        # phantom bf16 layout used by partition_B / make_fragment_B).
         self.b_layout_compute = utils.LayoutEnum.ROW_MAJOR
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
@@ -384,30 +433,39 @@ class BlackwellDenseGemmW4A16Kernel:
             1,
         )
 
-        # B Marlin TMA: tile is (tile_K // 16, 2 * tile_N) int32.
-        b_marlin_tma_tile = (
-            self.tile_shape_mnk[2] // _MARLIN_TILE_K,
-            2 * self.tile_shape_mnk[1],
+        # B TMA: tile is (tile_N, tile_K/2) uint8 -- raw FP4 bytes,
+        # K stride-1 in the source tensor.
+        b_tma_tile = (
+            self.tile_shape_mnk[1],
+            self.tile_shape_mnk[2] // _FP4_PER_BYTE,
         )
-        tma_atom_b_marlin, tma_tensor_b_marlin = self._make_tma_atoms_and_tensors(
-            b_marlin,
-            self.b_marlin_smem_layout_staged,
-            b_marlin_tma_tile,
+        tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
+            b,
+            self.b_raw_smem_layout_staged,
+            b_tma_tile,
             1,
         )
 
-        # B scale TMA: tile is (tile_K // group_size, tile_N) uint8.
-        # Small per-tile load -- this replaces ``tile_K // group_size``
-        # gmem-direct loads per thread per K-block in the dequant path.
-        b_sf_tma_tile = (
-            self.tile_shape_mnk[2] // self.GROUP_SIZE,
-            self.tile_shape_mnk[1],
+        # SF TMA: re-view the SF byte buffer as (N_blocks, K_sf_blocks,
+        # 512) where each row is one 128x4-swizzled SF block.  Tile shape
+        # (1, num_sf_blocks_per_k_tile, 512) loads the swizzle blocks
+        # this CTA needs for one K-tile.  cluster_shape (1,1,1) means
+        # no multicast; CTAs sharing an N-block load the same bytes.
+        num_sf_blocks_per_k_tile = self.tile_shape_mnk[2] // (
+            self.GROUP_SIZE * _SF_BLOCK_KSF
         )
-        tma_atom_b_sf, tma_tensor_b_sf = self._make_tma_atoms_and_tensors(
+        b_sf_tma_tile = (1, num_sf_blocks_per_k_tile, _SF_BLOCK_BYTES)
+        # SF SMEM layout is rank 4 ((1, num, 512, stage)).  Use a custom
+        # slice over the stage axis instead of the rank-3 helper.
+        b_sf_smem_layout = cute.slice_(
+            self.b_sf_smem_layout_staged, (None, None, None, 0)
+        )
+        tma_atom_b_sf, tma_tensor_b_sf = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
             b_sf,
-            self.b_sf_smem_layout_staged,
+            b_sf_smem_layout,
             b_sf_tma_tile,
-            1,
+            num_multicast=1,
         )
 
         tma_atom_c, tma_tensor_c = self._make_tma_store_atoms_and_tensors(
@@ -433,9 +491,9 @@ class BlackwellDenseGemmW4A16Kernel:
                 ],
                 self.buffer_align_bytes,
             ]
-            sB_marlin: cute.struct.Align[
+            sB_raw: cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Int32, cute.cosize(self.b_marlin_smem_layout_staged)
+                    cutlass.Uint8, cute.cosize(self.b_raw_smem_layout_staged)
                 ],
                 self.buffer_align_bytes,
             ]
@@ -457,8 +515,8 @@ class BlackwellDenseGemmW4A16Kernel:
         self.kernel(
             tma_atom_a,
             tma_tensor_a,
-            tma_atom_b_marlin,
-            tma_tensor_b_marlin,
+            tma_atom_b,
+            tma_tensor_b,
             tma_atom_b_sf,
             tma_tensor_b_sf,
             tma_atom_c,
@@ -467,7 +525,7 @@ class BlackwellDenseGemmW4A16Kernel:
             self.tiled_mma,
             self.cta_layout_mnk,
             self.a_smem_layout_staged,
-            self.b_marlin_smem_layout_staged,
+            self.b_raw_smem_layout_staged,
             self.b_sf_smem_layout_staged,
             self.b_bf16_logical_layout,
             self.epi_smem_layout_staged,
@@ -485,17 +543,17 @@ class BlackwellDenseGemmW4A16Kernel:
         self,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
-        tma_atom_b_marlin: cute.CopyAtom,
-        mB_marlin_kn: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_kn: cute.Tensor,
         tma_atom_b_sf: cute.CopyAtom,
-        mB_sf_kn: cute.Tensor,
+        mB_sf_nkblock: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
         mAlpha: cute.Tensor,
         tiled_mma: cute.TiledMma,
         cta_layout_mnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
-        b_marlin_smem_layout_staged: cute.Layout,
+        b_raw_smem_layout_staged: cute.Layout,
         b_sf_smem_layout_staged: cute.Layout,
         b_bf16_logical_layout: cute.ComposedLayout,
         epi_smem_layout_staged: cute.ComposedLayout,
@@ -508,7 +566,7 @@ class BlackwellDenseGemmW4A16Kernel:
         # Prefetch TMA descriptors from warp 0.
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b_marlin)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b_sf)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
 
@@ -527,11 +585,12 @@ class BlackwellDenseGemmW4A16Kernel:
         b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
 
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
-        b_marlin_smem_layout = cute.slice_(b_marlin_smem_layout_staged, (None, None, 0))
-        b_sf_smem_layout = cute.slice_(b_sf_smem_layout_staged, (None, None, 0))
+        b_raw_smem_layout = cute.slice_(b_raw_smem_layout_staged, (None, None, 0))
+        b_sf_smem_layout = cute.slice_(b_sf_smem_layout_staged, (None, None, None, 0))
+        # Pipeline transaction count: A + raw FP4 B + SF bytes.
         tma_copy_bytes = (
             cute.size_in_bytes(self.a_dtype, a_smem_layout)
-            + cute.size_in_bytes(cutlass.Int32, b_marlin_smem_layout)
+            + cute.size_in_bytes(cutlass.Uint8, b_raw_smem_layout)
             + cute.size_in_bytes(cutlass.Uint8, b_sf_smem_layout)
         )
 
@@ -565,8 +624,9 @@ class BlackwellDenseGemmW4A16Kernel:
         sA = storage.sA.get_tensor(
             a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
         )
-        # Both B-side tensors are plain (non-swizzled) staged layouts.
-        sB_marlin = storage.sB_marlin.get_tensor(b_marlin_smem_layout_staged)
+        # sB_raw is plain (non-swizzled) uint8 (tile_N, tile_K/2, stage).
+        sB_raw = storage.sB_raw.get_tensor(b_raw_smem_layout_staged)
+        # sB_sf is plain uint8 (num_sf_blocks_per_k_tile, 512, stage).
         sB_sf = storage.sB_sf.get_tensor(b_sf_smem_layout_staged)
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
@@ -577,22 +637,24 @@ class BlackwellDenseGemmW4A16Kernel:
             cute.slice_(self.tile_shape_mnk, (None, 0, None)),
             (None, None, None),
         )
-        # B Marlin: (K // 16, N * 2, L); tile = (tile_K // 16, 2 * tile_N).
-        b_marlin_tile_shape = (
-            self.tile_shape_mnk[2] // _MARLIN_TILE_K,
-            2 * self.tile_shape_mnk[1],
+        # B raw: (N, K/2, L) uint8; tile = (tile_N, tile_K/2).
+        b_tile_shape = (
+            self.tile_shape_mnk[1],
+            self.tile_shape_mnk[2] // _FP4_PER_BYTE,
         )
-        gB_marlin_kn = cute.local_tile(
-            mB_marlin_kn,
-            b_marlin_tile_shape,
+        gB_kn = cute.local_tile(
+            mB_kn,
+            b_tile_shape,
             (None, None, None),
         )
-        # Scales: (K // 16, N, L); per-tile slice has shape
-        # (tile_K // group_size, tile_N) = (tile_K // 16, tile_N).  Dequant
-        # indexes directly per K-block + per N-coord.
-        gB_sf_kn = cute.local_tile(
-            mB_sf_kn,
-            (self.tile_shape_mnk[2] // self.GROUP_SIZE, self.tile_shape_mnk[1]),
+        # SF view as (N_blocks, K_sf_blocks, 512); tile = (1, num_sf_blocks_per_k_tile, 512).
+        num_sf_blocks_per_k_tile_c = cutlass.const_expr(
+            self.tile_shape_mnk[2] // (self.GROUP_SIZE * _SF_BLOCK_KSF)
+        )
+        b_sf_tile_shape = (1, num_sf_blocks_per_k_tile_c, _SF_BLOCK_BYTES)
+        gB_sf = cute.local_tile(
+            mB_sf_nkblock,
+            b_sf_tile_shape,
             (None, None, None),
         )
         gC_mnl = cute.local_tile(
@@ -614,34 +676,34 @@ class BlackwellDenseGemmW4A16Kernel:
             cute.group_modes(gA_mkl, 0, 2),
         )
 
-        # TMA partition for B (Marlin int32).
+        # TMA partition for B raw FP4: (tile_N, tile_K/2) uint8.
         b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
         b_cta_crd = cluster_coord_mnk[0]
-        tBmarlin_s, tBmarlin_g = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_b_marlin,
+        tB_s, tB_g = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_b,
             b_cta_crd,
             b_cta_layout,
-            cute.group_modes(sB_marlin, 0, 2),
-            cute.group_modes(gB_marlin_kn, 0, 2),
+            cute.group_modes(sB_raw, 0, 2),
+            cute.group_modes(gB_kn, 0, 2),
         )
 
-        # TMA partition for B_sf (uint8 scales).  Shares the b_cta_crd
-        # (no N multicast since cluster_shape_mnk = (1,1,1)).
+        # TMA partition for SF: (1, num_sf_blocks_per_k_tile, 512) uint8.
+        # Both sB_sf and gB_sf have the 3 tile-inner modes grouped.
         tBsf_s, tBsf_g = cute.nvgpu.cpasync.tma_partition(
             tma_atom_b_sf,
             b_cta_crd,
             b_cta_layout,
-            cute.group_modes(sB_sf, 0, 2),
-            cute.group_modes(gB_sf_kn, 0, 2),
+            cute.group_modes(sB_sf, 0, 3),
+            cute.group_modes(gB_sf, 0, 3),
         )
 
-        # B partition uses a phantom bf16 layout on top of the sB_marlin
-        # int32 storage (recast pointer + bf16 logical layout).  This
-        # gives ``partition_B``/``make_fragment_B`` the right fragment
-        # shape; the data is never read through this view -- we always
-        # decode FP4 ourselves.
+        # B partition uses a phantom bf16 layout on top of sB_raw (uint8)
+        # storage (recast pointer + bf16 logical layout).  This gives
+        # ``partition_B`` / ``make_fragment_B`` the right fragment shape;
+        # the data is never read through this view -- we always decode
+        # FP4 ourselves in _dequant_b_to_register.
         sB_phantom = cute.make_tensor(
-            cute.recast_ptr(sB_marlin.iterator, dtype=self.b_compute_dtype),
+            cute.recast_ptr(sB_raw.iterator, dtype=self.b_compute_dtype),
             b_bf16_logical_layout,
         )
         tCsA = thr_mma.partition_A(sA)
@@ -695,6 +757,12 @@ class BlackwellDenseGemmW4A16Kernel:
                 tile_coord_mnl = work_tile.tile_idx
                 gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
                 accumulators.fill(0.0)
+                # CTA's N offset within its 128-N SF block.  For tile_N
+                # >= 128 this is always 0; for tile_N < 128 it cycles
+                # 0, tile_N, 2*tile_N, ... up to 128-tile_N.
+                cta_n_within_block = (
+                    tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
+                ) & Int32(_SF_BLOCK_N - 1)
 
                 mainloop_consumer_state.reset_count()
 
@@ -722,14 +790,14 @@ class BlackwellDenseGemmW4A16Kernel:
                             tCrA_copy_view[None, None, 0],
                         )
                     self._dequant_b_to_register(
-                        sB_marlin,
+                        sB_raw,
                         sB_sf,
                         tCrB,
                         alpha_val,
                         tidx,
                         mainloop_consumer_state.index,
-                        mainloop_consumer_state.count,
                         0,
+                        cta_n_within_block,
                     )
 
                 for k_tile in range(0, k_tile_cnt - 1, 1, unroll=1):
@@ -752,14 +820,14 @@ class BlackwellDenseGemmW4A16Kernel:
                                     tCrA_copy_view[None, None, k_block_idx],
                                 )
                             self._dequant_b_to_register(
-                                sB_marlin,
+                                sB_raw,
                                 sB_sf,
                                 tCrB,
                                 alpha_val,
                                 tidx,
                                 mainloop_consumer_state.index,
-                                mainloop_consumer_state.count,
                                 k_block_idx,
+                                cta_n_within_block,
                             )
                             if cutlass.const_expr(
                                 (self.ablation_mode & self.ABL_SKIP_MMA) == 0
@@ -819,14 +887,14 @@ class BlackwellDenseGemmW4A16Kernel:
                                     tCrA_copy_view[None, None, k_block_next],
                                 )
                             self._dequant_b_to_register(
-                                sB_marlin,
+                                sB_raw,
                                 sB_sf,
                                 tCrB,
                                 alpha_val,
                                 tidx,
                                 mainloop_consumer_state.index,
-                                mainloop_consumer_state.count,
                                 k_block_next,
+                                cta_n_within_block,
                             )
                             if cutlass.const_expr(
                                 (self.ablation_mode & self.ABL_SKIP_MMA) == 0
@@ -856,14 +924,14 @@ class BlackwellDenseGemmW4A16Kernel:
                                 tCrA_copy_view[None, None, k_block_idx],
                             )
                         self._dequant_b_to_register(
-                            sB_marlin,
+                            sB_raw,
                             sB_sf,
                             tCrB,
                             alpha_val,
                             tidx,
                             mainloop_consumer_state.index,
-                            mainloop_consumer_state.count,
                             k_block_idx,
+                            cta_n_within_block,
                         )
                         if cutlass.const_expr(
                             (self.ablation_mode & self.ABL_SKIP_MMA) == 0
@@ -894,14 +962,14 @@ class BlackwellDenseGemmW4A16Kernel:
                                     tCrA_copy_view[None, None, k_block_next],
                                 )
                             self._dequant_b_to_register(
-                                sB_marlin,
+                                sB_raw,
                                 sB_sf,
                                 tCrB,
                                 alpha_val,
                                 tidx,
                                 mainloop_consumer_state.index,
-                                mainloop_consumer_state.count,
                                 k_block_next,
+                                cta_n_within_block,
                             )
                         if cutlass.const_expr(
                             (self.ablation_mode & self.ABL_SKIP_MMA) == 0
@@ -1073,18 +1141,36 @@ class BlackwellDenseGemmW4A16Kernel:
 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-        # Single DMA warp: issues all 3 TMA descriptors (A, B_marlin, B_sf)
-        # back-to-back into the same stage barrier per K-tile.
+        # Single DMA warp: TMA-loads A + raw FP4 B into the same stage
+        # barrier per K-tile.  SF is gmem-direct (no producer step).
         elif warp_idx == self.num_mma_warps:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
-                tBmarlin_g_kn = tBmarlin_g[
-                    (None, None, tile_coord_mnl[1], tile_coord_mnl[2])
+                # B tensor outer modes are (N_tiles, K_tiles, L); fix N+L,
+                # iterate K.
+                tB_g_kn = tB_g[
+                    (None, tile_coord_mnl[1], None, tile_coord_mnl[2])
                 ]
+                # SF tensor outer modes are (N_blocks, K_sf_blocks_outer,
+                # 1) where N_blocks = N/128 (128 N per swizzle block).
+                # Each CTA's tile_N <= 128 maps to one N_block; for
+                # tile_N < 128 multiple CTAs share the same block.
+                n_block_per_cta = cutlass.const_expr(
+                    self.tile_shape_mnk[1] // _SF_BLOCK_N
+                )
+                if cutlass.const_expr(n_block_per_cta == 0):
+                    # tile_N < 128: divide n_tile by (128 / tile_N).
+                    ctas_per_n_block = cutlass.const_expr(
+                        _SF_BLOCK_N // self.tile_shape_mnk[1]
+                    )
+                    n_block_idx = tile_coord_mnl[1] // Int32(ctas_per_n_block)
+                else:
+                    # tile_N >= 128: n_block_idx = n_tile * n_block_per_cta.
+                    n_block_idx = tile_coord_mnl[1] * Int32(n_block_per_cta)
                 tBsf_g_kn = tBsf_g[
-                    (None, None, tile_coord_mnl[1], tile_coord_mnl[2])
+                    (None, n_block_idx, None, Int32(0))
                 ]
                 mainloop_producer_state.reset_count()
                 for k_tile in range(0, k_tile_cnt, 1, unroll=1):
@@ -1103,22 +1189,22 @@ class BlackwellDenseGemmW4A16Kernel:
                         mcast_mask=a_mcast_mask,
                     )
 
-                    tBmarlin_g_k = tBmarlin_g_kn[
-                        (None, mainloop_producer_state.count)
-                    ]
-                    tBmarlin_s_pipe = tBmarlin_s[
-                        (None, mainloop_producer_state.index)
-                    ]
+                    tB_g_k = tB_g_kn[(None, mainloop_producer_state.count)]
+                    tB_s_pipe = tB_s[(None, mainloop_producer_state.index)]
                     cute.copy(
-                        tma_atom_b_marlin,
-                        tBmarlin_g_k,
-                        tBmarlin_s_pipe,
+                        tma_atom_b,
+                        tB_g_k,
+                        tB_s_pipe,
                         tma_bar_ptr=barrier_ptr,
                         mcast_mask=b_mcast_mask,
                     )
 
-                    tBsf_g_k = tBsf_g_kn[(None, mainloop_producer_state.count)]
-                    tBsf_s_pipe = tBsf_s[(None, mainloop_producer_state.index)]
+                    tBsf_g_k = tBsf_g_kn[
+                        (None, mainloop_producer_state.count)
+                    ]
+                    tBsf_s_pipe = tBsf_s[
+                        (None, mainloop_producer_state.index)
+                    ]
                     cute.copy(
                         tma_atom_b_sf,
                         tBsf_g_k,
@@ -1148,7 +1234,12 @@ class BlackwellDenseGemmW4A16Kernel:
         """Stage budget accounting for A + B (Marlin int32) + B_sf (uint8).
 
         Per (16K x 64N) Marlin block: 128 int32 = 512 bytes.
-        Per (group_size K x tile_N N) scale block: tile_N bytes.
+        Per K-tile we hold:
+          - sA: tile_M * tile_K * sizeof(a_dtype) bytes
+          - sB_raw: tile_N * tile_K / 2 bytes (raw uint8 FP4)
+          - sB_sf: num_sf_blocks_per_k_tile * 512 bytes (128x4-swizzled
+            SF blocks TMA-loaded for this CTA's N range and this K-tile's
+            K_sf range)
         """
         c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
         epi_bytes = c_bytes_per_stage * epi_stage
@@ -1156,20 +1247,19 @@ class BlackwellDenseGemmW4A16Kernel:
         a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
         a_bytes_per_stage = cute.size(a_shape) * a_dtype.width // 8
 
-        # B side: Marlin int32, 128 int32 per (16K x 64N) block.
-        marlin_blocks_per_tile = (
-            (tile_shape_mnk[2] // _MARLIN_TILE_K)
-            * (tile_shape_mnk[1] // _MARLIN_TILE_N)
+        # B raw FP4: tile_N rows x (tile_K / 2) uint8 bytes.
+        b_raw_bytes_per_stage = tile_shape_mnk[1] * (
+            tile_shape_mnk[2] // _FP4_PER_BYTE
         )
-        b_marlin_bytes_per_stage = marlin_blocks_per_tile * _MARLIN_INTS_PER_TILE * 4
 
-        # Scale tile: 1 byte per (K-group, N).  Small compared to B_marlin.
-        b_sf_bytes_per_stage = (
-            (tile_shape_mnk[2] // group_size) * tile_shape_mnk[1]
+        # SF: num_sf_blocks_per_k_tile * 512 bytes.
+        num_sf_blocks_per_k_tile = tile_shape_mnk[2] // (
+            group_size * _SF_BLOCK_KSF
         )
+        b_sf_bytes_per_stage = num_sf_blocks_per_k_tile * _SF_BLOCK_BYTES
 
         ab_bytes_per_stage = (
-            a_bytes_per_stage + b_marlin_bytes_per_stage + b_sf_bytes_per_stage
+            a_bytes_per_stage + b_raw_bytes_per_stage + b_sf_bytes_per_stage
         )
         mbar_helpers_bytes = 1024
 
@@ -1194,15 +1284,19 @@ class BlackwellDenseGemmW4A16Kernel:
         epi_stage: int,
         group_size: int,
     ):
-        """Returns (sA, sB_marlin, sB_sf, b_bf16_phantom, sC) layouts.
+        """Returns (sA, sB_raw, sB_sf, b_bf16_phantom, sC) layouts.
 
-        ``sB_marlin_layout`` is a plain (non-swizzled) staged int32 layout
-        ``(tile_K // 16, 2 * tile_N, ab_stage)``.
+        ``sB_raw_layout`` is a plain (non-swizzled) staged uint8 layout
+        ``(tile_N, tile_K // 2, ab_stage)`` matching the (N, K/2) K-major
+        gmem layout of the user's FP4 weight tensor.
 
         ``sB_sf_layout`` is a plain staged uint8 layout
-        ``(tile_K // group_size, tile_N, ab_stage)`` -- one byte per
-        (K-group, N) cell.  Loaded via TMA once per K-tile, read from
-        SMEM in the dequant inner loop (replaces the gmem-direct path).
+        ``(num_sf_blocks_per_k_tile, 512, ab_stage)`` -- TMA-loads the
+        128x4-swizzled SF blocks needed by this CTA for each K-tile.
+        Each 512-byte block holds (128 N x 4 K_sf) entries in their
+        swizzled in-block byte order; the dequant function reads
+        per-thread using the same swizzle formula but with the SMEM
+        block index in place of the gmem (n/128, k_sf/4) coordinate.
 
         ``b_bf16_logical_layout`` is the phantom bf16 layout used only by
         ``partition_B`` / ``make_fragment_B`` for fragment-shape
@@ -1215,26 +1309,39 @@ class BlackwellDenseGemmW4A16Kernel:
             ab_stage,
         )
 
-        # sB_marlin: (tile_K // 16) rows x (2 * tile_N) int32 cols x stage.
-        b_marlin_smem_layout_staged = cute.make_ordered_layout(
+        # sB_raw: (tile_N) rows x (tile_K // 2) uint8 cols x stage.
+        b_raw_smem_layout_staged = cute.make_ordered_layout(
             (
-                tile_shape_mnk[2] // _MARLIN_TILE_K,
-                2 * tile_shape_mnk[1],
+                tile_shape_mnk[1],
+                tile_shape_mnk[2] // _FP4_PER_BYTE,
                 ab_stage,
             ),
             order=(1, 0, 2),
         )
 
-        # sB_sf: (tile_K // group_size) rows x tile_N uint8 cols x stage.
-        # Order (1, 0, 2) -> N innermost (= contiguous load lane), K next,
-        # stage outermost.  Matches the gmem layout.
+        # sB_sf: (num_sf_blocks_per_k_tile=tile_K/64) rows x 512 uint8
+        # cols x stage.  Each row is one 128x4-swizzled SF block.
+        num_sf_blocks_per_k_tile = tile_shape_mnk[2] // (
+            group_size * _SF_BLOCK_KSF
+        )
+        if num_sf_blocks_per_k_tile == 0:
+            raise ValueError(
+                f"tile_K={tile_shape_mnk[2]} must be a multiple of "
+                f"{group_size * _SF_BLOCK_KSF} (= group_size * 4) for the "
+                f"SF SMEM tile to align with the 128x4 swizzle."
+            )
+        # Rank 4 = tile_rank (3) + stage axis, to match the (1, num, 512)
+        # TMA tile rank.  The leading 1-dim is a no-op for indexing but
+        # required to match the SF gmem view's (N_blocks, K_sf_blocks,
+        # 512) shape.
         b_sf_smem_layout_staged = cute.make_ordered_layout(
             (
-                tile_shape_mnk[2] // group_size,
-                tile_shape_mnk[1],
+                1,
+                num_sf_blocks_per_k_tile,
+                _SF_BLOCK_BYTES,
                 ab_stage,
             ),
-            order=(1, 0, 2),
+            order=(2, 1, 0, 3),
         )
 
         # bf16 phantom layout for partition_B / make_fragment_B.
@@ -1253,7 +1360,7 @@ class BlackwellDenseGemmW4A16Kernel:
         )
         return (
             a_smem_layout_staged,
-            b_marlin_smem_layout_staged,
+            b_raw_smem_layout_staged,
             b_sf_smem_layout_staged,
             b_bf16_logical_layout,
             epi_smem_layout_staged,
@@ -1315,46 +1422,69 @@ class BlackwellDenseGemmW4A16Kernel:
         return tma_atom, tma_tensor
 
     @cute.jit
+    def _swizzled_e4m3_offset(
+        self,
+        n: Int32,         # global N coordinate
+        k_sf: Int32,      # global K_sf coordinate (= K // sf_vec_size)
+        sf_cols: Int32,   # padded ceil(K/16, 4) -- col stride within an N-block
+    ) -> Int64:
+        """128x4 mm_fp4 SF swizzle byte offset.
+
+        Matches mm_fp4's ``get_sf_out_offset_128x4`` and b12x's
+        ``swizzle_block_scale`` (Reshape-then-permute formula)::
+
+            offset = ((n/128) * (K_sf/4) + k_sf/4) * 512
+                   + (n%32)*16 + ((n%128)/32)*4 + (k_sf%4)
+        """
+        row_rb = n >> Int32(7)                   # n / 128
+        mode_a = (n >> Int32(5)) & Int32(3)      # (n % 128) / 32
+        mode_32 = n & Int32(31)                  # n % 32
+        cb_idx = k_sf >> Int32(2)                # k_sf / 4
+        mode_c = k_sf & Int32(3)                 # k_sf % 4
+        return (
+            Int64(row_rb) * Int64(sf_cols * Int32(128))
+            + Int64(cb_idx) * Int64(512)
+            + Int64(mode_32) * Int64(16)
+            + Int64(mode_a) * Int64(4)
+            + Int64(mode_c)
+        )
+
+    @cute.jit
     def _dequant_b_to_register(
         self,
-        sB_marlin: cute.Tensor,
-        sB_sf: cute.Tensor,
+        sB_raw: cute.Tensor,       # (tile_N, tile_K/2, ab_stage) uint8 raw FP4
+        sB_sf: cute.Tensor,        # (num_sf_blocks_per_k_tile, 512, ab_stage) uint8 swizzle blocks
         tCrB: cute.Tensor,
         alpha_val: Float32,
         tidx: Int32,
         stage_idx: Int32,
-        k_tile_idx: Int32,
         k_block_idx: cutlass.Constexpr,
+        cta_n_within_block: Int32,
     ):
-        """Decode 2 int32 per thread per K-block into 16 fp16 fragment slots.
+        """Decode 8 packed FP4 bytes per thread per K-block into 16
+        fp16 fragment slots, write to tCrB in-register.
 
-        Per the partition diagnostic for atom_layout (2,2,1) + *2 on N
-        (see ``scratch_partition_mapping.py``):
+        sB_raw byte addressing matches the (N, K/2) K-major gmem layout;
+        per K-block kb, per N position, we read 2 bytes at K-pair offsets
+        {kb*8 + tc_row/2, kb*8 + tc_row/2 + 4}.
 
-          tc_row     = (lane % 4) * 2          in {0, 2, 4, 6}
-          tc_col     = lane // 4               in [0, 8)
-          n_warp_idx = warp_idx // 2           in {0, 1}
-          base_n    = n_warp_idx * 8 + tc_col  in [0, 16)
+        sB_sf holds N TMA-loaded 512-byte 128x4 swizzle blocks for this
+        K-tile.  Each block packs (128 N x 4 K_sf) entries in the same
+        internal byte order as gmem.  For thread (lane, warp) at K-block
+        kb, the SF byte for (n_in_tile, k_sf=kb) is at SMEM offset::
 
-        Each thread covers:
-          K = {tc_row, tc_row+1, tc_row+8, tc_row+9}
-          N = {base_n, base_n+16, base_n+32, base_n+48}
+            block_idx = kb // 4                # 0..num_sf_blocks-1
+            n_in_block = cta_n_within_block + n_in_tile  # in [0, 128)
+            intra = (n_in_block % 32)*16
+                  + ((n_in_block % 128)/32)*4
+                  + (kb % 4)
+            sB_sf[block_idx, intra, stage_idx]
 
-        Two int32s per K-block per thread; sB_marlin offsets:
-          u32_0 @ sB_marlin[k_block_idx, n_warp_idx * 64 + lane * 2 + 0, stage]
-          u32_1 @ sB_marlin[k_block_idx, n_warp_idx * 64 + lane * 2 + 1, stage]
+        ``cta_n_within_block`` is the CTA's N offset relative to its
+        128-N SF block start (= (n_tile_idx * tile_N) % 128).  For tile_N
+        >= 128 this is 0; for tile_N = 64 it alternates 0 / 64.
 
-        Byte layout inside each int32 (see ``flashinfer/gemm/marlin_repack.py``):
-          u32_0:
-            byte 0: K=tc_row,    tc_row+1 at N=base_n        -> (mma_i=0,1, nn=0)
-            byte 1: K=tc_row+8,  tc_row+9 at N=base_n        -> (mma_i=2,3, nn=0)
-            byte 2: K=tc_row,    tc_row+1 at N=base_n+16     -> (mma_i=0,1, nn=1)
-            byte 3: K=tc_row+8,  tc_row+9 at N=base_n+16     -> (mma_i=2,3, nn=1)
-          u32_1 mirrors with N=base_n+32 and N=base_n+48 (nn=2, nn=3).
-
-        Ablation: when ``ABL_SKIP_DEQUANT`` is set in ``ablation_mode``,
-        this function is a no-op and tCrB stays at whatever the previous
-        iteration left in it (output is incorrect but timing is valid).
+        Ablation: ``ABL_SKIP_DEQUANT`` no-ops the whole function.
         """
         if cutlass.const_expr(
             (self.ablation_mode & self.ABL_SKIP_DEQUANT) != 0
@@ -1363,55 +1493,67 @@ class BlackwellDenseGemmW4A16Kernel:
 
         lane = tidx % Int32(32)
         warp = tidx // Int32(32)
-        # n_warp_idx maps warp -> N-stripe.  With (2,2,1) the 4 warps are
-        # arranged as 2 M-warps * 2 N-warps, so n_warp_idx = warp // 2.
-        # With (1,2,1) there are 2 warps total (no M-warp dim), so each
-        # warp is its own N-stripe: n_warp_idx = warp.  In general
-        # n_warp_idx = warp // atom_layout[0].
         n_warp_idx = warp // Int32(self.atom_layout[0])
-        tc_col = lane // Int32(4)
+        tc_row = (lane % Int32(4)) * Int32(2)       # {0, 2, 4, 6}
+        tc_col = lane // Int32(4)                   # [0, 8)
         base_n_in_tile = n_warp_idx * Int32(8) + tc_col
 
-        u32_pos_base = n_warp_idx * Int32(64) + lane * Int32(2)
-        if cutlass.const_expr(self.vectorized_smem_b == 1):
-            # Single ld.shared.v2.u32 (8-byte load) replaces 2 sequential
-            # ld.shared.u32.  u32_pos_base is always even (= n_warp*64 +
-            # lane*2), so the byte offset 4*u32_pos_base is 8-byte aligned.
-            # Targets long_scoreboard stalls (~18% per ncu).
-            smem_addr_b = get_smem_ptr_as_int32(
-                sB_marlin, sB_marlin.layout(
-                    (k_block_idx, u32_pos_base, stage_idx)
-                )
-            )
-            u32_0, u32_1 = ld_shared_v2_u32(smem_addr_b)
-        else:
-            u32_0 = Uint32(sB_marlin[k_block_idx, u32_pos_base, stage_idx])
-            u32_1 = Uint32(
-                sB_marlin[k_block_idx, u32_pos_base + Int32(1), stage_idx]
+        # K-pair byte offsets within sB_raw row.  k_block_idx is constexpr.
+        kb_base = Int32(k_block_idx) * Int32(self.GROUP_SIZE // _FP4_PER_BYTE)
+        k_pair_lo = kb_base + (tc_row // Int32(2))
+        k_pair_hi = k_pair_lo + Int32(4)
+
+        # 8 SMEM byte loads -- 4 N positions x 2 K-pair offsets.
+        n0 = base_n_in_tile + Int32(0)
+        n1 = base_n_in_tile + Int32(16)
+        n2 = base_n_in_tile + Int32(32)
+        n3 = base_n_in_tile + Int32(48)
+        b00 = Uint32(sB_raw[n0, k_pair_lo, stage_idx])
+        b01 = Uint32(sB_raw[n0, k_pair_hi, stage_idx])
+        b10 = Uint32(sB_raw[n1, k_pair_lo, stage_idx])
+        b11 = Uint32(sB_raw[n1, k_pair_hi, stage_idx])
+        b20 = Uint32(sB_raw[n2, k_pair_lo, stage_idx])
+        b21 = Uint32(sB_raw[n2, k_pair_hi, stage_idx])
+        b30 = Uint32(sB_raw[n3, k_pair_lo, stage_idx])
+        b31 = Uint32(sB_raw[n3, k_pair_hi, stage_idx])
+
+        # SF SMEM reads.  block_idx and (kb%4) are constexpr.
+        sf_block_idx = cutlass.const_expr(k_block_idx // _SF_BLOCK_KSF)
+        kb_mod4 = cutlass.const_expr(k_block_idx % _SF_BLOCK_KSF)
+
+        # Per-thread N position within the 128-N SF block.
+        nb0 = cta_n_within_block + n0
+        nb1 = cta_n_within_block + n1
+        nb2 = cta_n_within_block + n2
+        nb3 = cta_n_within_block + n3
+
+        def _sf_intra(nb: Int32) -> Int32:
+            return (
+                (nb & Int32(31)) * Int32(16)
+                + ((nb & Int32(127)) >> Int32(5)) * Int32(4)
+                + Int32(kb_mod4)
             )
 
-        # Per-group FP8-E4M3 scale loads.  4 distinct N positions per K-block.
-        sf_byte_0 = Uint32(
-            sB_sf[k_block_idx, base_n_in_tile + Int32(0), stage_idx]
-        )
-        sf_byte_1 = Uint32(
-            sB_sf[k_block_idx, base_n_in_tile + Int32(16), stage_idx]
-        )
-        sf_byte_2 = Uint32(
-            sB_sf[k_block_idx, base_n_in_tile + Int32(32), stage_idx]
-        )
-        sf_byte_3 = Uint32(
-            sB_sf[k_block_idx, base_n_in_tile + Int32(48), stage_idx]
-        )
+        sf_byte_0 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb0), stage_idx])
+        sf_byte_1 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb1), stage_idx])
+        sf_byte_2 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb2), stage_idx])
+        sf_byte_3 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb3), stage_idx])
+
+        # Decode each byte -> one fp16x2 = (K=tc_row, K=tc_row+1) for *_lo
+        # bytes; (K=tc_row+8, K=tc_row+9) for *_hi bytes.
+        h0_a = fp4_decode_2(b00)  # K=tc_row, tc_row+1 at N=base_n
+        h0_b = fp4_decode_2(b01)  # K=tc_row+8, tc_row+9 at N=base_n
+        h0_c = fp4_decode_2(b10)  # K=tc_row, tc_row+1 at N=base_n+16
+        h0_d = fp4_decode_2(b11)  # K=tc_row+8, tc_row+9 at N=base_n+16
+        h1_a = fp4_decode_2(b20)
+        h1_b = fp4_decode_2(b21)
+        h1_c = fp4_decode_2(b30)
+        h1_d = fp4_decode_2(b31)
 
         # ============================================================
-        # MODE 1 (default): cvt.rn.f16x2.e2m1x2 + hmul2 in fp16 + cvt to
-        # bf16 via fp32.  Saves 16 fp32 muls -> 8 hmul2 per K-block.
+        # MODE 1 (default): cvt + hmul2 in fp16 + cvt to bf16 via fp32.
         # ============================================================
         if cutlass.const_expr(self.dequant_mode == self.DEQUANT_MODE_HMUL2_F16):
-            h0_a, h0_b, h0_c, h0_d = fp4_decode_4bytes(u32_0)
-            h1_a, h1_b, h1_c, h1_d = fp4_decode_4bytes(u32_1)
-
             scale_n0_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_0) * alpha_val
             scale_n1_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_1) * alpha_val
             scale_n2_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_2) * alpha_val
@@ -1423,8 +1565,6 @@ class BlackwellDenseGemmW4A16Kernel:
             sc_n3 = f16x2_pack_broadcast(scale_n3_f32)
 
             def _write_hmul2(h2, scale_h2, mma_i_low, nn):
-                # Multiply in fp16x2; convert to bf16 via fp32 (no packed PTX
-                # for f16x2 -> bf16x2 exists, so unpack to fp32 then write).
                 scaled_h2 = half2_mul(h2, scale_h2)
                 f_lo, f_hi = f16x2_to_f32x2(scaled_h2)
                 tCrB[mma_i_low, nn, k_block_idx] = f_lo.to(self.b_compute_dtype)
@@ -1441,11 +1581,9 @@ class BlackwellDenseGemmW4A16Kernel:
             return
 
         # ============================================================
-        # MODE 0 (baseline): cvt.rn.f16x2.e2m1x2 + per-element fp32 multiply.
+        # MODE 0 (baseline): per-element fp32 multiply.  Uses the same
+        # h0_*/h1_* fp16x2 values from the byte-decode above.
         # ============================================================
-        h0_a, h0_b, h0_c, h0_d = fp4_decode_4bytes(u32_0)
-        h1_a, h1_b, h1_c, h1_d = fp4_decode_4bytes(u32_1)
-
         scale_n0 = cvt_e4m3_to_f32_via_f16(sf_byte_0) * alpha_val
         scale_n1 = cvt_e4m3_to_f32_via_f16(sf_byte_1) * alpha_val
         scale_n2 = cvt_e4m3_to_f32_via_f16(sf_byte_2) * alpha_val
@@ -1475,7 +1613,7 @@ class BlackwellDenseGemmW4A16Kernel:
     def wrapper(
         self,
         mA: cute.Tensor,
-        mB_marlin: cute.Tensor,
+        mB: cute.Tensor,
         mB_sf: cute.Tensor,
         mC: cute.Tensor,
         mAlpha: cute.Tensor,
@@ -1483,39 +1621,45 @@ class BlackwellDenseGemmW4A16Kernel:
         max_active_clusters: cutlass.Constexpr,
         current_stream,
     ):
-        """W4A16 wrapper for the FlashInfer compile interface.
+        """W4A16 mm_fp4-layout wrapper for the FlashInfer compile interface.
 
         Args:
-            mA:        (m, k) input tensor A, bf16 or fp16.
-            mB_marlin: (k // 16, n * 2) int32 -- Marlin-packed FP4.
-            mB_sf:     (k // 16, n) uint8 -- FP8-E4M3 per-group scales.
-            mC:        (m, n) output tensor C, bf16 or fp16.
-            mAlpha:    (1,) fp32 global scale.
-            l: batch dimension (Constexpr); typically 1.
-            max_active_clusters: Constexpr from get_max_active_clusters(1).
-            current_stream: CUDA stream (TVM-FFI fake stream).
+            mA:     (m, k) input tensor A, bf16 or fp16.
+            mB:     (n, k // 2) uint8 packed FP4 (= mat2_fp4).
+            mB_sf:  1-D byte buffer of the 128x4-swizzled FP8-E4M3 SF
+                    tensor (= mat2_inv_s.view(-1) from nvfp4_quantize
+                    with sfLayout=layout_128x4).
+            mC:     (m, n) output tensor C, bf16 or fp16.
+            mAlpha: (1,) fp32 scalar (= 1 / global_sf_B for nvfp4).
         """
         m = cute.size(mA, mode=[0])
         k = cute.size(mA, mode=[1])
         n = cute.size(mC, mode=[1])
-        k_tiles = k // _MARLIN_TILE_K
-        n_packed = 2 * n
-        k_sf_groups = k // self.GROUP_SIZE
+        k_half = k // _FP4_PER_BYTE
+        # SF gmem layout is (n_blocks, k_sf_blocks, 512) of uint8, where
+        # each 512-byte block is one 128x4 swizzle block.  n_blocks =
+        # ceil(N, 128) / 128 and k_sf_blocks = ceil(K/16, 4) / 4.  For
+        # supported shapes (N%128==0, K%64==0) this is exact division.
+        n_blocks = n // _SF_BLOCK_N
+        k_sf_blocks = k // (self.GROUP_SIZE * _SF_BLOCK_KSF)
 
         a_tensor = cute.make_tensor(
             mA.iterator,
             layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
         )
-        b_marlin_tensor = cute.make_tensor(
-            mB_marlin.iterator,
-            layout=cute.make_ordered_layout(
-                (k_tiles, n_packed, l), order=(1, 0, 2)
-            ),
+        # B underlying storage is (N, K/2, L) row-major (K/2 stride-1).
+        b_tensor = cute.make_tensor(
+            mB.iterator,
+            layout=cute.make_ordered_layout((n, k_half, l), order=(1, 0, 2)),
         )
+        # SF: re-view as (n_blocks, k_sf_blocks, 512) so TMA can chunk
+        # by swizzle block.  Each block is one 128x4-swizzled chunk; the
+        # dequant function reads bytes per-thread using the same intra-
+        # block swizzle formula.
         b_sf_tensor = cute.make_tensor(
             mB_sf.iterator,
             layout=cute.make_ordered_layout(
-                (k_sf_groups, n, l), order=(1, 0, 2)
+                (n_blocks, k_sf_blocks, _SF_BLOCK_BYTES), order=(2, 1, 0)
             ),
         )
         c_tensor = cute.make_tensor(
@@ -1525,7 +1669,7 @@ class BlackwellDenseGemmW4A16Kernel:
 
         self(
             a_tensor,
-            b_marlin_tensor,
+            b_tensor,
             b_sf_tensor,
             c_tensor,
             mAlpha,
