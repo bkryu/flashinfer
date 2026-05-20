@@ -50,7 +50,7 @@ Everything else (TMA pipeline for A, persistent tile scheduler,
 epilogue) is unchanged from the bf16 base.
 """
 
-from typing import Tuple, Type
+from typing import Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
 
@@ -169,6 +169,7 @@ class BlackwellDenseGemmW4A16Kernel:
         dequant_mode: int = 1,
         pipeline_depth: int = 1,
         vectorized_smem_b: int = 1,
+        atom_layout: Tuple[int, int, int] = (2, 2, 1),
     ):
         """W4A16 kernel.
 
@@ -219,7 +220,12 @@ class BlackwellDenseGemmW4A16Kernel:
         # diagnostic (see scratch_partition_mapping.py) shows mma_n=4
         # (n_inner=2 via *2 trick x n_outer=2), giving 16 fp16 per thread
         # per K-block = 2 int32 of FP4 to decode + scale.
-        self.atom_layout = (2, 2, 1)
+        self.atom_layout = tuple(atom_layout)
+        if self.atom_layout not in ((2, 2, 1), (1, 2, 1)):
+            raise ValueError(
+                f"Unsupported atom_layout {self.atom_layout!r}; "
+                "expected (2,2,1) or (1,2,1)"
+            )
         self.num_mma_warps = (
             self.atom_layout[0] * self.atom_layout[1] * self.atom_layout[2]
         )
@@ -1281,7 +1287,12 @@ class BlackwellDenseGemmW4A16Kernel:
 
         lane = tidx % Int32(32)
         warp = tidx // Int32(32)
-        n_warp_idx = warp // Int32(2)
+        # n_warp_idx maps warp -> N-stripe.  With (2,2,1) the 4 warps are
+        # arranged as 2 M-warps * 2 N-warps, so n_warp_idx = warp // 2.
+        # With (1,2,1) there are 2 warps total (no M-warp dim), so each
+        # warp is its own N-stripe: n_warp_idx = warp.  In general
+        # n_warp_idx = warp // atom_layout[0].
+        n_warp_idx = warp // Int32(self.atom_layout[0])
         tc_col = lane // Int32(4)
         base_n_in_tile = n_warp_idx * Int32(8) + tc_col
 

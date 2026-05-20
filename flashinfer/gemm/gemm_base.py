@@ -6006,28 +6006,44 @@ def _prepare_w4a16_alpha(
 
 def _select_w4a16_tile_shape(
     m: int, n: int, k: int
-) -> Tuple[int, int, int]:
-    """Pick a CTA tile shape for the cute-DSL W4A16 kernel.
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """Pick a CTA tile shape AND MMA atom_layout for the cute-DSL W4A16 kernel.
 
-    tile_M choice: the MMA partition uses atom_layout (2,2,1) + permutation
-    (32, 32, 16), so tile_M must be a multiple of 32.  For small batch (M
-    <= 32) we use tile_M=32 -- halves A SMEM and MMA work per CTA vs
-    tile_M=64 (which would waste ~94% of M rows at M=4).  At M=4 N=K=4096
-    this saves ~2.5 us vs tile_M=64 with the same tile_K.
+    Returns ``(tile_shape_mnk, atom_layout)``.
 
-    tile_K choice: when K is a multiple of 128 we use tile_K=128, which
-    halves the K-tile count and amortizes TMA-load + pipeline-barrier
-    overhead -- saves ~1.6 us vs tile_K=64 at the reference shape.  ab_stage
-    stays at 7 for tile_M=32, plenty for overlap.
+    Tile shape selection:
+      tile_M choice
+        * M <= 16 (and tile_K=128 path): use tile_M=16 with atom_layout
+          (1,2,1).  Halves wasted M-rows vs tile_M=32, and a 1-M-warp
+          layout removes the duplicate dequant that (2,2,1) suffers from.
+          20.4 us at M=4 N=K=4096.
+        * 16 < M <= 32: use tile_M=32 with atom_layout (2,2,1).  Smaller
+          MMA + epilogue waste than tile_M=64 -- 21.5 us at M=4 N=K=4096.
+        * M > 32: use tile_M=64 with atom_layout (2,2,1) -- standard tile,
+          more rows to amortize across.
 
-    Combined ``(32, 64, 128)`` is the locked-in default for M <= 32 and
-    K % 128 == 0; 21.5 us at M=4 N=K=4096.  Falls back to a wider tile
-    for larger M (more rows to amortize across) and to tile_K=64 when K
-    is not a multiple of 128.
+      tile_K choice
+        * K % 128 == 0: tile_K=128 (halves K-tile count and barrier
+          overhead -- saves ~1.6 us vs tile_K=64).
+        * Otherwise: tile_K=64.
+
+    Why atom_layout differs:
+      * (2,2,1) (default for tile_M >= 32): 4 MMA warps as 2 M x 2 N --
+        well-tested cute layout, but the 2 M-warps redundantly dequant
+        the same B values into their own register files (~50% waste in
+        dequant compute).
+      * (1,2,1) (used for tile_M=16): 2 MMA warps as 1 M x 2 N -- no
+        M-warp duplication.  Permutation_m = 16, so tile_M must be 16.
+        Cannot be used for larger tile_M (would need atom_layout (1,K,1)
+        with K>2 which hits a cute DSL *2-trick partitioning bug at the
+        (1,4,1) variant -- see project memory).
     """
-    tile_m = 32 if m <= 32 else 64
     tile_k = 128 if k % 128 == 0 else 64
-    return (tile_m, 64, tile_k)
+    if m <= 16 and tile_k == 128:
+        return ((16, 64, 128), (1, 2, 1))
+    if m <= 32:
+        return ((32, 64, tile_k), (2, 2, 1))
+    return ((64, 64, tile_k), (2, 2, 1))
 
 
 _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE: dict = {}
@@ -6037,6 +6053,7 @@ def _get_cute_dsl_w4a16_gemm(
     tile_shape_mnk: Tuple[int, int, int],
     a_dtype: torch.dtype,
     c_dtype: torch.dtype,
+    atom_layout: Tuple[int, int, int] = (2, 2, 1),
 ):
     """Compile (or fetch from cache) the cute-DSL W4A16 GEMM kernel.
 
@@ -6047,7 +6064,8 @@ def _get_cute_dsl_w4a16_gemm(
       mC        : (m, n)              c_dtype
       mAlpha    : (1,)                float32 scalar
     """
-    cache_key = (tile_shape_mnk, a_dtype, c_dtype)
+    atom_layout = tuple(atom_layout)
+    cache_key = (tile_shape_mnk, a_dtype, c_dtype, atom_layout)
     cached = _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -6092,7 +6110,9 @@ def _get_cute_dsl_w4a16_gemm(
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     gemm = BlackwellDenseGemmW4A16Kernel(
-        acc_dtype=cutlass.Float32, tile_shape_mnk=tile_shape_mnk
+        acc_dtype=cutlass.Float32,
+        tile_shape_mnk=tile_shape_mnk,
+        atom_layout=atom_layout,
     )
     max_active_clusters = get_max_active_clusters(1)
 
@@ -6184,8 +6204,10 @@ def mm_fp4_w4a16(
                 selected_backend = "torch"
 
     if selected_backend == "cute-dsl":
-        tile_shape_mnk = _select_w4a16_tile_shape(m, n, k)
-        compiled = _get_cute_dsl_w4a16_gemm(tile_shape_mnk, a.dtype, out_dtype)
+        tile_shape_mnk, atom_layout = _select_w4a16_tile_shape(m, n, k)
+        compiled = _get_cute_dsl_w4a16_gemm(
+            tile_shape_mnk, a.dtype, out_dtype, atom_layout
+        )
         b_sf_u8 = b_descale.view(torch.uint8).contiguous()
         alpha_for_launch = _prepare_w4a16_alpha(alpha, a.device)
         if out is None:
