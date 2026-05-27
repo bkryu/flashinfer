@@ -84,6 +84,75 @@ from cutlass.cutlass_dsl import dsl_user_op
 
 
 @dsl_user_op
+def cvt_bf16x2_to_f16x2_via_f32(
+    packed_bf16x2: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Packed bf16x2 (u32) -> f16x2 (u32) via f32 intermediate.
+
+    Single inline-asm block: mov.b32 unpack + 2x cvt.f32.bf16 + 1x
+    cvt.rn.f16x2.f32 packed.  Total 4 PTX instructions for the pair.
+
+    The direct `cvt.rn.f16x2.bf16x2` (a single PTX instr) is NOT
+    supported by ptxas on sm_100/sm_120 with CUDA 13.1 -- confirmed
+    via scratch_cvt_bf16x2_to_f16x2_probe.py.  When the toolchain
+    adds support we can swap this body for the single-instruction
+    direct cvt.
+
+    Compares to cute's per-element scalar `.to(Float16)` lowering:
+    that emits ~2 scalar instructions per element (cvt.f32.bf16 +
+    cvt.rn.f16.f32), or 4 instr per pair -- same count, but ours
+    keeps the second cvt packed."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(packed_bf16x2).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 b_lo, b_hi;
+                .reg .f32 f_lo, f_hi;
+                mov.b32 {b_lo, b_hi}, $1;
+                cvt.f32.bf16 f_lo, b_lo;
+                cvt.f32.bf16 f_hi, b_hi;
+                cvt.rn.f16x2.f32 $0, f_hi, f_lo;
+            }
+            """,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def f16x2_unpack(
+    packed_h2: Uint32, *, loc=None, ip=None
+) -> Tuple["cutlass.Float16", "cutlass.Float16"]:
+    """Unpack f16x2 (u32) into (f16_lo, f16_hi).  Free at HW level --
+    just a register-rename (mov.b32 {h_lo, h_hi}, packed).  Used by the
+    fp16-MMA path to bypass the f16->f32->bf16 cvt chain that the
+    default bf16-MMA path needs after hmul2."""
+    from cutlass import Float16
+    res = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(f16, f16)>"),
+        [Uint32(packed_h2).ir_value(loc=loc, ip=ip)],
+        "mov.b32 {$0, $1}, $2;",
+        "=h,=h,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float16(llvm.extractvalue(T.f16(), res, [0], loc=loc, ip=ip)),
+        Float16(llvm.extractvalue(T.f16(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def f16x2_pack_broadcast(v: Float32, *, loc=None, ip=None) -> Uint32:
     """Broadcast a single fp32 value to both lanes of an fp16x2 register."""
     return Uint32(
@@ -117,6 +186,41 @@ _TILE_K_MULT: cutlass.Constexpr = 16     # = GROUP_SIZE (one SF byte per K-block
 _SF_BLOCK_BYTES: cutlass.Constexpr = 512  # bytes per (128 N x 4 K_sf) block
 _SF_BLOCK_N: cutlass.Constexpr = 128
 _SF_BLOCK_KSF: cutlass.Constexpr = 4
+
+
+def _sb_raw_n_stride_bytes(tile_k_half: int) -> int:
+    """Per-row SMEM stride for sB_raw to suppress bank conflicts.
+
+    The dequant function reads 1 byte per thread per ld.shared.u8, where 8
+    threads in a warp share the same K coordinate and read 8 distinct N rows
+    (lane // 4 ∈ [0, 8)).  SMEM has 32 banks × 4 bytes wide, so the bank
+    each row hits is ``(n * row_stride // 4) % 32``.  For the natural compact
+    stride of 64 bytes (tile_K=128), 8 rows hit only 2 banks (4-way conflict
+    — ncu reports ~60% wavefront-replay rate).
+
+    Padding the row stride to a value that spreads the 8 rows across more
+    banks reduces conflict-replay cost.  Blackwell TMA's bulk-copy atom
+    requires 32-byte alignment on per-row destination addresses, so the
+    stride must be a multiple of 32.  Among 32-aligned strides >= tile_K/2:
+
+      stride  banks_seen_by_8_rows  conflict_factor
+        64    {0,16}                4-way (current)
+        96    {0,24,16,8}           2-way   ← best 32-aligned option
+       128    {0}                   8-way   (catastrophic)
+       160    {0,8,16,24}           2-way   (more SMEM, no improvement vs 96)
+       192    {0,16}                4-way   (same as 64)
+
+    For tile_K=128 we pick 96 (32-aligned, 2-way conflict, +50% SMEM vs 64).
+    For other tile_K we use the natural compact stride.
+
+    DISABLED 2026-05-20: stride 80 and 96 both crash with cudaErrorMisalignedAddress
+    despite satisfying 16/32-byte alignment.  TMA in cute-DSL appears to require
+    a tightly-packed destination layout (or there is another SMEM access path
+    that requires the natural compact stride).  Need to investigate further --
+    likely needs a different layout strategy (XOR swizzle or b12x-style decode-
+    to-bf16-SMEM) to break the bank conflicts.
+    """
+    return tile_k_half
 
 
 # 1-byte gmem load through non-coherent cache (for per-thread SF reads).
@@ -187,6 +291,14 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
     ABL_SKIP_TMA_STORE: cutlass.Constexpr = 64  # skip TMA store call
     ABL_SKIP_R2S: cutlass.Constexpr = 128  # skip the StMatrix R2S copy
 
+    # Fine-grained dequant ablations (HMUL2 path only).  Each replaces a
+    # stage's outputs with a runtime sentinel (Uint32(tidx)) to prevent
+    # constant-folding while skipping that stage's compute.  Output is
+    # incorrect under any of these -- timing only.
+    ABL_DQ_NO_SMEM: cutlass.Constexpr = 256    # skip sB_raw + sB_sf loads
+    ABL_DQ_NO_DECODE: cutlass.Constexpr = 512  # skip fp4_decode_2 + cvt_e4m3
+    ABL_DQ_NO_CVT_CHAIN: cutlass.Constexpr = 1024  # skip hmul2 + f16->f32->bf16
+
     # Dequant primitive selection (constexpr-friendly).
     #   0 = CVT_F32 (baseline, retained for ablation):
     #       cvt.rn.f16x2.e2m1x2 + per-element fp32 scale multiply, ~6 ops/pair.
@@ -204,8 +316,9 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
     DEQUANT_MODE_CVT_F32: cutlass.Constexpr = 0
     DEQUANT_MODE_HMUL2_F16: cutlass.Constexpr = 1
 
-    # Phase D: vectorize the 2 sB_marlin u32 reads as 1 ld.shared.v2.u32
-    # (u64 load).  Targets the long_scoreboard stalls (~18% per ncu).
+    # Reserved for a future sB_raw load-width experiment (see memory note
+    # project_w4a16_mmfp4_kernel for prior v2/v4.u32 attempts that didn't
+    # pay back -- the bottleneck is layout-bound, not width-bound).
     VECTORIZED_SMEM_B_DEFAULT: cutlass.Constexpr = 1
 
     # Phase C: K-block dequant pipeline depth (constexpr).
@@ -223,9 +336,21 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
         ablation_mode: int = 0,
         dequant_mode: int = 1,
         pipeline_depth: int = 1,
+        # Currently a no-op (the dequant function always uses ld.shared.u8).
+        # v2.u32 and v4.u32 widening were both tried and neither paid off
+        # -- see memory note project_w4a16_mmfp4_kernel.  Kept as a
+        # placeholder for future width-related experiments.
         vectorized_smem_b: int = 1,
         atom_layout: Tuple[int, int, int] = (2, 2, 1),
         epi_tile_override: Optional[Tuple[int, int]] = None,
+        sb_raw_n_stride_bytes: Optional[int] = None,
+        # 0 = bf16 MMA (default; A and B both bf16, matching the bf16 A
+        # input).  1 = fp16 MMA: drops the f16->f32->bf16 cvt chain on B
+        # (dequant writes fp16 directly), at the cost of an in-register
+        # bf16->fp16 conversion on A after ldmatrix.  Net hoped-for win
+        # is ~4-5us on the B-side cvt chain minus ~1-2us A conversion.
+        # Accumulator stays fp32 either way.
+        use_fp16_mma: int = 0,
     ):
         """W4A16 kernel.
 
@@ -262,6 +387,14 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
         self.epi_tile_override = (
             tuple(epi_tile_override) if epi_tile_override is not None else None
         )
+        # Optional override for the sB_raw N-row SMEM stride.  None = pick via
+        # _sb_raw_n_stride_bytes() to avoid bank conflicts (default).  Pass an
+        # explicit value (e.g., tile_K // 2 for natural compact stride) to A/B
+        # test against the padded version.
+        self.sb_raw_n_stride_bytes_override = (
+            int(sb_raw_n_stride_bytes) if sb_raw_n_stride_bytes is not None else None
+        )
+        self.use_fp16_mma = int(use_fp16_mma)
         self.tiled_mma = None
         self.num_mcast_ctas_a = None
         self.num_mcast_ctas_b = None
@@ -324,8 +457,11 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
 
     def _setup_attributes(self):
         self.mma_inst_mnk = (16, 8, 16)
+        # MmaF16BF16Op accepts ab_dtype in {Float16, BFloat16}.  We pick
+        # via b_compute_dtype so use_fp16_mma=1 swings the whole MMA to
+        # fp16 (both A and B fragments will be fp16-typed).
         op = cute.nvgpu.warp.MmaF16BF16Op(
-            self.a_dtype,
+            self.b_compute_dtype,
             self.acc_dtype,
             self.mma_inst_mnk,
         )
@@ -394,6 +530,7 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
             self.c_layout,
             self.epi_stage,
             self.GROUP_SIZE,
+            self.sb_raw_n_stride_bytes_override,
         )
 
     @cute.jit
@@ -407,8 +544,16 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
+        from cutlass import Float16
         self.a_dtype = a.element_type
-        self.b_compute_dtype = a.element_type  # MMA B fragment dtype = A dtype
+        # MMA operand dtype: bf16 by default (matches A), or fp16 when
+        # use_fp16_mma=1 (lets us skip the f16->f32->bf16 cvt chain on B).
+        # When fp16 MMA, A must be converted from bf16 to fp16 in-register
+        # after ldmatrix; see the mainloop's tCrA_bf16_staging path.
+        if cutlass.const_expr(self.use_fp16_mma == 1):
+            self.b_compute_dtype = Float16
+        else:
+            self.b_compute_dtype = a.element_type
         self.c_dtype = c.element_type
 
         self.a_layout = utils.LayoutEnum.from_tensor(a)
@@ -740,8 +885,14 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
 
             num_k_blocks = cute.size(tCrA, mode=[2])
 
-            # ldmatrix is only for A.  B is filled in-register from sB_marlin
+            # ldmatrix is only for A.  B is filled in-register from sB_raw
             # via FP4 decode + per-group scale.
+            #
+            # use_fp16_mma=1: tCrA is fp16-typed (matches the fp16 MMA),
+            # but sA is bf16 in SMEM.  ldmatrix into a bf16 staging
+            # fragment, then per-K-block convert bf16 -> fp16 in-register
+            # before MMA reads tCrA.  See _ldmatrix_a in the inner loop.
+            from cutlass import BFloat16, Float16
             atom_copy_ldmatrix_A = cute.make_copy_atom(
                 cute.nvgpu.warp.LdMatrix8x8x16bOp(self.a_layout.is_m_major_a(), 4),
                 self.a_dtype,
@@ -749,7 +900,14 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
             smem_tiled_copy_A = cute.make_tiled_copy_A(atom_copy_ldmatrix_A, tiled_mma)
             thr_copy_ldmatrix_A = smem_tiled_copy_A.get_slice(tidx)
             tCsA_copy_view = thr_copy_ldmatrix_A.partition_S(sA)
-            tCrA_copy_view = thr_copy_ldmatrix_A.retile(tCrA)
+            if cutlass.const_expr(self.use_fp16_mma == 1):
+                tCrA_bf16 = cute.make_fragment_like(tCrA, BFloat16)
+                tCrA_copy_view = thr_copy_ldmatrix_A.retile(tCrA_bf16)
+            else:
+                # Placeholder so the (dead) cvt branch at call sites can
+                # name-lookup tCrA_bf16 even when bf16-MMA is active.
+                tCrA_bf16 = tCrA
+                tCrA_copy_view = thr_copy_ldmatrix_A.retile(tCrA)
 
             alpha_val = Float32(mAlpha[Int32(0)])
 
@@ -789,6 +947,10 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
                             tCsA_p[None, None, 0],
                             tCrA_copy_view[None, None, 0],
                         )
+                        if cutlass.const_expr(self.use_fp16_mma == 1):
+                            self._cvt_a_bf16_to_fp16_one_k_block(
+                                tCrA, tCrA_bf16, 0
+                            )
                     self._dequant_b_to_register(
                         sB_raw,
                         sB_sf,
@@ -819,6 +981,10 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
                                     tCsA_p[None, None, k_block_idx],
                                     tCrA_copy_view[None, None, k_block_idx],
                                 )
+                                if cutlass.const_expr(self.use_fp16_mma == 1):
+                                    self._cvt_a_bf16_to_fp16_one_k_block(
+                                        tCrA, tCrA_bf16, k_block_idx
+                                    )
                             self._dequant_b_to_register(
                                 sB_raw,
                                 sB_sf,
@@ -886,6 +1052,10 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
                                     tCsA_p[None, None, k_block_next],
                                     tCrA_copy_view[None, None, k_block_next],
                                 )
+                                if cutlass.const_expr(self.use_fp16_mma == 1):
+                                    self._cvt_a_bf16_to_fp16_one_k_block(
+                                        tCrA, tCrA_bf16, k_block_next
+                                    )
                             self._dequant_b_to_register(
                                 sB_raw,
                                 sB_sf,
@@ -923,6 +1093,10 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
                                 tCsA_p[None, None, k_block_idx],
                                 tCrA_copy_view[None, None, k_block_idx],
                             )
+                            if cutlass.const_expr(self.use_fp16_mma == 1):
+                                self._cvt_a_bf16_to_fp16_one_k_block(
+                                    tCrA, tCrA_bf16, k_block_idx
+                                )
                         self._dequant_b_to_register(
                             sB_raw,
                             sB_sf,
@@ -961,6 +1135,10 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
                                     tCsA_p[None, None, k_block_next],
                                     tCrA_copy_view[None, None, k_block_next],
                                 )
+                                if cutlass.const_expr(self.use_fp16_mma == 1):
+                                    self._cvt_a_bf16_to_fp16_one_k_block(
+                                        tCrA, tCrA_bf16, k_block_next
+                                    )
                             self._dequant_b_to_register(
                                 sB_raw,
                                 sB_sf,
@@ -1283,6 +1461,7 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
         c_layout: cute.Layout,
         epi_stage: int,
         group_size: int,
+        sb_raw_n_stride_bytes_override: Optional[int] = None,
     ):
         """Returns (sA, sB_raw, sB_sf, b_bf16_phantom, sC) layouts.
 
@@ -1310,13 +1489,39 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
         )
 
         # sB_raw: (tile_N) rows x (tile_K // 2) uint8 cols x stage.
-        b_raw_smem_layout_staged = cute.make_ordered_layout(
+        # K is stride-1 (innermost), matching the (N, K/2) gmem layout the
+        # user provides.  N-row stride is padded above the natural
+        # (tile_K // 2) bytes to break SMEM bank-conflict aliasing for the
+        # dequant function's per-thread byte reads -- see the
+        # _sb_raw_n_stride_bytes() docstring for the bank math.
+        #
+        # Per row we only fill (tile_K // 2) bytes from gmem via TMA; the
+        # extra (stride - tile_K // 2) bytes at the end of each N row are
+        # untouched padding that the consumer never reads.
+        #
+        # Earlier attempts: K_SW32 / K_SW64 cute XOR swizzles -- both TMA-
+        # compatible for u8, but per-access swizzle ALU overhead (XOR/AND/
+        # shift) on every ld.shared.u8 exceeds the bank-conflict savings.
+        # XOR swizzle only pays off paired with ldmatrix (HW resolves the
+        # swizzle as part of the warp-wide load); for raw u8 reads it's
+        # net-negative.  See memory note project_w4a16_mmfp4_kernel.
+        if sb_raw_n_stride_bytes_override is not None:
+            n_stride_bytes = sb_raw_n_stride_bytes_override
+        else:
+            n_stride_bytes = _sb_raw_n_stride_bytes(
+                tile_shape_mnk[2] // _FP4_PER_BYTE
+            )
+        b_raw_smem_layout_staged = cute.make_layout(
             (
                 tile_shape_mnk[1],
                 tile_shape_mnk[2] // _FP4_PER_BYTE,
                 ab_stage,
             ),
-            order=(1, 0, 2),
+            stride=(
+                n_stride_bytes,
+                1,
+                n_stride_bytes * tile_shape_mnk[1],
+            ),
         )
 
         # sB_sf: (num_sf_blocks_per_k_tile=tile_K/64) rows x 512 uint8
@@ -1422,6 +1627,36 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
         return tma_atom, tma_tensor
 
     @cute.jit
+    def _cvt_a_bf16_to_fp16_one_k_block(
+        self,
+        tCrA_dst,
+        tCrA_bf16_src,
+        k_block: cutlass.Constexpr,
+    ):
+        """In-register bf16 -> fp16 cvt for one K-block of A.
+
+        Recasts both fragments to Uint32 (each u32 packs 2 16-bit elems)
+        and applies `cvt_bf16x2_to_f16x2_via_f32` per pair.  The packed
+        narrowing cvt (`cvt.rn.f16x2.f32`) combines what would be two
+        scalar `cvt.rn.f16.f32` instructions if we used cute's default
+        `.to(Float16)` lowering.
+
+        We can't use bf16/f16 typed inline-asm constraints directly on
+        sm_100a (NVVM rejects =h with bf16/f16 LLVM struct returns -- see
+        scratch_cvt_bf16x2_to_f16x2_probe.py), so we keep everything in
+        Uint32 pair representation.
+        """
+        bf_u32 = cute.recast_tensor(
+            tCrA_bf16_src[None, None, k_block], Uint32
+        )
+        fp_u32 = cute.recast_tensor(
+            tCrA_dst[None, None, k_block], Uint32
+        )
+        n_pairs = cute.size(bf_u32)
+        for i in cutlass.range_constexpr(n_pairs):
+            fp_u32[i] = cvt_bf16x2_to_f16x2_via_f32(Uint32(bf_u32[i]))
+
+    @cute.jit
     def _swizzled_e4m3_offset(
         self,
         n: Int32,         # global N coordinate
@@ -1504,18 +1739,38 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
         k_pair_hi = k_pair_lo + Int32(4)
 
         # 8 SMEM byte loads -- 4 N positions x 2 K-pair offsets.
+        # Documented bottleneck: 4-way bank conflict (8 N rows at stride-64
+        # alias to 2 banks; ~60% wavefront-replay per ncu).  Instruction-
+        # width tricks (v2.u32, v4.u32) don't help -- conflict is layout-
+        # bound, not width-bound.  See memory note project_w4a16_mmfp4_kernel.
         n0 = base_n_in_tile + Int32(0)
         n1 = base_n_in_tile + Int32(16)
         n2 = base_n_in_tile + Int32(32)
         n3 = base_n_in_tile + Int32(48)
-        b00 = Uint32(sB_raw[n0, k_pair_lo, stage_idx])
-        b01 = Uint32(sB_raw[n0, k_pair_hi, stage_idx])
-        b10 = Uint32(sB_raw[n1, k_pair_lo, stage_idx])
-        b11 = Uint32(sB_raw[n1, k_pair_hi, stage_idx])
-        b20 = Uint32(sB_raw[n2, k_pair_lo, stage_idx])
-        b21 = Uint32(sB_raw[n2, k_pair_hi, stage_idx])
-        b30 = Uint32(sB_raw[n3, k_pair_lo, stage_idx])
-        b31 = Uint32(sB_raw[n3, k_pair_hi, stage_idx])
+
+        # Runtime sentinel for fine-grained dequant ablations.  Must vary
+        # per use (otherwise the compiler CSEs the downstream chain since
+        # all sentinels share the same value) -- we XOR tidx with a
+        # per-variable constant.  Cheap runtime expression that defeats CSE.
+        def _sentinel(salt: int) -> "Uint32":
+            return Uint32(tidx ^ Int32(salt))
+
+        if cutlass.const_expr(
+            (self.ablation_mode & self.ABL_DQ_NO_SMEM) != 0
+        ):
+            b00 = _sentinel(0x01); b01 = _sentinel(0x02)
+            b10 = _sentinel(0x03); b11 = _sentinel(0x04)
+            b20 = _sentinel(0x05); b21 = _sentinel(0x06)
+            b30 = _sentinel(0x07); b31 = _sentinel(0x08)
+        else:
+            b00 = Uint32(sB_raw[n0, k_pair_lo, stage_idx])
+            b01 = Uint32(sB_raw[n0, k_pair_hi, stage_idx])
+            b10 = Uint32(sB_raw[n1, k_pair_lo, stage_idx])
+            b11 = Uint32(sB_raw[n1, k_pair_hi, stage_idx])
+            b20 = Uint32(sB_raw[n2, k_pair_lo, stage_idx])
+            b21 = Uint32(sB_raw[n2, k_pair_hi, stage_idx])
+            b30 = Uint32(sB_raw[n3, k_pair_lo, stage_idx])
+            b31 = Uint32(sB_raw[n3, k_pair_hi, stage_idx])
 
         # SF SMEM reads.  block_idx and (kb%4) are constexpr.
         sf_block_idx = cutlass.const_expr(k_block_idx // _SF_BLOCK_KSF)
@@ -1534,41 +1789,95 @@ class BlackwellDenseGemmW4A16MmFp4Kernel:
                 + Int32(kb_mod4)
             )
 
-        sf_byte_0 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb0), stage_idx])
-        sf_byte_1 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb1), stage_idx])
-        sf_byte_2 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb2), stage_idx])
-        sf_byte_3 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb3), stage_idx])
+        if cutlass.const_expr(
+            (self.ablation_mode & self.ABL_DQ_NO_SMEM) != 0
+        ):
+            sf_byte_0 = _sentinel(0x11); sf_byte_1 = _sentinel(0x12)
+            sf_byte_2 = _sentinel(0x13); sf_byte_3 = _sentinel(0x14)
+        else:
+            sf_byte_0 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb0), stage_idx])
+            sf_byte_1 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb1), stage_idx])
+            sf_byte_2 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb2), stage_idx])
+            sf_byte_3 = Uint32(sB_sf[0, sf_block_idx, _sf_intra(nb3), stage_idx])
 
         # Decode each byte -> one fp16x2 = (K=tc_row, K=tc_row+1) for *_lo
-        # bytes; (K=tc_row+8, K=tc_row+9) for *_hi bytes.
-        h0_a = fp4_decode_2(b00)  # K=tc_row, tc_row+1 at N=base_n
-        h0_b = fp4_decode_2(b01)  # K=tc_row+8, tc_row+9 at N=base_n
-        h0_c = fp4_decode_2(b10)  # K=tc_row, tc_row+1 at N=base_n+16
-        h0_d = fp4_decode_2(b11)  # K=tc_row+8, tc_row+9 at N=base_n+16
-        h1_a = fp4_decode_2(b20)
-        h1_b = fp4_decode_2(b21)
-        h1_c = fp4_decode_2(b30)
-        h1_d = fp4_decode_2(b31)
+        # bytes; (K=tc_row+8, K=tc_row+9) for *_hi bytes.  ABL_DQ_NO_DECODE
+        # skips the cvt.rn.f16x2.e2m1x2 by passing the source byte through
+        # as if it were already an f16x2 -- downstream hmul2 + cvt chain
+        # still execute on real runtime values.
+        if cutlass.const_expr(
+            (self.ablation_mode & self.ABL_DQ_NO_DECODE) != 0
+        ):
+            h0_a = b00; h0_b = b01; h0_c = b10; h0_d = b11
+            h1_a = b20; h1_b = b21; h1_c = b30; h1_d = b31
+        else:
+            h0_a = fp4_decode_2(b00)
+            h0_b = fp4_decode_2(b01)
+            h0_c = fp4_decode_2(b10)
+            h0_d = fp4_decode_2(b11)
+            h1_a = fp4_decode_2(b20)
+            h1_b = fp4_decode_2(b21)
+            h1_c = fp4_decode_2(b30)
+            h1_d = fp4_decode_2(b31)
 
         # ============================================================
         # MODE 1 (default): cvt + hmul2 in fp16 + cvt to bf16 via fp32.
         # ============================================================
         if cutlass.const_expr(self.dequant_mode == self.DEQUANT_MODE_HMUL2_F16):
-            scale_n0_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_0) * alpha_val
-            scale_n1_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_1) * alpha_val
-            scale_n2_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_2) * alpha_val
-            scale_n3_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_3) * alpha_val
+            # ABL_DQ_NO_DECODE also skips cvt_e4m3 + f16x2_pack_broadcast --
+            # we use sf_byte_* directly as the f16x2-packed scale.
+            if cutlass.const_expr(
+                (self.ablation_mode & self.ABL_DQ_NO_DECODE) != 0
+            ):
+                sc_n0 = sf_byte_0
+                sc_n1 = sf_byte_1
+                sc_n2 = sf_byte_2
+                sc_n3 = sf_byte_3
+            else:
+                scale_n0_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_0) * alpha_val
+                scale_n1_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_1) * alpha_val
+                scale_n2_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_2) * alpha_val
+                scale_n3_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_3) * alpha_val
+                sc_n0 = f16x2_pack_broadcast(scale_n0_f32)
+                sc_n1 = f16x2_pack_broadcast(scale_n1_f32)
+                sc_n2 = f16x2_pack_broadcast(scale_n2_f32)
+                sc_n3 = f16x2_pack_broadcast(scale_n3_f32)
 
-            sc_n0 = f16x2_pack_broadcast(scale_n0_f32)
-            sc_n1 = f16x2_pack_broadcast(scale_n1_f32)
-            sc_n2 = f16x2_pack_broadcast(scale_n2_f32)
-            sc_n3 = f16x2_pack_broadcast(scale_n3_f32)
+            # ABL_DQ_NO_CVT_CHAIN skips half2_mul + f16x2_to_f32x2 + .to(bf16)
+            # by writing a sentinel bf16 directly.  Lets us isolate the cost
+            # of the multiply + double-cvt sequence (called out in the
+            # optimization log as ~5-6 us on the older Marlin sibling).
+            if cutlass.const_expr(
+                (self.ablation_mode & self.ABL_DQ_NO_CVT_CHAIN) != 0
+            ):
+                # Vary the bf16 sentinel per write to defeat CSE.
+                tidx_f = Float32(tidx)
+                for mma_i in cutlass.range_constexpr(4):
+                    for nn in cutlass.range_constexpr(4):
+                        salt = Float32(mma_i * 4 + nn)
+                        tCrB[mma_i, nn, k_block_idx] = (
+                            tidx_f + salt
+                        ).to(self.b_compute_dtype)
+                return
 
-            def _write_hmul2(h2, scale_h2, mma_i_low, nn):
-                scaled_h2 = half2_mul(h2, scale_h2)
-                f_lo, f_hi = f16x2_to_f32x2(scaled_h2)
-                tCrB[mma_i_low, nn, k_block_idx] = f_lo.to(self.b_compute_dtype)
-                tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi.to(self.b_compute_dtype)
+            if cutlass.const_expr(self.use_fp16_mma == 1):
+                # fp16-MMA path: scaled_h2 (f16x2) -> 2 fp16 -> tCrB.
+                # Saves the f16->f32->bf16 cvt chain (5 ops/pair -> 1 op/pair).
+                def _write_hmul2(h2, scale_h2, mma_i_low, nn):
+                    scaled_h2 = half2_mul(h2, scale_h2)
+                    f_lo, f_hi = f16x2_unpack(scaled_h2)
+                    tCrB[mma_i_low, nn, k_block_idx] = f_lo
+                    tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi
+            else:
+                def _write_hmul2(h2, scale_h2, mma_i_low, nn):
+                    scaled_h2 = half2_mul(h2, scale_h2)
+                    f_lo, f_hi = f16x2_to_f32x2(scaled_h2)
+                    tCrB[mma_i_low, nn, k_block_idx] = f_lo.to(
+                        self.b_compute_dtype
+                    )
+                    tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi.to(
+                        self.b_compute_dtype
+                    )
 
             _write_hmul2(h0_a, sc_n0, 0, 0)
             _write_hmul2(h0_b, sc_n0, 2, 0)

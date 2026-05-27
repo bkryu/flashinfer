@@ -76,6 +76,68 @@ from cutlass.cutlass_dsl import dsl_user_op
 
 
 @dsl_user_op
+def cvt_bf16x2_to_f16x2_via_f32(
+    packed_bf16x2: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Packed bf16x2 (u32) -> f16x2 (u32) via f32 intermediate.
+
+    Used by the fp16-MMA path (use_fp16_mma=1) to convert A's ldmatrix
+    output (bf16 bit pattern from sA) to fp16 bit pattern for the fp16
+    MMA inputs.  Direct ``cvt.rn.f16x2.bf16x2`` is rejected by ptxas on
+    sm_100a / CUDA 13.1; this packed via-f32 path is 4 PTX instrs per
+    pair (mov.b32 unpack + 2x cvt.f32.bf16 + 1x cvt.rn.f16x2.f32).
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(packed_bf16x2).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 b_lo, b_hi;
+                .reg .f32 f_lo, f_hi;
+                mov.b32 {b_lo, b_hi}, $1;
+                cvt.f32.bf16 f_lo, b_lo;
+                cvt.f32.bf16 f_hi, b_hi;
+                cvt.rn.f16x2.f32 $0, f_hi, f_lo;
+            }
+            """,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def f16x2_unpack(
+    packed_h2: Uint32, *, loc=None, ip=None
+) -> Tuple["cutlass.Float16", "cutlass.Float16"]:
+    """Unpack f16x2 (u32) into (f16_lo, f16_hi).  Free at HW level --
+    just a register-rename (mov.b32 {h_lo, h_hi}, packed).  Used by the
+    fp16-MMA path to bypass the f16->f32->bf16 cvt chain that the
+    default bf16-MMA path needs after hmul2."""
+    from cutlass import Float16
+    res = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(f16, f16)>"),
+        [Uint32(packed_h2).ir_value(loc=loc, ip=ip)],
+        "mov.b32 {$0, $1}, $2;",
+        "=h,=h,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float16(llvm.extractvalue(T.f16(), res, [0], loc=loc, ip=ip)),
+        Float16(llvm.extractvalue(T.f16(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def f16x2_pack_broadcast(v: Float32, *, loc=None, ip=None) -> Uint32:
     """Broadcast a single fp32 value to both lanes of an fp16x2 register."""
     return Uint32(
@@ -177,6 +239,19 @@ class BlackwellDenseGemmW4A16Kernel:
         vectorized_smem_b: int = 1,
         atom_layout: Tuple[int, int, int] = (2, 2, 1),
         epi_tile_override: Optional[Tuple[int, int]] = None,
+        # 1 = fp16 MMA (default): MmaF16BF16Op uses Float16.  Dequant writes
+        #     fp16 directly to tCrB (skipping the f16->f32->bf16 cvt chain
+        #     the bf16 path needs after hmul2).  A is bf16 in SMEM ->
+        #     ldmatrix into bf16 staging fragment -> in-register packed
+        #     bf16->fp16 cvt -> fp16 tCrA.  Same trick that gave the
+        #     mm_fp4 sibling a -1.95us / -7.7% win.  Slightly *more*
+        #     accurate than bf16 MMA for well-behaved inputs since fp16's
+        #     10-bit mantissa beats bf16's 7-bit at the multiply step;
+        #     accumulator stays fp32 in both modes.
+        # 0 = bf16 MMA: original path.  Safer for workloads with very
+        #     large activation magnitudes (|A| > ~30000) since bf16's
+        #     wider exponent range avoids saturation in the A cvt.
+        use_fp16_mma: int = 1,
     ):
         """W4A16 kernel.
 
@@ -204,6 +279,7 @@ class BlackwellDenseGemmW4A16Kernel:
         self.dequant_mode = int(dequant_mode)
         self.pipeline_depth = int(pipeline_depth)
         self.vectorized_smem_b = int(vectorized_smem_b)
+        self.use_fp16_mma = int(use_fp16_mma)
         # Optional override for the epilogue tile shape.  Smaller epi_tile_m
         # enables fine-grained skipping of OOB epilogue iterations when
         # m_actual < tile_M.  Must be a multiple of the MMA-atom shape
@@ -275,8 +351,11 @@ class BlackwellDenseGemmW4A16Kernel:
 
     def _setup_attributes(self):
         self.mma_inst_mnk = (16, 8, 16)
+        # MmaF16BF16Op accepts ab_dtype in {Float16, BFloat16}.  We pick via
+        # b_compute_dtype so use_fp16_mma=1 swings the whole MMA to fp16
+        # (both A and B fragments will be fp16-typed).
         op = cute.nvgpu.warp.MmaF16BF16Op(
-            self.a_dtype,
+            self.b_compute_dtype,
             self.acc_dtype,
             self.mma_inst_mnk,
         )
@@ -358,8 +437,16 @@ class BlackwellDenseGemmW4A16Kernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
+        from cutlass import Float16
         self.a_dtype = a.element_type
-        self.b_compute_dtype = a.element_type  # MMA B fragment dtype = A dtype
+        # MMA operand dtype: bf16 by default matches A, or fp16 when
+        # use_fp16_mma=1 (lets us skip the f16->f32->bf16 cvt chain on B).
+        # When fp16 MMA, A must be converted from bf16 to fp16 in-register
+        # after ldmatrix; see the mainloop's tCrA_bf16 staging path.
+        if cutlass.const_expr(self.use_fp16_mma == 1):
+            self.b_compute_dtype = Float16
+        else:
+            self.b_compute_dtype = a.element_type
         self.c_dtype = c.element_type
 
         self.a_layout = utils.LayoutEnum.from_tensor(a)
@@ -680,6 +767,12 @@ class BlackwellDenseGemmW4A16Kernel:
 
             # ldmatrix is only for A.  B is filled in-register from sB_marlin
             # via FP4 decode + per-group scale.
+            #
+            # use_fp16_mma=1: tCrA is fp16-typed (matches the fp16 MMA), but
+            # sA is bf16 in SMEM.  ldmatrix into a bf16 staging fragment,
+            # then per-K-block convert bf16 -> fp16 in-register before MMA
+            # reads tCrA.  See the inline cvt at each ldmatrix site.
+            from cutlass import BFloat16, Float16
             atom_copy_ldmatrix_A = cute.make_copy_atom(
                 cute.nvgpu.warp.LdMatrix8x8x16bOp(self.a_layout.is_m_major_a(), 4),
                 self.a_dtype,
@@ -687,7 +780,14 @@ class BlackwellDenseGemmW4A16Kernel:
             smem_tiled_copy_A = cute.make_tiled_copy_A(atom_copy_ldmatrix_A, tiled_mma)
             thr_copy_ldmatrix_A = smem_tiled_copy_A.get_slice(tidx)
             tCsA_copy_view = thr_copy_ldmatrix_A.partition_S(sA)
-            tCrA_copy_view = thr_copy_ldmatrix_A.retile(tCrA)
+            if cutlass.const_expr(self.use_fp16_mma == 1):
+                tCrA_bf16 = cute.make_fragment_like(tCrA, BFloat16)
+                tCrA_copy_view = thr_copy_ldmatrix_A.retile(tCrA_bf16)
+            else:
+                # Placeholder so the (dead) cvt branch at call sites can
+                # name-lookup tCrA_bf16 even when bf16-MMA is active.
+                tCrA_bf16 = tCrA
+                tCrA_copy_view = thr_copy_ldmatrix_A.retile(tCrA)
 
             alpha_val = Float32(mAlpha[Int32(0)])
 
@@ -721,6 +821,10 @@ class BlackwellDenseGemmW4A16Kernel:
                             tCsA_p[None, None, 0],
                             tCrA_copy_view[None, None, 0],
                         )
+                        if cutlass.const_expr(self.use_fp16_mma == 1):
+                            self._cvt_a_bf16_to_fp16_one_k_block(
+                                tCrA, tCrA_bf16, 0
+                            )
                     self._dequant_b_to_register(
                         sB_marlin,
                         sB_sf,
@@ -751,6 +855,10 @@ class BlackwellDenseGemmW4A16Kernel:
                                     tCsA_p[None, None, k_block_idx],
                                     tCrA_copy_view[None, None, k_block_idx],
                                 )
+                                if cutlass.const_expr(self.use_fp16_mma == 1):
+                                    self._cvt_a_bf16_to_fp16_one_k_block(
+                                        tCrA, tCrA_bf16, k_block_idx
+                                    )
                             self._dequant_b_to_register(
                                 sB_marlin,
                                 sB_sf,
@@ -818,6 +926,10 @@ class BlackwellDenseGemmW4A16Kernel:
                                     tCsA_p[None, None, k_block_next],
                                     tCrA_copy_view[None, None, k_block_next],
                                 )
+                                if cutlass.const_expr(self.use_fp16_mma == 1):
+                                    self._cvt_a_bf16_to_fp16_one_k_block(
+                                        tCrA, tCrA_bf16, k_block_next
+                                    )
                             self._dequant_b_to_register(
                                 sB_marlin,
                                 sB_sf,
@@ -855,6 +967,10 @@ class BlackwellDenseGemmW4A16Kernel:
                                 tCsA_p[None, None, k_block_idx],
                                 tCrA_copy_view[None, None, k_block_idx],
                             )
+                            if cutlass.const_expr(self.use_fp16_mma == 1):
+                                self._cvt_a_bf16_to_fp16_one_k_block(
+                                    tCrA, tCrA_bf16, k_block_idx
+                                )
                         self._dequant_b_to_register(
                             sB_marlin,
                             sB_sf,
@@ -893,6 +1009,10 @@ class BlackwellDenseGemmW4A16Kernel:
                                     tCsA_p[None, None, k_block_next],
                                     tCrA_copy_view[None, None, k_block_next],
                                 )
+                                if cutlass.const_expr(self.use_fp16_mma == 1):
+                                    self._cvt_a_bf16_to_fp16_one_k_block(
+                                        tCrA, tCrA_bf16, k_block_next
+                                    )
                             self._dequant_b_to_register(
                                 sB_marlin,
                                 sB_sf,
@@ -1315,6 +1435,35 @@ class BlackwellDenseGemmW4A16Kernel:
         return tma_atom, tma_tensor
 
     @cute.jit
+    def _cvt_a_bf16_to_fp16_one_k_block(
+        self,
+        tCrA_dst,
+        tCrA_bf16_src,
+        k_block: cutlass.Constexpr,
+    ):
+        """In-register bf16 -> fp16 cvt for one K-block of A.
+
+        Recasts both fragments to Uint32 (each u32 packs 2 16-bit elems)
+        and applies `cvt_bf16x2_to_f16x2_via_f32` per pair.  The packed
+        narrowing cvt (`cvt.rn.f16x2.f32`) combines what would be two
+        scalar `cvt.rn.f16.f32` instructions if we used cute's default
+        `.to(Float16)` lowering.
+
+        bf16/f16 typed inline-asm constraints don't compile on sm_100a
+        (NVVM rejects them), so we keep everything in Uint32 pair
+        representation via cute.recast_tensor.
+        """
+        bf_u32 = cute.recast_tensor(
+            tCrA_bf16_src[None, None, k_block], Uint32
+        )
+        fp_u32 = cute.recast_tensor(
+            tCrA_dst[None, None, k_block], Uint32
+        )
+        n_pairs = cute.size(bf_u32)
+        for i in cutlass.range_constexpr(n_pairs):
+            fp_u32[i] = cvt_bf16x2_to_f16x2_via_f32(Uint32(bf_u32[i]))
+
+    @cute.jit
     def _dequant_b_to_register(
         self,
         sB_marlin: cute.Tensor,
@@ -1422,13 +1571,27 @@ class BlackwellDenseGemmW4A16Kernel:
             sc_n2 = f16x2_pack_broadcast(scale_n2_f32)
             sc_n3 = f16x2_pack_broadcast(scale_n3_f32)
 
-            def _write_hmul2(h2, scale_h2, mma_i_low, nn):
-                # Multiply in fp16x2; convert to bf16 via fp32 (no packed PTX
-                # for f16x2 -> bf16x2 exists, so unpack to fp32 then write).
-                scaled_h2 = half2_mul(h2, scale_h2)
-                f_lo, f_hi = f16x2_to_f32x2(scaled_h2)
-                tCrB[mma_i_low, nn, k_block_idx] = f_lo.to(self.b_compute_dtype)
-                tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi.to(self.b_compute_dtype)
+            if cutlass.const_expr(self.use_fp16_mma == 1):
+                # fp16-MMA path: scaled_h2 (f16x2) -> 2 fp16 -> tCrB.
+                # Saves the f16->f32->bf16 cvt chain (5 ops/pair -> 1 op/pair).
+                def _write_hmul2(h2, scale_h2, mma_i_low, nn):
+                    scaled_h2 = half2_mul(h2, scale_h2)
+                    f_lo, f_hi = f16x2_unpack(scaled_h2)
+                    tCrB[mma_i_low, nn, k_block_idx] = f_lo
+                    tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi
+            else:
+                def _write_hmul2(h2, scale_h2, mma_i_low, nn):
+                    # Multiply in fp16x2; convert to bf16 via fp32 (no packed
+                    # PTX for f16x2 -> bf16x2 on sm_100a, so unpack to fp32
+                    # then write).
+                    scaled_h2 = half2_mul(h2, scale_h2)
+                    f_lo, f_hi = f16x2_to_f32x2(scaled_h2)
+                    tCrB[mma_i_low, nn, k_block_idx] = f_lo.to(
+                        self.b_compute_dtype
+                    )
+                    tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi.to(
+                        self.b_compute_dtype
+                    )
 
             _write_hmul2(h0_a, sc_n0, 0, 0)
             _write_hmul2(h0_b, sc_n0, 2, 0)
