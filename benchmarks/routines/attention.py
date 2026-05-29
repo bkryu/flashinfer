@@ -108,6 +108,7 @@ def parse_attention_args(line, parser):
             "fa2",
             "fa2_tc",
             "fa3",
+            "FlashAttention",
             "auto",
             "cudnn",
             "cudnn-native",
@@ -966,6 +967,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
+    if "FlashAttention" in backends:
+        import flash_attn.cute.interface as flash_attn_interface
 
     # Check for layer-specific constraints
     layer_not_supported = False
@@ -1265,6 +1268,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         else:
             resolved_backends[backend] = backend
 
+    # FlashAttention-4 expects a paged KV cache laid out as
+    # (num_pages, page_size, num_kv_heads, head_dim). The benchmark stores
+    # k_cache/v_cache as (num_pages, num_kv_heads, page_size, head_dim), so
+    # swap the page-size and head axes (cheap view, no data movement).
+    if "FlashAttention" in backends:
+        k_cache_flashattention = torch.swapaxes(k_cache, 1, 2)
+        v_cache_flashattention = torch.swapaxes(v_cache, 1, 2)
+
     def run_backend_wrapper(
         backend,
         q,
@@ -1324,6 +1335,18 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
             )
+        elif backend == "FlashAttention":
+            # qo_indptr is the cumulative query sequence-length offset
+            # (cu_seqlens_q) expected by the FlashAttention varlen API.
+            return flash_attn_interface.flash_attn_varlen_func(
+                q,
+                k_cache_flashattention,
+                v_cache_flashattention,
+                cu_seqlens_q=qo_indptr,
+                seqused_k=actual_seq_lens_kv_device.view(-1),
+                page_table=block_tables,
+                causal=causal,
+            )[0]
         elif backend == "cudnn-native":
             # Direct cudnn_batch_prefill_with_kv_cache call (similar to trtllm-native)
             return flashinfer.prefill.cudnn_batch_prefill_with_kv_cache(
@@ -1702,6 +1725,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
+    if "FlashAttention" in backends:
+        import flash_attn.cute.interface as flash_attn_interface
 
     # Check for layer-specific constraints
     layer_not_supported = False
@@ -1994,6 +2019,17 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 return_lse=True,
                 out=trtllm_out,
                 backend="cute-dsl",
+            )[0]
+        elif backend == "FlashAttention":
+            # qo_indptr / kv_indptr are the cumulative query / key sequence-length
+            # offsets (cu_seqlens_q / cu_seqlens_k) expected by the varlen API.
+            return flash_attn_interface.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=qo_indptr,
+                cu_seqlens_k=kv_indptr,
+                causal=causal,
             )[0]
         elif backend == "cudnn":
             # cuDNN uses wrapper API

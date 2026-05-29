@@ -346,8 +346,26 @@ routine_cc_to_supported_backends = {
         "8.6": ["fa2", "auto", "cudnn", "cudnn-native"],
         "8.9": ["fa2", "auto", "cudnn", "cudnn-native"],
         "9.0": ["fa2", "fa3", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
-        "10.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
-        "10.3": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
+        "10.0": [
+            "fa2",
+            "FlashAttention",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+        ],
+        "10.3": [
+            "fa2",
+            "FlashAttention",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+        ],
+        # NOTE: FlashAttention omitted on SM12x: FA4 paged KV is unsupported there
+        # (flash_attn/cute asserts page_table is None for arch // 10 == 12).
         "12.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
         "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
     },
@@ -362,6 +380,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["fa2", "fa3", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
         "10.0": [
             "fa2",
+            "FlashAttention",
             "cudnn",
             "cudnn-native",
             "cutlass",
@@ -370,14 +389,15 @@ routine_cc_to_supported_backends = {
         ],
         "10.3": [
             "fa2",
+            "FlashAttention",
             "cudnn",
             "cudnn-native",
             "cutlass",
             "cute-dsl",
             "trtllm-native",
         ],
-        "12.0": ["fa2", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
-        "12.1": ["fa2", "cudnn", "cudnn-native"],
+        "12.0": ["fa2", "FlashAttention", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "12.1": ["fa2", "FlashAttention", "cudnn", "cudnn-native"],
     },
     "BatchMLAPagedAttentionWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla(backend="trtllm-gen")
