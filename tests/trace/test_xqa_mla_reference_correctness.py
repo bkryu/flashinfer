@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _cc,
-    _close_pass_ratio,
+    _check,
 )
 
 
@@ -29,7 +29,7 @@ from tests.trace.reference_utils import (
             beam_width=1,
             num_pages=2,
             max_pages_per_seq=2,
-            num_heads_qo=64,
+            num_heads_qo=128,
             head_dim_ckv=512,
             head_dim_qk=576,
             page_size=16,
@@ -58,10 +58,10 @@ def test_xqa_mla_reference_correctness(shape_kwargs):
         sm_count=sm_count,
     )
     # Reference uses dequantized API inputs for a clean comparison.
-    q_ref = inputs["q"].float().squeeze(1)  # [B, Hq, QK]
+    q_ref = inputs["q"].float()
     k_ref = inputs["k_cache"].float().squeeze(-2)
     v_ref = inputs["v_cache"].float().squeeze(-2)
-    seq_lens_ref = inputs["seq_lens"].squeeze(1).to(torch.int32)
+    seq_lens_ref = inputs["seq_lens"].to(torch.int32)
     ref_buffer = torch.empty_like(inputs["output"])
     ref_out = xqa_mla_trace.reference(
         q_ref,
@@ -76,12 +76,13 @@ def test_xqa_mla_reference_correctness(shape_kwargs):
     # positions land on tied FP8 rounding boundaries. Matches the pass-ratio
     # metric the existing tests/attention/test_xqa.py uses for the same op:
     # >=95% of elements within (atol=0.05, rtol=0.05).
-    _close_pass_ratio(
-        inputs["output"].squeeze(1).float(),
+    _check(
+        xqa_mla_trace,
         ref_out.float(),
+        inputs["output"].float(),
         atol=0.05,
         rtol=0.05,
-        pass_ratio=0.95,
+        max_mismatch_pct=5.0,
     )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

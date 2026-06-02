@@ -20,6 +20,7 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
     is_close_stats,
     filter_backends_by_compute_capability,
+    warn_if_pdl_unsupported,
 )
 
 
@@ -185,12 +186,6 @@ def parse_gemm_args(line, parser):
         default=False,
         help="Use bias (enabled for mm_bf16 with TGV and TinyGEMM backends)",
     )
-    parser.add_argument(
-        "--enable_pdl",
-        action="store_true",
-        default=False,
-        help="Enable programmatic dependent launch.",
-    )
 
     args = parser.parse_args(line)
     has_backends_arg = any(
@@ -240,6 +235,7 @@ def testGemmFp8NtGroupwise(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testGemmFp8NtGroupwise")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -429,6 +425,7 @@ def testGroupGemmFp8NtGroupwise(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testGroupGemmFp8NtGroupwise")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -613,6 +610,7 @@ def testBmmFp8(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testBmmFp8")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -640,11 +638,6 @@ def testBmmFp8(args):
     ]
     res = []
 
-    backends = filter_backends_by_compute_capability(backends, args.routine, device)
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return res
-
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(
@@ -663,19 +656,6 @@ def testBmmFp8(args):
             f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16 and float16."
         )
     ## Done parsing input arguments
-
-    if getattr(args, "autotune", False):
-        backends_to_remove = []
-        for cur_backend in backends:
-            if cur_backend not in autotune_supported_backends:
-                print(f"[INFO] {cur_backend} backend does not support autotune")
-                backends_to_remove.append(cur_backend)
-        for cur_backend in backends_to_remove:
-            backends.remove(cur_backend)
-
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return
 
     ## Prepare input tensors
     input = torch.randn([batch_size, m, k], device=device, dtype=torch.bfloat16)
@@ -696,9 +676,21 @@ def testBmmFp8(args):
         print(f"[VVERBOSE] {mat2_inv_s = }")
         print(f"[VVERBOSE] {mat2_inv_s.dtype = }")
 
-    def run_backend(backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s):
-        if backend in ["cudnn", "cublas", "cutlass"]:
-            return flashinfer.gemm.bmm_fp8(
+    # Programmatically filter backends: rely on bmm_fp8's @backend_requirement
+    # support checks (instead of a hard-coded compute-capability table) by
+    # probing each backend with a trial call.
+    backends_to_remove = []
+    for backend in backends:
+        if (
+            getattr(args, "autotune", False)
+            and backend not in autotune_supported_backends
+        ):
+            print(f"[INFO] {backend} backend does not support autotune")
+            backends_to_remove.append(backend)
+            continue
+
+        try:
+            flashinfer.gemm.bmm_fp8(
                 A=input_fp8,
                 B=mat2_fp8,
                 A_scale=input_inv_s,
@@ -706,8 +698,28 @@ def testBmmFp8(args):
                 dtype=res_dtype,
                 backend=backend,
             )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends_to_remove.append(backend)
+
+    for backend in backends_to_remove:
+        backends.remove(backend)
+
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return res
+
+    def run_backend(backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s):
+        return flashinfer.gemm.bmm_fp8(
+            A=input_fp8,
+            B=mat2_fp8,
+            A_scale=input_inv_s,
+            B_scale=mat2_inv_s,
+            dtype=res_dtype,
+            backend=backend,
+        )
 
     has_reference_output = False
     if run_refcheck:
@@ -835,6 +847,7 @@ def testBmmMxfp8(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testBmmMxfp8")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1448,6 +1461,7 @@ def testMmFp4(args):
                 use_8x4_sf_layout=not use_128x4_sf_layout,
                 backend=backend,
                 use_nvfp4=use_nvfp4,
+                enable_pdl=args.enable_pdl,
             )
         except Exception as e:
             print(
@@ -1483,6 +1497,7 @@ def testMmFp4(args):
             use_8x4_sf_layout=not use_128x4_sf_layout,
             backend=backend,
             use_nvfp4=use_nvfp4,
+            enable_pdl=args.enable_pdl,
         )
 
     has_reference_output = False
@@ -1621,6 +1636,7 @@ def testMmMxfp8(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testMmMxfp8")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -2279,6 +2295,7 @@ def testBmmBf16(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testBmmBf16")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
