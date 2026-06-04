@@ -562,6 +562,37 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
         std::min(window_left >= 0 ? ceil_div(window_left + cta_tile_q, page_size) : kv_len_arr[i],
                  kv_len_arr[i]);
   }
+  // Short-query (speculative-decode) regime: when every request fits in a single query tile
+  // (total_num_tiles_q == batch_size), attention is memory-bound on the KV read. Split-KV
+  // writes float partial states (O + LSE) to global memory that the merge kernel reads back
+  // (~ 2 * chunks * total_num_rows * num_qo_heads * head_dim * sizeof(float)). At SHORT context
+  // the default split (~two CTA-waves) over-splits: the KV read is small, so this partial-state
+  // DRAM traffic is a large fraction of total bytes and dominates, while the extra CTAs give no
+  // throughput (occupancy beyond ~one wave doesn't help this regime -- verified on GB10:
+  // doubling achieved occupancy left kernel time unchanged). Cap #chunks where the partial
+  // traffic would reach ~3/8 of the KV read (3 * kv_tokens * kv_heads / (64 * rows * qo_heads);
+  // head_dim cancels, conservatively assuming 1-byte/FP8 KV). The traffic terms scale with
+  // batch, so this is a per-request cap; new_batch_size is the total split count, hence the
+  // *batch_size. min() with the default keeps it a ceiling. Net (batch-1 cold-L2 on GB10,
+  // empirical-SOL memory-utilization): s_kv~8k goes 68%->75% of the staged-copy ceiling (hd256,
+  // ~13% faster; picks ~12 vs ~47 chunks); s_kv>=32k the cap exceeds the default so the default
+  // is kept (already split-optimal -- no change); batches that already fill the GPU keep the
+  // default split (no regression). Long-context prefill (many q-tiles) and padded_batch_size
+  // (CUDA-graph buffer sizing) are untouched.
+  const bool short_q_regime = (total_num_tiles_q == batch_size);
+  uint32_t split_target = max_batch_size_if_split;
+  if (short_q_regime) {
+    int64_t total_kv_tokens = 0;
+    for (uint32_t i = 0; i < batch_size; ++i) {
+      total_kv_tokens += effective_kv_len_arr[i] * int64_t(page_size);
+    }
+    const int64_t denom = int64_t(64) * std::max<int64_t>(1, int64_t(total_num_rows)) *
+                          std::max<uint32_t>(1u, num_qo_heads);
+    const int64_t per_request_cap =
+        std::max<int64_t>(1, (int64_t(3) * total_kv_tokens * int64_t(num_kv_heads)) / denom);
+    split_target = uint32_t(std::min<int64_t>(int64_t(max_batch_size_if_split),
+                                              int64_t(batch_size) * per_request_cap));
+  }
   bool split_kv = false;
   int64_t kv_chunk_size;
   if (disable_split_kv) {
@@ -570,7 +601,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     kv_chunk_size = fixed_split_size;
   } else {
     std::tie(split_kv, kv_chunk_size) = PrefillBinarySearchKVChunkSize(
-        enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr, effective_kv_len_arr,
+        enable_cuda_graph, split_target, packed_qo_len_arr, effective_kv_len_arr,
         cta_tile_q, min_kv_chunk_size);
   }
   // step 3: split qo_indptr and kv_indptr
