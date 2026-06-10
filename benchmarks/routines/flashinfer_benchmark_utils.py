@@ -385,6 +385,8 @@ routine_cc_to_supported_backends = {
         # NOTE: cute-dsl calls trtllm_batch_decode_with_kv_cache_mla(backend="cute-dsl")
         # NOTE: auto calls trtllm_batch_decode_with_kv_cache_mla(backend="auto")
         #       and is the only backend that benefits from --autotune
+        # NOTE: xqa calls trtllm_batch_decode_with_kv_cache_mla(backend="xqa"),
+        #       the XQA MLA decode kernel for SM120/SM121.
         "7.5": [],
         "8.0": ["fa2"],
         "8.6": ["fa2"],
@@ -392,8 +394,8 @@ routine_cc_to_supported_backends = {
         "9.0": ["fa2", "fa3"],
         "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
         "10.3": ["fa2", "cutlass", "trtllm-native"],
-        "12.0": ["fa2"],
-        "12.1": ["fa2"],
+        "12.0": ["fa2", "xqa"],
+        "12.1": ["fa2", "xqa"],
     },
     # GEMM
     "gemm_fp8_nt_groupwise": {

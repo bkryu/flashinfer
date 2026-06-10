@@ -117,8 +117,9 @@ def parse_attention_args(line, parser):
             "trtllm-fmha-v2",
             "trtllm-gen-native",  # Deprecated, will be removed in future
             "cute-dsl",
+            "xqa",
         ],
-        help="Kernel backends to test. Default: fa2. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
+        help="Kernel backends to test. Default: fa2. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl). backend=xqa is supported for BatchMLAPagedAttentionWrapper on SM120/SM121 (XQA MLA decode kernel).",
     )
     parser.add_argument(
         "--page_size",
@@ -2555,6 +2556,25 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
                 backend="cute-dsl",
+                enable_pdl=args.enable_pdl,
+            ).squeeze(1)
+        elif backend == "xqa":
+            # XQA MLA decode kernel (SM120/SM121). Requires q_dtype == kv_dtype
+            # (bf16 or fp8_e4m3). num_qo_heads < 128 are handled by a
+            # pad-and-slice fallback inside the XQA wrapper.
+            return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+                query=q.unsqueeze(1),
+                kv_cache=kv_cache.unsqueeze(1),
+                workspace_buffer=workspace_buffer,
+                qk_nope_head_dim=128,
+                kv_lora_rank=head_dim_ckv,
+                qk_rope_head_dim=head_dim_kpe,
+                block_tables=block_tables,
+                seq_lens=actual_seq_lens_kv.flatten(),
+                max_seq_len=s_kv,
+                bmm1_scale=sm_scale,
+                bmm2_scale=1.0,
+                backend="xqa",
                 enable_pdl=args.enable_pdl,
             ).squeeze(1)
         else:
