@@ -86,9 +86,16 @@ struct KernelTraits {
   static constexpr uint32_t CTA_TILE_KV = CTA_TILE_KV_;
 
   static constexpr SwizzleMode SWIZZLE_MODE_Q_NOPE = SwizzleMode::k128B;
-  static constexpr SwizzleMode SWIZZLE_MODE_Q_PE = SwizzleMode::k128B;
+  // The k128B swizzle XORs the column with up to 7, so it requires a row of at
+  // least 8 b128 slots. The rope (PE) buffers hold HEAD_DIM_KPE=64 elements per
+  // row: 8 slots for a 16-bit type, but only 4 for fp8 -- there the k128B XOR
+  // bleeds across rows and past the buffer (corrupting whatever follows in the
+  // shared-memory struct), so fp8 must use the k64B swizzle (XOR <= 3).
+  static constexpr SwizzleMode SWIZZLE_MODE_Q_PE =
+      (HEAD_DIM_KPE / upcast_size<DTypeQ_>()) >= 8 ? SwizzleMode::k128B : SwizzleMode::k64B;
   static constexpr SwizzleMode SWIZZLE_MODE_CKV = SwizzleMode::k128B;
-  static constexpr SwizzleMode SWIZZLE_MODE_KPE = SwizzleMode::k128B;
+  static constexpr SwizzleMode SWIZZLE_MODE_KPE =
+      (HEAD_DIM_KPE / upcast_size<DTypeQ_>()) >= 8 ? SwizzleMode::k128B : SwizzleMode::k64B;
   static constexpr SwizzleMode SWIZZLE_MODE_P =
       CTA_TILE_KV >= 64 ? SwizzleMode::k128B : SwizzleMode::k64B;
   static constexpr SwizzleMode SWIZZLE_MODE_O = SwizzleMode::k128B;
@@ -108,6 +115,14 @@ struct KernelTraits {
   using DTypeQKAccum = float;
 
   static constexpr bool USE_FP8_MMA = (sizeof(DTypeQ_) == 1 && sizeof(DTypeKV_) == 1);
+  // fp8 PV quantizes the softmax probs as P * FP8_P_SCALE so that small
+  // probabilities stay above the e4m3 denormal threshold (2^-9): with a peaked
+  // softmax over a long context, unscaled probs flush to zero and the output
+  // loses the tail mass. The scale cancels in o = (P V) / d (both the PV
+  // accumulation and the rowsum d carry it), but inflates d, so the LSE write
+  // subtracts FP8_P_SCALE_LOG2.
+  static constexpr float FP8_P_SCALE = 128.0f;
+  static constexpr float FP8_P_SCALE_LOG2 = 7.0f;  // log2(FP8_P_SCALE)
   using DTypeMath = std::conditional_t<USE_FP8_MMA, __nv_bfloat16, DTypeQ_>;
   static constexpr uint32_t QK_MMA_K = USE_FP8_MMA ? 32 : 16;
   static constexpr uint32_t NUM_MMA_D_CKV_QK = HEAD_DIM_CKV / QK_MMA_K;
@@ -645,7 +660,7 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
     }
   } else if constexpr (KTraits::USE_FP8_MMA) {
     using DTypeKVf8 = typename KTraits::DTypeKV;  // fp8 storage type
-    constexpr float P_SCALE = 1.0f;
+    constexpr float P_SCALE = KTraits::FP8_P_SCALE;
     constexpr uint32_t PV_WG_MMA_D = NUM_MMA_D_CKV / 2;
     const uint32_t tid = lane_idx % 4, gid = lane_idx / 4;
     uint8_t* p_base = smem_storage->fp8_p_smem + (warpgroup_idx * 4 + warp_idx_in_wg) * (16u * 32u);
@@ -906,7 +921,8 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
       if (lane_idx % 4 == 0 && q_idx < q_len) {
         float lse = (m[j] == typename KTraits::DTypeQKAccum(-math::inf))
                         ? -cuda::std::numeric_limits<float>::infinity()
-                        : math::ptx_log2(d[j]) + float(m[j]);
+                        : math::ptx_log2(d[j]) + float(m[j]) -
+                              (KTraits::USE_FP8_MMA ? KTraits::FP8_P_SCALE_LOG2 : 0.0f);
         partial_lse[(blockIdx.x * 4 + warp_idx_in_wg) * 16 + 8 * j + lane_idx / 4] = lse;
       }
     }
@@ -943,8 +959,9 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
         num_heads.divmod(packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4, q, r);
         if (lane_idx % 4 == 0 && q < q_len) {
           final_lse[q * num_heads + r] = (m[j] == typename KTraits::DTypeQKAccum(-math::inf))
-                                             ? -cuda::std::numeric_limits<float>::infinity()
-                                             : math::ptx_log2(d[j]) + float(m[j]);
+              ? -cuda::std::numeric_limits<float>::infinity()
+              : math::ptx_log2(d[j]) + float(m[j]) -
+                    (KTraits::USE_FP8_MMA ? KTraits::FP8_P_SCALE_LOG2 : 0.0f);
           if (return_lse_base_on_e) {
             final_lse[q * num_heads + r] *= math::loge2;
           }

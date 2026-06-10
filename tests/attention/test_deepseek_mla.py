@@ -832,6 +832,107 @@ def test_batch_mla_fp8_kv_matches_bf16(batch_size, kv_len, num_heads, page_size)
     )
 
 
+# Full-fp8 fa2 MLA (q, ckv, kpe all fp8 e4m3; native fp8 tensor-core QK and PV).
+# Coverage and pass criteria deliberately mirror the XQA MLA fp8 test
+# (test_xqa_mla_batch_decode.py): same batch sweep, sm scales, page sizes,
+# random per-request sequence lengths, shuffled block tables, direct-cast fp8
+# quantization, a bf16 fake-quantized reference on the same fa2 kernel, and the
+# elementwise (atol=0.05 | rtol=0.05) >= 95% criterion. XQA's enable_pdl knob
+# has no fa2 equivalent and is omitted.
+@pytest.mark.parametrize(
+    "batch_size",
+    [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024],
+)
+@pytest.mark.parametrize("scale", [1.0, 0.5])
+@pytest.mark.parametrize("page_size", [32, 64, 128])
+def test_batch_mla_fp8_qkv_matches_bf16(batch_size, scale, page_size):
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if get_compute_capability(device)[0] < 10:
+        pytest.skip("fa2 fp8 MLA requires SM100+ (.b8 transposed ldmatrix)")
+    torch.manual_seed(42)
+    dtype = torch.float8_e4m3fn
+    num_heads = 128
+    head_dim_ckv, head_dim_kpe, qk_nope_head_dim = 512, 64, 128
+    sm_scale = scale / ((qk_nope_head_dim + head_dim_kpe) ** 0.5)
+    max_seq_len = 1024
+
+    # Random per-request sequence lengths (last request pinned to the max).
+    seq_lens = [torch.randint(1, max_seq_len, (1,)).item() for _ in range(batch_size)]
+    seq_lens[-1] = max_seq_len
+    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
+    total_blocks = int(blocks_per_seq.sum().item())
+    # Random but unique block IDs so the paging pattern is non-trivial.
+    all_block_ids = torch.randperm(total_blocks, device=device)
+
+    q_nope8 = torch.randn(
+        batch_size, num_heads, head_dim_ckv, dtype=torch.float32, device=device
+    ).to(dtype)
+    q_pe8 = torch.randn(
+        batch_size, num_heads, head_dim_kpe, dtype=torch.float32, device=device
+    ).to(dtype)
+    ckv8 = torch.randn(
+        total_blocks, page_size, head_dim_ckv, dtype=torch.float32, device=device
+    ).to(dtype)
+    kpe8 = torch.randn(
+        total_blocks, page_size, head_dim_kpe, dtype=torch.float32, device=device
+    ).to(dtype)
+
+    q_indptr = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+    kv_indptr = torch.zeros_like(q_indptr)
+    kv_indptr[1:] = torch.cumsum(blocks_per_seq, dim=0)
+    kv_indices = all_block_ids.int()
+
+    ws_ref = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    ws_fp8 = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    def plan_run(workspace, q_nope_in, q_pe_in, ckv_in, kpe_in, io_dtype, **run_kwargs):
+        wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa2")
+        wrapper.plan(
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            seq_lens_tensor,
+            num_heads,
+            head_dim_ckv,
+            head_dim_kpe,
+            page_size,
+            True,
+            sm_scale,
+            io_dtype,
+            io_dtype,
+        )
+        return wrapper.run(
+            q_nope_in, q_pe_in, ckv_in, kpe_in, return_lse=False, **run_kwargs
+        )
+
+    # Reference: the same fa2 kernel in bf16 on the fake-quantized (upcast fp8)
+    # inputs, so the comparison isolates the kernel-internal fp8 compute error.
+    o_ref = plan_run(
+        ws_ref,
+        q_nope8.to(torch.bfloat16),
+        q_pe8.to(torch.bfloat16),
+        ckv8.to(torch.bfloat16),
+        kpe8.to(torch.bfloat16),
+        torch.bfloat16,
+    )
+    o_fp8 = plan_run(
+        ws_fp8, q_nope8, q_pe8, ckv8, kpe8, dtype, q_scale=1.0, kv_scale=1.0
+    )
+
+    assert torch.isfinite(o_fp8).all()
+    diff_abs = (o_fp8.float() - o_ref.float()).abs()
+    diff_rel = diff_abs / (o_ref.float().abs() + 1e-8)
+    within_tolerance = (diff_abs <= 0.05) | (diff_rel <= 0.05)
+    pass_ratio = within_tolerance.float().mean().item()
+    required_ratio = 0.95
+    assert pass_ratio >= required_ratio, (
+        f"Total {o_ref.numel()} elements, only {pass_ratio:.1%} meet tolerance "
+        f"criteria, require at least {required_ratio:.1%}"
+    )
+
+
 def test_batch_mla_fp8_kv_requires_scale():
     """An fp8 KV cache without kv_scale must raise (avoid silent wrong results)."""
     device = torch.device("cuda:0")
