@@ -2283,11 +2283,10 @@ def testBatchMLAPagedAttentionWrapper(args):
     # Check for backend-specific constraints
     if "fa2" in backends:
         remove_fa2 = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] FA2 backend does not support FP8. Skipping.")
+        # fa2 MLA supports an fp8 KV cache (dequant-on-load) with a 16-bit
+        # query, but not an fp8 query.
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            print("[INFO] FA2 MLA backend does not support an FP8 query. Skipping.")
             remove_fa2 = True
         if remove_fa2:
             backends.remove("fa2")
@@ -2488,6 +2487,11 @@ def testBatchMLAPagedAttentionWrapper(args):
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
             # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
             # cute-dsl branches below pass args.enable_pdl to the direct API.
+            # For an fp8 KV cache the benchmark quantizes ckv/kpe with a direct
+            # cast (no rescale), so the dequant scale is 1.0.
+            mla_kv_scale = (
+                1.0 if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else None
+            )
             return backend_wrappers[backend].run(
                 q_nope,
                 q_pe,
@@ -2495,6 +2499,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 kpe_cache,
                 page_table=block_tables,
                 return_lse=False,
+                kv_scale=mla_kv_scale,
             )
         elif backend == "cutlass":
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl.
