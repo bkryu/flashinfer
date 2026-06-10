@@ -958,10 +958,11 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
         uint32_t q, r;
         num_heads.divmod(packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4, q, r);
         if (lane_idx % 4 == 0 && q < q_len) {
-          final_lse[q * num_heads + r] = (m[j] == typename KTraits::DTypeQKAccum(-math::inf))
-              ? -cuda::std::numeric_limits<float>::infinity()
-              : math::ptx_log2(d[j]) + float(m[j]) -
-                    (KTraits::USE_FP8_MMA ? KTraits::FP8_P_SCALE_LOG2 : 0.0f);
+          final_lse[q * num_heads + r] =
+              (m[j] == typename KTraits::DTypeQKAccum(-math::inf))
+                  ? -cuda::std::numeric_limits<float>::infinity()
+                  : math::ptx_log2(d[j]) + float(m[j]) -
+                        (KTraits::USE_FP8_MMA ? KTraits::FP8_P_SCALE_LOG2 : 0.0f);
           if (return_lse_base_on_e) {
             final_lse[q * num_heads + r] *= math::loge2;
           }
