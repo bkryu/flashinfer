@@ -179,14 +179,14 @@ def parse_attention_args(line, parser):
         type=str,
         required=False,
         default="bfloat16",
-        help="Data type of the query. Currently only bfloat16 is supported.",
+        help="Data type of the query (e.g. bfloat16, fp8_e4m3). Support is backend/routine dependent; XQA MLA accepts fp8_e4m3 (with fp8_e4m3 KV).",
     )
     parser.add_argument(
         "--kv_dtype",
         type=str,
         required=False,
         default="bfloat16",
-        help="Data type of the key and value. Currently only bfloat16 is supported.",
+        help="Data type of the key/value cache (e.g. bfloat16, fp8_e4m3). Support is backend/routine dependent; fa2 MLA accepts an fp8_e4m3 KV cache, XQA MLA accepts fp8_e4m3 q+kv.",
     )
     parser.add_argument(
         "--out_dtype",
