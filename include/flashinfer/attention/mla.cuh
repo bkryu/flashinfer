@@ -184,32 +184,47 @@ __device__ __forceinline__ void load_q(
   }
 }
 
-// Load one 8-element (compute-type) chunk of KV from global memory into the
-// swizzled smem slot at `smem_offset` (a b128_t index). For a 16-bit KV cache
-// (DTypeKV == DTypeQ) this is a plain async 128b copy. For an fp8 KV cache the
-// 8 fp8 elements are loaded and dequantized to 8 DTypeQ elements, then stored
-// as one b128_t (dequant-on-load). The kv_scale is folded into sm_scale (QK)
-// and the output (PV) on the host side, so no scale is applied here.
-template <typename KTraits, SwizzleMode SWIZZLE_MODE>
-__device__ __forceinline__ void load_kv_chunk_(smem_t<SWIZZLE_MODE>& dst_smem, uint32_t smem_offset,
-                                               const typename KTraits::DTypeKV* gptr,
-                                               bool predicate) {
+// Load NUM_CHUNKS consecutive 8-element (compute-type) column chunks of one KV
+// row from global memory into the swizzled smem row `row`.
+//
+// For a 16-bit KV cache (DTypeKV == DTypeQ) each chunk is a plain async 128b
+// copy (the original code path). For an fp8 KV cache the chunks are loaded and
+// dequantized to the compute type on the fly (dequant-on-load). To keep the
+// global-memory loads latency-hidden -- the way cp.async batches them -- the
+// fp8 path issues *all* raw loads first (memory-level parallelism) and only
+// then converts + stores, instead of serializing load->convert->store per
+// chunk. The kv_scale is folded into sm_scale (QK) and the output (PV) on the
+// host side, so no scale is applied here.
+template <typename KTraits, uint32_t NUM_CHUNKS, uint32_t STRIDE, SwizzleMode SWIZZLE_MODE>
+__device__ __forceinline__ void load_kv_row_(smem_t<SWIZZLE_MODE>& dst_smem, uint32_t row,
+                                             uint32_t lane_idx,
+                                             const typename KTraits::DTypeKV* gptr,
+                                             bool predicate) {
   using DTypeKV = typename KTraits::DTypeKV;
   using DTypeQ = typename KTraits::DTypeQ;
+  constexpr uint32_t CHUNK_ELEMS = 8 * upcast_size<DTypeQ>();  // global elems per chunk stride
   if constexpr (sizeof(DTypeKV) == sizeof(DTypeQ)) {
-    dst_smem.template load_128b_async<SharedMemFillMode::kFillZero>(smem_offset, gptr, predicate);
-  } else {
-    // fp8 (or other sub-16bit) storage -> dequantize to the compute type.
-    alignas(16) DTypeQ conv[8];
-    if (predicate) {
-      vec_cast<DTypeQ, DTypeKV>::template cast<8>(conv, gptr);
-    } else {
 #pragma unroll
-      for (uint32_t i = 0; i < 8; ++i) {
-        conv[i] = DTypeQ(0);
-      }
+    for (uint32_t c = 0; c < NUM_CHUNKS; ++c) {
+      uint32_t off = dst_smem.template get_permuted_offset<STRIDE>(row, 8 * c + lane_idx % 8);
+      dst_smem.template load_128b_async<SharedMemFillMode::kFillZero>(off, gptr + c * CHUNK_ELEMS,
+                                                                      predicate);
     }
-    dst_smem.base[smem_offset] = *reinterpret_cast<b128_t*>(conv);
+  } else {
+    // Phase 1: issue all 64-bit (8 x fp8) global loads up front for MLP.
+    uint2 raw[NUM_CHUNKS];
+#pragma unroll
+    for (uint32_t c = 0; c < NUM_CHUNKS; ++c) {
+      raw[c] = predicate ? *reinterpret_cast<const uint2*>(gptr + c * CHUNK_ELEMS) : uint2{0u, 0u};
+    }
+    // Phase 2: dequantize each chunk to 8 compute-type elements and store 128b.
+#pragma unroll
+    for (uint32_t c = 0; c < NUM_CHUNKS; ++c) {
+      uint32_t off = dst_smem.template get_permuted_offset<STRIDE>(row, 8 * c + lane_idx % 8);
+      alignas(16) DTypeQ conv[8];
+      vec_cast<DTypeQ, DTypeKV>::template cast<8>(conv, reinterpret_cast<DTypeKV*>(&raw[c]));
+      dst_smem.base[off] = *reinterpret_cast<b128_t*>(conv);
+    }
   }
 }
 
@@ -251,23 +266,13 @@ __device__ __forceinline__ void load_kv(
               kpe_stride_page +
           r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeQ>();
 
-#pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 4; ++mma_d) {
-        uint32_t ckv_smem_offset_w = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
-            warp_idx_in_wg * 4 + lane_idx / 8, 8 * mma_d + lane_idx % 8);
-        load_kv_chunk_<KTraits>(ckv_smem, ckv_smem_offset_w, ckv_ptr,
-                                packed_block_iter < packed_kv_bound);
-        ckv_ptr += 8 * upcast_size<DTypeQ>();
-      }
+      load_kv_row_<KTraits, KTraits::NUM_MMA_D_CKV / 4, UPCAST_STRIDE_CKV>(
+          ckv_smem, warp_idx_in_wg * 4 + lane_idx / 8, lane_idx, ckv_ptr,
+          packed_block_iter < packed_kv_bound);
 
-#pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_KPE / 4; ++mma_d) {
-        uint32_t kpe_smem_offset_w = kpe_smem.template get_permuted_offset<UPCAST_STRIDE_KPE>(
-            warp_idx_in_wg * 4 + lane_idx / 8, 8 * mma_d + lane_idx % 8);
-        load_kv_chunk_<KTraits>(kpe_smem, kpe_smem_offset_w, kpe_ptr,
-                                packed_block_iter < packed_kv_bound);
-        kpe_ptr += 8 * upcast_size<DTypeQ>();
-      }
+      load_kv_row_<KTraits, KTraits::NUM_MMA_D_KPE / 4, UPCAST_STRIDE_KPE>(
+          kpe_smem, warp_idx_in_wg * 4 + lane_idx / 8, lane_idx, kpe_ptr,
+          packed_block_iter < packed_kv_bound);
     }
   } else {
 #pragma unroll
@@ -289,25 +294,13 @@ __device__ __forceinline__ void load_kv(
               kpe_stride_page +
           r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeQ>();
 
-#pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 4; ++mma_d) {
-        uint32_t ckv_smem_offset_w = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
-            32 * mma_kv + warpgroup_idx * 16 + warp_idx_in_wg * 4 + lane_idx / 8,
-            8 * mma_d + lane_idx % 8);
-        load_kv_chunk_<KTraits>(ckv_smem, ckv_smem_offset_w, ckv_ptr,
-                                packed_block_iter < packed_kv_bound);
-        ckv_ptr += 8 * upcast_size<DTypeQ>();
-      }
+      load_kv_row_<KTraits, KTraits::NUM_MMA_D_CKV / 4, UPCAST_STRIDE_CKV>(
+          ckv_smem, 32 * mma_kv + warpgroup_idx * 16 + warp_idx_in_wg * 4 + lane_idx / 8, lane_idx,
+          ckv_ptr, packed_block_iter < packed_kv_bound);
 
-#pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_KPE / 4; ++mma_d) {
-        uint32_t kpe_smem_offset_w = kpe_smem.template get_permuted_offset<UPCAST_STRIDE_KPE>(
-            32 * mma_kv + warpgroup_idx * 16 + warp_idx_in_wg * 4 + lane_idx / 8,
-            8 * mma_d + lane_idx % 8);
-        load_kv_chunk_<KTraits>(kpe_smem, kpe_smem_offset_w, kpe_ptr,
-                                packed_block_iter < packed_kv_bound);
-        kpe_ptr += 8 * upcast_size<DTypeQ>();
-      }
+      load_kv_row_<KTraits, KTraits::NUM_MMA_D_KPE / 4, UPCAST_STRIDE_KPE>(
+          kpe_smem, 32 * mma_kv + warpgroup_idx * 16 + warp_idx_in_wg * 4 + lane_idx / 8, lane_idx,
+          kpe_ptr, packed_block_iter < packed_kv_bound);
     }
   }
 }
