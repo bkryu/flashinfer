@@ -917,6 +917,7 @@ class BatchMLAPagedAttentionWrapper:
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
+        kv_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -1014,9 +1015,35 @@ class BatchMLAPagedAttentionWrapper:
                 raise ValueError(
                     "Profiler is enabled, profiler_buffer must be provided"
                 )
+
+        # FP8 KV cache (fa2 backend): the kernel dequantizes the stored fp8
+        # ckv/kpe to bf16 *without* applying a scale, so the per-tensor kv_scale
+        # is folded in here -- into sm_scale for the QK matmul, and applied to
+        # the output for the PV matmul (ckv is shared as both K and V). This
+        # mirrors the non-MLA decode/prefill k_scale/v_scale handling.
+        is_fp8_kv = ckv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        if is_fp8_kv:
+            if self._backend != "fa2":
+                raise ValueError(
+                    f"FP8 KV cache for MLA is only supported on the 'fa2' backend, "
+                    f"got backend={self._backend!r}."
+                )
+            if kv_scale is None:
+                raise ValueError(
+                    "kv_scale must be provided for an FP8 KV cache (per-tensor "
+                    "dequantization scale for ckv/kpe)."
+                )
+        elif kv_scale is not None and kv_scale != 1.0:
+            raise ValueError(
+                "kv_scale is only meaningful for an FP8 KV cache; got a non-trivial "
+                f"kv_scale={kv_scale} with a {ckv_cache.dtype} KV cache."
+            )
+
         num_heads = q_nope.shape[1]
         page_size = self._page_size
         sm_scale = self._sm_scale
+        if kv_scale is not None:
+            sm_scale = sm_scale * kv_scale
         causal = self._causal
         mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
         device = self.device
@@ -1053,6 +1080,10 @@ class BatchMLAPagedAttentionWrapper:
             return_lse_base_on_e,
             *profiler_args,
         )
+
+        # PV output dequant for FP8 KV: O = kv_scale * sum_t softmax_t * ckv_fp8_t.
+        if kv_scale is not None and kv_scale != 1.0:
+            out.mul_(kv_scale)
 
         return (out, lse) if return_lse else out
 

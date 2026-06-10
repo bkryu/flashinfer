@@ -49,8 +49,10 @@ struct SharedStorageQKVO {
     struct {
       alignas(16) DTypeQ q_smem_nope[CTA_TILE_Q * HEAD_DIM_CKV];
       alignas(16) DTypeQ q_smem_pe[CTA_TILE_Q * HEAD_DIM_KPE];
-      alignas(16) DTypeKV ckv_smem[NUM_STAGES][CTA_TILE_KV * HEAD_DIM_CKV];
-      alignas(16) DTypeKV
+      // KV is dequantized to the compute type DTypeQ on load, so the smem KV
+      // buffers are DTypeQ (not the possibly-fp8 storage type DTypeKV).
+      alignas(16) DTypeQ ckv_smem[NUM_STAGES][CTA_TILE_KV * HEAD_DIM_CKV];
+      alignas(16) DTypeQ
           kpe_p_smem[NUM_STAGES]
                     [CTA_TILE_KV * (HEAD_DIM_KPE > CTA_TILE_Q ? HEAD_DIM_KPE : CTA_TILE_Q)];
       union {
@@ -91,10 +93,15 @@ struct KernelTraits {
   static constexpr SwizzleMode SWIZZLE_MODE_O = SwizzleMode::k128B;
   static constexpr uint32_t UPCAST_STRIDE_Q_NOPE = HEAD_DIM_CKV / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_Q_PE = HEAD_DIM_KPE / upcast_size<DTypeQ_>();
-  static constexpr uint32_t UPCAST_STRIDE_CKV = HEAD_DIM_CKV / upcast_size<DTypeKV_>();
-  static constexpr uint32_t UPCAST_STRIDE_KPE = HEAD_DIM_KPE / upcast_size<DTypeKV_>();
+  // The KV cache is stored as DTypeKV_ in global memory (possibly fp8), but is
+  // dequantized to the compute type DTypeQ_ during the global->smem load (see
+  // load_kv). Therefore the smem KV buffers and all downstream strides use the
+  // compute type DTypeQ_, not the storage type DTypeKV_. For a bf16/fp16 KV
+  // cache (DTypeKV_ == DTypeQ_) this is identical to the original behavior.
+  static constexpr uint32_t UPCAST_STRIDE_CKV = HEAD_DIM_CKV / upcast_size<DTypeQ_>();
+  static constexpr uint32_t UPCAST_STRIDE_KPE = HEAD_DIM_KPE / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_FINAL_O = HEAD_DIM_CKV / upcast_size<DTypeO_>();
-  static constexpr uint32_t UPCAST_STRIDE_P = CTA_TILE_KV / upcast_size<DTypeKV_>();
+  static constexpr uint32_t UPCAST_STRIDE_P = CTA_TILE_KV / upcast_size<DTypeQ_>();
 
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
@@ -177,6 +184,35 @@ __device__ __forceinline__ void load_q(
   }
 }
 
+// Load one 8-element (compute-type) chunk of KV from global memory into the
+// swizzled smem slot at `smem_offset` (a b128_t index). For a 16-bit KV cache
+// (DTypeKV == DTypeQ) this is a plain async 128b copy. For an fp8 KV cache the
+// 8 fp8 elements are loaded and dequantized to 8 DTypeQ elements, then stored
+// as one b128_t (dequant-on-load). The kv_scale is folded into sm_scale (QK)
+// and the output (PV) on the host side, so no scale is applied here.
+template <typename KTraits, SwizzleMode SWIZZLE_MODE>
+__device__ __forceinline__ void load_kv_chunk_(smem_t<SWIZZLE_MODE>& dst_smem, uint32_t smem_offset,
+                                               const typename KTraits::DTypeKV* gptr,
+                                               bool predicate) {
+  using DTypeKV = typename KTraits::DTypeKV;
+  using DTypeQ = typename KTraits::DTypeQ;
+  if constexpr (sizeof(DTypeKV) == sizeof(DTypeQ)) {
+    dst_smem.template load_128b_async<SharedMemFillMode::kFillZero>(smem_offset, gptr, predicate);
+  } else {
+    // fp8 (or other sub-16bit) storage -> dequantize to the compute type.
+    alignas(16) DTypeQ conv[8];
+    if (predicate) {
+      vec_cast<DTypeQ, DTypeKV>::template cast<8>(conv, gptr);
+    } else {
+#pragma unroll
+      for (uint32_t i = 0; i < 8; ++i) {
+        conv[i] = DTypeQ(0);
+      }
+    }
+    dst_smem.base[smem_offset] = *reinterpret_cast<b128_t*>(conv);
+  }
+}
+
 template <typename KTraits>
 __device__ __forceinline__ void load_kv(
     typename KTraits::SharedStorage* smem_storage, typename KTraits::DTypeKV* ckv,
@@ -185,6 +221,7 @@ __device__ __forceinline__ void load_kv(
     const uint32_t packed_kv_bound, const uint32_t packed_block_iter_base,
     const uint_fastdiv& block_size, const uint32_t stage_idx) {
   using DTypeKV = typename KTraits::DTypeKV;
+  using DTypeQ = typename KTraits::DTypeQ;
   constexpr uint32_t UPCAST_STRIDE_CKV = KTraits::UPCAST_STRIDE_CKV;
   constexpr uint32_t UPCAST_STRIDE_KPE = KTraits::UPCAST_STRIDE_KPE;
   constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
@@ -207,29 +244,29 @@ __device__ __forceinline__ void load_kv(
           ckv +
           static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
               ckv_stride_page +
-          r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
+          r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeQ>();
       DTypeKV* kpe_ptr =
           kpe +
           static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
               kpe_stride_page +
-          r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
+          r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeQ>();
 
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 4; ++mma_d) {
         uint32_t ckv_smem_offset_w = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
             warp_idx_in_wg * 4 + lane_idx / 8, 8 * mma_d + lane_idx % 8);
-        ckv_smem.load_128b_async<SharedMemFillMode::kFillZero>(ckv_smem_offset_w, ckv_ptr,
-                                                               packed_block_iter < packed_kv_bound);
-        ckv_ptr += 8 * upcast_size<DTypeKV>();
+        load_kv_chunk_<KTraits>(ckv_smem, ckv_smem_offset_w, ckv_ptr,
+                                packed_block_iter < packed_kv_bound);
+        ckv_ptr += 8 * upcast_size<DTypeQ>();
       }
 
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_KPE / 4; ++mma_d) {
         uint32_t kpe_smem_offset_w = kpe_smem.template get_permuted_offset<UPCAST_STRIDE_KPE>(
             warp_idx_in_wg * 4 + lane_idx / 8, 8 * mma_d + lane_idx % 8);
-        kpe_smem.load_128b_async<SharedMemFillMode::kFillZero>(kpe_smem_offset_w, kpe_ptr,
-                                                               packed_block_iter < packed_kv_bound);
-        kpe_ptr += 8 * upcast_size<DTypeKV>();
+        load_kv_chunk_<KTraits>(kpe_smem, kpe_smem_offset_w, kpe_ptr,
+                                packed_block_iter < packed_kv_bound);
+        kpe_ptr += 8 * upcast_size<DTypeQ>();
       }
     }
   } else {
@@ -245,21 +282,21 @@ __device__ __forceinline__ void load_kv(
           ckv +
           static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
               ckv_stride_page +
-          r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
+          r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeQ>();
       DTypeKV* kpe_ptr =
           kpe +
           static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
               kpe_stride_page +
-          r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
+          r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeQ>();
 
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 4; ++mma_d) {
         uint32_t ckv_smem_offset_w = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
             32 * mma_kv + warpgroup_idx * 16 + warp_idx_in_wg * 4 + lane_idx / 8,
             8 * mma_d + lane_idx % 8);
-        ckv_smem.load_128b_async<SharedMemFillMode::kFillZero>(ckv_smem_offset_w, ckv_ptr,
-                                                               packed_block_iter < packed_kv_bound);
-        ckv_ptr += 8 * upcast_size<DTypeKV>();
+        load_kv_chunk_<KTraits>(ckv_smem, ckv_smem_offset_w, ckv_ptr,
+                                packed_block_iter < packed_kv_bound);
+        ckv_ptr += 8 * upcast_size<DTypeQ>();
       }
 
 #pragma unroll
@@ -267,9 +304,9 @@ __device__ __forceinline__ void load_kv(
         uint32_t kpe_smem_offset_w = kpe_smem.template get_permuted_offset<UPCAST_STRIDE_KPE>(
             32 * mma_kv + warpgroup_idx * 16 + warp_idx_in_wg * 4 + lane_idx / 8,
             8 * mma_d + lane_idx % 8);
-        kpe_smem.load_128b_async<SharedMemFillMode::kFillZero>(kpe_smem_offset_w, kpe_ptr,
-                                                               packed_block_iter < packed_kv_bound);
-        kpe_ptr += 8 * upcast_size<DTypeKV>();
+        load_kv_chunk_<KTraits>(kpe_smem, kpe_smem_offset_w, kpe_ptr,
+                                packed_block_iter < packed_kv_bound);
+        kpe_ptr += 8 * upcast_size<DTypeQ>();
       }
     }
   }
@@ -504,10 +541,10 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
       lane_idx % 16, warpgroup_idx * NUM_MMA_D_CKV + lane_idx / 16);
   if constexpr (KTraits::QK_SHARD) {
     // shard s_frag computation on KV dimension across warpgroups, need allgather
-    alignas(16) typename KTraits::DTypeKV p_f16[NUM_MMA_KV / 2][8];
+    alignas(16) typename KTraits::DTypeQ p_f16[NUM_MMA_KV / 2][8];
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
-      vec_cast<typename KTraits::DTypeKV, float>::cast<8>(p_f16[mma_kv], s_frag[mma_kv]);
+      vec_cast<typename KTraits::DTypeQ, float>::cast<8>(p_f16[mma_kv], s_frag[mma_kv]);
       mma::m16k16_rowsum_f16f16f32(d, p_f16[mma_kv]);
     }
 
@@ -549,8 +586,8 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 2; ++mma_d) {
         uint32_t v_frag[4];
         ckv_smem.ldmatrix_m8n8x4_trans(ckv_smem_offset_r, v_frag);
-        mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeKV>(o_frag[mma_d], p_frag,
-                                                                             v_frag);
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(o_frag[mma_d], p_frag,
+                                                                            v_frag);
         ckv_smem_offset_r = ckv_smem.template advance_offset_by_column<2>(ckv_smem_offset_r, mma_d);
       }
       ckv_smem_offset_r =
@@ -559,10 +596,10 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
     }
   } else {
     // no need to store p_smem because all warpgroups are working on the same p
-    alignas(16) typename KTraits::DTypeKV p_f16[NUM_MMA_KV][8];
+    alignas(16) typename KTraits::DTypeQ p_f16[NUM_MMA_KV][8];
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
-      vec_cast<typename KTraits::DTypeKV, float>::cast<8>(p_f16[mma_kv], s_frag[mma_kv]);
+      vec_cast<typename KTraits::DTypeQ, float>::cast<8>(p_f16[mma_kv], s_frag[mma_kv]);
       mma::m16k16_rowsum_f16f16f32(d, p_f16[mma_kv]);
     }
 #pragma unroll
@@ -571,7 +608,7 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 2; ++mma_d) {
         uint32_t v_frag[4];
         ckv_smem.ldmatrix_m8n8x4_trans(ckv_smem_offset_r, v_frag);
-        mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeKV>(
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
             o_frag[mma_d], (uint32_t*)p_f16[mma_kv], v_frag);
         ckv_smem_offset_r = ckv_smem.template advance_offset_by_column<2>(ckv_smem_offset_r, mma_d);
       }
