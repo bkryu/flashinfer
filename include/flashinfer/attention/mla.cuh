@@ -109,6 +109,17 @@ struct KernelTraits {
   using IdType = IdType_;
   using DTypeQKAccum = float;
 
+  // FP8 tensor-core path: when both Q and KV are fp8 (matching XQA's input
+  // surface), the QK matmul runs on native fp8 tensor cores (m16n8k32). The
+  // softmax/PV/output still compute in a 16-bit "math" type (PV is dequantized
+  // to bf16 in this prototype). For a 16-bit Q this is all a no-op.
+  static constexpr bool USE_FP8_MMA = (sizeof(DTypeQ_) == 1 && sizeof(DTypeKV_) == 1);
+  using DTypeMath = std::conditional_t<USE_FP8_MMA, __nv_bfloat16, DTypeQ_>;
+  // QK contraction tiling: fp8 MMA contracts k=32 per step, bf16 contracts k=16.
+  static constexpr uint32_t QK_MMA_K = USE_FP8_MMA ? 32 : 16;
+  static constexpr uint32_t NUM_MMA_D_CKV_QK = HEAD_DIM_CKV / QK_MMA_K;
+  static constexpr uint32_t NUM_MMA_D_KPE_QK = HEAD_DIM_KPE / QK_MMA_K;
+
   using SharedStorage = SharedStorageQKVO<NUM_STAGES, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_CKV,
                                           HEAD_DIM_KPE, DTypeQ, DTypeKV, DTypeO>;
   using AttentionVariant = StandardAttention;
@@ -305,6 +316,20 @@ __device__ __forceinline__ void load_kv(
   }
 }
 
+// Dispatch the QK matmul to fp8 (m16n8k32) or bf16/fp16 (m16n8k16) tensor cores.
+// Operand register counts are identical (A[4], B[4], C[8]); only the contracted
+// k dimension (32 vs 16) and the instruction differ.
+template <typename KTraits, bool is_init>
+__device__ __forceinline__ void qk_mma_(typename KTraits::DTypeQKAccum* acc, uint32_t* q_frag,
+                                        uint32_t* k_frag) {
+  constexpr MMAMode mode = is_init ? MMAMode::kInit : MMAMode::kInplaceUpdate;
+  if constexpr (KTraits::USE_FP8_MMA) {
+    mma::mma_sync_m16n16k32_row_col_f8f8f32<typename KTraits::DTypeQ, mode>(acc, q_frag, k_frag);
+  } else {
+    mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ, mode>(acc, q_frag, k_frag);
+  }
+}
+
 template <bool init, typename KTraits, uint32_t NUM_MMA_D_QK, uint32_t UPCAST_STRIDE_Q,
           uint32_t UPCAST_STRIDE_K, SwizzleMode SWIZZLE_MODE_Q, SwizzleMode SWIZZLE_MODE_KV>
 __device__ __forceinline__ void compute_qk_(smem_t<SWIZZLE_MODE_Q> q_smem,
@@ -330,11 +355,9 @@ __device__ __forceinline__ void compute_qk_(smem_t<SWIZZLE_MODE_Q> q_smem,
         k_smem.ldmatrix_m8n8x4(k_smem_offset_r, k_frag);
 
         if (init && mma_d == 0) {
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ, MMAMode::kInit>(
-              s_frag[mma_kv], q_frag, k_frag);
+          qk_mma_<KTraits, true>(s_frag[mma_kv], q_frag, k_frag);
         } else {
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(s_frag[mma_kv],
-                                                                              q_frag, k_frag);
+          qk_mma_<KTraits, false>(s_frag[mma_kv], q_frag, k_frag);
         }
       }
     } else {
@@ -346,11 +369,9 @@ __device__ __forceinline__ void compute_qk_(smem_t<SWIZZLE_MODE_Q> q_smem,
         k_smem.ldmatrix_m8n8x4(k_smem_offset_r, k_frag);
 
         if (init && mma_d == 0) {
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ, MMAMode::kInit>(
-              s_frag[mma_kv], q_frag, k_frag);
+          qk_mma_<KTraits, true>(s_frag[mma_kv], q_frag, k_frag);
         } else {
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(s_frag[mma_kv],
-                                                                              q_frag, k_frag);
+          qk_mma_<KTraits, false>(s_frag[mma_kv], q_frag, k_frag);
         }
       }
     }
@@ -513,9 +534,9 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
   smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
   smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->kpe_p_smem[stage_idx]);
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
-  compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
+  compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE_QK, KTraits::UPCAST_STRIDE_Q_PE,
               KTraits::UPCAST_STRIDE_KPE>(q_smem_pe, kpe_smem, s_frag);
-  compute_qk_</*init=*/false, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
+  compute_qk_</*init=*/false, KTraits, KTraits::NUM_MMA_D_CKV_QK, KTraits::UPCAST_STRIDE_Q_NOPE,
               KTraits::UPCAST_STRIDE_CKV>(q_smem_nope, ckv_smem, s_frag);
 }
 
