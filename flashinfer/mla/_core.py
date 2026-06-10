@@ -827,11 +827,15 @@ class BatchMLAPagedAttentionWrapper:
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
         """
+        # The fp8 MLA paths are validated for e4m3 only.
+        if torch.float8_e5m2 in (q_data_type, kv_data_type):
+            raise ValueError(
+                "fp8 MLA supports torch.float8_e4m3fn only; "
+                "torch.float8_e5m2 is not supported."
+            )
         # For an fp8 query (fp8 tensor-core QK path) the output is still bf16.
         out_data_type = (
-            torch.bfloat16
-            if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
-            else q_data_type
+            torch.bfloat16 if q_data_type == torch.float8_e4m3fn else q_data_type
         )
         self._out_data_type = out_data_type
         self._cached_module = get_batch_mla_module(
@@ -1024,9 +1028,13 @@ class BatchMLAPagedAttentionWrapper:
                     "Profiler is enabled, profiler_buffer must be provided"
                 )
 
-        _fp8 = (torch.float8_e4m3fn, torch.float8_e5m2)
-        is_fp8_kv = ckv_cache.dtype in _fp8
-        is_fp8_q = q_nope.dtype in _fp8
+        if torch.float8_e5m2 in (q_nope.dtype, ckv_cache.dtype):
+            raise ValueError(
+                "fp8 MLA supports torch.float8_e4m3fn only; "
+                "torch.float8_e5m2 is not supported."
+            )
+        is_fp8_kv = ckv_cache.dtype == torch.float8_e4m3fn
+        is_fp8_q = q_nope.dtype == torch.float8_e4m3fn
         if is_fp8_kv:
             if kv_scale is None:
                 raise ValueError(

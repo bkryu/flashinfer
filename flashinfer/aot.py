@@ -219,6 +219,8 @@ def gen_attention(
     use_logits_soft_cap_: List[bool],
     has_sm90: bool,
     has_sm100: bool,
+    has_sm80_or_newer: bool,
+    has_sm100_or_newer: bool,
     add_gemma: bool,
     add_oai_oss: bool,
 ) -> Iterator[JitSpec]:
@@ -362,7 +364,6 @@ def gen_attention(
         yield gen_trtllm_gen_fmha_module()
 
     # MLA
-    # NOTE: fp8 kv not supported in MLA
     mla_backend_ = ["fa2"] + (["fa3"] if has_sm90 else [])
     for dtype_qo in f16_dtype_:
         for backend in mla_backend_:
@@ -376,6 +377,31 @@ def gen_attention(
                 head_dim_kpe=head_dim_kpe,
                 use_profiler=False,
             )
+
+    # MLA fp8 (fa2, e4m3 only): bf16-q + fp8-kv (dequant-on-load, SM80+) and
+    # full-fp8 q+kv (native fp8 tensor cores, SM100+). Output is bf16.
+    if has_sm80_or_newer:
+        yield gen_batch_mla_module(
+            backend="fa2",
+            dtype_q=torch.bfloat16,
+            dtype_kv=torch.float8_e4m3fn,
+            dtype_o=torch.bfloat16,
+            dtype_idx=torch.int32,
+            head_dim_ckv=head_dim_ckv,
+            head_dim_kpe=head_dim_kpe,
+            use_profiler=False,
+        )
+    if has_sm100_or_newer:
+        yield gen_batch_mla_module(
+            backend="fa2",
+            dtype_q=torch.float8_e4m3fn,
+            dtype_kv=torch.float8_e4m3fn,
+            dtype_o=torch.bfloat16,
+            dtype_idx=torch.int32,
+            head_dim_ckv=head_dim_ckv,
+            head_dim_kpe=head_dim_kpe,
+            use_profiler=False,
+        )
 
     # MLA SM100
     if has_sm100:
@@ -474,6 +500,10 @@ def gen_all_modules(
     has_sm120f = sm_capabilities.get("sm120f", False)
     has_sm121 = sm_capabilities.get("sm121", False)
 
+    has_sm100_or_newer = any(
+        [has_sm100, has_sm100f, has_sm103, has_sm110, has_sm120, has_sm120f, has_sm121]
+    )
+    has_sm80_or_newer = any([has_sm80, has_sm90, has_sm100_or_newer])
     jit_specs += list(
         gen_attention(
             f16_dtype_,
@@ -484,6 +514,8 @@ def gen_all_modules(
             use_logits_soft_cap_,
             has_sm90,
             has_sm100,
+            has_sm80_or_newer,
+            has_sm100_or_newer,
             add_gemma,
             add_oai_oss,
         )

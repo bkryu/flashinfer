@@ -121,6 +121,8 @@ def gen_batch_mla_module(
 ) -> JitSpec:
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
+    if torch.float8_e5m2 in (dtype_q, dtype_kv):
+        raise ValueError("fp8 MLA supports torch.float8_e4m3fn only.")
     uri = get_batch_mla_uri(
         backend,
         dtype_q,
@@ -195,6 +197,17 @@ def gen_batch_mla_module(
     extra_cuda_cflags = []
     if backend == "fa3":
         extra_cuda_cflags += sm90a_nvcc_flags
+    if backend == "fa2" and dtype_q == torch.float8_e4m3fn:
+        # Native fp8 tensor-core path: needs the .b8 transposed ldmatrix (SM100+).
+        extra_cuda_cflags += current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[10, 11, 12]
+        )
+    elif backend == "fa2" and dtype_kv == torch.float8_e4m3fn:
+        # fp8 KV dequant-on-load path: bf16 tensor cores + fp8 conversion
+        # (software fallback below SM89), so SM80+.
+        extra_cuda_cflags += current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[8, 9, 10, 11, 12]
+        )
     if use_profiler:
         extra_cuda_cflags += ["-DFLASHINFER_ENABLE_PROFILER"]
 
