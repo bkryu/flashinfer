@@ -159,9 +159,6 @@ struct smem_t {
     mma::ldmatrix_m8n8x4_trans_right_half(R, smem_ptr);
   }
 
-  // Byte-level (.b8) transposed ldmatrix of two 16x16 fp8 matrices. Used for the
-  // transposed V (B) operand of the fp8 PV matmul, where a .b16 transpose would
-  // scramble the fp8 bytes. Returns 4 registers in R.
   __device__ __forceinline__ void ldmatrix_m16n16x2_trans_b8(uint32_t offset, uint32_t* R) {
     b128_t* smem_ptr = base + offset;
     mma::ldmatrix_m16n16x2_trans_b8(R, smem_ptr);

@@ -119,7 +119,7 @@ def parse_attention_args(line, parser):
             "cute-dsl",
             "xqa",
         ],
-        help="Kernel backends to test. Default: fa2. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl). backend=xqa is supported for BatchMLAPagedAttentionWrapper on SM120/SM121 (XQA MLA decode kernel).",
+        help="Kernel backends to test. Default: fa2. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
     parser.add_argument(
         "--page_size",
@@ -179,14 +179,14 @@ def parse_attention_args(line, parser):
         type=str,
         required=False,
         default="bfloat16",
-        help="Data type of the query (e.g. bfloat16, fp8_e4m3). Support is backend/routine dependent; XQA MLA accepts fp8_e4m3 (with fp8_e4m3 KV).",
+        help="Data type of the query (e.g. bfloat16, fp8_e4m3). Support is backend/routine dependent.",
     )
     parser.add_argument(
         "--kv_dtype",
         type=str,
         required=False,
         default="bfloat16",
-        help="Data type of the key/value cache (e.g. bfloat16, fp8_e4m3). Support is backend/routine dependent; fa2 MLA accepts an fp8_e4m3 KV cache, XQA MLA accepts fp8_e4m3 q+kv.",
+        help="Data type of the key/value cache (e.g. bfloat16, fp8_e4m3). Support is backend/routine dependent.",
     )
     parser.add_argument(
         "--out_dtype",
@@ -2283,9 +2283,7 @@ def testBatchMLAPagedAttentionWrapper(args):
     # Check for backend-specific constraints
     if "fa2" in backends:
         remove_fa2 = False
-        # fa2 MLA supports an fp8 KV cache (dequant-on-load) with a 16-bit
-        # query, and a native fp8 tensor-core path when both q and kv are
-        # fp8 e4m3 (matching XQA's input surface).
+        # fa2 MLA (q, kv) = (bf16, fp8_e4m3) or (fp8_e4m3, fp8_e4m3).
         if q_dtype == torch.float8_e5m2 or (
             q_dtype == torch.float8_e4m3fn and kv_dtype != torch.float8_e4m3fn
         ):

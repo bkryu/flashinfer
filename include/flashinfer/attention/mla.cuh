@@ -49,17 +49,11 @@ struct SharedStorageQKVO {
     struct {
       alignas(16) DTypeQ q_smem_nope[CTA_TILE_Q * HEAD_DIM_CKV];
       alignas(16) DTypeQ q_smem_pe[CTA_TILE_Q * HEAD_DIM_KPE];
-      // KV is dequantized to the compute type DTypeQ on load, so the smem KV
-      // buffers are DTypeQ (not the possibly-fp8 storage type DTypeKV).
       alignas(16) DTypeQ ckv_smem[NUM_STAGES][CTA_TILE_KV * HEAD_DIM_CKV];
       alignas(16) DTypeQ
           kpe_p_smem[NUM_STAGES]
                     [CTA_TILE_KV * (HEAD_DIM_KPE > CTA_TILE_Q ? HEAD_DIM_KPE : CTA_TILE_Q)];
-      // fp8 PV scratch: each of the 8 warps reorders its 16 (local head) x 32
-      // (token) softmax probs through smem to assemble the m16n8k32 A operand
-      // (the QK score layout differs from the fp8 A-operand layout). 4KB for fp8;
-      // a negligible placeholder for 16-bit Q (this path is unused there). Lives
-      // in the same union arm as ckv_smem, so it is free under the o_smem bound.
+      // fp8 PV scratch space
       alignas(16) uint8_t
           fp8_p_smem[(sizeof(DTypeQ) == 1 && sizeof(DTypeKV) == 1) ? (8 * 16 * 32) : 16];
       union {
@@ -100,20 +94,12 @@ struct KernelTraits {
   static constexpr SwizzleMode SWIZZLE_MODE_O = SwizzleMode::k128B;
   static constexpr uint32_t UPCAST_STRIDE_Q_NOPE = HEAD_DIM_CKV / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_Q_PE = HEAD_DIM_KPE / upcast_size<DTypeQ_>();
-  // The KV cache is stored as DTypeKV_ in global memory (possibly fp8), but is
-  // dequantized to the compute type DTypeQ_ during the global->smem load (see
-  // load_kv). Therefore the smem KV buffers and all downstream strides use the
-  // compute type DTypeQ_, not the storage type DTypeKV_. For a bf16/fp16 KV
-  // cache (DTypeKV_ == DTypeQ_) this is identical to the original behavior.
   static constexpr uint32_t UPCAST_STRIDE_CKV = HEAD_DIM_CKV / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_KPE = HEAD_DIM_KPE / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_FINAL_O = HEAD_DIM_CKV / upcast_size<DTypeO_>();
-  // P (softmax probs) is stored in the bf16 compute type even when the query is
-  // fp8, so its swizzle stride uses the math type, not the fp8 storage type.
   static constexpr uint32_t UPCAST_STRIDE_P =
-      CTA_TILE_KV /
-      upcast_size<std::conditional_t<(sizeof(DTypeQ_) == 1 && sizeof(DTypeKV_) == 1),
-                                     __nv_bfloat16, DTypeQ_>>();
+      CTA_TILE_KV / upcast_size<std::conditional_t<(sizeof(DTypeQ_) == 1 && sizeof(DTypeKV_) == 1),
+                                                   __nv_bfloat16, DTypeQ_>>();
 
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
@@ -121,13 +107,8 @@ struct KernelTraits {
   using IdType = IdType_;
   using DTypeQKAccum = float;
 
-  // FP8 tensor-core path: when both Q and KV are fp8 (matching XQA's input
-  // surface), the QK matmul runs on native fp8 tensor cores (m16n8k32). The
-  // softmax/PV/output still compute in a 16-bit "math" type (PV is dequantized
-  // to bf16 in this prototype). For a 16-bit Q this is all a no-op.
   static constexpr bool USE_FP8_MMA = (sizeof(DTypeQ_) == 1 && sizeof(DTypeKV_) == 1);
   using DTypeMath = std::conditional_t<USE_FP8_MMA, __nv_bfloat16, DTypeQ_>;
-  // QK contraction tiling: fp8 MMA contracts k=32 per step, bf16 contracts k=16.
   static constexpr uint32_t QK_MMA_K = USE_FP8_MMA ? 32 : 16;
   static constexpr uint32_t NUM_MMA_D_CKV_QK = HEAD_DIM_CKV / QK_MMA_K;
   static constexpr uint32_t NUM_MMA_D_KPE_QK = HEAD_DIM_KPE / QK_MMA_K;
@@ -184,10 +165,6 @@ __device__ __forceinline__ void load_q(
         q_nope + q * q_nope_stride_n + r * q_nope_stride_h + (lane_idx % 8) * upcast_size<DTypeQ>();
     DTypeQ* q_pe_ptr =
         q_pe + q * q_pe_stride_n + r * q_pe_stride_h + (lane_idx % 8) * upcast_size<DTypeQ>();
-    // Number of 128b chunks per head-row depends on the element size (fp8 packs
-    // 16 elems / 128b vs 8 for bf16), so iterate over the actual b128 count and
-    // predicate the partial last group. For bf16 this is identical to the
-    // original NUM_MMA_D_CKV/4 loop.
     constexpr uint32_t NB128_CKV = UPCAST_STRIDE_Q_NOPE;  // = HEAD_DIM_CKV / upcast_size<DTypeQ>
     constexpr uint32_t NB128_KPE = UPCAST_STRIDE_Q_PE;
 #pragma unroll
@@ -218,12 +195,10 @@ __device__ __forceinline__ void load_q(
 //
 // For a 16-bit KV cache (DTypeKV == DTypeQ) each chunk is a plain async 128b
 // copy (the original code path). For an fp8 KV cache the chunks are loaded and
-// dequantized to the compute type on the fly (dequant-on-load). To keep the
-// global-memory loads latency-hidden -- the way cp.async batches them -- the
+// dequantized to the compute type on the fly (dequant-on-load). The
 // fp8 path issues *all* raw loads first (memory-level parallelism) and only
 // then converts + stores, instead of serializing load->convert->store per
-// chunk. The kv_scale is folded into sm_scale (QK) and the output (PV) on the
-// host side, so no scale is applied here.
+// chunk.
 template <typename KTraits, uint32_t STRIDE, SwizzleMode SWIZZLE_MODE>
 __device__ __forceinline__ void load_kv_row_(smem_t<SWIZZLE_MODE>& dst_smem, uint32_t row,
                                              uint32_t lane_idx,
@@ -232,18 +207,14 @@ __device__ __forceinline__ void load_kv_row_(smem_t<SWIZZLE_MODE>& dst_smem, uin
   using DTypeKV = typename KTraits::DTypeKV;
   using DTypeQ = typename KTraits::DTypeQ;
   constexpr uint32_t CHUNK_ELEMS = 8 * upcast_size<DTypeQ>();  // global elems per chunk stride
-  // STRIDE is the number of 128b chunks per row (HEAD_DIM / upcast_size<DTypeQ>),
-  // which is half as many for an fp8 compute type as for bf16. Iterate over that
-  // count (8 lanes per group) and predicate the partial last group so we never
-  // read past the row / write past the swizzled smem stride.
   constexpr uint32_t NUM_CHUNKS = (STRIDE + 7) / 8;
   if constexpr (sizeof(DTypeKV) == sizeof(DTypeQ)) {
 #pragma unroll
     for (uint32_t c = 0; c < NUM_CHUNKS; ++c) {
       uint32_t col = 8 * c + lane_idx % 8;
       uint32_t off = dst_smem.template get_permuted_offset<STRIDE>(row, col);
-      dst_smem.template load_128b_async<SharedMemFillMode::kFillZero>(
-          off, gptr + c * CHUNK_ELEMS, predicate && col < STRIDE);
+      dst_smem.template load_128b_async<SharedMemFillMode::kFillZero>(off, gptr + c * CHUNK_ELEMS,
+                                                                      predicate && col < STRIDE);
     }
   } else {
     // Phase 1: issue all 64-bit (8 x fp8) global loads up front for MLP.
@@ -306,13 +277,13 @@ __device__ __forceinline__ void load_kv(
               kpe_stride_page +
           r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeQ>();
 
-      load_kv_row_<KTraits, UPCAST_STRIDE_CKV>(
-          ckv_smem, warp_idx_in_wg * 4 + lane_idx / 8, lane_idx, ckv_ptr,
-          packed_block_iter < packed_kv_bound);
+      load_kv_row_<KTraits, UPCAST_STRIDE_CKV>(ckv_smem, warp_idx_in_wg * 4 + lane_idx / 8,
+                                               lane_idx, ckv_ptr,
+                                               packed_block_iter < packed_kv_bound);
 
-      load_kv_row_<KTraits, UPCAST_STRIDE_KPE>(
-          kpe_smem, warp_idx_in_wg * 4 + lane_idx / 8, lane_idx, kpe_ptr,
-          packed_block_iter < packed_kv_bound);
+      load_kv_row_<KTraits, UPCAST_STRIDE_KPE>(kpe_smem, warp_idx_in_wg * 4 + lane_idx / 8,
+                                               lane_idx, kpe_ptr,
+                                               packed_block_iter < packed_kv_bound);
     }
   } else {
 #pragma unroll
@@ -345,9 +316,6 @@ __device__ __forceinline__ void load_kv(
   }
 }
 
-// Dispatch the QK matmul to fp8 (m16n8k32) or bf16/fp16 (m16n8k16) tensor cores.
-// Operand register counts are identical (A[4], B[4], C[8]); only the contracted
-// k dimension (32 vs 16) and the instruction differ.
 template <typename KTraits, bool is_init>
 __device__ __forceinline__ void qk_mma_(typename KTraits::DTypeQKAccum* acc, uint32_t* q_frag,
                                         uint32_t* k_frag) {
@@ -569,12 +537,7 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
               KTraits::UPCAST_STRIDE_CKV>(q_smem_nope, ckv_smem, s_frag);
 }
 
-// Load one transposed V fragment (B operand of the P*V matmul) for output-dim
-// chunk mma_d. For a 16-bit V this is a plain transposed ldmatrix. For an fp8 V
-// (fp8 QK path) the value is dequantized to the bf16 compute type: two
-// consecutive mma_d share one ldmatrix (left half for even, right half for
-// odd), followed by the transposed fp8->16bit fragment swizzle, vec_cast, and
-// the standard b_frag[1]<->b_frag[2] swap.
+// Load one transposed V fragment (B operand of the P*V matmul) for output-dim chunk mma_d.
 template <typename KTraits, SwizzleMode SM>
 __device__ __forceinline__ void load_v_frag_(smem_t<SM>& v_smem, uint32_t offset, uint32_t mma_d,
                                              uint32_t* v_frag) {
@@ -598,8 +561,6 @@ __device__ __forceinline__ void load_v_frag_(smem_t<SM>& v_smem, uint32_t offset
   }
 }
 
-// Advance the V-read smem offset along the output-dim columns. For fp8 a single
-// ldmatrix serves two mma_d, so the offset only advances on the odd iteration.
 template <typename KTraits, SwizzleMode SM>
 __device__ __forceinline__ uint32_t advance_v_offset_(smem_t<SM>& v_smem, uint32_t offset,
                                                       uint32_t mma_d) {
@@ -623,9 +584,6 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
   constexpr uint32_t UPCAST_STRIDE_CKV = KTraits::UPCAST_STRIDE_CKV;
-  // The V-read column is in 128b units of the (possibly fp8) ckv smem. fp8 packs
-  // 16 elems / 128b vs 8 for bf16, so the per-warpgroup output-dim column span
-  // is half as wide for fp8.
   constexpr uint32_t PV_WG_COLS = KTraits::USE_FP8_MMA ? NUM_MMA_D_CKV / 2 : NUM_MMA_D_CKV;
   smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
   uint32_t ckv_smem_offset_r = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
@@ -686,28 +644,14 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
           (KTraits::USE_FP8_MMA ? NUM_MMA_D_CKV / 2 : NUM_MMA_D_CKV);
     }
   } else if constexpr (KTraits::USE_FP8_MMA) {
-    // Native fp8 PV (matches XQA's MLA PV): the softmax probs P are quantized to
-    // fp8 (A operand) and V is loaded with a byte-level (.b8) transposed
-    // ldmatrix, then both feed the m16n8k32 fp8 tensor core. The fp8 MMA
-    // contracts k=32 tokens per step, so tokens are processed in 32-wide
-    // sub-tiles (two of the 16-token QK tiles). The P-scale below cancels in the
-    // final o/d normalization (it is applied identically to the rowsum and the
-    // PV accumulation), and only widens the fp8 dynamic range of the probs.
     using DTypeKVf8 = typename KTraits::DTypeKV;  // fp8 storage type
     constexpr float P_SCALE = 1.0f;
     constexpr uint32_t PV_WG_MMA_D = NUM_MMA_D_CKV / 2;
-    // Per-warp scratch (16 local heads x 32 tokens of fp8) used to reorder the
-    // softmax probs from the QK score layout into the fp8 m16n8k32 A operand.
     const uint32_t tid = lane_idx % 4, gid = lane_idx / 4;
-    uint8_t* p_base = smem_storage->fp8_p_smem +
-                      (warpgroup_idx * 4 + warp_idx_in_wg) * (16u * 32u);
+    uint8_t* p_base = smem_storage->fp8_p_smem + (warpgroup_idx * 4 + warp_idx_in_wg) * (16u * 32u);
 #pragma unroll
     for (uint32_t mma_kv2 = 0; mma_kv2 < NUM_MMA_KV / 2; ++mma_kv2) {
       const uint32_t a = 2 * mma_kv2, b = 2 * mma_kv2 + 1;
-      // Scatter this lane's 16 probs to smem at [local_head][token]. QK score
-      // fragment layout: s[*][0,1]/[4,5] -> head gid at tokens {2tid,2tid+1}/
-      // {8+2tid,..}; s[*][2,3]/[6,7] -> head gid+8; sub-tile a covers tokens
-      // 0-15, b covers 16-31.
 #define FI_PSTORE(head, tok, val) \
   p_base[(head) * 32u + (tok)] = static_cast<DTypeKVf8>((val) * P_SCALE).__x
       FI_PSTORE(gid, 2 * tid, s_frag[a][0]);
@@ -730,9 +674,9 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
       __syncwarp();
       // Gather the m16n8k32 A operand: 4 contiguous tokens per register.
       alignas(16) uint32_t P[4];
-      P[0] = *reinterpret_cast<uint32_t*>(p_base + gid * 32u + 4 * tid);          // head gid, k0-15
-      P[1] = *reinterpret_cast<uint32_t*>(p_base + (gid + 8) * 32u + 4 * tid);    // head gid+8
-      P[2] = *reinterpret_cast<uint32_t*>(p_base + gid * 32u + 4 * tid + 16);     // head gid, k16-31
+      P[0] = *reinterpret_cast<uint32_t*>(p_base + gid * 32u + 4 * tid);        // head gid, k0-15
+      P[1] = *reinterpret_cast<uint32_t*>(p_base + (gid + 8) * 32u + 4 * tid);  // head gid+8
+      P[2] = *reinterpret_cast<uint32_t*>(p_base + gid * 32u + 4 * tid + 16);   // head gid, k16-31
       P[3] = *reinterpret_cast<uint32_t*>(p_base + (gid + 8) * 32u + 4 * tid + 16);
       mma::m16k32_rowsum_f8f8f32<DTypeKVf8>(d, reinterpret_cast<DTypeKVf8*>(P));
 #pragma unroll
@@ -1297,18 +1241,18 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
   cudaGetDevice(&device);
   cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
 
-#define MLA_LAUNCH_KERNEL(NUM_STAGES, CTA_TILE_KV, QK_SHARD)                                     \
-  {                                                                                              \
-    using KTraits = KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,       \
-                                 /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO,       \
-                                 IdType>;                                                        \
-    size_t smem_size = sizeof(typename KTraits::SharedStorage);                                  \
-    auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;                                 \
-    void* args[] = {(void*)&params};                                                             \
-    FLASHINFER_CUDA_CALL(                                                                         \
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));   \
-    FLASHINFER_CUDA_CALL(                                                                         \
-        cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));      \
+#define MLA_LAUNCH_KERNEL(NUM_STAGES, CTA_TILE_KV, QK_SHARD)                                       \
+  {                                                                                                \
+    using KTraits =                                                                                \
+        KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE, /*CTA_TILE_Q_=*/64, \
+                     CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;                                \
+    size_t smem_size = sizeof(typename KTraits::SharedStorage);                                    \
+    auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;                                   \
+    void* args[] = {(void*)&params};                                                               \
+    FLASHINFER_CUDA_CALL(                                                                          \
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));     \
+    FLASHINFER_CUDA_CALL(                                                                          \
+        cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));        \
   }
 
   if constexpr (sizeof(DTypeQ) == 1 && sizeof(DTypeKV) == 1) {

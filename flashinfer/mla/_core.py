@@ -827,8 +827,7 @@ class BatchMLAPagedAttentionWrapper:
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
         """
-        # For an fp8 query (fp8 tensor-core QK path) the output is still bf16:
-        # softmax/PV/output compute in 16-bit, only QK consumes fp8.
+        # For an fp8 query (fp8 tensor-core QK path) the output is still bf16.
         out_data_type = (
             torch.bfloat16
             if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -1025,42 +1024,20 @@ class BatchMLAPagedAttentionWrapper:
                     "Profiler is enabled, profiler_buffer must be provided"
                 )
 
-        # FP8 KV cache (fa2 backend): the kernel dequantizes the stored fp8
-        # ckv/kpe to bf16 *without* applying a scale, so the per-tensor kv_scale
-        # is folded in here -- into sm_scale for the QK matmul, and applied to
-        # the output for the PV matmul (ckv is shared as both K and V). This
-        # mirrors the non-MLA decode/prefill k_scale/v_scale handling.
         _fp8 = (torch.float8_e4m3fn, torch.float8_e5m2)
         is_fp8_kv = ckv_cache.dtype in _fp8
         is_fp8_q = q_nope.dtype in _fp8
         if is_fp8_kv:
-            if self._backend != "fa2":
-                raise ValueError(
-                    f"FP8 KV cache for MLA is only supported on the 'fa2' backend, "
-                    f"got backend={self._backend!r}."
-                )
             if kv_scale is None:
                 raise ValueError(
                     "kv_scale must be provided for an FP8 KV cache (per-tensor "
                     "dequantization scale for ckv/kpe)."
                 )
-        elif kv_scale is not None and kv_scale != 1.0:
-            raise ValueError(
-                "kv_scale is only meaningful for an FP8 KV cache; got a non-trivial "
-                f"kv_scale={kv_scale} with a {ckv_cache.dtype} KV cache."
-            )
-        # FP8 query (fp8 tensor-core QK): matches XQA's input surface, so it
-        # requires an fp8 KV cache. q_scale folds into sm_scale (QK only).
         if is_fp8_q:
             if not is_fp8_kv:
                 raise ValueError("An fp8 MLA query requires an fp8 KV cache.")
             if q_scale is None:
                 raise ValueError("q_scale must be provided for an fp8 MLA query.")
-        elif q_scale is not None and q_scale != 1.0:
-            raise ValueError(
-                f"q_scale is only meaningful for an fp8 query; got q_scale={q_scale} "
-                f"with a {q_nope.dtype} query."
-            )
 
         num_heads = q_nope.shape[1]
         page_size = self._page_size
