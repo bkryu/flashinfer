@@ -2284,9 +2284,14 @@ def testBatchMLAPagedAttentionWrapper(args):
     if "fa2" in backends:
         remove_fa2 = False
         # fa2 MLA supports an fp8 KV cache (dequant-on-load) with a 16-bit
-        # query, but not an fp8 query.
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            print("[INFO] FA2 MLA backend does not support an FP8 query. Skipping.")
+        # query, and a native fp8 tensor-core path when both q and kv are
+        # fp8 e4m3 (matching XQA's input surface).
+        if q_dtype == torch.float8_e5m2 or (
+            q_dtype == torch.float8_e4m3fn and kv_dtype != torch.float8_e4m3fn
+        ):
+            print(
+                "[INFO] FA2 MLA supports an FP8 query only as e4m3 with an e4m3 KV cache. Skipping."
+            )
             remove_fa2 = True
         if remove_fa2:
             backends.remove("fa2")
@@ -2487,10 +2492,13 @@ def testBatchMLAPagedAttentionWrapper(args):
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
             # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
             # cute-dsl branches below pass args.enable_pdl to the direct API.
-            # For an fp8 KV cache the benchmark quantizes ckv/kpe with a direct
-            # cast (no rescale), so the dequant scale is 1.0.
+            # For fp8 q/kv the benchmark quantizes with a direct cast (no
+            # rescale), so the dequant scales are 1.0.
             mla_kv_scale = (
                 1.0 if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else None
+            )
+            mla_q_scale = (
+                1.0 if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else None
             )
             return backend_wrappers[backend].run(
                 q_nope,
@@ -2499,6 +2507,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 kpe_cache,
                 page_table=block_tables,
                 return_lse=False,
+                q_scale=mla_q_scale,
                 kv_scale=mla_kv_scale,
             )
         elif backend == "cutlass":
