@@ -827,11 +827,19 @@ class BatchMLAPagedAttentionWrapper:
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
         """
+        # For an fp8 query (fp8 tensor-core QK path) the output is still bf16:
+        # softmax/PV/output compute in 16-bit, only QK consumes fp8.
+        out_data_type = (
+            torch.bfloat16
+            if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+            else q_data_type
+        )
+        self._out_data_type = out_data_type
         self._cached_module = get_batch_mla_module(
             self._backend,
             q_data_type,
             kv_data_type,
-            q_data_type,
+            out_data_type,
             qo_indptr.dtype,
             head_dim_ckv,
             head_dim_kpe,
@@ -918,6 +926,7 @@ class BatchMLAPagedAttentionWrapper:
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
         kv_scale: Optional[float] = None,
+        q_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -1021,7 +1030,9 @@ class BatchMLAPagedAttentionWrapper:
         # is folded in here -- into sm_scale for the QK matmul, and applied to
         # the output for the PV matmul (ckv is shared as both K and V). This
         # mirrors the non-MLA decode/prefill k_scale/v_scale handling.
-        is_fp8_kv = ckv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        _fp8 = (torch.float8_e4m3fn, torch.float8_e5m2)
+        is_fp8_kv = ckv_cache.dtype in _fp8
+        is_fp8_q = q_nope.dtype in _fp8
         if is_fp8_kv:
             if self._backend != "fa2":
                 raise ValueError(
@@ -1038,21 +1049,35 @@ class BatchMLAPagedAttentionWrapper:
                 "kv_scale is only meaningful for an FP8 KV cache; got a non-trivial "
                 f"kv_scale={kv_scale} with a {ckv_cache.dtype} KV cache."
             )
+        # FP8 query (fp8 tensor-core QK): matches XQA's input surface, so it
+        # requires an fp8 KV cache. q_scale folds into sm_scale (QK only).
+        if is_fp8_q:
+            if not is_fp8_kv:
+                raise ValueError("An fp8 MLA query requires an fp8 KV cache.")
+            if q_scale is None:
+                raise ValueError("q_scale must be provided for an fp8 MLA query.")
+        elif q_scale is not None and q_scale != 1.0:
+            raise ValueError(
+                f"q_scale is only meaningful for an fp8 query; got q_scale={q_scale} "
+                f"with a {q_nope.dtype} query."
+            )
 
         num_heads = q_nope.shape[1]
         page_size = self._page_size
         sm_scale = self._sm_scale
         if kv_scale is not None:
             sm_scale = sm_scale * kv_scale
+        if q_scale is not None:
+            sm_scale = sm_scale * q_scale
         causal = self._causal
         mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
         device = self.device
+        # Output is the planned output dtype (bf16 for an fp8 query), not q's dtype.
+        out_dtype = getattr(self, "_out_data_type", q_nope.dtype)
         if out is None:
-            out = torch.empty_like(q_nope)
+            out = torch.empty(q_nope.shape, dtype=out_dtype, device=device)
         else:
-            check_shape_dtype_device(
-                out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
-            )
+            check_shape_dtype_device(out, q_nope.shape, out_dtype, q_nope.device, "out")
 
         if return_lse:
             if lse is None:

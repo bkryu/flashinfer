@@ -48,6 +48,16 @@ namespace mma {
 #endif
 #endif
 
+// Byte-level (.b8) transposed ldmatrix. Unlike the .b16 transpose (which
+// transposes 16-bit elements and therefore scrambles the bytes of fp8 data),
+// the m16n16 .b8 variant transposes at byte granularity, which is what an fp8
+// (8-bit) B operand requires. Blackwell (sm_100+) / PTX 8.7 (CUDA 12.8+).
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000))
+#define FLASHINFER_LDMATRIX_M16N16_TRANS_B8_ENABLED
+#endif
+#endif
+
 #if defined(__CUDA_ARCH__)
 #define FLASHINFER_RUNTIME_ASSERT(x) __brkpt()
 #else
@@ -170,6 +180,28 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans_right_half(uint32_t* R, T*
                : "r"(smem_int_ptr));
 #else
   FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+#endif
+}
+
+/*!
+ * \brief Wrapper of PTX ldmatrix m16n16.x2.trans.b8 instruction. Loads two 16x16
+ *   byte (fp8) matrices from shared memory and transposes them at byte
+ *   granularity. Returns 4 registers (R[0..3]); for a k=32 fp8 B operand the
+ *   caller interleaves them as {R[0],R[2]} and {R[1],R[3]} (see XQA's MLA PV).
+ * \tparam T data type of the fragment (8-bit)
+ * \param R pointer to the 4-register output fragment
+ * \param smem_ptr pointer to the shared memory (16-byte aligned row start)
+ */
+template <typename T>
+__device__ __forceinline__ void ldmatrix_m16n16x2_trans_b8(uint32_t* R, T* smem_ptr) {
+#ifdef FLASHINFER_LDMATRIX_M16N16_TRANS_B8_ENABLED
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
+      : "r"(smem_int_ptr));
+#else
+  FLASHINFER_RUNTIME_ASSERT("m16n16.trans.b8 ldmatrix requires sm_100+ and CUDA 12.8+");
 #endif
 }
 
