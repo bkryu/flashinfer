@@ -28,6 +28,7 @@ from flashinfer.jit.attention import (
     gen_single_prefill_module,
 )
 from flashinfer.utils import (
+    get_compute_capability,
     has_flashinfer_jit_cache,
     is_sm90a_supported,
     is_sm100a_supported,
@@ -730,6 +731,144 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
     )
     o_ans = mla_ans.run(q_nope, q_pe, ckv, kpe, kv_len=kv_lens, page_table=page_table)
     torch.testing.assert_close(o_ans, o_ref, rtol=1e-2, atol=1e-2)
+
+
+# fp8 (e4m3) KV cache for the fa2 MLA decode kernel (issue #2745 follow-up).
+# The kernel dequantizes the stored fp8 ckv/kpe to the compute dtype during the
+# global->smem load; the per-tensor ``kv_scale`` folds into ``sm_scale`` (QK)
+# and the output (PV). These tests validate the fp8 path against the bf16
+# reference (same fa2 kernel, bf16 KV) within fp8 quantization tolerance.
+_FP8_MAX = 448.0  # e4m3 max magnitude
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("kv_len", [256, 1024])
+@pytest.mark.parametrize("num_heads", [16, 128])
+@pytest.mark.parametrize("page_size", [32, 64])
+def test_batch_mla_fp8_kv_matches_bf16(batch_size, kv_len, num_heads, page_size):
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if get_compute_capability(device)[0] < 8:
+        pytest.skip("fa2 MLA requires SM80+")
+    torch.manual_seed(42)
+    head_dim_ckv, head_dim_kpe, qk_nope_head_dim = 512, 64, 128
+    sm_scale = 1.0 / ((qk_nope_head_dim + head_dim_kpe) ** 0.5)
+    ws_ref = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    ws_fp8 = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    q_nope = torch.randn(
+        batch_size, num_heads, head_dim_ckv, dtype=torch.bfloat16, device=device
+    )
+    q_pe = torch.randn(
+        batch_size, num_heads, head_dim_kpe, dtype=torch.bfloat16, device=device
+    )
+    pages_num = math.ceil(kv_len / page_size)
+    # Scale the magnitude so fp8 quantization is representative.
+    ckv = (
+        torch.randn(
+            batch_size * pages_num,
+            page_size,
+            head_dim_ckv,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.1
+    )
+    kpe = (
+        torch.randn(
+            batch_size * pages_num,
+            page_size,
+            head_dim_kpe,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.1
+    )
+
+    q_indptr = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * pages_num
+    )
+    kv_indices = torch.arange(
+        0, batch_size * pages_num, device=device, dtype=torch.int32
+    )
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+
+    def plan_run(workspace, ckv_in, kpe_in, kv_dtype, kv_scale):
+        wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa2")
+        wrapper.plan(
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_lens,
+            num_heads,
+            head_dim_ckv,
+            head_dim_kpe,
+            page_size,
+            False,
+            sm_scale,
+            torch.bfloat16,
+            kv_dtype,
+        )
+        return wrapper.run(
+            q_nope, q_pe, ckv_in, kpe_in, return_lse=False, kv_scale=kv_scale
+        )
+
+    o_ref = plan_run(ws_ref, ckv, kpe, torch.bfloat16, None)
+
+    # Per-tensor fp8 quantization with a single shared kv_scale (ckv and kpe).
+    kv_scale = max(ckv.abs().max().item(), kpe.abs().max().item()) / _FP8_MAX
+    ckv8 = (ckv.float() / kv_scale).to(torch.float8_e4m3fn)
+    kpe8 = (kpe.float() / kv_scale).to(torch.float8_e4m3fn)
+    o_fp8 = plan_run(ws_fp8, ckv8, kpe8, torch.float8_e4m3fn, kv_scale)
+
+    assert torch.isfinite(o_fp8).all()
+    diff_abs = (o_fp8.float() - o_ref.float()).abs()
+    diff_rel = diff_abs / (o_ref.float().abs() + 1e-3)
+    pass_ratio = ((diff_abs <= 0.05) | (diff_rel <= 0.05)).float().mean().item()
+    assert pass_ratio >= 0.99, (
+        f"fp8 KV MLA mismatch: only {pass_ratio:.1%} within tolerance "
+        f"(max_abs_diff={diff_abs.max():.4f})"
+    )
+
+
+def test_batch_mla_fp8_kv_requires_scale():
+    """An fp8 KV cache without kv_scale must raise (avoid silent wrong results)."""
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if get_compute_capability(device)[0] < 8:
+        pytest.skip("fa2 MLA requires SM80+")
+    head_dim_ckv, head_dim_kpe, page_size = 512, 64, 64
+    ws = torch.empty(64 * 1024 * 1024, dtype=torch.int8, device=device)
+    q_nope = torch.randn(2, 16, head_dim_ckv, dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn(2, 16, head_dim_kpe, dtype=torch.bfloat16, device=device)
+    ckv8 = torch.zeros(
+        2, page_size, head_dim_ckv, dtype=torch.float8_e4m3fn, device=device
+    )
+    kpe8 = torch.zeros(
+        2, page_size, head_dim_kpe, dtype=torch.float8_e4m3fn, device=device
+    )
+    q_indptr = torch.arange(0, 3, device=device, dtype=torch.int32)
+    kv_indptr = torch.tensor([0, 1, 2], device=device, dtype=torch.int32)
+    kv_indices = torch.arange(2, device=device, dtype=torch.int32)
+    kv_lens = torch.full((2,), page_size, dtype=torch.int32, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(ws, backend="fa2")
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_lens,
+        16,
+        head_dim_ckv,
+        head_dim_kpe,
+        page_size,
+        False,
+        0.07,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    )
+    with pytest.raises(ValueError, match="kv_scale must be provided"):
+        wrapper.run(q_nope, q_pe, ckv8, kpe8, return_lse=False)
 
 
 if __name__ == "__main__":
