@@ -1316,7 +1316,7 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
     // per step, so it needs a >=32-token tile. fp8 q+kv halve the smem
     // footprint, so CTA_TILE_KV=32 fits wherever the bf16 CTA_TILE_KV=16 config
     // did (the o_smem bf16 union member dominates and is unchanged).
-    MLA_LAUNCH_KERNEL(/*NUM_STAGES=*/1, /*CTA_TILE_KV=*/32, /*QK_SHARD=*/false);
+    MLA_LAUNCH_KERNEL(/*NUM_STAGES=*/2, /*CTA_TILE_KV=*/32, /*QK_SHARD=*/false);
   } else {
     DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD,
                          MLA_LAUNCH_KERNEL(NUM_STAGES, CTA_TILE_KV, QK_SHARD));
