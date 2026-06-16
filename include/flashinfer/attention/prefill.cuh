@@ -2845,8 +2845,8 @@ __device__ __forceinline__ void vosplit_write_o(
 template <typename KTraits, typename Params, typename SmemStorage>
 __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const Params params, SmemStorage& smem_storage, const dim3 tid = threadIdx,
-    const uint32_t bx = blockIdx.x, const uint32_t kv_head_idx = blockIdx.z,
-    const uint32_t num_kv_heads = gridDim.z) {
+    const uint32_t bx = blockIdx.z, const uint32_t kv_head_idx = blockIdx.x,
+    const uint32_t num_kv_heads = gridDim.x) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -3625,7 +3625,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     return cudaSuccess;
   }
 
-  dim3 nblks(padded_batch_size, 1, num_kv_heads);
+  dim3 nblks(num_kv_heads, 1, padded_batch_size);
   dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
 
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
