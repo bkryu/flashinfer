@@ -42,6 +42,13 @@ def is_vllm_marlin_available():
         )
     except Exception as e:  # ImportError, or vLLM platform-init failure
         return False, f"{type(e).__name__}: {e}"
+    # Newer vLLMs (>=0.22, stable-ABI kernel split) no longer load the legacy
+    # vllm._C extension on CUDA platform init, and marlin_gemm still lives
+    # there -- load it explicitly (idempotent on older vLLMs).
+    try:
+        import vllm._C  # noqa: F401
+    except ImportError as e:
+        return False, f"vllm._C failed to load: {type(e).__name__}: {e}"
     if not hasattr(torch.ops._C, "marlin_gemm"):
         return False, "torch.ops._C.marlin_gemm missing (vLLM _C extension not built)"
     return True, "ok"
