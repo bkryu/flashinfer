@@ -1,6 +1,6 @@
 """vLLM Marlin nvfp4 W4A16 GEMM adapter for flashinfer_benchmark.
 
-Lets the ``mm_w4a16_fp4`` routine benchmark vLLM's Marlin nvfp4 (4-bit weight,
+Lets the ``mm_bf16_fp4`` routine benchmark vLLM's Marlin nvfp4 (4-bit weight,
 bf16 activation) dense GEMM side-by-side with FlashInfer's own w4a16 backends,
 for an apples-to-apples *performance* comparison.
 
