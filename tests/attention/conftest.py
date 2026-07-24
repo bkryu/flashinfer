@@ -55,38 +55,46 @@ def pytest_collection_modifyitems(session, config, items):
     if not xqa_items:
         return
 
+    # --collect-only enumerates tests without running them, so don't pre-build.
+    if config.getoption("--collect-only"):
+        return
+
     from flashinfer.jit.core import build_jit_specs
     from flashinfer.jit.xqa import gen_xqa_module
 
-    specs = {}
-    for it in xqa_items:
-        cs = getattr(it, "callspec", None)
-        if cs is None:
-            continue
-        kwargs = _executed_xqa_uri(cs.params)
-        if kwargs is None:
-            continue
-        try:
-            spec = gen_xqa_module(**kwargs)
-        except ValueError as e:
-            logger.debug("xqa-prebuild: skipping unsupported config %s: %s", kwargs, e)
-            continue
-        specs[spec.name] = spec
-
-    specs = list(specs.values())
-    if not specs:
-        return
-
     reporter = config.pluginmanager.getplugin("terminalreporter")
-    if reporter:
-        reporter.write_line(
-            f"[xqa-prebuild] compiling {len(specs)} XQA kernels in parallel..."
-        )
 
-    # Any failure here (e.g. compilation failure) must not abort collection
-    # for the whole suite. Fall back to the normal per-test first-touch JIT path,
-    # where a genuinely broken kernel surfaces as its own test failure instead.
+    # The whole prebuild is a best-effort optimization. Any failure here must not
+    # abort collection for the entire suite.
     try:
+        specs = {}
+        for it in xqa_items:
+            cs = getattr(it, "callspec", None)
+            if cs is None:
+                continue
+            kwargs = _executed_xqa_uri(cs.params)
+            if kwargs is None:
+                continue
+            try:
+                spec = gen_xqa_module(**kwargs)
+            except ValueError as e:
+                # Per-config unsupported (bad dtype/page_size/head_dim): skip just
+                # this config and keep prebuilding the rest.
+                logger.debug(
+                    "xqa-prebuild: skipping unsupported config %s: %s", kwargs, e
+                )
+                continue
+            specs[spec.name] = spec
+
+        specs = list(specs.values())
+        if not specs:
+            return
+
+        if reporter:
+            reporter.write_line(
+                f"[xqa-prebuild] compiling {len(specs)} XQA kernels in parallel..."
+            )
+
         # One ninja graph, built in parallel; skip_prebuilt reuses anything already AOT'd.
         build_jit_specs(specs, verbose=False)
 
