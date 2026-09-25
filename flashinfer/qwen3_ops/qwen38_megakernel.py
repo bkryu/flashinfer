@@ -160,6 +160,7 @@ def qwen38_megakernel_decode(
     block_table: torch.Tensor,
     state_slots: torch.Tensor | None = None,
     *,
+    num_accepted: torch.Tensor | None = None,
     embeds: torch.Tensor | None = None,
     final_norm: bool = True,
     out: torch.Tensor | None = None,
@@ -167,7 +168,9 @@ def qwen38_megakernel_decode(
     """Run the decoder over ``hidden`` [num_tokens, H] bf16 (the residual stream entering layer 0; with drafter_fold the
     drafter's ``hidden`` input, and ``embeds`` [num_tokens, H] its embedding input). ``positions`` / ``slot_mapping``
     int32 [num_tokens]; ``seq_lens`` int32 [num_seqs] (context length including the new rows); ``block_table`` int32
-    [num_seqs, max_pages]; ``state_slots`` int32 [num_seqs] GDN pool slots (None for attention-only layer lists).
+    [num_seqs, max_pages]; ``state_slots`` int32 [num_seqs] GDN pool slots (None for attention-only layer lists), or
+    with ``spec.slot_table`` the per-token slot table [(groups,) num_seqs, >= spec_rows] plus ``num_accepted`` int32
+    [num_seqs] (the previous step's accepted counts, 1..spec_rows).
     Returns rms_norm(final residual) * wn_out as bf16 [num_tokens, H] (or the raw residual with final_norm=False).
     Every tensor must keep its address across CUDA-graph replays (the plan's own buffers do)."""
     from ..experimental.qwen38_megakernel import decoder_entry, rowstat
@@ -203,6 +206,7 @@ def qwen38_megakernel_decode(
             slots,
             xcat=plan.xcat,
             out=plan.out,
+            num_accepted=num_accepted,
         )(stream)
         res = plan.out
         if out is not None:
@@ -228,6 +232,7 @@ def qwen38_megakernel_decode(
         seq_lens,
         block_table,
         slots,
+        num_accepted=num_accepted,
     )(stream)
     if not final_norm:
         return plan.resid

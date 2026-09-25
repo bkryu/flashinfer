@@ -40,6 +40,20 @@ originating study for the ladder and the refuted levers.
 | attention KV | bf16 `k_cache / v_cache [pages, 32, HKV, 256]`, `block_table int32 [seqs, max_pages]`, `slot_mapping int32 [tokens]` |
 | verify form (`spec_rows=R`) | R ordered rows per sequence; pools read-only, per-row `stash_x/y/a/b` filled for the framework's accept step |
 
+## Framework layouts (DecoderSpec knobs, default off)
+
+- `state_vk`: SSM state `[slot, hv, dv, dk]` (dk innermost), any slot stride.
+- `conv_sd`: conv state `[slot, rows, C]` (rows = K-1 + num_spec), taps at row
+  offset accepted-1, sliding-window write-back (vLLM's conv update semantics).
+- `kv_packed`: K | V as the halves of one `[pages, page, hkv, 2D]` tensor.
+- `slot_table`: per-token GDN state slots `[(groups,) seqs, R]` + accepted
+  counts: state read from `idx[acc-1]`, S_t stored to `idx[t]` per verify row
+  (vLLM's spec-decode convention; slot 0 = null, padded rows skip stores).
+
+`vllm/models/qwen3_5/nvidia/megakernel.py` in the vLLM branch turns all four
+on and feeds the model's own caches, so stock kernels and the megakernel can
+alternate step by step (prefill / mixed batches stay on the stock path).
+
 ## Files
 
 - `decoder_mega_sm120.py` — the kernel (`DecoderMegaSm120`), all phases.
