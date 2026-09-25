@@ -27,12 +27,16 @@ from .decoder_mega_sm120 import (
     IT_B1,
     IT_B2,
     IT_B3,
+    IT_CROWS,
+    IT_CSS,
     IT_HDN,
     IT_K2,
     IT_KCC,
     IT_KIND,
     IT_KT0,
     IT_N1,
+    IT_SGO,
+    IT_SSS,
     IT_TA,
     IT_TB,
     IT_TB0,
@@ -203,6 +207,10 @@ class DecoderSpec:
         wtype="fp8fp4",
         w16_stages=None,
         drafter_fold=False,
+        state_vk=False,
+        conv_sd=False,
+        kv_packed=False,
+        slot_table=False,
     ):
         self.hk, self.hv, self.hq, self.hkv, self.d, self.rot, self.page = (
             hk,
@@ -213,6 +221,19 @@ class DecoderSpec:
             rot,
             page,
         )
+        # ---- framework (vLLM) layouts, see `DecoderTables` for the tensor forms each one expects
+        self.state_vk = bool(
+            state_vk
+        )  # ssm_pool [slots, hv, dv, dk] (dk innermost), any slot stride
+        self.conv_sd = bool(
+            conv_sd
+        )  # conv_pool [slots, rows, C] (rows >= 3, row stride C), any slot stride
+        self.kv_packed = bool(
+            kv_packed
+        )  # k_cache / v_cache = the two halves of one [pages, page, hkv, 2d] tensor
+        self.slot_table = bool(
+            slot_table
+        )  # state_slots [seqs, >= R] + num_accepted: per-token slots (vLLM spec-decode convention)
         if wtype not in ("fp8fp4", "bf16"):
             raise ValueError(
                 f"decoder: wtype {wtype!r} (fp8fp4 = the 27B recipe; bf16 = unquantized weights, the MTP drafter)"
@@ -275,6 +296,9 @@ class DecoderTables:
         R = int(spec.spec_rows)
         if R < 1 or M % R:
             raise ValueError(f"decoder: M={M} is not a multiple of spec_rows={R}")
+        self.stash = (
+            R > 1 and not spec.slot_table
+        )  # the study's verify form keeps per-row stash tensors in the GDN layers
         nseq = M // R
         w16 = spec.wtype == "bf16"
         KT = (
@@ -322,7 +346,7 @@ class DecoderTables:
                     2 * kd + vd,
                 )  # items per (sequence, head); hdn = arrivals per head counter
                 tbkv = tb0
-                if R > 1:
+                if self.stash:
                     for key, col in (
                         ("stash_x", PT_STX),
                         ("stash_y", PT_STY),
@@ -352,13 +376,52 @@ class DecoderTables:
                     ("a_log", PT_ALOG),
                     ("dt_bias", PT_DTB),
                     ("norm_w", PT_NORMW),
-                    ("conv_pool", PT_CONV),
-                    ("ssm_pool", PT_SSM),
                 ):
                     t = ly[key]
                     if not t.is_contiguous():
                         raise ValueError(f"decoder: layer {j} {key} must be contiguous")
                     pt[j, col] = t.data_ptr()
+                cp, sp_ = ly["conv_pool"], ly["ssm_pool"]
+                pt[j, PT_CONV], pt[j, PT_SSM] = cp.data_ptr(), sp_.data_ptr()
+                if spec.conv_sd:
+                    # [slots, rows, C]: rows >= 3 (+ R - 1 for the per-token window), row stride C, any slot stride (padded pages)
+                    need = 3 + (R - 1 if spec.slot_table else 0)
+                    if (
+                        cp.dim() != 3
+                        or cp.shape[2] != w
+                        or cp.shape[1] < need
+                        or cp.stride(2) != 1
+                        or cp.stride(1) != w
+                    ):
+                        raise ValueError(
+                            f"decoder: layer {j} conv_pool must be [slots, rows >= {need}, {w}] with contiguous rows"
+                        )
+                    it[j, IT_CSS], it[j, IT_CROWS] = cp.stride(0), cp.shape[1]
+                else:
+                    if cp.shape[1:] != (w, 3) or not cp.is_contiguous():
+                        raise ValueError(
+                            f"decoder: layer {j} conv_pool must be contiguous [slots, {w}, 3]"
+                        )
+                    it[j, IT_CSS], it[j, IT_CROWS] = 3 * w, 3
+                if (
+                    sp_.dim() != 4
+                    or sp_.shape[1:] != (spec.hv, 128, 128)
+                    or sp_.stride(3) != 1
+                    or sp_.stride(2) != 128
+                    or sp_.stride(1) != 16384
+                    or sp_.stride(0) < spec.hv * 16384
+                ):
+                    raise ValueError(
+                        f"decoder: layer {j} ssm_pool must be [slots, {spec.hv}, 128, 128] with contiguous heads"
+                    )
+                if not spec.state_vk and not sp_.is_contiguous():
+                    raise ValueError(
+                        f"decoder: layer {j} ssm_pool must be contiguous (state_vk=False)"
+                    )
+                it[j, IT_SSS] = sp_.stride(0)
+                it[j, IT_SGO] = int(
+                    ly.get("slot_group", 0)
+                )  # index into the slot table's group mode (3-D slots)
                 if (
                     ly["a_log"].dtype != torch.float32
                     or ly["dt_bias"].dtype != torch.float32
@@ -396,22 +459,38 @@ class DecoderTables:
                     + ta
                     + 16
                 )  # kv-write, merge, q-prep flags; tail-half counters
-                for key, col in (
-                    ("wq", PT_WQ),
-                    ("wk", PT_WK),
-                    ("k_cache", PT_KC),
-                    ("v_cache", PT_VC),
-                ):
+                for key, col in (("wq", PT_WQ), ("wk", PT_WK)):
                     t = ly[key]
                     if not t.is_contiguous():
                         raise ValueError(f"decoder: layer {j} {key} must be contiguous")
                     pt[j, col] = t.data_ptr()
-                if (
-                    ly["k_cache"].shape[1:] != (spec.page, spec.hkv, spec.d)
-                    or ly["k_cache"].dtype != torch.bfloat16
+                kc, vc = ly["k_cache"], ly["v_cache"]
+                pt[j, PT_KC], pt[j, PT_VC] = kc.data_ptr(), vc.data_ptr()
+                mult = 2 if spec.kv_packed else 1
+                for name, t in (("k_cache", kc), ("v_cache", vc)):
+                    if (
+                        t.dim() != 4
+                        or t.shape[1:] != (spec.page, spec.hkv, spec.d)
+                        or t.dtype != torch.bfloat16
+                        or t.stride(3) != 1
+                        or t.stride(2) != mult * spec.d
+                        or t.stride(1) != mult * spec.d * spec.hkv
+                        or t.stride(0) != mult * spec.d * spec.hkv * spec.page
+                    ):
+                        raise ValueError(
+                            f"decoder: {name} must be bf16 [pages, {spec.page}, {spec.hkv}, {spec.d}]"
+                            + (
+                                " as one half of a packed [pages, page, hkv, 2d] tensor"
+                                if spec.kv_packed
+                                else " contiguous"
+                            )
+                        )
+                if spec.kv_packed and vc.data_ptr() - kc.data_ptr() not in (
+                    2 * spec.d,
+                    -2 * spec.d,
                 ):
                     raise ValueError(
-                        "decoder: caches must be bf16 [pages, 32, hkv, 256]"
+                        "decoder: kv_packed needs k_cache / v_cache to be the two halves of one tensor"
                     )
             for key, col in (
                 ("w_in", PT_WIN),
@@ -548,6 +627,17 @@ def _w16_scale_dummy(device, n):
     return t
 
 
+_ONES: dict = {}
+
+
+def _ones_i32(device, n):
+    key = (str(device), n)
+    t = _ONES.get(key)
+    if t is None:
+        t = _ONES[key] = torch.ones(n, dtype=torch.int32, device=device)
+    return t
+
+
 def _i32(t):
     return from_dlpack(
         t.to(torch.int32).contiguous(), assumed_align=4
@@ -573,11 +663,14 @@ def decoder_entry(
     max_ctas=None,
     xcat=None,
     out=None,
+    num_accepted=None,
 ):
     """ONE launch for tables.nl layers. xw0 [M,H] bf16 / sq0 [H/64,M] fp32 = first-layer input (and every
     layer's output), xw1 / sq1 mid scratch, resid [M,H] bf16 in place, act_buf [M,I] bf16 scratch.
     §19.7 drafter fold: xcat [M, 2H] bf16 = cat(embeds | hidden) (slack buffer; the kernel produces xw0 / sq0 / resid
-    itself) and out [M, H] bf16 = the final-norm output."""
+    itself) and out [M, H] bf16 = the final-norm output.
+    slot_table form: slots int32 [seqs, >= R] (per-token GDN state slots; column 0 also holds the conv state) and
+    num_accepted int32 [seqs] (the previous step's accepted count, 1..R: state read from slots[:, acc - 1])."""
     from . import _runtime as pdl_mod
     from . import _runtime as pg
     from .decoder_mega_sm120 import DecoderMegaSm120
@@ -716,14 +809,47 @@ def decoder_entry(
     rope_t = from_dlpack(rope_table.contiguous(), assumed_align=16).mark_layout_dynamic(
         leading_dim=1
     )
-    pos_t, slot_t, seq_t, bt_t, slots_t = (
+    pos_t, slot_t, seq_t, bt_t = (
         _i32(positions),
         _i32(slot_mapping),
         _i32(seq_lens),
         _i32(block_table.reshape(-1)),
-        _i32(slots),
     )
     bt_stride = int(block_table.shape[1])
+    nseq = M // int(spec.spec_rows)
+    if spec.slot_table:
+        if (
+            slots.dim() not in (2, 3)
+            or slots.shape[-2] < nseq
+            or slots.shape[-1] < int(spec.spec_rows)
+            or slots.stride(-1) != 1
+        ):
+            raise ValueError(
+                f"decoder slot_table: slots must be int32 [(groups,) >= {nseq}, >= {spec.spec_rows}] with contiguous rows"
+            )
+        if num_accepted is None or num_accepted.shape[0] < nseq:
+            raise ValueError(
+                f"decoder slot_table: num_accepted int32 [>= {nseq}] is required"
+            )
+        if (
+            slots.dim() == 3
+        ):  # [groups, seqs, R]: GDN layers pick their group through `slot_group`
+            slots_gstride, slots_stride = int(slots.stride(0)), int(slots.stride(1))
+        else:
+            slots_gstride, slots_stride = 0, int(slots.stride(0))
+        slots_t = _i32(
+            slots.reshape(-1)
+            if slots.is_contiguous()
+            else slots.contiguous().reshape(-1)
+        )
+        acc_t = _i32(num_accepted)
+    else:
+        if slots.dim() != 1:
+            raise ValueError(
+                "decoder: slots must be int32 [seqs] (one state slot per sequence) unless slot_table=True"
+            )
+        slots_t, slots_stride, slots_gstride = _i32(slots), 1, 0
+        acc_t = _i32(_ones_i32(dev, nseq))
     cnt = _counters(dev, tables.nl, tables.cs)
     cnt_t = from_dlpack(cnt, assumed_align=16).mark_layout_dynamic(leading_dim=0)
     tmaps = _tmaps(dev, mac)
@@ -785,6 +911,10 @@ def decoder_entry(
         spec.wtype,
         w16_stages,
         bool(spec.drafter_fold),
+        spec.state_vk,
+        spec.conv_sd,
+        spec.kv_packed,
+        spec.slot_table,
     )
     fn = _KERNELS.get(key)
     args = (
@@ -823,6 +953,7 @@ def decoder_entry(
         seq_t,
         bt_t,
         slots_t,
+        acc_t,
         cnt_t,
         tmaps_t,
         ptab_t,
@@ -834,6 +965,8 @@ def decoder_entry(
         int(tables.cs),
         int(KS),
         bt_stride,
+        slots_stride,
+        slots_gstride,
     )
     if fn is None:
         import cutlass
@@ -866,6 +999,10 @@ def decoder_entry(
             wtype=spec.wtype,
             w16_stages=w16_stages,
             drafter_fold=bool(spec.drafter_fold),
+            state_vk=spec.state_vk,
+            conv_sd=spec.conv_sd,
+            kv_packed=spec.kv_packed,
+            slot_table=spec.slot_table,
         )
         fn = _KERNELS[key] = _rt.compile_cached(kern, *args, mac, stream=None, key=key)
 

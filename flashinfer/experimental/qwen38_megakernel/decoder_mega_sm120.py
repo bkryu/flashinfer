@@ -61,8 +61,12 @@ LOG2E = 1.4426950408889634
     IT_TB0I,
     IT_TBKV,
     IT_TF,
-) = range(16)
-NI = 16
+    IT_CSS,
+    IT_CROWS,
+    IT_SSS,
+    IT_SGO,
+) = range(20)  # + conv slot stride / rows, SSM slot stride (elements), slot-table group
+NI = 20
 (
     PT_WIN,
     PT_WOUT,
@@ -129,6 +133,10 @@ class DecoderMegaSm120(GdnMegaSm120):
         wtype="fp8fp4",
         w16_stages=4,
         drafter_fold=False,
+        state_vk=False,
+        conv_sd=False,
+        kv_packed=False,
+        slot_table=False,
     ):
         super().__init__(
             acc_dtype,
@@ -182,11 +190,32 @@ class DecoderMegaSm120(GdnMegaSm120):
         self.fold = bool(
             drafter_fold
         )  # §19.7: fc + pre-fc norms in front of layer 0, final norm behind the last layer
+        # ---- framework (vLLM) layouts: every knob is a compile-time constant of the kind
+        self.state_vk = bool(
+            state_vk
+        )  # SSM state [slot][hv][dv][dk] (dk innermost): the core walks its value ROW with a rotated dk index
+        self.conv_sd = bool(
+            conv_sd
+        )  # conv state [slot][row][channel] (rows = K-1 (+ num_spec)); slot stride / rows from the layer table
+        self.kv_packed = bool(
+            kv_packed
+        )  # K | V packed in one [pages, page, hkv, 2D] tensor (FlashInfer backend pages)
+        self.slot_table = bool(
+            slot_table
+        )  # per-token GDN state slots [seq, R] + accepted counts: state read from idx[acc-1], S_r stored to
+        # idx[r]; conv taps at row offset acc-1 and the sliding window [old(acc), old(acc+1), x_0..x_{R-1}] written back; slots <= 0 = null
+        self.stash = (
+            self.R > 1 and not self.slot_table
+        )  # the study's verify form: pools read-only, per-row stash for a later apply
         if self.fold and (not self.w16 or self.nsplit != 2):
             raise ValueError(
                 "drafter_fold needs the bf16 weight kind with 2 splits (one per pre-fc norm half)"
             )
         self.hq, self.hkv, self.d = int(hq), int(hkv), int(d)
+        self.kv_hs = self.d * (
+            2 if self.kv_packed else 1
+        )  # elements between the kv heads of one token
+        self.kv_ts = self.hkv * self.kv_hs  # elements between the tokens of a page
         if (
             self.hq % self.hkv
             or self.d != 256
@@ -205,6 +234,47 @@ class DecoderMegaSm120(GdnMegaSm120):
         )
         self.s_tile = (tile_shape_mnk[0], tile_shape_mnk[2] // 16)
         self.prefetch = bool(prefetch)
+
+    @cute.jit
+    def _acc_off(self, mAcc, b):
+        """Accepted count of sequence b (clamped to [1, R]) minus one: the conv tap row / state slot offset."""
+        o_ = cutlass.Int32(0)
+        if cutlass.const_expr(self.slot_table):
+            a_ = mAcc[b]
+            if a_ < 1:
+                a_ = cutlass.Int32(1)
+            if a_ > self.R:
+                a_ = cutlass.Int32(self.R)
+            o_ = a_ - 1
+        return o_
+
+    @cute.jit
+    def _head_base(self, slot, SSS, h):
+        """Element offset of (slot, value head) in the SSM pool: slot stride from the layer table (Int64: padded framework pages)."""
+        return slot.to(cutlass.Int64) * SSS.to(cutlass.Int64) + (h * 16384).to(
+            cutlass.Int64
+        )
+
+    @cute.jit
+    def _sidx(self, r, tidx):
+        """dk index this thread touches at step r: rotated by its value column in the V-major layout (a warp's smem reads of its
+        own rows then hit 32 distinct banks); the study's layout reads row r of every column."""
+        if cutlass.const_expr(self.state_vk):
+            return (r + tidx) & 127
+        return r
+
+    @cute.jit
+    def _sget(self, sSt, rr, tidx):
+        if cutlass.const_expr(self.state_vk):
+            return sSt[(tidx, rr)]
+        return sSt[(rr, tidx)]
+
+    @cute.jit
+    def _sset(self, sSt, rr, tidx, v):
+        if cutlass.const_expr(self.state_vk):
+            sSt[(tidx, rr)] = v
+        else:
+            sSt[(rr, tidx)] = v
 
     def _setup_attributes(self):
         super()._setup_attributes()
@@ -405,6 +475,7 @@ class DecoderMegaSm120(GdnMegaSm120):
         seqlen: cute.Tensor,
         bt: cute.Tensor,
         slots: cute.Tensor,
+        acc: cute.Tensor,  # Int32 [seqs] accepted counts (all ones outside the slot-table form)
         cnt: cute.Tensor,
         tmaps: cute.Tensor,  # counters (NL*CS + 32), tensormap workspace (num_ctas, NTMAP, 16) Int64
         ptab: cute.Tensor,
@@ -416,6 +487,8 @@ class DecoderMegaSm120(GdnMegaSm120):
         cs: cutlass.Int32,
         kv_splits: cutlass.Int32,
         bt_stride: cutlass.Int32,
+        slots_stride: cutlass.Int32,
+        slots_gstride: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -623,6 +696,7 @@ class DecoderMegaSm120(GdnMegaSm120):
             seqlen,
             bt,
             slots,
+            acc,
             ws,
             wsa,
             cnt,
@@ -650,6 +724,8 @@ class DecoderMegaSm120(GdnMegaSm120):
             vd,
             kv_splits,
             bt_stride,
+            slots_stride,
+            slots_gstride,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -705,6 +781,7 @@ class DecoderMegaSm120(GdnMegaSm120):
         mSeq: cute.Tensor,
         mBT: cute.Tensor,
         mSlots: cute.Tensor,
+        mAcc: cute.Tensor,
         mWs: cute.Tensor,
         mWsA: cute.Tensor,
         mCnt: cute.Tensor,
@@ -732,6 +809,8 @@ class DecoderMegaSm120(GdnMegaSm120):
         VD: cutlass.Int32,
         KV_SPLITS: cutlass.Int32,
         BT_STRIDE: cutlass.Int32,
+        SLOTS_STRIDE: cutlass.Int32,
+        SLOTS_GSTRIDE: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -1162,8 +1241,8 @@ class DecoderMegaSm120(GdnMegaSm120):
                 thr_cpv = tcp_v.get_slice(tidx)
                 tKsD = thr_cpk.partition_D(sKp)
                 tVsD = thr_cpv.partition_D(sV)
-                gK_lay = cute.make_layout((PAGE, D), stride=(self.hkv * D, 1))
-                gV_lay = cute.make_layout((D, PAGE), stride=(1, self.hkv * D))
+                gK_lay = cute.make_layout((PAGE, D), stride=(self.kv_ts, 1))
+                gV_lay = cute.make_layout((D, PAGE), stride=(1, self.kv_ts))
             conv16 = cute.make_rmem_tensor((16,), self.b_dtype)
             conv32 = cute.recast_tensor(conv16, cutlass.Int32)
             conv16f = cute.make_rmem_tensor((8, 4), cutlass.Float16)
@@ -1488,6 +1567,14 @@ class DecoderMegaSm120(GdnMegaSm120):
                     TB = mItab[(L, IT_TB)]
                     KT0 = mItab[(L, IT_KT0)]
                     W = mItab[(L, IT_W)]
+                    CSS = mItab[(L, IT_CSS)]  # conv state: elements between slots
+                    CROWS = mItab[
+                        (L, IT_CROWS)
+                    ]  # conv state: rows per slot (K-1 (+ num_spec))
+                    SSS = mItab[(L, IT_SSS)]  # SSM state: elements between slots
+                    SGO = (
+                        mItab[(L, IT_SGO)] * SLOTS_GSTRIDE
+                    )  # this layer's slot-table group (framework KV-cache groups)
                     mMz = cute.make_tensor(
                         mMzF.iterator,
                         cute.make_layout((N1, n_tok, c1), stride=(c1, N1, c0)),
@@ -1544,7 +1631,6 @@ class DecoderMegaSm120(GdnMegaSm120):
                     mXwMid = mXw1
                     mXwOut = mXw0
                     TC = NT2 * self.nsplit
-                    TD = TC
                     TGDN = TAI + TB0I + TB + TC
                     # counter layout inside the layer region (each kind's own)
                     HD = TA  # lever 3 (§14): one heads-done counter per v head (GDN) / kv head (attention)
@@ -2310,22 +2396,40 @@ class DecoderMegaSm120(GdnMegaSm120):
                                 ),
                                 cute.make_layout((W, 4), stride=(4, 1)),
                             )
-                            mConv = cute.make_tensor(
-                                cute.make_ptr(
-                                    self.b_dtype,
-                                    mPtab[(L, PT_CONV)],
-                                    AddressSpace.gmem,
-                                    assumed_align=2,
-                                ),
-                                cute.make_layout((BIG, W, 3), stride=(3 * W, 3, 1)),
-                            )
+                            if cutlass.const_expr(self.conv_sd):
+                                mConv = cute.make_tensor(
+                                    cute.make_ptr(
+                                        self.b_dtype,
+                                        mPtab[(L, PT_CONV)],
+                                        AddressSpace.gmem,
+                                        assumed_align=2,
+                                    ),
+                                    cute.make_layout(
+                                        (BIG, W, CROWS), stride=(CSS, 1, W)
+                                    ),
+                                )  # [slot][row][channel]
+                            else:
+                                mConv = cute.make_tensor(
+                                    cute.make_ptr(
+                                        self.b_dtype,
+                                        mPtab[(L, PT_CONV)],
+                                        AddressSpace.gmem,
+                                        assumed_align=2,
+                                    ),
+                                    cute.make_layout((BIG, W, 3), stride=(3 * W, 3, 1)),
+                                )  # [slot][channel][tap]
                             if is_b0:
                                 if cutlass.const_expr(self.R > 1):
                                     # §18 verify form: q|k conv of the R rows of one (sequence, key head) on register tap windows
                                     it = work - TAI
                                     sq_ = it // self.hk
                                     kh = it % self.hk
-                                    slot = mSlots[sq_]
+                                    slot = mSlots[
+                                        SGO + sq_ * SLOTS_STRIDE
+                                    ]  # conv slot (the sequence's first)
+                                    o_ = self._acc_off(
+                                        mAcc, sq_
+                                    )  # tap row offset (accepted - 1; 0 in the study's form)
                                     q0 = kh * self.dk
                                     kk0 = KD + kh * self.dk
                                     if tidx < 4:
@@ -2339,12 +2443,26 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     self.epilog_sync_barrier.arrive_and_wait()
                                     cq = q0 + tidx
                                     ck = kk0 + tidx
-                                    tq0 = mConv[(slot, cq, 0)].to(cutlass.Float32)
-                                    tq1 = mConv[(slot, cq, 1)].to(cutlass.Float32)
-                                    tq2 = mConv[(slot, cq, 2)].to(cutlass.Float32)
-                                    tk0 = mConv[(slot, ck, 0)].to(cutlass.Float32)
-                                    tk1 = mConv[(slot, ck, 1)].to(cutlass.Float32)
-                                    tk2 = mConv[(slot, ck, 2)].to(cutlass.Float32)
+                                    rq0 = mConv[(slot, cq, o_)]
+                                    rq1 = mConv[(slot, cq, o_ + 1)]
+                                    rq2 = mConv[(slot, cq, o_ + 2)]
+                                    rk0 = mConv[(slot, ck, o_)]
+                                    rk1 = mConv[(slot, ck, o_ + 1)]
+                                    rk2 = mConv[(slot, ck, o_ + 2)]
+                                    tq0 = rq0.to(cutlass.Float32)
+                                    tq1 = rq1.to(cutlass.Float32)
+                                    tq2 = rq2.to(cutlass.Float32)
+                                    tk0 = rk0.to(cutlass.Float32)
+                                    tk1 = rk1.to(cutlass.Float32)
+                                    tk2 = rk2.to(cutlass.Float32)
+                                    if cutlass.const_expr(self.slot_table):
+                                        if (
+                                            slot > 0
+                                        ):  # window rows 0, 1 = the two newest committed inputs; rows 2.. = this step's inputs (below)
+                                            mConv[(slot, cq, 0)] = rq1
+                                            mConv[(slot, cq, 1)] = rq2
+                                            mConv[(slot, ck, 0)] = rk1
+                                            mConv[(slot, ck, 1)] = rk2
                                     wq0 = mConvW[(cq, 0)].to(cutlass.Float32)
                                     wq1 = mConvW[(cq, 1)].to(cutlass.Float32)
                                     wq2 = mConvW[(cq, 2)].to(cutlass.Float32)
@@ -2381,10 +2499,19 @@ class DecoderMegaSm120(GdnMegaSm120):
                                         yk = ak / (
                                             cutlass.Float32(1.0) + cute.math.exp(-ak)
                                         )
-                                        mStX[(m * W + cq,)] = xq
-                                        mStX[(m * W + ck,)] = xk
-                                        mStY[(m * W + cq,)] = yq.to(mStY.element_type)
-                                        mStY[(m * W + ck,)] = yk.to(mStY.element_type)
+                                        if cutlass.const_expr(self.stash):
+                                            mStX[(m * W + cq,)] = xq
+                                            mStX[(m * W + ck,)] = xk
+                                            mStY[(m * W + cq,)] = yq.to(
+                                                mStY.element_type
+                                            )
+                                            mStY[(m * W + ck,)] = yk.to(
+                                                mStY.element_type
+                                            )
+                                        if cutlass.const_expr(self.slot_table):
+                                            if slot > 0:
+                                                mConv[(slot, cq, 2 + r_)] = xq
+                                                mConv[(slot, ck, 2 + r_)] = xk
                                         ssq = self._block_sum(
                                             yq * yq, sRed1, warp_idx, lane
                                         )
@@ -2416,7 +2543,7 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     it = work - TAI
                                     m = it // self.hk
                                     kh = it % self.hk
-                                    slot = mSlots[m]
+                                    slot = mSlots[SGO + m * SLOTS_STRIDE]
                                     q0 = kh * self.dk
                                     kk0 = KD + kh * self.dk
                                     if tidx < 4:
@@ -2467,7 +2594,11 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     sq_ = it // self.hv
                                     h = it % self.hv
                                     kh = h // self.rep
-                                    slot = mSlots[sq_]
+                                    slot = mSlots[SGO + sq_ * SLOTS_STRIDE]  # conv slot
+                                    o_ = self._acc_off(mAcc, sq_)
+                                    slot_r = mSlots[
+                                        SGO + sq_ * SLOTS_STRIDE + o_
+                                    ]  # state slot: after the accepted prefix of the last step
                                     mSsm = cute.make_tensor(
                                         cute.make_ptr(
                                             cutlass.Float32,
@@ -2515,7 +2646,7 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     )
                                     vc0 = 2 * KD + h * self.dv
                                     zc0 = W + h * self.dv
-                                    head_base = (slot * self.hv + h) * 16384
+                                    head_base = self._head_base(slot_r, SSS, h)
                                     if tidx == 0:
                                         cute.arch.mbarrier_arrive_and_expect_tx(
                                             state_bar, 65536
@@ -2558,9 +2689,16 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     dtb_h = mDtb[(h,)]
                                     alog_h = mAlog[(h,)]
                                     cv = vc0 + tidx
-                                    tv0 = mConv[(slot, cv, 0)].to(cutlass.Float32)
-                                    tv1 = mConv[(slot, cv, 1)].to(cutlass.Float32)
-                                    tv2 = mConv[(slot, cv, 2)].to(cutlass.Float32)
+                                    rv0 = mConv[(slot, cv, o_)]
+                                    rv1 = mConv[(slot, cv, o_ + 1)]
+                                    rv2 = mConv[(slot, cv, o_ + 2)]
+                                    tv0 = rv0.to(cutlass.Float32)
+                                    tv1 = rv1.to(cutlass.Float32)
+                                    tv2 = rv2.to(cutlass.Float32)
+                                    if cutlass.const_expr(self.slot_table):
+                                        if slot > 0:
+                                            mConv[(slot, cv, 0)] = rv1
+                                            mConv[(slot, cv, 1)] = rv2
                                     wv0 = mConvW[(cv, 0)].to(cutlass.Float32)
                                     wv1 = mConvW[(cv, 1)].to(cutlass.Float32)
                                     wv2 = mConvW[(cv, 2)].to(cutlass.Float32)
@@ -2636,8 +2774,14 @@ class DecoderMegaSm120(GdnMegaSm120):
                                             cutlass.Float32(1.0) + cute.math.exp(-av)
                                         )
                                         vv[r_] = yv
-                                        mStX[(m * W + cv,)] = xv
-                                        mStY[(m * W + cv,)] = yv.to(mStY.element_type)
+                                        if cutlass.const_expr(self.stash):
+                                            mStX[(m * W + cv,)] = xv
+                                            mStY[(m * W + cv,)] = yv.to(
+                                                mStY.element_type
+                                            )
+                                        if cutlass.const_expr(self.slot_table):
+                                            if slot > 0:
+                                                mConv[(slot, cv, 2 + r_)] = xv
                                         pb = cutlass.Float32(0.0)
                                         pa = cutlass.Float32(0.0)
                                         for j in cutlass.range_constexpr(self.kchunk):
@@ -2656,9 +2800,10 @@ class DecoderMegaSm120(GdnMegaSm120):
                                         a_bf = asum.to(cutlass.BFloat16).to(
                                             cutlass.Float32
                                         )
-                                        if tidx == 0:
-                                            mStA[(m * self.hv + h,)] = a_bf
-                                            mStB[(m * self.hv + h,)] = b_bf
+                                        if cutlass.const_expr(self.stash):
+                                            if tidx == 0:
+                                                mStA[(m * self.hv + h,)] = a_bf
+                                                mStB[(m * self.hv + h,)] = b_bf
                                         beta_r[r_] = (
                                             (
                                                 cutlass.Float32(1.0)
@@ -2686,8 +2831,8 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     oqp.fill(0.0)
                                     for c8 in range(0, 32, 1, unroll=1):
                                         for i in cutlass.range_constexpr(4):
-                                            r0 = c8 * 4 + i
-                                            s0 = sStA[(r0, tidx)]
+                                            r0 = self._sidx(c8 * 4 + i, tidx)
+                                            s0 = self._sget(sStA, r0, tidx)
                                             for r_ in cutlass.range_constexpr(RR):
                                                 kvp[r_] = (
                                                     kvp[r_] + s0 * sKq[(0, r_, r0)]
@@ -2782,6 +2927,51 @@ class DecoderMegaSm120(GdnMegaSm120):
                                         mAttn[(h * self.dv + tidx, m, 0)] = (
                                             y_bf * sil
                                         ).to(mAttn.element_type)
+                                    if cutlass.const_expr(self.slot_table):
+                                        # per-token slots: S_t = e^{g_t} S_{t-1} + k_t (x) u_t on the resident tile (u_t = the chain's
+                                        # delta), each stored to the token's slot (the framework reads idx[accepted - 1] next step)
+                                        for t_ in cutlass.range_constexpr(RR):
+                                            gprev = (
+                                                gc_r[t_ - 1]
+                                                if t_ > 0
+                                                else cutlass.Float32(0.0)
+                                            )  # trace-time choice (t_ is unrolled)
+                                            egr = cute.math.exp(gc_r[t_] - gprev)
+                                            ut = uu[t_]
+                                            for c8 in range(0, 32, 1, unroll=1):
+                                                for i in cutlass.range_constexpr(4):
+                                                    r0 = self._sidx(c8 * 4 + i, tidx)
+                                                    self._sset(
+                                                        sStA,
+                                                        r0,
+                                                        tidx,
+                                                        self._sget(sStA, r0, tidx) * egr
+                                                        + sKq[(0, t_, r0)] * ut,
+                                                    )
+                                            cute.arch.fence_view_async_shared()
+                                            self.epilog_sync_barrier.arrive_and_wait()
+                                            slot_w = mSlots[
+                                                SGO + sq_ * SLOTS_STRIDE + t_
+                                            ]
+                                            if tidx == 0:
+                                                if slot_w > 0:
+                                                    gStW = cute.make_tensor(
+                                                        mSsm.iterator
+                                                        + self._head_base(
+                                                            slot_w, SSS, h
+                                                        ),
+                                                        cute.make_layout((16384,)),
+                                                    )
+                                                    sStW = cute.make_tensor(
+                                                        sStA.iterator,
+                                                        cute.make_layout((16384,)),
+                                                    )
+                                                    cute.copy(bulk_s2g, sStW, gStW)
+                                                    cute.arch.cp_async_bulk_commit_group()
+                                                    cute.arch.cp_async_bulk_wait_group(
+                                                        0, read=True
+                                                    )  # smem is reused by the next token
+                                            self.epilog_sync_barrier.arrive_and_wait()
                                     cute.arch.fence_view_async_shared()
                                     cute.arch.fence_acq_rel_gpu()
                                     self.epilog_sync_barrier.arrive_and_wait()
@@ -2798,7 +2988,7 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     m = it // self.hv
                                     h = it % self.hv
                                     kh = h // self.rep
-                                    slot = mSlots[m]
+                                    slot = mSlots[SGO + m * SLOTS_STRIDE]
                                     mSsm = cute.make_tensor(
                                         cute.make_ptr(
                                             cutlass.Float32,
@@ -2851,7 +3041,7 @@ class DecoderMegaSm120(GdnMegaSm120):
                                         ts0 = cute.arch.globaltimer()
                                     # independent of the in-projection flags: state load, gate-projection fragments, per-head
                                     # scalars — all issued before the flag spin so their latency overlaps the wait (§15)
-                                    head_base = (slot * self.hv + h) * 16384
+                                    head_base = self._head_base(slot, SSS, h)
                                     if tidx == 0:
                                         cute.arch.mbarrier_arrive_and_expect_tx(
                                             state_bar, 65536
@@ -3001,15 +3191,25 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     for c8 in range(0, 8, 1, unroll=1):
                                         for i in cutlass.range_constexpr(4):
                                             r0 = c8 * 16 + 4 * i
-                                            kvm = kvm + sStA[(r0, tidx)] * sK[r0]
+                                            i0 = self._sidx(r0, tidx)
+                                            i1 = self._sidx(r0 + 1, tidx)
+                                            i2 = self._sidx(r0 + 2, tidx)
+                                            i3 = self._sidx(r0 + 3, tidx)
+                                            kvm = (
+                                                kvm
+                                                + self._sget(sStA, i0, tidx) * sK[i0]
+                                            )
                                             kv1 = (
-                                                kv1 + sStA[(r0 + 1, tidx)] * sK[r0 + 1]
+                                                kv1
+                                                + self._sget(sStA, i1, tidx) * sK[i1]
                                             )
                                             kv2 = (
-                                                kv2 + sStA[(r0 + 2, tidx)] * sK[r0 + 2]
+                                                kv2
+                                                + self._sget(sStA, i2, tidx) * sK[i2]
                                             )
                                             kv3 = (
-                                                kv3 + sStA[(r0 + 3, tidx)] * sK[r0 + 3]
+                                                kv3
+                                                + self._sget(sStA, i3, tidx) * sK[i3]
                                             )
                                     kvm = ((kvm + kv1) + (kv2 + kv3)) * eg
                                     delta = (yv - kvm) * beta
@@ -3032,40 +3232,55 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     for c8 in range(0, 8, 1, unroll=1):
                                         for i in cutlass.range_constexpr(4):
                                             r0 = c8 * 16 + 4 * i
-                                            s0 = sStA[(r0, tidx)] * eg + sK[r0] * delta
+                                            i0 = self._sidx(r0, tidx)
+                                            i1 = self._sidx(r0 + 1, tidx)
+                                            i2 = self._sidx(r0 + 2, tidx)
+                                            i3 = self._sidx(r0 + 3, tidx)
+                                            s0 = (
+                                                self._sget(sStA, i0, tidx) * eg
+                                                + sK[i0] * delta
+                                            )
                                             s1 = (
-                                                sStA[(r0 + 1, tidx)] * eg
-                                                + sK[r0 + 1] * delta
+                                                self._sget(sStA, i1, tidx) * eg
+                                                + sK[i1] * delta
                                             )
                                             s2 = (
-                                                sStA[(r0 + 2, tidx)] * eg
-                                                + sK[r0 + 2] * delta
+                                                self._sget(sStA, i2, tidx) * eg
+                                                + sK[i2] * delta
                                             )
                                             s3 = (
-                                                sStA[(r0 + 3, tidx)] * eg
-                                                + sK[r0 + 3] * delta
+                                                self._sget(sStA, i3, tidx) * eg
+                                                + sK[i3] * delta
                                             )
-                                            sStA[(r0, tidx)] = s0
-                                            sStA[(r0 + 1, tidx)] = s1
-                                            sStA[(r0 + 2, tidx)] = s2
-                                            sStA[(r0 + 3, tidx)] = s3
-                                            ot = ot + s0 * sQg[r0]
-                                            ot1 = ot1 + s1 * sQg[r0 + 1]
-                                            ot2 = ot2 + s2 * sQg[r0 + 2]
-                                            ot3 = ot3 + s3 * sQg[r0 + 3]
+                                            self._sset(sStA, i0, tidx, s0)
+                                            self._sset(sStA, i1, tidx, s1)
+                                            self._sset(sStA, i2, tidx, s2)
+                                            self._sset(sStA, i3, tidx, s3)
+                                            ot = ot + s0 * sQg[i0]
+                                            ot1 = ot1 + s1 * sQg[i1]
+                                            ot2 = ot2 + s2 * sQg[i2]
+                                            ot3 = ot3 + s3 * sQg[i3]
                                     ot = (ot + ot1) + (ot2 + ot3)
                                     cute.arch.fence_view_async_shared()
                                     self.epilog_sync_barrier.arrive_and_wait()
+                                    do_store = cutlass.Boolean(True)
+                                    if cutlass.const_expr(self.slot_table):
+                                        if slot <= 0:
+                                            do_store = cutlass.Boolean(
+                                                False
+                                            )  # null slot (padded row)
                                     if tidx == 0:
-                                        gStF2 = cute.make_tensor(
-                                            mSsm.iterator + head_base,
-                                            cute.make_layout((16384,)),
-                                        )
-                                        sStF2 = cute.make_tensor(
-                                            sStA.iterator, cute.make_layout((16384,))
-                                        )
-                                        cute.copy(bulk_s2g, sStF2, gStF2)
-                                        cute.arch.cp_async_bulk_commit_group()
+                                        if do_store:
+                                            gStF2 = cute.make_tensor(
+                                                mSsm.iterator + head_base,
+                                                cute.make_layout((16384,)),
+                                            )
+                                            sStF2 = cute.make_tensor(
+                                                sStA.iterator,
+                                                cute.make_layout((16384,)),
+                                            )
+                                            cute.copy(bulk_s2g, sStF2, gStF2)
+                                            cute.arch.cp_async_bulk_commit_group()
                                     self.epilog_sync_barrier.arrive_and_wait()
                                     if cutlass.const_expr(self.profile):
                                         ts1 = cute.arch.globaltimer()
@@ -3359,7 +3574,7 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                 o1 = val
                                         sl = mSlot[m]
                                         if sl >= 0:
-                                            cbase = (sl * self.hkv + kh) * D
+                                            cbase = sl * self.kv_ts + kh * self.kv_hs
                                             mKC[(cbase + 2 * tidx,)] = o0.to(
                                                 mKC.element_type
                                             )
@@ -3394,6 +3609,10 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     m0 = sq_ * self.R
                                     NQ = self.R * G
                                     seq_len = mSeq[sq_]
+                                    if seq_len < 1:
+                                        seq_len = cutlass.Int32(
+                                            1
+                                        )  # padded row (null pages): attend to one key
                                     lps = (
                                         (seq_len + S * PAGE - 1) // (S * PAGE)
                                     ) * PAGE
@@ -3442,7 +3661,8 @@ class DecoderMegaSm120(GdnMegaSm120):
                                             (sq_ * BT_STRIDE + start_n // PAGE,)
                                         ]
                                         kb0 = cute.assume(
-                                            (page_id0 * PAGE * self.hkv + kh) * D,
+                                            page_id0 * PAGE * self.kv_ts
+                                            + kh * self.kv_hs,
                                             divby=256,
                                         )
                                         gK0 = cute.make_tensor(
@@ -3472,7 +3692,8 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                 (sq_ * BT_STRIDE + (n0 + PAGE) // PAGE,)
                                             ]
                                             kbn = cute.assume(
-                                                (page_idn * PAGE * self.hkv + kh) * D,
+                                                page_idn * PAGE * self.kv_ts
+                                                + kh * self.kv_hs,
                                                 divby=256,
                                             )
                                             gKn = cute.make_tensor(
@@ -3725,6 +3946,10 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     )  # §18: sequence of row m (== m when R == 1)
                                     rr_ = m % self.R
                                     seq_len = mSeq[sq_]
+                                    if seq_len < 1:
+                                        seq_len = cutlass.Int32(
+                                            1
+                                        )  # padded row (null pages): attend to one key
                                     lps = (
                                         (seq_len + S * PAGE - 1) // (S * PAGE)
                                     ) * PAGE
@@ -3802,7 +4027,8 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                 (sq_ * BT_STRIDE + start_n // PAGE,)
                                             ]
                                             kb0 = cute.assume(
-                                                (page_id0 * PAGE * self.hkv + kh) * D,
+                                                page_id0 * PAGE * self.kv_ts
+                                                + kh * self.kv_hs,
                                                 divby=256,
                                             )
                                             gK0 = cute.make_tensor(
@@ -3830,7 +4056,8 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                 (sq_ * BT_STRIDE + start_n // PAGE + 1,)
                                             ]
                                             kb1 = cute.assume(
-                                                (page_id1 * PAGE * self.hkv + kh) * D,
+                                                page_id1 * PAGE * self.kv_ts
+                                                + kh * self.kv_hs,
                                                 divby=256,
                                             )
                                             gV1 = cute.make_tensor(
@@ -3883,13 +4110,8 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                             )
                                                         ]
                                                         kbn = cute.assume(
-                                                            (
-                                                                page_idn
-                                                                * PAGE
-                                                                * self.hkv
-                                                                + kh
-                                                            )
-                                                            * D,
+                                                            page_idn * PAGE * self.kv_ts
+                                                            + kh * self.kv_hs,
                                                             divby=256,
                                                         )
                                                         gVn = cute.make_tensor(
@@ -3918,11 +4140,8 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                         )
                                                     ]
                                                     kb2 = cute.assume(
-                                                        (
-                                                            page_id2 * PAGE * self.hkv
-                                                            + kh
-                                                        )
-                                                        * D,
+                                                        page_id2 * PAGE * self.kv_ts
+                                                        + kh * self.kv_hs,
                                                         divby=256,
                                                     )
                                                     gK2 = cute.make_tensor(
@@ -3952,11 +4171,8 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                         )
                                                     ]
                                                     kbn = cute.assume(
-                                                        (
-                                                            page_idn * PAGE * self.hkv
-                                                            + kh
-                                                        )
-                                                        * D,
+                                                        page_idn * PAGE * self.kv_ts
+                                                        + kh * self.kv_hs,
                                                         divby=256,
                                                     )
                                                     gKn = cute.make_tensor(
@@ -4137,12 +4353,8 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                 (sq_ * BT_STRIDE + start_n // PAGE,)
                                             ]
                                             kbase0 = cute.assume(
-                                                (
-                                                    (page_id0 * PAGE + key_id)
-                                                    * self.hkv
-                                                    + kh
-                                                )
-                                                * D
+                                                (page_id0 * PAGE + key_id) * self.kv_ts
+                                                + kh * self.kv_hs
                                                 + quarter * 64,
                                                 divby=64,
                                             )
@@ -4158,16 +4370,9 @@ class DecoderMegaSm120(GdnMegaSm120):
                                             ]
                                             for kk in cutlass.range_constexpr(8):
                                                 vbase = cute.assume(
-                                                    (
-                                                        (
-                                                            page_id * PAGE
-                                                            + warp_idx * 8
-                                                            + kk
-                                                        )
-                                                        * self.hkv
-                                                        + kh
-                                                    )
-                                                    * D
+                                                    (page_id * PAGE + warp_idx * 8 + kk)
+                                                    * self.kv_ts
+                                                    + kh * self.kv_hs
                                                     + lane * 8,
                                                     divby=8,
                                                 )
@@ -4209,12 +4414,9 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                     )
                                                 ]
                                                 kbasen = cute.assume(
-                                                    (
-                                                        (page_idn * PAGE + key_id)
-                                                        * self.hkv
-                                                        + kh
-                                                    )
-                                                    * D
+                                                    (page_idn * PAGE + key_id)
+                                                    * self.kv_ts
+                                                    + kh * self.kv_hs
                                                     + quarter * 64,
                                                     divby=64,
                                                 )

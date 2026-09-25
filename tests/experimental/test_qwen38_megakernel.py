@@ -410,7 +410,7 @@ def run_ref(layers0, case, x, wn0):
             case.slot_mapping,
             case.seq_lens,
             case.bt,
-            case.gslots,
+            ly.get("_gslots", case.gslots),
         )
         wn = ly["wn_out"]
     return resid, state_of(layers)
@@ -949,3 +949,346 @@ def test_unsupported_reasons():
         assert "spec_rows" in qwen38_megakernel_unsupported_reason(
             "cuda", **{**geo, "num_tokens": 4, "spec_rows": 3}
         )
+
+
+# ------------------------------------------------------------------------------ framework (vLLM) layouts
+# state_vk: SSM state [slot, hv, dv, dk] (dk innermost) in padded slot pages; conv_sd: conv state [slot, rows, C] (rows =
+# K-1 + num_spec) in padded pages, committed taps at rows acc-1..acc+1; kv_packed: K | V as the halves of one
+# [pages, page, hkv, 2D] tensor; slot_table: per-token GDN state slots [seq, R] + accepted counts, slot 0 = null.
+VLLM = dict(state_vk=True, conv_sd=True, kv_packed=True, slot_table=True)
+CONV_ROWS = 6  # K-1 + num_spec (num_spec = 3)
+PAD = 384  # padding elements after every slot page (the framework pads mamba pages to the attention page size)
+
+
+def to_vllm_layout(layers, tap_row0=None):
+    """Study-layout layers -> vLLM-form state / caches (fresh storage). ``tap_row0`` [slots] int: the row where each slot's
+    committed taps start (acc - 1); default 0."""
+    out = []
+    for ly in layers:
+        c = dict(ly)
+        if c["kind"] == 0:
+            S_, W, _ = c["conv_pool"].shape
+            buf = torch.randn(S_, CONV_ROWS * W + PAD, device=CUDA).to(
+                torch.bfloat16
+            )  # garbage outside the live rows
+            cp = torch.as_strided(buf, (S_, CONV_ROWS, W), (CONV_ROWS * W + PAD, W, 1))
+            for s in range(S_):
+                r0 = 0 if tap_row0 is None else int(tap_row0[s])
+                cp[s, r0 : r0 + 3] = c["conv_pool"][s].t()
+            c["conv_pool"] = cp
+            c["_conv_buf"] = buf
+            sbuf = torch.randn(S_, HV * 16384 + PAD, device=CUDA)
+            sp = torch.as_strided(
+                sbuf, (S_, HV, 128, 128), (HV * 16384 + PAD, 16384, 128, 1)
+            )
+            sp.copy_(c["ssm_pool"].transpose(2, 3))
+            c["ssm_pool"] = sp
+            c["_ssm_buf"] = sbuf
+        else:
+            kv = torch.empty(
+                *c["k_cache"].shape[:3], 2 * D, dtype=torch.bfloat16, device=CUDA
+            )
+            kv[..., :D] = c["k_cache"]
+            kv[..., D:] = c["v_cache"]
+            c["k_cache"], c["v_cache"], c["_kv"] = kv[..., :D], kv[..., D:], kv
+        out.append(c)
+    return out
+
+
+def from_vllm_state(ly, tap_row0=0):
+    """The study-layout view of a vLLM-form layer's state: (conv taps [S, W, 3] from rows tap_row0.., ssm [S, hv, dk, dv]) or (k, v)."""
+    if ly["kind"] == 0:
+        return ly["conv_pool"][:, tap_row0 : tap_row0 + 3].transpose(1, 2), ly[
+            "ssm_pool"
+        ].transpose(2, 3)
+    return ly["k_cache"], ly["v_cache"]
+
+
+def run_kernel_vllm(
+    mk, spec, layers_v, case, x, wn0, slots_tab, num_accepted, KS=4, pad_rows=0
+):
+    """One launch on vLLM-form layers (state advanced in place); ``pad_rows`` trailing rows are padding (slot 0, slot_mapping
+    -1, seq_len 0, block-table row 0)."""
+    M = case.M + pad_rows
+    tables = mk.DecoderTables(spec, layers_v, M, KS)
+    xw0 = mk.slack_buffer((M, H), torch.bfloat16, CUDA)
+    xin = (
+        torch.cat([x, torch.zeros(pad_rows, H, dtype=torch.bfloat16, device=CUDA)])
+        if pad_rows
+        else x
+    )
+    torch.mul(xin, wn0, out=xw0)
+    sq0 = torch.zeros(H // 64, M, dtype=torch.float32, device=CUDA)
+    sq0[0:1] = mk.rowstat(xin)
+    xw1 = mk.slack_buffer((M, H), torch.bfloat16, CUDA)
+    sq1 = torch.empty(H // 64, M, dtype=torch.float32, device=CUDA)
+    act = mk.slack_buffer((M, I), torch.bfloat16, CUDA)
+    resid = xin.clone()
+    R = int(spec.spec_rows)
+    nseq = M // R
+    pos = torch.cat(
+        [case.positions, torch.zeros(pad_rows, dtype=torch.int32, device=CUDA)]
+    )
+    slot_map = torch.cat(
+        [case.slot_mapping, torch.full((pad_rows,), -1, dtype=torch.int32, device=CUDA)]
+    )
+    seq_lens = torch.cat(
+        [case.seq_lens, torch.zeros(pad_rows // R, dtype=torch.int32, device=CUDA)]
+    )
+    bt = torch.cat(
+        [
+            case.bt,
+            torch.zeros(
+                pad_rows // R, case.bt.shape[1], dtype=torch.int32, device=CUDA
+            ),
+        ]
+    )
+    st = torch.cat(
+        [
+            slots_tab,
+            torch.zeros(
+                *slots_tab.shape[:-2],
+                pad_rows // R,
+                slots_tab.shape[-1],
+                dtype=torch.int32,
+                device=CUDA,
+            ),
+        ],
+        dim=-2,
+    )
+    acc = torch.cat(
+        [num_accepted, torch.ones(pad_rows // R, dtype=torch.int32, device=CUDA)]
+    )
+    assert st.shape[-2] == nseq
+    mk.decoder_entry(
+        spec,
+        tables,
+        xw0,
+        sq0,
+        xw1,
+        sq1,
+        resid,
+        act,
+        mk.build_rope_cache(4096, ROT, device=CUDA),
+        pos,
+        slot_map,
+        seq_lens,
+        bt,
+        st,
+        num_accepted=acc,
+    )(torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    return resid[: case.M], xw0[: case.M]
+
+
+@pytest.mark.parametrize(
+    "M,pad_rows", [(1, 0), (4, 0), (16, 0), (3, 1)], ids=["m1", "m4", "m16", "m3+pad"]
+)
+@pytest.mark.parametrize("kinds", [(0, 1, 0, 0)], ids=["mixed4"])
+def test_vllm_layouts_plain_match_torch_oracle(mk, kinds, M, pad_rows):
+    """Plain decode on the framework layouts (state slots 1..M, slot 0 = null): outputs and the advanced state (viewed back
+    in the study layout) match the torch oracle; padded rows touch neither slot 0's SSM state nor real rows."""
+    g = torch.Generator(device=CUDA).manual_seed(131 + M)
+    case = Case(g, M)
+    layers0 = [make_layer(mk, g, k, M, case.seq_lens_list) for k in kinds]
+    x = (torch.randn(M, H, device=CUDA, generator=g) * 2).to(torch.bfloat16)
+    wn0 = (torch.rand(H, device=CUDA, generator=g) + 0.5).to(torch.bfloat16)
+    # 1-based slots (vLLM's slot 0 is the null block); three slot-table groups like vLLM's GDN KV-cache groups, GDN layer j
+    # reading group j % 3 (a different permutation of 1..M each)
+    groups = torch.stack(
+        [torch.randperm(M, generator=g, device=CUDA) + 1 for _ in range(3)]
+    ).to(torch.int32)  # [3, M]
+    gi = 0
+    for ly in layers0:
+        if ly["kind"] == 0:
+            ly["slot_group"] = gi % 3
+            ly["_gslots"] = groups[gi % 3]
+            gi += 1
+    case.gslots = groups[0]
+    ref_resid, ref_state = run_ref(layers0, case, x, wn0)
+    layers_v = to_vllm_layout(clone_state(layers0))
+    ssm0_before = [ly["ssm_pool"][0].clone() for ly in layers_v if ly["kind"] == 0]
+    spec = mk.DecoderSpec(HK, HV, HQ, HKV, D, ROT, PAGE, H, I, splits=2, **VLLM)
+    resid, xw = run_kernel_vllm(
+        mk,
+        spec,
+        layers_v,
+        case,
+        x,
+        wn0,
+        groups.view(3, M, 1),
+        torch.ones(M, dtype=torch.int32, device=CUDA),
+        pad_rows=pad_rows,
+    )
+    band("vllm-layout resid", resid, ref_resid, 0.03, 0.003)
+    band(
+        "vllm-layout xw_out",
+        xw,
+        (ref_resid.float() * layers0[-1]["wn_out"].float()).to(torch.bfloat16),
+        0.03,
+        0.003,
+    )
+    names = [k for ly in layers0 for k in STATE_KEYS if k in ly]
+    got = [t for ly in layers_v for t in from_vllm_state(ly)]
+    for name, a_, b_ in zip(names, got, ref_state, strict=True):
+        if name == "conv_pool":
+            band(
+                name, a_[1:], b_[1:], 0.02, 0.002
+            )  # slot 0 (null) is not compared: padded rows may shift its taps
+        else:
+            band(name, a_, b_, 0.02, 0.002)
+    for s0, ly in zip(
+        ssm0_before, [ly for ly in layers_v if ly["kind"] == 0], strict=True
+    ):
+        assert torch.equal(ly["ssm_pool"][0], s0), "padded row wrote the null SSM slot"
+
+
+@pytest.mark.parametrize("nseq", [1, 2])
+def test_vllm_per_token_slots_verify_matches_sequential(mk, nseq):
+    """The verify form with vLLM per-token state slots: sequence b reads its state from slots[b, acc-1] (the accepted prefix
+    of the last step) and its conv taps from window rows acc-1.., writes S_r to slots[b, r] for every row and the window
+    [old(acc), old(acc+1), x_0..x_{R-1}] to rows 0..R+1 of slots[b, 0]. Reference: the study-layout plain decoder fed the
+    same R tokens one at a time, each intermediate state captured."""
+    R = 4
+    kinds = (0, 1, 0, 0)
+    g = torch.Generator(device=CUDA).manual_seed(141 + nseq)
+    case = Case(g, nseq, R, committed=(100, 33))
+    M = case.M
+    acc = torch.tensor(
+        [3, 1][:nseq], dtype=torch.int32, device=CUDA
+    )  # accepted counts of the previous step (1..R)
+    n_slots = nseq * R + 1
+    layers0 = [
+        make_layer(mk, g, k, n_slots - 1, case.seq_lens_list) for k in kinds
+    ]  # pools with n_slots slots (0 = null)
+    slots_tab = torch.arange(1, n_slots, dtype=torch.int32, device=CUDA).view(nseq, R)
+    x = (torch.randn(M, H, device=CUDA, generator=g) * 2).to(torch.bfloat16)
+    wn0 = (torch.rand(H, device=CUDA, generator=g) + 0.5).to(torch.bfloat16)
+    table = mk.build_rope_cache(4096, ROT, device=CUDA)
+    spec_p = mk.DecoderSpec(HK, HV, HQ, HKV, D, ROT, PAGE, H, I, splits=2)
+
+    # ---- reference: study layout, one state slot per sequence = its "read" slot, R sequential plain launches
+    read_slots = slots_tab[torch.arange(nseq, device=CUDA), acc.long() - 1]
+    layers_p = clone_state(layers0)
+    resid_ref = torch.empty(M, H, dtype=torch.bfloat16, device=CUDA)
+    states_ref = []  # per row r: [(conv taps, ssm) of the read slots after r+1 tokens]
+    for r in range(R):
+        rows = [b * R + r for b in range(nseq)]
+        xin = x[rows].contiguous()
+        pos = torch.tensor(
+            [c + r for c in case.committed], dtype=torch.int32, device=CUDA
+        )
+        slots = torch.tensor(
+            [slot_of(case.bt, b, c + r) for b, c in enumerate(case.committed)],
+            dtype=torch.int32,
+            device=CUDA,
+        )
+        sl = torch.tensor(
+            [c + r + 1 for c in case.committed], dtype=torch.int32, device=CUDA
+        )
+        tables = mk.DecoderTables(spec_p, layers_p, nseq, 4)
+        xw0 = mk.slack_buffer((nseq, H), torch.bfloat16, CUDA)
+        torch.mul(xin, wn0, out=xw0)
+        sq0 = torch.zeros(H // 64, nseq, dtype=torch.float32, device=CUDA)
+        sq0[0:1] = mk.rowstat(xin)
+        resid = xin.clone()
+        mk.decoder_entry(
+            spec_p,
+            tables,
+            xw0,
+            sq0,
+            mk.slack_buffer((nseq, H), torch.bfloat16, CUDA),
+            torch.empty(H // 64, nseq, dtype=torch.float32, device=CUDA),
+            resid,
+            mk.slack_buffer((nseq, I), torch.bfloat16, CUDA),
+            table,
+            pos,
+            slots,
+            sl,
+            case.bt,
+            read_slots,
+        )(torch.cuda.current_stream())
+        torch.cuda.synchronize()
+        resid_ref[rows] = resid
+        states_ref.append(
+            [
+                (
+                    ly["conv_pool"][read_slots.long()].clone(),
+                    ly["ssm_pool"][read_slots.long()].clone(),
+                )
+                for ly in layers_p
+                if ly["kind"] == 0
+            ]
+        )
+
+    # ---- the verify form on the framework layouts: taps live at rows acc-1.. of slots[b, 0]; the state at slots[b, acc-1]
+    layers_v = to_vllm_layout(
+        clone_state(layers0), tap_row0=torch.zeros(n_slots, dtype=torch.int64)
+    )
+    for lv in [
+        q for q in layers_v if q["kind"] == 0
+    ]:  # the conv slots' windows start as garbage
+        for b in range(nseq):
+            lv["conv_pool"][int(slots_tab[b, 0])] = torch.randn(
+                CONV_ROWS, lv["conv_pool"].shape[2], device=CUDA
+            ).to(torch.bfloat16)
+    # (re)place the committed taps of the conv slot at rows acc-1..acc+1, from the original pools
+    for lv, l0 in zip(
+        [q for q in layers_v if q["kind"] == 0],
+        [q for q in layers0 if q["kind"] == 0],
+        strict=True,
+    ):
+        for b in range(nseq):
+            s0, a_ = int(slots_tab[b, 0]), int(acc[b])
+            lv["conv_pool"][s0, a_ - 1 : a_ + 2] = l0["conv_pool"][
+                int(read_slots[b])
+            ].t()
+    spec_v = mk.DecoderSpec(
+        HK, HV, HQ, HKV, D, ROT, PAGE, H, I, splits=2, spec_rows=R, **VLLM
+    )
+    resid_v, _ = run_kernel_vllm(mk, spec_v, layers_v, case, x, wn0, slots_tab, acc)
+    band("vllm verify resid", resid_v, resid_ref, 0.02, 0.002)
+    gdn_v = [q for q in layers_v if q["kind"] == 0]
+    for li, lv in enumerate(gdn_v):
+        for b in range(nseq):
+            for r in range(R):
+                got = lv["ssm_pool"][int(slots_tab[b, r])].transpose(1, 2)
+                band(
+                    f"S after row {r} layer {li} seq {b}",
+                    got,
+                    states_ref[r][li][1][b],
+                    0.02,
+                    0.002,
+                )
+            # conv window of slots[b, 0]: rows 0, 1 = the two newest committed inputs, rows 2.. = this step's raw inputs
+            taps_ref = states_ref[R - 1][li][0][
+                b
+            ]  # [W, 3] after R tokens = [x_{R-3}, x_{R-2}, x_{R-1}]
+            win = lv["conv_pool"][int(slots_tab[b, 0])]  # [rows, W]
+            torch.testing.assert_close(
+                win[R - 1 : R + 2].t(), taps_ref, rtol=2e-2, atol=1e-3
+            )
+            l0c = [q for q in layers0 if q["kind"] == 0][li]["conv_pool"][
+                int(read_slots[b])
+            ]  # committed taps [W, 3] = h1 h2 h3
+            torch.testing.assert_close(win[0:2].t(), l0c[:, 1:3], rtol=0, atol=0)
+    for lv, lp in zip(
+        [q for q in layers_v if q["kind"] == 1],
+        [q for q in layers_p if q["kind"] == 1],
+        strict=True,
+    ):
+        for b, c in enumerate(case.committed):
+            for r in range(R):
+                sidx = slot_of(case.bt, b, c + r)
+                torch.testing.assert_close(
+                    lv["k_cache"][sidx // PAGE, sidx % PAGE],
+                    lp["k_cache"][sidx // PAGE, sidx % PAGE],
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
+                torch.testing.assert_close(
+                    lv["v_cache"][sidx // PAGE, sidx % PAGE],
+                    lp["v_cache"][sidx // PAGE, sidx % PAGE],
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
