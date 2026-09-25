@@ -211,6 +211,8 @@ class DecoderSpec:
         conv_sd=False,
         kv_packed=False,
         slot_table=False,
+        gate_up_split=False,
+        q_gate_il=False,
     ):
         self.hk, self.hv, self.hq, self.hkv, self.d, self.rot, self.page = (
             hk,
@@ -234,6 +236,14 @@ class DecoderSpec:
         self.slot_table = bool(
             slot_table
         )  # state_slots [seqs, >= R] + num_accepted: per-token slots (vLLM spec-decode convention)
+        # w_gu_il / s_gu_il hold the stored [gate (I) | up (I)] rows (no 8-row interleave): two TMA boxes per stage
+        self.gate_up_split = bool(gate_up_split)
+        # attention w_in rows [q_h | gate_h] per head, then k | v (vLLM's fused QKV with the output gate); one in-proj alpha
+        self.q_gate_il = bool(q_gate_il)
+        if self.gate_up_split and wtype == "bf16":
+            raise ValueError(
+                "decoder: gate_up_split is implemented for the fp8 / NVFP4 kind"
+            )
         if wtype not in ("fp8fp4", "bf16"):
             raise ValueError(
                 f"decoder: wtype {wtype!r} (fp8fp4 = the 27B recipe; bf16 = unquantized weights, the MTP drafter)"
@@ -444,6 +454,10 @@ class DecoderTables:
                 )  # q-prep per token; splits per sequence (§18b); hdn per head counter
                 tbkv = nseq * spec.hkv  # kv-write items per (sequence, kv head)
                 b1, b2, b3 = qd, 2 * qd, 2 * qd + kvd
+                if spec.q_gate_il and (len(a_in) < 2 or a_in[0] != a_in[1]):
+                    raise ValueError(
+                        f"decoder: layer {j} q_gate_il needs one alpha for the interleaved q | gate rows"
+                    )
                 n_cnt = (
                     ta
                     + spec.hkv
@@ -915,6 +929,8 @@ def decoder_entry(
         spec.conv_sd,
         spec.kv_packed,
         spec.slot_table,
+        spec.gate_up_split,
+        spec.q_gate_il,
     )
     fn = _KERNELS.get(key)
     args = (
@@ -1003,6 +1019,8 @@ def decoder_entry(
             conv_sd=spec.conv_sd,
             kv_packed=spec.kv_packed,
             slot_table=spec.slot_table,
+            gate_up_split=spec.gate_up_split,
+            q_gate_il=spec.q_gate_il,
         )
         fn = _KERNELS[key] = _rt.compile_cached(kern, *args, mac, stream=None, key=key)
 

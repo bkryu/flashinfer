@@ -137,6 +137,8 @@ class DecoderMegaSm120(GdnMegaSm120):
         conv_sd=False,
         kv_packed=False,
         slot_table=False,
+        gate_up_split=False,
+        q_gate_il=False,
     ):
         super().__init__(
             acc_dtype,
@@ -207,6 +209,13 @@ class DecoderMegaSm120(GdnMegaSm120):
         self.stash = (
             self.R > 1 and not self.slot_table
         )  # the study's verify form: pools read-only, per-row stash for a later apply
+        # gate_up as stored ([gate (I) | up (I)] rows): each 64-row stage is two 32-row TMA boxes (gate tile t, up tile I/32 + t) and
+        # the SwiGLU epilogue pairs row r with row r + 32 through smem (the interleaved form pairs them inside one MMA fragment)
+        self.gu_split = bool(gate_up_split)
+        if self.gu_split and self.w16:
+            raise ValueError("gate_up_split is implemented for the fp8 / NVFP4 kind")
+        # attention in-projection rows per head [q_h | gate_h] (vLLM's QKVParallelLinear with the output gate), then k | v
+        self.qg = 2 if q_gate_il else 1
         if self.fold and (not self.w16 or self.nsplit != 2):
             raise ValueError(
                 "drafter_fold needs the bf16 weight kind with 2 splits (one per pre-fc norm half)"
@@ -320,6 +329,27 @@ class DecoderMegaSm120(GdnMegaSm120):
         self.s_smem_layout_staged = cute.make_layout(
             (self.s_tile[0], tks, self.mlp_stage), stride=(tks, 1, self.s_tile[0] * tks)
         )
+        self.a4_smem_layout_tma3 = (
+            self.a4_smem_layout_staged
+        )  # gate_up TMA destination layout (64-row boxes)
+        self.s_smem_layout_tma3 = self.s_smem_layout_staged
+        if self.gu_split:
+            # the same stage bytes as (64 rows x stages), addressed as (32 rows x 2*stages): 128-B rows, 8-row swizzle atoms
+            half_tile = (32, self.a4_tile_mnk[1], self.a4_tile_mnk[2])
+            self.a4_smem_layout_half = sm90_utils.make_smem_layout_a(
+                self.a_layout, half_tile, self.a_dtype, 2 * self.mlp_stage
+            )
+            self.s_smem_layout_half = cute.make_layout(
+                (32, tks, 2 * self.mlp_stage), stride=(tks, 1, 32 * tks)
+            )
+            if cute.cosize(self.a4_smem_layout_half) != cute.cosize(
+                self.a4_smem_layout_staged
+            ):
+                raise ValueError(
+                    "gate_up_split: half-tile smem layout does not tile the stage ring"
+                )
+            self.a4_smem_layout_tma3 = self.a4_smem_layout_half
+            self.s_smem_layout_tma3 = self.s_smem_layout_half
         if cute.cosize(self.a4_smem_layout_staged) > cute.cosize(
             self.a_smem_layout_staged
         ):
@@ -546,12 +576,19 @@ class DecoderMegaSm120(GdnMegaSm120):
                 1,
             )
         else:
-            tma_a3, mA3 = self._make_tma_atoms_and_tensors(
-                a3,
-                self.a4_smem_layout_staged,
-                (self.a4_tile_mnk[0], self.a4_tile_mnk[2]),
-                1,
-            )
+            if cutlass.const_expr(
+                self.gu_split
+            ):  # __call__ is jit-traced: plain `if` on a Python bool is not enough
+                tma_a3, mA3 = self._make_tma_atoms_and_tensors(
+                    a3, self.a4_smem_layout_half, (32, self.a4_tile_mnk[2]), 1
+                )
+            else:
+                tma_a3, mA3 = self._make_tma_atoms_and_tensors(
+                    a3,
+                    self.a4_smem_layout_staged,
+                    (self.a4_tile_mnk[0], self.a4_tile_mnk[2]),
+                    1,
+                )
             tma_a4, mA4 = self._make_tma_atoms_and_tensors(
                 a4,
                 self.a4_smem_layout_staged,
@@ -570,9 +607,14 @@ class DecoderMegaSm120(GdnMegaSm120):
                 (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
                 1,
             )
-        tma_s3, mS3 = self._make_tma_atoms_and_tensors(
-            s3, self.s_smem_layout_staged, self.s_tile, 1
-        )
+        if cutlass.const_expr(self.gu_split):
+            tma_s3, mS3 = self._make_tma_atoms_and_tensors(
+                s3, self.s_smem_layout_half, (32, self.s_tile[1]), 1
+            )
+        else:
+            tma_s3, mS3 = self._make_tma_atoms_and_tensors(
+                s3, self.s_smem_layout_staged, self.s_tile, 1
+            )
         tma_s4, mS4 = self._make_tma_atoms_and_tensors(
             s4, self.s_smem_layout_staged, self.s_tile, 1
         )
@@ -712,6 +754,8 @@ class DecoderMegaSm120(GdnMegaSm120):
             self.a4_smem_layout_staged,
             self.s_smem_layout_staged,
             self.b4_smem_layout_staged,
+            self.a4_smem_layout_tma3,
+            self.s_smem_layout_tma3,
             nl,
             cs,
             nt2,
@@ -797,6 +841,8 @@ class DecoderMegaSm120(GdnMegaSm120):
         a4_smem_layout_staged: cute.ComposedLayout,
         s_smem_layout_staged: cute.Layout,
         b4_smem_layout_staged: cute.ComposedLayout,
+        a4_smem_layout_half: cute.ComposedLayout,
+        s_smem_layout_half: cute.Layout,
         NL: cutlass.Int32,
         CS: cutlass.Int32,
         NT2: cutlass.Int32,
@@ -962,14 +1008,18 @@ class DecoderMegaSm120(GdnMegaSm120):
         gFB = cute.local_tile(
             mFB, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None)
         )
-        gA3 = cute.local_tile(
-            mA3,
-            cute.slice_(
-                self.a_tile_mnk if self.w16 else self.a4_tile_mnk, (None, 0, None)
-            ),
-            (None, None, None),
-        )
-        gS3 = cute.local_tile(mS3, self.s_tile, (None, None, None))
+        if cutlass.const_expr(self.gu_split):
+            gA3 = cute.local_tile(mA3, (32, self.a4_tile_mnk[2]), (None, None, None))
+            gS3 = cute.local_tile(mS3, (32, self.s_tile[1]), (None, None, None))
+        else:
+            gA3 = cute.local_tile(
+                mA3,
+                cute.slice_(
+                    self.a_tile_mnk if self.w16 else self.a4_tile_mnk, (None, 0, None)
+                ),
+                (None, None, None),
+            )
+            gS3 = cute.local_tile(mS3, self.s_tile, (None, None, None))
         gB3 = cute.local_tile(
             mB3, cute.slice_(self.tile_shape_mnk, (0, None, None)), (None, None, None)
         )
@@ -1004,12 +1054,35 @@ class DecoderMegaSm120(GdnMegaSm120):
         _, tBgFB = cute.nvgpu.cpasync.tma_partition(
             tma_fb, 0, one, cute.group_modes(sB, 0, 2), cute.group_modes(gFB, 0, 2)
         )
-        tAsA4, tAgA3 = cute.nvgpu.cpasync.tma_partition(
-            tma_a3, 0, one, cute.group_modes(sA4, 0, 2), cute.group_modes(gA3, 0, 2)
-        )
-        tSsS, tSgS3 = cute.nvgpu.cpasync.tma_partition(
-            tma_s3, 0, one, cute.group_modes(sS, 0, 2), cute.group_modes(gS3, 0, 2)
-        )
+        if cutlass.const_expr(self.gu_split):
+            sA4h = storage.sA.get_tensor(
+                a4_smem_layout_half.outer, swizzle=a4_smem_layout_half.inner
+            )  # (32, K, 2*stages) view
+            sSh = storage.sS.get_tensor(s_smem_layout_half)
+            # gate_up: 32-row boxes into the half view; down keeps its 64-row destination partition (from the a4 / s4 atoms)
+            tAsA4h, tAgA3 = cute.nvgpu.cpasync.tma_partition(
+                tma_a3,
+                0,
+                one,
+                cute.group_modes(sA4h, 0, 2),
+                cute.group_modes(gA3, 0, 2),
+            )
+            tSsSh, tSgS3 = cute.nvgpu.cpasync.tma_partition(
+                tma_s3, 0, one, cute.group_modes(sSh, 0, 2), cute.group_modes(gS3, 0, 2)
+            )
+            tAsA4, _ = cute.nvgpu.cpasync.tma_partition(
+                tma_a4, 0, one, cute.group_modes(sA4, 0, 2), cute.group_modes(gA4, 0, 2)
+            )
+            tSsS, _ = cute.nvgpu.cpasync.tma_partition(
+                tma_s4, 0, one, cute.group_modes(sS, 0, 2), cute.group_modes(gS4, 0, 2)
+            )
+        else:
+            tAsA4, tAgA3 = cute.nvgpu.cpasync.tma_partition(
+                tma_a3, 0, one, cute.group_modes(sA4, 0, 2), cute.group_modes(gA3, 0, 2)
+            )
+            tSsS, tSgS3 = cute.nvgpu.cpasync.tma_partition(
+                tma_s3, 0, one, cute.group_modes(sS, 0, 2), cute.group_modes(gS3, 0, 2)
+            )
         tBsB4, tBgB3 = cute.nvgpu.cpasync.tma_partition(
             tma_b3, 0, one, cute.group_modes(sB4, 0, 2), cute.group_modes(gB3, 0, 2)
         )
@@ -1870,37 +1943,88 @@ class DecoderMegaSm120(GdnMegaSm120):
                             for i in cutlass.range_constexpr(cute.size(accumulators)):
                                 accumulators[i] = accumulators[i] + accumulators_b[i]
                         if is_g:
-                            for cc in cutlass.range_constexpr(2):
-                                for m in cutlass.range_constexpr(mma_m):
-                                    for n in cutlass.range_constexpr(
-                                        cute.size(accumulators, mode=[2])
-                                    ):
-                                        crd = tCcC[((cc, 0), m, n)]
-                                        r = row0 + crd[0]
-                                        col = crd[1]
-                                        gg = (
-                                            accumulators[((cc, 0), m, n)]
-                                            * mFtab[(L, 5)]
-                                            * rinv_c[(cc, n)]
-                                        )
-                                        uu = (
-                                            accumulators[((cc, 1), m, n)]
-                                            * mFtab[(L, 6)]
-                                            * rinv_c[(cc, n)]
-                                        )
-                                        y = (
-                                            gg
-                                            / (
-                                                cutlass.Float32(1.0)
-                                                + cute.math.exp(-gg)
+                            if cutlass.const_expr(self.gu_split):
+                                sGU = cute.make_tensor(
+                                    sPart.iterator,
+                                    cute.make_layout((64, 16), stride=(16, 1)),
+                                )
+                                for cc in cutlass.range_constexpr(2):
+                                    for rh in cutlass.range_constexpr(2):
+                                        for m in cutlass.range_constexpr(mma_m):
+                                            for n in cutlass.range_constexpr(
+                                                cute.size(accumulators, mode=[2])
+                                            ):
+                                                crd = tCcC[((cc, rh), m, n)]
+                                                av = mFtab[(L, 5)]
+                                                if crd[0] >= 32:
+                                                    av = mFtab[(L, 6)]
+                                                if crd[1] < n_tok:
+                                                    sGU[(crd[0], crd[1])] = (
+                                                        accumulators[((cc, rh), m, n)]
+                                                        * av
+                                                        * rinv_c[(cc, n)]
+                                                    )
+                                cute.arch.fence_view_async_shared()
+                                self.epilog_sync_barrier.arrive_and_wait()
+                                for cc in cutlass.range_constexpr(2):
+                                    for rh in cutlass.range_constexpr(2):
+                                        for m in cutlass.range_constexpr(mma_m):
+                                            for n in cutlass.range_constexpr(
+                                                cute.size(accumulators, mode=[2])
+                                            ):
+                                                crd = tCcC[((cc, rh), m, n)]
+                                                if crd[0] < 32:
+                                                    if crd[1] < n_tok:
+                                                        gg = sGU[(crd[0], crd[1])]
+                                                        uu = sGU[(crd[0] + 32, crd[1])]
+                                                        y = (
+                                                            gg
+                                                            / (
+                                                                cutlass.Float32(1.0)
+                                                                + cute.math.exp(-gg)
+                                                            )
+                                                            * uu
+                                                        )
+                                                        mAct[
+                                                            (
+                                                                n_tile * 32 + crd[0],
+                                                                crd[1],
+                                                                0,
+                                                            )
+                                                        ] = y.to(mAct.element_type)
+                                self.epilog_sync_barrier.arrive_and_wait()  # sGU (core_part) is free again
+                            else:
+                                for cc in cutlass.range_constexpr(2):
+                                    for m in cutlass.range_constexpr(mma_m):
+                                        for n in cutlass.range_constexpr(
+                                            cute.size(accumulators, mode=[2])
+                                        ):
+                                            crd = tCcC[((cc, 0), m, n)]
+                                            r = row0 + crd[0]
+                                            col = crd[1]
+                                            gg = (
+                                                accumulators[((cc, 0), m, n)]
+                                                * mFtab[(L, 5)]
+                                                * rinv_c[(cc, n)]
                                             )
-                                            * uu
-                                        )
-                                        orow = (r // 16) * 8 + (r % 16)
-                                        if col < n_tok:
-                                            mAct[(orow, col, 0)] = y.to(
-                                                mAct.element_type
+                                            uu = (
+                                                accumulators[((cc, 1), m, n)]
+                                                * mFtab[(L, 6)]
+                                                * rinv_c[(cc, n)]
                                             )
+                                            y = (
+                                                gg
+                                                / (
+                                                    cutlass.Float32(1.0)
+                                                    + cute.math.exp(-gg)
+                                                )
+                                                * uu
+                                            )
+                                            orow = (r // 16) * 8 + (r % 16)
+                                            if col < n_tok:
+                                                mAct[(orow, col, 0)] = y.to(
+                                                    mAct.element_type
+                                                )
                             cute.arch.fence_acq_rel_gpu()
                             self.epilog_sync_barrier.arrive_and_wait()
                             if tidx == 0:
@@ -3391,11 +3515,14 @@ class DecoderMegaSm120(GdnMegaSm120):
                                 kh = it % self.hkv
                                 krow0 = 2 * QD + kh * D
                                 vrow0 = 2 * QD + KVD + kh * D
-                                qrow0 = kh * G * D
-                                NQT = G * D // 64
+                                qrow0 = kh * G * D  # compact q rows (mQB / mAttn)
+                                qin0 = (
+                                    qrow0 * self.qg
+                                )  # this group's q rows in the in-projection output
+                                NQT = G * D * self.qg // 64
                                 if is_qp:
                                     if tidx < NQT:
-                                        self._wait_flag(mCntL, qrow0 // 64 + tidx)
+                                        self._wait_flag(mCntL, qin0 // 64 + tidx)
                                 else:
                                     if tidx < 8:
                                         base = krow0
@@ -3423,11 +3550,15 @@ class DecoderMegaSm120(GdnMegaSm120):
                                 )
                                 if is_qp:
                                     for h in cutlass.range_constexpr(G):
-                                        q0 = mMz[(qrow0 + h * D + 2 * tidx, m, 0)].to(
-                                            cutlass.Float32
-                                        )
+                                        q0 = mMz[
+                                            (qin0 + h * D * self.qg + 2 * tidx, m, 0)
+                                        ].to(cutlass.Float32)
                                         q1 = mMz[
-                                            (qrow0 + h * D + 2 * tidx + 1, m, 0)
+                                            (
+                                                qin0 + h * D * self.qg + 2 * tidx + 1,
+                                                m,
+                                                0,
+                                            )
                                         ].to(cutlass.Float32)
                                         ss = self._warp_sum(q0 * q0 + q1 * q1)
                                         if lane == 0:
@@ -3605,7 +3736,14 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     sq_ = ik // self.hkv
                                     kh = ik % self.hkv
                                     qrow0 = kh * G * D
-                                    grow0 = QD + qrow0
+                                    grow0 = (
+                                        (qrow0 * 2 + D)
+                                        if self.qg == 2
+                                        else (QD + qrow0)
+                                    )  # first gate row of this group
+                                    gw0 = (
+                                        (qrow0 * 2) if self.qg == 2 else grow0
+                                    )  # first in-projection tile row to wait for
                                     m0 = sq_ * self.R
                                     NQ = self.R * G
                                     seq_len = mSeq[sq_]
@@ -3855,11 +3993,9 @@ class DecoderMegaSm120(GdnMegaSm120):
                                             m = m0 + r_
                                             mk = m * self.hkv + kh
                                             cute.arch.fence_acq_rel_gpu()
-                                            NGT = G * D // 64
+                                            NGT = G * D * self.qg // 64
                                             if tidx < NGT:
-                                                self._wait_flag(
-                                                    mCntL, grow0 // 64 + tidx
-                                                )
+                                                self._wait_flag(mCntL, gw0 // 64 + tidx)
                                             self.epilog_sync_barrier.arrive_and_wait()
                                             mbase = mk * S * G
                                             for rep_ in cutlass.range_constexpr(
@@ -3908,7 +4044,13 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                             .to(cutlass.Float32)
                                                         )
                                                         gg = mMz[
-                                                            (grow0 + hh * D + dd, m, 0)
+                                                            (
+                                                                grow0
+                                                                + hh * D * self.qg
+                                                                + dd,
+                                                                m,
+                                                                0,
+                                                            )
                                                         ].to(cutlass.Float32)
                                                         mAttn[
                                                             (qrow0 + hh * D + dd, m, 0)
@@ -3937,7 +4079,14 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     m = mk // self.hkv
                                     kh = mk % self.hkv
                                     qrow0 = kh * G * D
-                                    grow0 = QD + qrow0
+                                    grow0 = (
+                                        (qrow0 * 2 + D)
+                                        if self.qg == 2
+                                        else (QD + qrow0)
+                                    )  # first gate row of this group
+                                    gw0 = (
+                                        (qrow0 * 2) if self.qg == 2 else grow0
+                                    )  # first in-projection tile row to wait for
                                     tu0 = cutlass.Int64(0)
                                     if cutlass.const_expr(self.profile):
                                         tu0 = cute.arch.globaltimer()
@@ -4556,9 +4705,9 @@ class DecoderMegaSm120(GdnMegaSm120):
                                         tu0 = tu1
                                     if sFlag[0] == S - 1:
                                         cute.arch.fence_acq_rel_gpu()
-                                        NGT = G * D // 64
+                                        NGT = G * D * self.qg // 64
                                         if tidx < NGT:
-                                            self._wait_flag(mCntL, grow0 // 64 + tidx)
+                                            self._wait_flag(mCntL, gw0 // 64 + tidx)
                                         self.epilog_sync_barrier.arrive_and_wait()
                                         mbase = mk * S * G
                                         # §15 lever C: heads spread across the 4 warps (lane = 8 dims of one head); per-element
@@ -4604,7 +4753,13 @@ class DecoderMegaSm120(GdnMegaSm120):
                                                         .to(cutlass.Float32)
                                                     )
                                                     gg = mMz[
-                                                        (grow0 + hh * D + dd, m, 0)
+                                                        (
+                                                            grow0
+                                                            + hh * D * self.qg
+                                                            + dd,
+                                                            m,
+                                                            0,
+                                                        )
                                                     ].to(cutlass.Float32)
                                                     mAttn[
                                                         (qrow0 + hh * D + dd, m, 0)
@@ -5125,6 +5280,15 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     )
                                     tAg3p = tAgA3[(None, n_tile0, None, 0)]
                                     tSg3p = tSgS3[(None, n_tile0, None, 0)]
+                                    if cutlass.const_expr(
+                                        self.gu_split
+                                    ):  # up half: tile I/32 + t
+                                        tAg3u = tAgA3[
+                                            (None, n_tile0 + self.inter // 32, None, 0)
+                                        ]
+                                        tSg3u = tSgS3[
+                                            (None, n_tile0 + self.inter // 32, None, 0)
+                                        ]
                                     for _k_tile in range(0, npre, 1, unroll=1):
                                         mlp_pipeline.producer_acquire(
                                             mlp_producer_state
@@ -5134,21 +5298,51 @@ class DecoderMegaSm120(GdnMegaSm120):
                                         )
                                         cnt_ = mlp_producer_state.count
                                         idx = mlp_producer_state.index
-                                        cute.copy(
-                                            tma_a3,
-                                            tAg3p[(None, cnt_)],
-                                            tAsA4[(None, idx)],
-                                            tma_bar_ptr=bar,
-                                            tma_desc_ptr=dp_a3,
-                                        )
-                                        if cutlass.const_expr(not self.w16):
+                                        if cutlass.const_expr(self.gu_split):
+                                            cute.copy(
+                                                tma_a3,
+                                                tAg3p[(None, cnt_)],
+                                                tAsA4h[(None, 2 * idx)],
+                                                tma_bar_ptr=bar,
+                                                tma_desc_ptr=dp_a3,
+                                            )
+                                            cute.copy(
+                                                tma_a3,
+                                                tAg3u[(None, cnt_)],
+                                                tAsA4h[(None, 2 * idx + 1)],
+                                                tma_bar_ptr=bar,
+                                                tma_desc_ptr=dp_a3,
+                                            )
                                             cute.copy(
                                                 tma_s3,
                                                 tSg3p[(None, cnt_)],
-                                                tSsS[(None, idx)],
+                                                tSsSh[(None, 2 * idx)],
                                                 tma_bar_ptr=bar,
                                                 tma_desc_ptr=dp_s3,
                                             )
+                                            cute.copy(
+                                                tma_s3,
+                                                tSg3u[(None, cnt_)],
+                                                tSsSh[(None, 2 * idx + 1)],
+                                                tma_bar_ptr=bar,
+                                                tma_desc_ptr=dp_s3,
+                                            )
+                                        else:
+                                            cute.copy(
+                                                tma_a3,
+                                                tAg3p[(None, cnt_)],
+                                                tAsA4[(None, idx)],
+                                                tma_bar_ptr=bar,
+                                                tma_desc_ptr=dp_a3,
+                                            )
+                                            if cutlass.const_expr(not self.w16):
+                                                cute.copy(
+                                                    tma_s3,
+                                                    tSg3p[(None, cnt_)],
+                                                    tSsS[(None, idx)],
+                                                    tma_bar_ptr=bar,
+                                                    tma_desc_ptr=dp_s3,
+                                                )
                                         mlp_producer_state.advance()
                             tq0 = cutlass.Int64(0)
                             if cutlass.const_expr(self.profile):
@@ -5203,6 +5397,15 @@ class DecoderMegaSm120(GdnMegaSm120):
                                         pre_state.advance()
                                     tAg3p2 = tAgA3[(None, n_tile0, None, 0)]
                                     tSg3p2 = tSgS3[(None, n_tile0, None, 0)]
+                                    if cutlass.const_expr(
+                                        self.gu_split
+                                    ):  # up half: tile I/32 + t
+                                        tAg3u2 = tAgA3[
+                                            (None, n_tile0 + self.inter // 32, None, 0)
+                                        ]
+                                        tSg3u2 = tSgS3[
+                                            (None, n_tile0 + self.inter // 32, None, 0)
+                                        ]
                                     for _k_tile in range(npre, k_cnt_g, 1, unroll=1):
                                         mlp_pipeline.producer_acquire(
                                             mlp_producer_state
@@ -5212,21 +5415,51 @@ class DecoderMegaSm120(GdnMegaSm120):
                                         )
                                         cnt_ = mlp_producer_state.count
                                         idx = mlp_producer_state.index
-                                        cute.copy(
-                                            tma_a3,
-                                            tAg3p2[(None, cnt_)],
-                                            tAsA4[(None, idx)],
-                                            tma_bar_ptr=bar,
-                                            tma_desc_ptr=dp_a3,
-                                        )
-                                        if cutlass.const_expr(not self.w16):
+                                        if cutlass.const_expr(self.gu_split):
+                                            cute.copy(
+                                                tma_a3,
+                                                tAg3p2[(None, cnt_)],
+                                                tAsA4h[(None, 2 * idx)],
+                                                tma_bar_ptr=bar,
+                                                tma_desc_ptr=dp_a3,
+                                            )
+                                            cute.copy(
+                                                tma_a3,
+                                                tAg3u2[(None, cnt_)],
+                                                tAsA4h[(None, 2 * idx + 1)],
+                                                tma_bar_ptr=bar,
+                                                tma_desc_ptr=dp_a3,
+                                            )
                                             cute.copy(
                                                 tma_s3,
                                                 tSg3p2[(None, cnt_)],
-                                                tSsS[(None, idx)],
+                                                tSsSh[(None, 2 * idx)],
                                                 tma_bar_ptr=bar,
                                                 tma_desc_ptr=dp_s3,
                                             )
+                                            cute.copy(
+                                                tma_s3,
+                                                tSg3u2[(None, cnt_)],
+                                                tSsSh[(None, 2 * idx + 1)],
+                                                tma_bar_ptr=bar,
+                                                tma_desc_ptr=dp_s3,
+                                            )
+                                        else:
+                                            cute.copy(
+                                                tma_a3,
+                                                tAg3p2[(None, cnt_)],
+                                                tAsA4[(None, idx)],
+                                                tma_bar_ptr=bar,
+                                                tma_desc_ptr=dp_a3,
+                                            )
+                                            if cutlass.const_expr(not self.w16):
+                                                cute.copy(
+                                                    tma_s3,
+                                                    tSg3p2[(None, cnt_)],
+                                                    tSsS[(None, idx)],
+                                                    tma_bar_ptr=bar,
+                                                    tma_desc_ptr=dp_s3,
+                                                )
                                         cute.copy(
                                             tma_b3,
                                             tBg3p[(None, cnt_)],

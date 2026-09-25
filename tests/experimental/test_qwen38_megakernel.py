@@ -956,16 +956,32 @@ def test_unsupported_reasons():
 # K-1 + num_spec) in padded pages, committed taps at rows acc-1..acc+1; kv_packed: K | V as the halves of one
 # [pages, page, hkv, 2D] tensor; slot_table: per-token GDN state slots [seq, R] + accepted counts, slot 0 = null.
 VLLM = dict(state_vk=True, conv_sd=True, kv_packed=True, slot_table=True)
+VLLM_W = dict(
+    VLLM, gate_up_split=True, q_gate_il=True
+)  # + gate | up rows as stored, per-head [q_h | gate_h] in-proj rows
 CONV_ROWS = 6  # K-1 + num_spec (num_spec = 3)
 PAD = 384  # padding elements after every slot page (the framework pads mamba pages to the attention page size)
 
 
-def to_vllm_layout(layers, tap_row0=None):
+def il_qkv_rows(w_in):
+    """Compact q | gate | k | v rows -> vLLM's per-head [q_h | gate_h] rows, then k | v (a row permutation)."""
+    q, gate, kv = w_in[:QD], w_in[QD : 2 * QD], w_in[2 * QD :]
+    qg = torch.stack([q.view(HQ, D, -1), gate.view(HQ, D, -1)], dim=1).reshape(
+        2 * QD, -1
+    )
+    return torch.cat([qg, kv]).contiguous()
+
+
+def to_vllm_layout(layers, tap_row0=None, gu_split=False, q_il=False):
     """Study-layout layers -> vLLM-form state / caches (fresh storage). ``tap_row0`` [slots] int: the row where each slot's
     committed taps start (acc - 1); default 0."""
     out = []
     for ly in layers:
         c = dict(ly)
+        if gu_split:  # stored [gate | up] rows (no 8-row interleave)
+            c["w_gu_il"], c["s_gu_il"] = c["_ref"]["w_gu"], c["_ref"]["s_gu"]
+        if q_il and c["kind"] == 1:  # per-head [q_h | gate_h] in-proj rows
+            c["w_in"] = il_qkv_rows(c["w_in"])
         if c["kind"] == 0:
             S_, W, _ = c["conv_pool"].shape
             buf = torch.randn(S_, CONV_ROWS * W + PAD, device=CUDA).to(
@@ -1085,7 +1101,12 @@ def run_kernel_vllm(
     "M,pad_rows", [(1, 0), (4, 0), (16, 0), (3, 1)], ids=["m1", "m4", "m16", "m3+pad"]
 )
 @pytest.mark.parametrize("kinds", [(0, 1, 0, 0)], ids=["mixed4"])
-def test_vllm_layouts_plain_match_torch_oracle(mk, kinds, M, pad_rows):
+@pytest.mark.parametrize(
+    "knobs",
+    [VLLM, dict(VLLM, gate_up_split=True), dict(VLLM, q_gate_il=True), VLLM_W],
+    ids=["state", "state+gu", "state+qg", "state+weights"],
+)
+def test_vllm_layouts_plain_match_torch_oracle(mk, kinds, M, pad_rows, knobs):
     """Plain decode on the framework layouts (state slots 1..M, slot 0 = null): outputs and the advanced state (viewed back
     in the study layout) match the torch oracle; padded rows touch neither slot 0's SSM state nor real rows."""
     g = torch.Generator(device=CUDA).manual_seed(131 + M)
@@ -1105,10 +1126,17 @@ def test_vllm_layouts_plain_match_torch_oracle(mk, kinds, M, pad_rows):
             ly["_gslots"] = groups[gi % 3]
             gi += 1
     case.gslots = groups[0]
+    q_il = bool(knobs.get("q_gate_il"))
+    if q_il:  # one in-proj alpha for the interleaved q | gate rows (vLLM has one per-tensor fp8 scale)
+        for ly in layers0:
+            if ly["kind"] == 1:
+                ly["alpha_in"][1] = ly["alpha_in"][0]
     ref_resid, ref_state = run_ref(layers0, case, x, wn0)
-    layers_v = to_vllm_layout(clone_state(layers0))
+    layers_v = to_vllm_layout(
+        clone_state(layers0), gu_split=bool(knobs.get("gate_up_split")), q_il=q_il
+    )
     ssm0_before = [ly["ssm_pool"][0].clone() for ly in layers_v if ly["kind"] == 0]
-    spec = mk.DecoderSpec(HK, HV, HQ, HKV, D, ROT, PAGE, H, I, splits=2, **VLLM)
+    spec = mk.DecoderSpec(HK, HV, HQ, HKV, D, ROT, PAGE, H, I, splits=2, **knobs)
     resid, xw = run_kernel_vllm(
         mk,
         spec,
@@ -1161,6 +1189,9 @@ def test_vllm_per_token_slots_verify_matches_sequential(mk, nseq):
     layers0 = [
         make_layer(mk, g, k, n_slots - 1, case.seq_lens_list) for k in kinds
     ]  # pools with n_slots slots (0 = null)
+    for ly in layers0:
+        if ly["kind"] == 1:
+            ly["alpha_in"][1] = ly["alpha_in"][0]
     slots_tab = torch.arange(1, n_slots, dtype=torch.int32, device=CUDA).view(nseq, R)
     x = (torch.randn(M, H, device=CUDA, generator=g) * 2).to(torch.bfloat16)
     wn0 = (torch.rand(H, device=CUDA, generator=g) + 0.5).to(torch.bfloat16)
@@ -1223,7 +1254,10 @@ def test_vllm_per_token_slots_verify_matches_sequential(mk, nseq):
 
     # ---- the verify form on the framework layouts: taps live at rows acc-1.. of slots[b, 0]; the state at slots[b, acc-1]
     layers_v = to_vllm_layout(
-        clone_state(layers0), tap_row0=torch.zeros(n_slots, dtype=torch.int64)
+        clone_state(layers0),
+        tap_row0=torch.zeros(n_slots, dtype=torch.int64),
+        gu_split=True,
+        q_il=True,
     )
     for lv in [
         q for q in layers_v if q["kind"] == 0
@@ -1244,7 +1278,7 @@ def test_vllm_per_token_slots_verify_matches_sequential(mk, nseq):
                 int(read_slots[b])
             ].t()
     spec_v = mk.DecoderSpec(
-        HK, HV, HQ, HKV, D, ROT, PAGE, H, I, splits=2, spec_rows=R, **VLLM
+        HK, HV, HQ, HKV, D, ROT, PAGE, H, I, splits=2, spec_rows=R, **VLLM_W
     )
     resid_v, _ = run_kernel_vllm(mk, spec_v, layers_v, case, x, wn0, slots_tab, acc)
     band("vllm verify resid", resid_v, resid_ref, 0.02, 0.002)
