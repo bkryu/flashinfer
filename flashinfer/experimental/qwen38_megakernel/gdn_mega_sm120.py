@@ -3,8 +3,7 @@
 # compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 # Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
 # on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# Ported from LightLM's cutlass_dsl megakernel study (docs/megakernel-plan.md there) for the FlashInfer experimental
-# track: the Qwen3.8-27B one-launch decoder on SM120.
+# Qwen3.8-27B one-launch decoder on SM120 (FlashInfer experimental track).
 """Megakernel study, GDN mixer block (docs/megakernel-plan.md §7): ONE persistent
 CuTe DSL kernel runs a Qwen3.8-27B linear-attention block at decode:
 

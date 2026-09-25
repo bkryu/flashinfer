@@ -24,7 +24,7 @@ the next layer's norm weight folded into the activation the epilogue emits.
 Layers hand off through device counters; the TMA descriptors are rewritten per
 layer from device tables, so the layer count is a runtime value.
 
-Measured on one RTX PRO 6000 (LightLM harness, 27B, decode): 1.33–1.36 TB/s
+Measured on one RTX PRO 6000 (study harness, 27B, decode): 1.33–1.36 TB/s
 achieved HBM streaming (83–85 % of the 1.6 TB/s spec) at 1k–64k context, +7.5–9 %
 tokens/s over the unfused kernel chain; +5 % at MTP=3 (verify form). See the
 originating study for the ladder and the refuted levers.

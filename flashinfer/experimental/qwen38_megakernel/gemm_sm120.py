@@ -3,8 +3,7 @@
 # compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 # Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
 # on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# Ported from LightLM's cutlass_dsl megakernel study (docs/megakernel-plan.md there) for the FlashInfer experimental
-# track: the Qwen3.8-27B one-launch decoder on SM120.
+# Qwen3.8-27B one-launch decoder on SM120 (FlashInfer experimental track).
 # Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -33,7 +32,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""LightLM cutlass_dsl SM120 dense GEMM kernel (bf16/fp16, fp32 acc).
+"""SM120 dense GEMM kernel (bf16/fp16, fp32 acc).
 
 Derived from NVIDIA CUTLASS `examples/python/CuTeDSL/cute/blackwell_geforce/
 kernel/dense_gemm/dense_gemm.py` (BSD-3-Clause, header above), which is the
@@ -42,7 +41,7 @@ verified SM120 recipe: TMA-fed `PipelineTmaAsync` mainloop, one DMA warp +
 MmaF16BF16Op`), ldmatrix operand fetch, `stmatrix` + TMA-store epilogue,
 static persistent tile scheduler, `setmaxregister` 40/232 split.
 
-LightLM changes (docs/cutlass-dsl-kernel-guide.md §3, §4):
+Changes vs the upstream example:
   * `epi_stage`, `atom_layout`, `occupancy` are constructor parameters
     (the example fixes 8 / (2,2,1) / 1). The example's epilogue staging
     (8 x 64x32 subtiles = the WHOLE C tile, 32 KB at 128x128) is what
@@ -53,7 +52,7 @@ LightLM changes (docs/cutlass-dsl-kernel-guide.md §3, §4):
     buffer still being read by TMA (measured: wrong results for every
     epi_stage < subtiles). All MMA warps now rendezvous on the named
     barrier after warp 0's `producer_acquire()`.
-  * Host CLI / reference-check harness removed; LightLM drives it from
+  * Host CLI / reference-check harness removed; the host drives it from
     `cutlass_dsl/gemm.py` (dynamic layouts, compile cache, raced configs).
 """
 
@@ -65,7 +64,7 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 
 
-class LtlmSm120Gemm:
+class Sm120DenseGemm:
     def __init__(
         self,
         acc_dtype,
@@ -774,7 +773,7 @@ class LtlmSm120Gemm:
                         )
                         tma_store_pipeline.producer_commit()
                         tma_store_pipeline.producer_acquire()
-                    # LightLM: with epi_stage < number of C subtiles the
+                    # with epi_stage < number of C subtiles the
                     # buffer written next iteration is one TMA is still
                     # reading unless EVERY MMA warp waits for warp 0's
                     # acquire above (the example let them run ahead)
@@ -955,7 +954,7 @@ class LtlmSm120Gemm:
                  (A/B operand stages, epilogue stages)
         :rtype: tuple[int, int]
         """
-        # epi_stage from the config (LightLM); example fixed 8
+        # epi_stage from the config; the example fixed 8
         c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
         epi_bytes = c_bytes_per_stage * epi_stage
 

@@ -3,8 +3,7 @@
 # compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 # Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
 # on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# Ported from LightLM's cutlass_dsl megakernel study (docs/megakernel-plan.md there) for the FlashInfer experimental
-# track: the Qwen3.8-27B one-launch decoder on SM120.
+# Qwen3.8-27B one-launch decoder on SM120 (FlashInfer experimental track).
 """cutlass_dsl decode W8A16 GEMM for SM120 (Phase C.4): fp8 [N,K] weight
 streamed as the swap-AB MMA A operand, dequantized to bf16 in registers.
 
@@ -12,7 +11,7 @@ Problem: y[M,N] = x[M,K](bf16) @ dequant(W)^T, W fp8 e4m3 stored
 CHECKPOINT-NATIVE [N,K] (K contiguous, bryu ruling 2026-09-08), one fp32
 scale per fused shard applied in the epilogue. Decode M <= 16.
 
-Structure (subclass of the B.1 kernel `LtlmSm120Gemm`, swap-AB form):
+Structure (subclass of the B.1 kernel `Sm120DenseGemm`, swap-AB form):
   C^T[N,M] = W[N,K] @ x^T[K,M]
   A operand = W presented as a 16-BIT CONTAINER [N, K/2] (each bf16 slot
              holds two fp8 bytes), so the unchanged bf16 machinery (TMA,
@@ -51,12 +50,12 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 
-from .gemm_sm120 import LtlmSm120Gemm
+from .gemm_sm120 import Sm120DenseGemm
 
 MAX_SHARDS = 8
 
 
-class W8A16SwapSm120(LtlmSm120Gemm):
+class W8A16SwapSm120(Sm120DenseGemm):
     """Swap-AB fp8-weight / bf16-activation GEMM, see module docstring.
 
     tile_shape_mnk is (TILE_N, 16, TILE_K) in LOGICAL (fp8) K units.

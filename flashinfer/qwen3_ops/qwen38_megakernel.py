@@ -3,8 +3,7 @@
 # compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 # Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
 # on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# Ported from LightLM's cutlass_dsl megakernel study (docs/megakernel-plan.md there) for the FlashInfer experimental
-# track: the Qwen3.8-27B one-launch decoder on SM120.
+# Qwen3.8-27B one-launch decoder on SM120 (FlashInfer experimental track).
 
 """Experimental: the Qwen3.8-27B decoder (48 gated-DeltaNet + 16 full-attention layers, or any prefix / the MTP drafter
 layer) as ONE persistent CuTe DSL launch per decode step on SM120 (RTX PRO 6000 / GeForce Blackwell).
