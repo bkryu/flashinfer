@@ -40,7 +40,7 @@ def fp4(n, k, dev):
     return w, s
 
 
-def make_layer(kind, geo, n_slots, n_pages, dev):
+def make_layer(kind, geo, n_slots, n_pages, dev, stored=False, q_il=False):
     H, I, HK, HV, HQ, HKV, D = (
         geo["H"],
         geo["I"],
@@ -53,7 +53,9 @@ def make_layer(kind, geo, n_slots, n_pages, dev):
     bf = torch.bfloat16
     ly = {"kind": kind}
     wgu, sgu = fp4(2 * I, H, dev)
-    ly["w_gu_il"], ly["s_gu_il"] = interleave_gate_up(wgu, sgu, I)
+    ly["w_gu_il"], ly["s_gu_il"] = (
+        (wgu, sgu) if stored else interleave_gate_up(wgu, sgu, I)
+    )
     ly["w_dn"], ly["s_dn"] = fp4(H, I, dev)
     ly["alpha_gu"] = torch.tensor([0.5, 0.125], device=dev)
     ly["alpha_dn"] = torch.tensor([0.02], device=dev)
@@ -81,7 +83,9 @@ def make_layer(kind, geo, n_slots, n_pages, dev):
         ly["w_in"] = (torch.randn(2 * qd + 2 * kvd, H, device=dev) * 0.05).to(
             torch.float8_e4m3fn
         )
-        ly["alpha_in"] = torch.tensor([0.02, 0.03, 0.025, 0.015], device=dev)
+        ly["alpha_in"] = torch.tensor(
+            [0.02, 0.02 if q_il else 0.03, 0.025, 0.015], device=dev
+        )
         ly["w_out"] = (torch.randn(H, qd, device=dev) * 0.05).to(torch.float8_e4m3fn)
         ly["wq"] = (torch.rand(D, device=dev) + 0.5).to(bf)
         ly["wk"] = (torch.rand(D, device=dev) + 0.5).to(bf)
@@ -110,13 +114,29 @@ def main() -> None:
         help="a 2048-wide geometry instead of the 27B one",
     )
     p.add_argument("--iters", type=int, default=20)
+    p.add_argument(
+        "--stored-layouts",
+        action="store_true",
+        help="gate | up rows as stored + per-head [q_h | gate_h] in-proj rows "
+        "(gate_up_split, q_gate_il) instead of interleaved copies",
+    )
+    p.add_argument("--gu-split", action="store_true", help="gate_up_split only")
+    p.add_argument("--hidden", type=int, default=0, help="override hidden size")
+    p.add_argument("--inter", type=int, default=0, help="override intermediate size")
+    p.add_argument("--q-il", action="store_true", help="q_gate_il only")
     args = p.parse_args()
+    gu_split = args.stored_layouts or args.gu_split
+    q_il = args.stored_layouts or args.q_il
     dev = torch.device("cuda")
     geo = (
         dict(H=2048, I=2048, hk=2, hv=8, hq=6, hkv=2, d=256, rot=64)
         if args.small
         else dict(H=5120, I=17408, hk=16, hv=48, hq=24, hkv=4, d=256, rot=64)
     )
+    if args.hidden:
+        geo["H"] = args.hidden
+    if args.inter:
+        geo["I"] = args.inter
     PAGE = 32
     reason = qwen38_megakernel_unsupported_reason(
         dev,
@@ -138,7 +158,10 @@ def main() -> None:
     B, L = args.batch, args.context
     pages_per_seq = (L + PAGE - 1) // PAGE
     kinds = [1 if (j % 4 == 3) else 0 for j in range(args.layers)]
-    layers = [make_layer(k, geo, B, B * pages_per_seq + 1, dev) for k in kinds]
+    layers = [
+        make_layer(k, geo, B, B * pages_per_seq + 1, dev, stored=gu_split, q_il=q_il)
+        for k in kinds
+    ]
     spec = DecoderSpec(
         geo["hk"],
         geo["hv"],
@@ -150,6 +173,8 @@ def main() -> None:
         geo["H"],
         geo["I"],
         splits=2,
+        gate_up_split=gu_split,
+        q_gate_il=q_il,
     )
     plan = qwen38_megakernel_prepare(spec, layers, B, max_seq_len=L)
 

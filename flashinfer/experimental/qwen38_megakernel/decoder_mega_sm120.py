@@ -5477,6 +5477,13 @@ class DecoderMegaSm120(GdnMegaSm120):
                                 n_tile = work - TGDN
                                 tAg = tAgA3[(None, n_tile, None, 0)]
                                 tSg = tSgS3[(None, n_tile, None, 0)]
+                                if cutlass.const_expr(self.gu_split):
+                                    tAgu = tAgA3[
+                                        (None, n_tile + self.inter // 32, None, 0)
+                                    ]
+                                    tSgu = tSgS3[
+                                        (None, n_tile + self.inter // 32, None, 0)
+                                    ]
                                 tBg = (
                                     tBgB3[(None, 0, 0, None)]
                                     if self.w16
@@ -5490,21 +5497,51 @@ class DecoderMegaSm120(GdnMegaSm120):
                                     )
                                     cnt_ = mlp_producer_state.count
                                     idx = mlp_producer_state.index
-                                    cute.copy(
-                                        tma_a3,
-                                        tAg[(None, cnt_)],
-                                        tAsA4[(None, idx)],
-                                        tma_bar_ptr=bar,
-                                        tma_desc_ptr=dp_a3,
-                                    )
-                                    if cutlass.const_expr(not self.w16):
+                                    if cutlass.const_expr(self.gu_split):
+                                        cute.copy(
+                                            tma_a3,
+                                            tAg[(None, cnt_)],
+                                            tAsA4h[(None, 2 * idx)],
+                                            tma_bar_ptr=bar,
+                                            tma_desc_ptr=dp_a3,
+                                        )
+                                        cute.copy(
+                                            tma_a3,
+                                            tAgu[(None, cnt_)],
+                                            tAsA4h[(None, 2 * idx + 1)],
+                                            tma_bar_ptr=bar,
+                                            tma_desc_ptr=dp_a3,
+                                        )
                                         cute.copy(
                                             tma_s3,
                                             tSg[(None, cnt_)],
-                                            tSsS[(None, idx)],
+                                            tSsSh[(None, 2 * idx)],
                                             tma_bar_ptr=bar,
                                             tma_desc_ptr=dp_s3,
                                         )
+                                        cute.copy(
+                                            tma_s3,
+                                            tSgu[(None, cnt_)],
+                                            tSsSh[(None, 2 * idx + 1)],
+                                            tma_bar_ptr=bar,
+                                            tma_desc_ptr=dp_s3,
+                                        )
+                                    else:
+                                        cute.copy(
+                                            tma_a3,
+                                            tAg[(None, cnt_)],
+                                            tAsA4[(None, idx)],
+                                            tma_bar_ptr=bar,
+                                            tma_desc_ptr=dp_a3,
+                                        )
+                                        if cutlass.const_expr(not self.w16):
+                                            cute.copy(
+                                                tma_s3,
+                                                tSg[(None, cnt_)],
+                                                tSsS[(None, idx)],
+                                                tma_bar_ptr=bar,
+                                                tma_desc_ptr=dp_s3,
+                                            )
                                     cute.copy(
                                         tma_b3,
                                         tBg[(None, cnt_)],
