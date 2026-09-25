@@ -80,13 +80,18 @@ replay. Example: `examples/experimental/qwen38_megakernel_decode.py`.
 - `FLASHINFER_QWEN38_TVM_FFI=0` — ctypes launch path instead of TVM-FFI.
 - `FLASHINFER_QWEN38_PDL=0` — launch without programmatic dependent launch.
 
-## vLLM adaptation
+## vLLM
 
-The v1 layouts are the study's. vLLM stores the SSM state as
-`[blocks, HV, Dv, Dk]` (Dk innermost) with a padded per-block stride, the
-conv state as `(K-1 [+num_spec], conv_dim)` and the FlashInfer-backend KV as
-`[blocks, HKV, block, 2*head]`-style packed pages; the integration in vLLM
-(`vllm/models/qwen3_5/nvidia/megakernel.py`) prepares weights once
-(row permutations / dtype views only — never a re-quantization) and passes
-state / cache views the kernel accepts. Layout options are added to
-`DecoderSpec` as they land.
+The vLLM branch (`vllm/models/qwen3_5/nvidia/megakernel.py`) turns the four
+layout knobs on and feeds the model's own caches, so stock kernels and the
+megakernel alternate step by step (prefill / mixed batches / > 16 rows / the
+MTP drafter stay on the stock path):
+
+```bash
+vllm serve nvidia/Qwen3.8-27B-NVFP4 --gdn-decode-backend megakernel \
+    --limit-mm-per-prompt '{"image": 0, "video": 0}' \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'  # optional
+```
+
+The config hook forces block size 32 and the FLASHINFER attention backend.
+`VLLM_QWEN38_MEGAKERNEL_DEBUG=1` range-checks every routed step (eager only).
