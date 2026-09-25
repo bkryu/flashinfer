@@ -1171,7 +1171,7 @@ def test_vllm_layouts_plain_match_torch_oracle(mk, kinds, M, pad_rows, knobs):
         assert torch.equal(ly["ssm_pool"][0], s0), "padded row wrote the null SSM slot"
 
 
-@pytest.mark.parametrize("nseq", [1, 2])
+@pytest.mark.parametrize("nseq", [1, 2, 4])
 def test_vllm_per_token_slots_verify_matches_sequential(mk, nseq):
     """The verify form with vLLM per-token state slots: sequence b reads its state from slots[b, acc-1] (the accepted prefix
     of the last step) and its conv taps from window rows acc-1.., writes S_r to slots[b, r] for every row and the window
@@ -1180,10 +1180,10 @@ def test_vllm_per_token_slots_verify_matches_sequential(mk, nseq):
     R = 4
     kinds = (0, 1, 0, 0)
     g = torch.Generator(device=CUDA).manual_seed(141 + nseq)
-    case = Case(g, nseq, R, committed=(100, 33))
+    case = Case(g, nseq, R, committed=(100, 33, 700, 5))
     M = case.M
     acc = torch.tensor(
-        [3, 1][:nseq], dtype=torch.int32, device=CUDA
+        [3, 1, 4, 2][:nseq], dtype=torch.int32, device=CUDA
     )  # accepted counts of the previous step (1..R)
     n_slots = nseq * R + 1
     layers0 = [
