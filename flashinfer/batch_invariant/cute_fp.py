@@ -57,7 +57,7 @@ class CuteF32:
     @staticmethod
     def fmaxc(a, b):
         """The attention class's commutative ``max.f32`` join: the same instruction as ``fmax`` (the
-        symbolic algebra normalises the operand order; the CPU model uses the probed zero rule)."""
+        symbolic algebra normalises the operand order; the CPU model uses the measured zero rule)."""
         return cute.arch.fmax(a, b)
 
     # -- packed pairs (sm_100+ ``f32x2`` instructions): two independent ``.rn`` ops in one instruction, bit for bit the
@@ -176,7 +176,7 @@ def ex2_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
 @dsl_user_op
 def lg2_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
     """The one ``log2`` an RL-ready kernel may use: PTX ``lg2.approx.ftz.f32`` (MUFU.LG2), deterministic per architecture;
-    the MLA class's LSE member ``add(mul(m, c), lg2(l))`` (``flashinfer/batch_invariant/attention/mla/spec.py``). Like ``ex2`` it has no CPU model: a
+    the MLA class's LSE member ``add(mul(m, c), lg2(l))``. Like ``ex2`` it has no CPU model: a
     device helper tabulates its values for the exact evaluator."""
     return Float32(
         llvm.inline_asm(

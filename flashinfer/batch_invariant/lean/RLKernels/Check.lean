@@ -4,8 +4,8 @@ import RLKernels.MXQuant
 /-! Axiom audit, printed at build time: every core theorem below depends only on Lean's standard axioms (`propext`,
 `Quot.sound`, `Classical.choice`) and never on `sorryAx`. The enforced form of this audit is `lake exe axioms`
 (`Axioms.lean`), which walks every declaration of the library and fails the build on a `sorry` or on an axiom outside
-the policy (the decided tables -- `native_decide`, axiom `Lean.ofReduceBool` -- are admitted only for the generated
-conformance cases and the named table theorems of `MXQuant.lean`). -/
+the policy: `Lean.ofReduceBool` (`native_decide`, the compiled evaluator) is admitted only for the eight named
+exhaustive table theorems; the generated conformance cases are closed by kernel `decide`. -/
 #print axioms RLK.tree_split
 #print axioms RLK.bfly_tree
 #print axioms RLK.exec_eq_tree

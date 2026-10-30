@@ -156,7 +156,7 @@ curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh
 export PATH="$HOME/.elan/bin:$PATH"
 cd flashinfer/batch_invariant/lean
 
-lake build                     # elaborates the engine theorems, the class and the generated cases (~3 min cold: the cases are decided by the kernel)
+lake build                     # elaborates the engine theorems, the class and the generated cases (~1.5 min cold: the cases are closed by kernel decide)
 #   ... info: 'RLK.MXQuant.block_amax_invariance' depends on axioms: [propext, Quot.sound]    (Check.lean prints the audit)
 #   Build completed successfully.
 

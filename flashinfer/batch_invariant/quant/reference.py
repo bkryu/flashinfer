@@ -34,7 +34,7 @@ class ExactF32:
     fmax = staticmethod(fp32.fmax)
     fmaxc = staticmethod(
         fp32.fmaxc
-    )  # the probed sm_107 max.f32 rule (shared with the attention class)
+    )  # the SM107 max.f32 zero rule (shared with the attention classes)
     fabs = staticmethod(fp32.fabs)
     nzor = staticmethod(fp32.nzor)
 

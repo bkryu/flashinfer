@@ -544,7 +544,7 @@ class BlockedFold:
     accumulate predicate (:meth:`accumulate`). :meth:`trace` simulates the whole nest for a
     concrete block count, so the term a kernel builds is conformed node for node against the
     reduction's canonical term (``GemmKernelPlan.verify``) and against the Lean loop model
-    (``GEMMConfig.kblockLoop``, generated cases in ``Cases.lean``).
+    (the GEMM classes' ``kblockLoop`` model and its generated cases).
     """
 
     digit: str

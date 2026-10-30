@@ -828,17 +828,19 @@ def test_flashinfer_output_contract(precompiled):
     assert sfl.shape == (37 * 3,) and torch.equal(
         ql.view(torch.uint8), q.view(torch.uint8)
     )
-    # alignment: K = 96 padded to 128 with zero columns, as FlashInfer's backends do (bitwise the same bytes)
+    # alignment: K = 96 padded to 128 with zero columns, as FlashInfer's backends do (bitwise the same bytes on an
+    # input without the documented tiny-block / infinity corner); the padded columns are zero codes
+    xa = _no_tiny_blocks(adversarial_rows(37, 96, torch.bfloat16, seed=9).cuda())
     for layout in L.LAYOUTS:
         qa, sfa = flashinfer.mxfp8_quantize(
-            x,
+            xa,
             alignment=128,
             sf_swizzle_layout=FI_LAYOUTS[layout],
             backend="auto",
             batch_invariant=True,
         )
         qf, sff = flashinfer.mxfp8_quantize(
-            x,
+            xa,
             alignment=128,
             sf_swizzle_layout=FI_LAYOUTS[layout],
             backend="cute-dsl",
@@ -849,6 +851,10 @@ def test_flashinfer_output_contract(precompiled):
             sfa, sff
         ), layout
         assert int(qa.view(torch.uint8)[:, 96:].sum()) == 0
+        # the same bytes as the class on the explicitly zero-padded input
+        xp = torch.zeros(37, 128, dtype=torch.bfloat16, device="cuda")
+        xp[:, :96] = xa
+        assert _same((qa.view(torch.uint8).cpu(), sfa.cpu()), _api(xp, layout)), layout
     # >2-D input: rows are the flattened leading dimensions
     x3 = _edge_rows(36, 96, torch.bfloat16, seed=3, device="cuda").view(3, 12, 96)
     q3, s3 = flashinfer.mxfp8_quantize(x3, backend="auto", batch_invariant=True)

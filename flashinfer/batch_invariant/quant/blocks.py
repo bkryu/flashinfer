@@ -1,6 +1,6 @@
 """Device building blocks of the block-scaled quantizers: the pieces a fused
 norm -> quant kernel composes, importable without the standalone kernels' launch closures (this module imports the
-engine core, ``cute_fp``, ``cvt_fp8``, ``layout`` and ``mx_spec``; never ``kernel.py`` / ``mx_kernel.py``).
+engine core, ``cute_fp``, ``cvt_fp8``, ``layout`` and ``mx_spec``; never ``mx_kernel.py``).
 
 Stable names: ``cvt_f32_to_ue8m0``, ``cvt_f32x2_to_fp8x2`` (re-exported from ``flashinfer.batch_invariant.cvt_fp8``), ``cvt_f32x8_to_e2m1x8``,
 ``block_amax``, ``pack_block_codes``, ``sf_offset_128x4_dev``, ``sf_offset_linear_dev``, ``SfTileStage``; plumbing:
@@ -125,8 +125,7 @@ def cvt_f32x8_to_e2m1x8(
     ip=None,
 ) -> Uint32:
     """Four ``cvt.rn.satfinite.e2m1x2.f32``: element ``2j`` in the low nibble of byte ``j``, the four
-    bytes packed little-endian into one 32-bit word (byte 0 = elements 0, 1). The same primitive as the
-    NVFP4 kernel's (``flashinfer/batch_invariant/quant/kernel.py``; the strings are pinned identical by ``tests/test_mx_quant_cpu.py``)."""
+    bytes packed little-endian into one 32-bit word (byte 0 = elements 0, 1); the NVFP4 classes' conversion primitive."""
     return Uint32(
         llvm.inline_asm(
             T.i32(),

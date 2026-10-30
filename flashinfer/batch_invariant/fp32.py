@@ -371,7 +371,7 @@ CANONICAL_NAN_16 = 0x7FFF  # bf16 / f16 canonical NaN after cvt.rn from an f32 N
 def to_f32(x: float) -> float:
     """The Python float ``x`` (a double) rounded to binary32 with RNE; inf/nan pass through.
     Every constant that enters a kernel or a spec goes through this, so the CPU reference,
-    the symbolic spec and the device constant are the same binary32 value (F03)."""
+    the symbolic spec and the device constant are the same binary32 value."""
     x = float(x)
     if math.isnan(x) or math.isinf(x):
         return x

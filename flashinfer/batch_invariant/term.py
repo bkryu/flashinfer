@@ -70,7 +70,7 @@ class TermAlgebra:
         return self._mk("r", row, i)
 
     def const(self, value: float) -> Term:
-        # constants are binary32 values (F03); keyed on the bit pattern so +0.0 and -0.0 differ
+        # constants are binary32 values; keyed on the bit pattern so +0.0 and -0.0 differ
         value = fp32.to_f32(value)
         return self._mk("const", value, math.copysign(1.0, value))
 
@@ -278,7 +278,7 @@ def fingerprint(t: Term) -> str:
     """Structural sha256 of the canonical S-expression of a term (op names, leaf
     coordinates, binary32 constants, association; commutative operands sorted), hence
     independent of interning ids and of the order in which terms were constructed in the
-    process (F05). Two specs with equal fingerprints produce equal bits on any backend that
+    process. Two specs with equal fingerprints produce equal bits on any backend that
     satisfies the primitive assumptions."""
     import hashlib
 

@@ -106,7 +106,7 @@ theorem evalO_oadd (P : Prims α) (z : α) (hl : ∀ a, P.add z a = a) (hr : ∀
 additive identity `z`, the zero-padded tree evaluates to the same bits as the spec's tree
 with absent leaves dropped.
 
-WARNING (audit F08): the hypotheses `hl`/`hr` are NOT satisfied by IEEE binary32 bit
+WARNING: the hypotheses `hl`/`hr` are NOT satisfied by IEEE binary32 bit
 patterns, because `(+0) + (-0) = +0`: `+0` is not an identity for `-0`. This theorem is
 kept for reference only. The realistic statement, with the identity restricted to the
 values the sums of squares can take (`Good`, i.e. "not `-0`"), is `tree_pad_good` below,
@@ -125,7 +125,7 @@ theorem tree_pad (P : Prims α) (zt : Term) (z : α) (hz : eval P zt = z)
       rw [evalO_oadd P z hl hr, evalO_oadd P z hl hr,
           tree_pad P zt z hz hl hr n, tree_pad P zt z hz hl hr n]
 
-/-! ## Restricted identity padding (the realistic hypothesis; audit F08)
+/-! ## Restricted identity padding (the realistic hypothesis)
 
 `tree_pad` asks for a global identity `∀ a, add z a = a`. IEEE binary32 does not satisfy
 it: `(+0) + (-0) = +0`. What does hold is the restricted law `add(v, +0) = v` for every
@@ -139,7 +139,7 @@ kept abstract. The theorems need only
 * the identity law on Good values,
 * every *present* leaf evaluating to a Good value.
 
-This is exactly what `Digit.identity_note` in `rlk/rmsnorm/spec.py` claims
+This is exactly what `Digit.identity_note` of the row-norm spec claims
 ("add(v, +0) == v for v >= +0"; "fma(0, 0, acc) == acc; acc starts at +0 and stays >= +0").
 The kernel pads at two levels, and both are covered:
 

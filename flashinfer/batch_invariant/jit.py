@@ -14,8 +14,8 @@ Two rules of the engine's cache are kept on top of :class:`flashinfer.jit.cute_d
 
 * **wipe only on definite evidence**: a module directory is deleted when its meta reads back as a *different* key or
   when the directory exists with no meta at all (a half-committed module); a meta that exists but cannot be read right
-  now (another process replacing it, a transient NFS error) is retried once and is then NOT evidence -- a reader once
-  wiped an 11,000-kernel module under a running GPU session because a precompile pool was committing into it;
+  now (another process replacing it, a transient network-filesystem error) is retried once and is then NOT evidence --
+  treating it as stale would let a reader wipe a module that a precompile pool is committing into;
 * **compile outside the module lock**: the lock is taken only to commit the artifact (milliseconds), so the device-free
   precompile pool (:mod:`flashinfer.batch_invariant.quant.mx_precompile`) really compiles in parallel.
 
@@ -120,7 +120,7 @@ def source_sha256(module: str) -> str:
 
 
 def module_is_stale(module_dir: Path, meta_path: Path, expected: dict) -> bool:
-    """DEFINITE evidence that a module directory was built from another closure (see the module docstring)."""
+    """Definite evidence that a module directory was built from another closure (see the module docstring)."""
     if not module_dir.exists():
         return False
     meta = _read_meta(meta_path)

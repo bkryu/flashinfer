@@ -77,7 +77,7 @@ def canonical_nan(
 ) -> torch.Tensor:
     """The spec does not define NaN payloads or signs; the device produces the canonical quiet
     NaN of each format (0x7fffffff, 0x7fff, 0x7f). Rewrite every NaN of the CPU reference to
-    that pattern so a bitwise comparison is meaningful (F06). ``nan_mask`` may be supplied
+    that pattern so a bitwise comparison is meaningful. ``nan_mask`` may be supplied
     (e.g. from the float64 values) for dtypes without ``isnan`` support."""
     it, pat = _CANON_NAN[t.dtype]
     mask = torch.isnan(t) if nan_mask is None else nan_mask
