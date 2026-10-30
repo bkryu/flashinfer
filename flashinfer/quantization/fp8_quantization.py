@@ -279,8 +279,10 @@ def mxfp8_quantize(
     is_sf_swizzled_layout: bool = True,
     alignment: int = 32,
     enable_pdl: Optional[bool] = None,
-    backend: Literal["cuda", "cute-dsl"] = "cuda",
+    backend: Literal["auto", "cuda", "cute-dsl"] = "cuda",
     sf_swizzle_layout: Optional[SfLayout] = None,
+    *,
+    batch_invariant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to MxFP8 format.
 
@@ -302,14 +304,32 @@ def mxfp8_quantize(
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Auto-detected
         from device capability (SM >= 9.0) when ``None``.
-    backend : {"cuda", "cute-dsl"}
+    backend : {"auto", "cuda", "cute-dsl"}
         Backend to use:
 
         - ``"cuda"``: stable JIT-compiled CUDA kernel (default).
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+        - ``"auto"``: with ``batch_invariant=False`` the same as ``"cuda"``;
+          the only value accepted with ``batch_invariant=True``.
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``.
+    batch_invariant : bool
+        Run the batch-invariant class ``mxfp8.quant`` of
+        :mod:`flashinfer.batch_invariant` (keyword-only; defaults to
+        ``False``). The output bits then depend on the input values alone:
+        the same row quantizes to the same bits in any batch, under any
+        configuration the dispatcher picks and in any scale-factor layout
+        (``flashinfer.batch_invariant.fingerprint("mxfp8_quantize")`` is
+        the receipt). Requires ``backend="auto"`` (any other value raises
+        ``ValueError``) and an SM100 / SM103 / SM107 device; an unsupported
+        input, dtype, layout or architecture raises
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back to another kernel. The dataflow is
+        TransformerEngine's MXFP8 chain; it differs from the ``"cuda"`` and
+        ``"cute-dsl"`` backends only on blocks whose amax is below
+        ``448 * 2**-127`` (kept, where those backends zero them) and on
+        ``-inf`` elements (see ``flashinfer/batch_invariant/README.md``).
 
     Returns
     -------
@@ -328,14 +348,30 @@ def mxfp8_quantize(
     sf_vec_size = 32
 
     assert input.shape[-1] % sf_vec_size == 0
-    assert backend in ("cuda", "cute-dsl"), (
-        f"backend must be 'cuda' or 'cute-dsl', got '{backend}'"
+    assert backend in ("auto", "cuda", "cute-dsl"), (
+        f"backend must be 'auto', 'cuda' or 'cute-dsl', got '{backend}'"
     )
 
     if sf_swizzle_layout is None:
         sf_swizzle_layout = (
             SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
         )
+
+    if batch_invariant or backend == "auto":
+        from ..batch_invariant.support import BATCH_INVARIANT, resolve_backend
+
+        # batch_invariant=True is reachable only through backend="auto" (any other
+        # value raises); "auto" without the flag is the default backend, "cuda".
+        resolved = resolve_backend(
+            "mxfp8_quantize", backend, batch_invariant, default="cuda"
+        )
+        if resolved == BATCH_INVARIANT:
+            from ..batch_invariant.quant.mx_api import mxfp8_quantize_batch_invariant
+
+            return mxfp8_quantize_batch_invariant(
+                input, sf_swizzle_layout, alignment, enable_pdl
+            )
+        backend = "cuda"
 
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available

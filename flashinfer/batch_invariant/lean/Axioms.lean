@@ -1,0 +1,64 @@
+import Lean
+import RLKernels
+/-! `lake exe axioms`: the enforced axiom policy of the library.
+
+Every declaration of the `RLKernels.*` modules is checked:
+
+* `sorryAx` anywhere fails the build;
+* a theorem may depend on Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`) and on nothing else,
+  except that the decided tables -- the generated conformance cases of `RLKernels.Cases` and the named table theorems
+  of `MXQuant.lean` below, all proved by `native_decide` -- may additionally depend on `Lean.ofReduceBool` (the
+  compiled evaluation `native_decide` trusts). No other axiom is admitted anywhere. -/
+open Lean
+
+def standardAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
+def decidedAxiom : Name := ``Lean.ofReduceBool
+/-- The named `native_decide` theorems outside the generated cases: decided layout bijections and UE8M0 tables. -/
+def decidedTheorems : List Name :=
+  [``RLK.MXQuant.layout128x4_bijective, ``RLK.MXQuant.layoutLinear_bijective, ``RLK.MXQuant.ue8m0_powers_fixed,
+   ``RLK.MXQuant.ue8m0_roundings, ``RLK.MXQuant.ue8m0_saturates]
+def casesModule : Name := `RLKernels.Cases
+
+def moduleOf (env : Environment) (n : Name) : Option Name :=
+  match env.getModuleIdxFor? n with
+  | some idx => env.header.moduleNames[idx.toNat]?
+  | none => none
+
+def isOurs (m : Option Name) : Bool :=
+  match m with
+  | some m => m.toString.startsWith "RLKernels"
+  | none => false
+
+/-- Compiler-generated auxiliaries (`_cstage1` / `_cstage2` stages carrying `lcProof` / `lcUnreachable`, `_spec_n`
+specialisations, `_elambda_n` closures, the `_auxLemma.n` helpers `native_decide` emits for a decided theorem, the
+`_private` prefix of derived instances) are not proofs: every user theorem they belong to is checked by its own name. -/
+def isGenerated (n : Name) : Bool :=
+  n.components.any fun c => c.toString.startsWith "_"
+
+def main : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let env ← importModules #[{ module := `RLKernels }] {} 0
+  let mut failures : Array String := #[]
+  let mut checked := 0
+  let mut decided := 0
+  let mut sorries := 0
+  for (n, _) in env.constants.toList do
+    let m := moduleOf env n
+    unless isOurs m do continue
+    if isGenerated n then continue
+    let (_, st) := ((CollectAxioms.collect n).run env).run {}
+    checked := checked + 1
+    if st.axioms.contains ``sorryAx then
+      sorries := sorries + 1
+      failures := failures.push s!"{n}: depends on sorryAx"
+    let allowDecided := m == some casesModule || decidedTheorems.contains n
+    if st.axioms.contains decidedAxiom then decided := decided + 1
+    for a in st.axioms do
+      if a == ``sorryAx then continue
+      if standardAxioms.contains a then continue
+      if a == decidedAxiom && allowDecided then continue
+      failures := failures.push s!"{n}: axiom {a} is outside the policy (module {m.getD .anonymous})"
+  IO.println s!"axioms check: {checked} user declarations of RLKernels.*, {decided} decided by native_decide (Lean.ofReduceBool), {sorries} with sorry, {failures.size} violations"
+  for f in failures do
+    IO.eprintln s!"  VIOLATION {f}"
+  return (if failures.isEmpty then 0 else 1)
