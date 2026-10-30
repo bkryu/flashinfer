@@ -54,6 +54,28 @@ from .mx_spec import (
 )
 
 VEC_BYTES = 16  # bytes per input / output vector copy
+MX_QUANT_MODULE = (
+    "batch_invariant_mx_quant"  # the on-disk cache module of every MX quantizer kernel
+)
+_LAYOUT_TAG = {"128x4": "sw", True: "sw", "8x4": "8x4", "linear": "lin", False: "lin"}
+
+
+def mx_quant_kernel_name(
+    fmt_name: str,
+    rule_name: str,
+    dtype_str: str,
+    Kbp: int,
+    cfg_describe: str,
+    swizzled,
+    enable_pdl: bool,
+) -> str:
+    """The cache name of one specialization: the format, the recipe constants' name, the input dtype, the Kbp bucket,
+    the configuration, the scale-factor layout (``sw`` = 128x4, ``8x4``, ``lin``) and PDL; never M (one specialization
+    serves every row count)."""
+    tag = _LAYOUT_TAG[swizzled]
+    return jit.sanitize_symbol_name(
+        f"{fmt_name}_{rule_name}_{dtype_str}_Kbp{Kbp}_{cfg_describe}_{tag}_pdl{int(enable_pdl)}"
+    )
 
 
 class _Loader:
@@ -479,7 +501,6 @@ def _compile_bucket(
     enable_pdl: bool,
 ):
     from ..dtypes import get_cutlass_dtype
-    from ..kernel_names import MX_QUANT_MODULE, mx_quant_kernel_name
 
     dtype = get_cutlass_dtype(dtype_str)
     elem_bytes = dtype.width // 8

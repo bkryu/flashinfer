@@ -5,10 +5,9 @@ family under ``FLASHINFER_JIT_DIR`` (``<module>_<arch>_cute_dsl/``), one exporte
 one ``meta.json`` per module whose ``source_sha256`` is the hash of the **source closure** of the module's kernels: the
 transitive closure of relative imports (module- and function-level) from the module's root files (:data:`MODULE_ROOTS`)
 plus the ``__init__`` of every package touched. The closure of the MX quantizer is {``quant/mx_kernel.py``,
-``quant/mx_sweep.py``, ``quant/blocks.py``, ``quant/mx_spec.py``, ``quant/mx_schedule.py``, ``quant/layout.py``,
-``canon.py``, ``term.py``, ``fp32.py``, ``cute_fp.py``, ``cvt_fp8.py``, ``dtypes.py``, ``kernel_names.py``, this file and
-the two ``__init__`` files}; the APIs, the CPU references and the precompiler are outside it, so editing them keeps the
-compiled kernels valid (``tests/batch_invariant/test_mxfp8_quantize.py`` pins the closure).
+``quant/blocks.py``, ``quant/mx_spec.py``, ``quant/mx_schedule.py``, ``quant/layout.py``, ``canon.py``, ``term.py``,
+``fp32.py``, ``cute_fp.py``, ``cvt_fp8.py``, ``dtypes.py``, this file and the two ``__init__`` files}; the API module is
+outside it, so editing it keeps the compiled kernels valid.
 
 Two rules of the engine's cache are kept on top of :class:`flashinfer.jit.cute_dsl_core.JitSpecCuteDsl`:
 
@@ -16,8 +15,8 @@ Two rules of the engine's cache are kept on top of :class:`flashinfer.jit.cute_d
   when the directory exists with no meta at all (a half-committed module); a meta that exists but cannot be read right
   now (another process replacing it, a transient network-filesystem error) is retried once and is then NOT evidence --
   treating it as stale would let a reader wipe a module that a precompile pool is committing into;
-* **compile outside the module lock**: the lock is taken only to commit the artifact (milliseconds), so the device-free
-  precompile pool (:mod:`flashinfer.batch_invariant.quant.mx_precompile`) really compiles in parallel.
+* **compile outside the module lock**: the lock is taken only to commit the artifact (milliseconds), so several
+  processes compiling different specializations of one module really compile in parallel.
 
 ``FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`` bypasses the cache (FlashInfer's switch).
 """
@@ -27,12 +26,11 @@ from __future__ import annotations
 import ast
 import functools
 import hashlib
-import json
 import logging
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 from ..jit.cute_dsl_core import (
     JitSpecCuteDsl,
@@ -40,15 +38,22 @@ from ..jit.cute_dsl_core import (
     cute_dsl_cache_disabled,
     sanitize_symbol_name,
 )
-from ..jit.cute_dsl_core import _get_compile_arch as compile_arch
-from ..jit import env as jit_env
+
+__all__ = [
+    "BatchInvariantJitSpec",
+    "build_and_load",
+    "module_sources",
+    "relative_sources",
+    "source_sha256",
+    "sanitize_symbol_name",
+]
 
 logger = logging.getLogger("flashinfer.batch_invariant.jit")
 _PKG_DIR = Path(__file__).resolve().parent
 
 #: Root files of every cache module; the module's closure is the transitive relative-import closure of these files.
 MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
-    "batch_invariant_mx_quant": ("quant/mx_kernel.py", "quant/mx_sweep.py"),
+    "batch_invariant_mx_quant": ("quant/mx_kernel.py",),
 }
 
 
@@ -196,39 +201,3 @@ def build_and_load(module: str, kernel: str, compile_fn: Callable[[], Any]) -> A
     if cute_dsl_cache_disabled():
         return compile_fn()
     return BatchInvariantJitSpec(module, kernel, compile_fn).build_and_load()
-
-
-def module_dir(module: str) -> Path:
-    return jit_env.FLASHINFER_JIT_DIR / sanitize_symbol_name(
-        f"{module}_{compile_arch()}_cute_dsl"
-    )
-
-
-def expected_meta(module: str) -> dict:
-    from ..jit.cute_dsl_core import _get_cute_dsl_version
-
-    return {
-        "arch": compile_arch(),
-        "cute_dsl_version": _get_cute_dsl_version(),
-        "source_sha256": source_sha256(module),
-        "sources": relative_sources(module),
-    }
-
-
-def is_cached(module: str, kernel: str) -> bool:
-    """True iff ``kernel``'s object is on disk under a meta that matches the current key (no load)."""
-    if cute_dsl_cache_disabled():
-        return False
-    d = module_dir(module)
-    obj = d / f"{sanitize_symbol_name(kernel)}.o"
-    return obj.exists() and _read_meta(d / "meta.json") == expected_meta(module)
-
-
-def wipe_module(module: str) -> None:
-    """Delete a module's cache directory (used when precompiled objects prove unusable)."""
-    shutil.rmtree(module_dir(module), ignore_errors=True)
-
-
-def read_meta(module: str) -> Optional[dict]:
-    meta = _read_meta(module_dir(module) / "meta.json")
-    return json.loads(json.dumps(meta)) if isinstance(meta, dict) else None

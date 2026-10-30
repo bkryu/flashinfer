@@ -10,7 +10,7 @@ For the MX quantizer the file carries
   invariance theorem instantiated on it;
 * the block amaxes the kernel reads before the ownership digit for one row configuration per block order, a 4-lanes-per-
   block configuration and the tile placement (``canon.trace(..., stop_before="blk")``);
-* per format and recipe rule the scale terms of blocks 0 and 1 and the codes 0 and 63 (``MXQuantSpec.outputs``);
+* per recipe rule of the mxfp8 format the scale terms of blocks 0 and 1 and the codes 0 and 63 (``MXQuantSpec.outputs``);
 * the UE8M0 conversion tables: ``fp32.to_ue8m0`` on binary32 magnitudes ``a * 2^e`` under the three roundings, which
   ``MXQuant.ue8m0Byte`` must reproduce (the only generated theorems decided by ``native_decide``: ``Nat.log2`` is
   defined by well-founded recursion, which kernel ``decide`` does not evaluate).
@@ -45,7 +45,7 @@ MXQ_RULES = [
     (mxspec.ScaleRule(norm="div"), "MXQuant.Rule.div"),
     (mxspec.ScaleRule(round="rn"), "MXQuant.Rule.rn"),
 ]
-MXQ_FMTS = [(mxspec.MXFP8, "MXQuant.Fmt.mxfp8"), (mxspec.MXFP4, "MXQuant.Fmt.mxfp4")]
+MXQ_FMTS = [(mxspec.MXFP8, "MXQuant.Fmt.mxfp8")]
 MXQ_OUT_WHICH = ("sf0", "sf1", "code0", "codeL")
 
 
@@ -89,7 +89,7 @@ def mxquant_cases() -> List[Dict]:
 
 
 def mxquant_out_cases() -> List[Dict]:
-    """Per format and recipe rule: the scale terms of blocks 0 and 1 and the codes 0 and 63 at K = 64."""
+    """Per recipe rule (mxfp8): the scale terms of blocks 0 and 1 and the codes 0 and 63 at K = 64."""
     out = []
     for fmt, lf in MXQ_FMTS:
         for rule, lr in MXQ_RULES:

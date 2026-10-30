@@ -215,5 +215,3 @@ flashinfer/moe_ep/backends/split/comm/nixl_ep/_vendored/
 
 # Lean build directory of the batch-invariant mode's proofs
 flashinfer/batch_invariant/lean/.lake/
-# heatmap PNGs of the batch-invariant benchmarks are attached to PRs, the CSVs are committed
-benchmarks/results/batch_invariant/**/*.png
