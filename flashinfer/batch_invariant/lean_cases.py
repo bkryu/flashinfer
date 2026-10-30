@@ -6,13 +6,14 @@ For the MX quantizer the file carries
   :mod:`quant.mx_schedule` uses one of them), the dataflow term the *Python engine* produces for each at unit (0, 0, 0)
   (``canon.trace``, the same ``init_state`` / ``apply_step`` code path the kernel executes at trace time) and the term the
   *Python spec* produces, with Lean theorems stating that the Lean model (an independent implementation) produces the same
-  canonical S-expression (``native_decide``), that the placement is valid (``PlacementOK``, ``decide``) and the engine's
+  canonical S-expression (by kernel ``decide``), that the placement is valid (``PlacementOK``, ``decide``) and the engine's
   invariance theorem instantiated on it;
 * the block amaxes the kernel reads before the ownership digit for one row configuration per block order, a 4-lanes-per-
   block configuration and the tile placement (``canon.trace(..., stop_before="blk")``);
 * per format and recipe rule the scale terms of blocks 0 and 1 and the codes 0 and 63 (``MXQuantSpec.outputs``);
-* the UE8M0 conversion table: ``fp32.to_ue8m0`` on binary32 magnitudes ``a * 2^e`` under the three roundings, which
-  ``MXQuant.ue8m0Byte`` must reproduce.
+* the UE8M0 conversion tables: ``fp32.to_ue8m0`` on binary32 magnitudes ``a * 2^e`` under the three roundings, which
+  ``MXQuant.ue8m0Byte`` must reproduce (the only generated theorems decided by ``native_decide``: ``Nat.log2`` is
+  defined by well-founded recursion, which kernel ``decide`` does not evaluate).
 
 Consequently a change to ``canon.apply_step``, a placement, the spec's chain or a recipe constant that is not reflected
 in the Lean model makes ``lake build`` fail; and a regenerated file that differs from the committed one fails the
@@ -235,10 +236,10 @@ def render() -> str:
     L.append(f"def mxqPy_amax0 : String := {lean_str(amax_sx)}")
     L.append(f"def mxqPy_amax1 : String := {lean_str(mqo[0]['amax1'])}")
     L.append(
-        "theorem mxq_spec_amax0 : osexpr (MXQuant.blockAmax quantRow 0) = mxqPy_amax0 := by native_decide"
+        "theorem mxq_spec_amax0 : osexpr (MXQuant.blockAmax quantRow 0) = mxqPy_amax0 := by decide"
     )
     L.append(
-        "theorem mxq_spec_amax1 : osexpr (MXQuant.blockAmax quantRow 1) = mxqPy_amax1 := by native_decide"
+        "theorem mxq_spec_amax1 : osexpr (MXQuant.blockAmax quantRow 1) = mxqPy_amax1 := by decide"
     )
     for i, c in enumerate(mqs):
         assert c["spec"] == amax_sx
@@ -246,7 +247,7 @@ def render() -> str:
         L.append(f"def mxqPl{i} : List (List Factor) := {c['ps']}  -- {c['name']}")
         L.append(f"theorem mxq{i}_ok : PlacementOK [5] mxqPl{i} := by decide")
         L.append(
-            f"theorem mxq{i}_kernel : osexpr (execC .fmaxc (flatten mxqPl{i}) (MXQuant.blockLeaf quantRow 0) (zeroCoords (flatten mxqPl{i}))) = {rhs} := by native_decide"
+            f"theorem mxq{i}_kernel : osexpr (execC .fmaxc (flatten mxqPl{i}) (MXQuant.blockLeaf quantRow 0) (zeroCoords (flatten mxqPl{i}))) = {rhs} := by decide"
         )
         L.append(
             f"theorem mxq{i}_inv : OEquiv (execC .fmaxc (flatten mxqPl{i}) (MXQuant.blockLeaf quantRow 0) (zeroCoords (flatten mxqPl{i}))) (MXQuant.blockAmax quantRow 0) :="
@@ -269,16 +270,16 @@ def render() -> str:
         tag = f"mxq_{c['fmt']}_{c['rule'].replace('-', '_')}"
         f, r = c["lean_fmt"], c["lean_rule"]
         L.append(
-            f"theorem {tag}_sf0 : osexpr (MXQuant.specSf {f} {r} quantRow 0) = {_mx_ref(c['sf0'], c['amax0'], c['amax1'])} := by native_decide"
+            f"theorem {tag}_sf0 : osexpr (MXQuant.specSf {f} {r} quantRow 0) = {_mx_ref(c['sf0'], c['amax0'], c['amax1'])} := by decide"
         )
         L.append(
-            f"theorem {tag}_sf1 : osexpr (MXQuant.specSf {f} {r} quantRow 1) = {_mx_ref(c['sf1'], c['amax0'], c['amax1'])} := by native_decide"
+            f"theorem {tag}_sf1 : osexpr (MXQuant.specSf {f} {r} quantRow 1) = {_mx_ref(c['sf1'], c['amax0'], c['amax1'])} := by decide"
         )
         L.append(
-            f"theorem {tag}_code0 : osexpr (MXQuant.specCode {f} {r} quantRow 0) = {_mx_ref(c['code0'], c['amax0'], c['amax1'])} := by native_decide"
+            f"theorem {tag}_code0 : osexpr (MXQuant.specCode {f} {r} quantRow 0) = {_mx_ref(c['code0'], c['amax0'], c['amax1'])} := by decide"
         )
         L.append(
-            f"theorem {tag}_codeL : osexpr (MXQuant.specCode {f} {r} quantRow {MXQ_K - 1}) = {_mx_ref(c['codeL'], c['amax0'], c['amax1'])} := by native_decide"
+            f"theorem {tag}_codeL : osexpr (MXQuant.specCode {f} {r} quantRow {MXQ_K - 1}) = {_mx_ref(c['codeL'], c['amax0'], c['amax1'])} := by decide"
         )
     L.append(
         "def mxqOutCases : List (String × String × MXQuant.Fmt × MXQuant.Rule) := ["
@@ -290,7 +291,7 @@ def render() -> str:
     )
     for i, (b, name, sx) in enumerate(mqb):
         L.append(
-            f"theorem mxqblock{i} : osexpr (MXQuant.blockAmax quantRow {b}) = {lean_str(sx)} := by native_decide  -- {name}"
+            f"theorem mxqblock{i} : osexpr (MXQuant.blockAmax quantRow {b}) = {lean_str(sx)} := by decide  -- {name}"
         )
     L.append(
         "def mxqBlockCases : List (Nat × String) := ["

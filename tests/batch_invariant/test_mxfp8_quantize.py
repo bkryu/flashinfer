@@ -73,6 +73,13 @@ SM_COUNTS = [148, 152, 204, 224]
 GRID_M = [1, 2, 7, 16, 37, 256, 1000, 4096, 8192, 16384, 65536]
 GRID_K = [2048, 4096, 7168, 8192, 16384]
 KS_CPU = [32, 64, 96, 256, 1024, 2048, 4096, 7168, 8192, 16384]
+KS_CPU_QUICK = [
+    32,
+    96,
+    256,
+    1024,
+    4096,
+]  # the plan verification over every configuration is the slow device-free test
 # GPU quick tier: the K that exercise one block, a partial scale-column tile, a 2-block bucket, the Kbp < 4 padding
 # columns, the bench grid's common sizes and the largest bucket
 KS_GPU = [32, 96, 1024, 2048, 4096, 7168]
@@ -181,7 +188,7 @@ def test_term_structure():
 
 
 @pytest.mark.parametrize("eb", [2, 4])
-@pytest.mark.parametrize("K", KS_CPU)
+@pytest.mark.parametrize("K", KS_CPU_QUICK)
 def test_every_config_plan_verifies_and_block_terms_are_canonical(K, eb):
     """Every configuration of the enumerated space is a placement of the canonical reduction: the engine's trace of every
     simulated thread equals the canonical term, and the block states the kernel reads before the ownership digit are the
@@ -209,6 +216,13 @@ def test_every_config_plan_verifies_and_block_terms_are_canonical(K, eb):
                     assert val is blocks.get(b), (cfg.describe(), b)
             n += 1
     assert n >= 20
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("eb", [2, 4])
+@pytest.mark.parametrize("K", [k for k in KS_CPU if k not in KS_CPU_QUICK])
+def test_nightly_every_config_plan_verifies_remaining_k(K, eb):
+    test_every_config_plan_verifies_and_block_terms_are_canonical(K, eb)
 
 
 @pytest.mark.parametrize("V", [32, 16, 8])

@@ -99,15 +99,21 @@ pin test checks the compiled kernel contains nothing else (no `arith` float ops,
 | Every placement of the block amax computes the canonical tree; scale and codes are `Equiv`, hence bit-equal under any commutative interpretation (R3 in the model) | proved | `lean/RLKernels/Canon.lean` (`config_invarianceC`), `MXQuant.lean` (`block_amax_invariance`, `block_outputs_invariant`, `sf_bits_equal`) |
 | The zero-filling bucket kernel (blocks beyond K, rows beyond M read as +0) equals the absent-dropping spec bit for bit | proved under the restricted identity `fmax(v, +0) = v` for `v >= +0` | `Semantics.lean` (`execC_pad_good`), `MXQuant.lean` (`blockamax_padded_bits`) |
 | A block's outputs depend on its 32 inputs alone; determinism, batch / permutation / sub-batch invariance on the launch model (R1, R2) | proved (by construction of the model) | `MXQuant.lean` (`block_locality`, `batch_invariance`, ...) |
-| The two swizzled layouts are bijections of the padded grid onto the buffer (R4 within the class) | decided (`native_decide`) | `MXQuant.lean` (`layout128x4_bijective`) |
-| The emitted terms are the terms Lean checks, node for node | tested (regenerate + byte-compare, no toolchain; `lake build` of the generated cases in the Lean tier) | `lean_cases.py`, `tests/batch_invariant/test_mxfp8_quantize.py` |
+| The two swizzled layouts are bijections of the padded grid onto the buffer (R4 within the class) | decided (`native_decide`: one of the eight `Lean.ofReduceBool` table checks) | `MXQuant.lean` (`layout128x4_bijective`) |
+| The emitted terms are the terms Lean checks, node for node | tested (regenerate + byte-compare, no toolchain; `lake build` of the generated cases by kernel `decide` in the Lean tier) | `lean_cases.py`, `tests/batch_invariant/test_mxfp8_quantize.py` |
 | The compiled kernel contains only `.rn` arithmetic and the declared conversions | tested per code path, device-free | `tests/batch_invariant/test_ir_pins.py` |
 | The device computes the exact CPU model (R1-R4 on silicon) | tested bitwise over the space, adversarial inputs, FlashInfer's kernels as a second oracle | `tests/batch_invariant/test_mxfp8_quantize.py` |
 | `cvt.rp.satfinite.ue8m0x2.f32` and `cvt.rn.satfinite.e4m3x2.f32` compute the CPU model | assumed per architecture; the UE8M0 conversion tested over every binary32 bit pattern (nightly) | `quant/mx_sweep.py` |
 
-No `sorry` anywhere; the core theorems depend on Lean's standard axioms only (`propext`, `Classical.choice`,
-`Quot.sound`); the decided tables (the generated cases, the layout bijections, the UE8M0 tables) additionally depend
-on `Lean.ofReduceBool` (`native_decide`). `lake exe axioms` enforces exactly this policy.
+No `sorry` anywhere. The axiom claim is: **Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`), plus
+`Lean.ofReduceBool` for eight named exhaustive table checks.** `Lean.ofReduceBool` is the axiom behind `native_decide`:
+it trusts the compiled evaluator (Lean's code generator and interpreter) for the evaluation of a closed Boolean term,
+instead of the kernel's own reduction. Every engine and class theorem, and every generated conformance case (kernel
+`decide`), is free of it; the eight exceptions are the two decided layout bijections (`layout128x4_bijective`,
+`layoutLinear_bijective`: 6144 and 8320 offsets), the three UE8M0 fact tables (`ue8m0_powers_fixed`,
+`ue8m0_roundings`, `ue8m0_saturates`) and the three generated UE8M0 conversion tables (`ue8m0_model_matches_{rp,rz,rn}`:
+531 magnitudes under three roundings), where `ue8m0Byte` is defined through `Nat.log2`, a well-founded recursion the
+kernel does not evaluate. `lake exe axioms` enforces exactly this policy and names the eight theorems.
 
 ## Running the tiers
 
@@ -121,10 +127,8 @@ pytest tests/batch_invariant/test_ir_pins.py -q
 # nightly tier: the full enumerated spaces and the exhaustive UE8M0 device sweep (2^32 bit patterns)
 FLASHINFER_BI_NIGHTLY=1 pytest tests/batch_invariant -q -m nightly
 
-# Lean tier: lake build + the conformance executable + the axioms check (needs elan; the pinned toolchain is lean/lean-toolchain)
+# Lean tier: lake build + the conformance executable + the axioms check (needs elan; see "How to check the proofs")
 FLASHINFER_BI_LEAN=1 pytest tests/batch_invariant/test_lean.py -q -m lean
-#   or by hand:
-cd flashinfer/batch_invariant/lean && lake build && lake exe conformance | head && lake exe axioms
 
 # regenerate the Lean cases after a change to the Python spec / engine
 python -m flashinfer.batch_invariant.lean_cases
@@ -141,8 +145,29 @@ Compiled kernels live in FlashInfer's CuTe-DSL cache (`FLASHINFER_WORKSPACE_BASE
 listed in `jit.py`): an edit to the engine or the kernel invalidates the module, an edit to the API, the references or
 the tests does not.
 
-The CI workflow `.github/workflows/batch-invariant-lean.yml` runs the Lean tier on every change to this package
-(`lake build`, then `lake exe axioms`), with the build directory cached.
+## How to check the proofs
+
+The Lean checks run by hand for now (a CI job follows once the project has a runner for it); the device-free
+byte-compare of the generated cases runs under the normal pytest on every CI job.
+
+```bash
+# the pinned toolchain (lean/lean-toolchain: leanprover/lean4:v4.15.0) through elan; no Mathlib, no other dependency
+curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+export PATH="$HOME/.elan/bin:$PATH"
+cd flashinfer/batch_invariant/lean
+
+lake build                     # elaborates the engine theorems, the class and the generated cases (~3 min cold: the cases are decided by the kernel)
+#   ... info: 'RLK.MXQuant.block_amax_invariance' depends on axioms: [propext, Quot.sound]    (Check.lean prints the audit)
+#   Build completed successfully.
+
+lake build conformance axioms  # the two executables
+lake exe conformance | wc -l   # the Lean model's terms for the generated cases: 67 lines, compared with the Python side by the Lean test tier
+lake exe axioms                # the axiom policy over every declaration of the library
+#   axioms check: 637 user declarations of RLKernels.*, 8 named table theorems decided by native_decide (Lean.ofReduceBool), 0 with sorry, 0 violations
+```
+
+`lake exe axioms` exits non-zero and names the declaration on any `sorry` or any axiom outside the policy. The pytest
+form of the same three steps is `FLASHINFER_BI_LEAN=1 pytest tests/batch_invariant/test_lean.py -q -m lean`.
 
 ## Layout
 

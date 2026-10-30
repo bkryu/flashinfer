@@ -164,7 +164,7 @@ def mxfp8_quantize_batch_invariant(
 
     Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class (dtype,
     K not a multiple of 32, layout, device, architecture); it never falls back."""
-    from ..utils import device_support_pdl
+    from ...utils import device_support_pdl
 
     check_device(input.device, CLASS_MXFP8)
     if input.dtype not in _DTYPE_STR:

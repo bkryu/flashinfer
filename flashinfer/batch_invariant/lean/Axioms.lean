@@ -6,19 +6,24 @@ Every declaration of the `RLKernels.*` modules is checked:
 
 * `sorryAx` anywhere fails the build;
 * a theorem may depend on Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`) and on nothing else,
-  except that the decided tables -- the generated conformance cases of `RLKernels.Cases` and the named table theorems
-  of `MXQuant.lean` below, all proved by `native_decide` -- may additionally depend on `Lean.ofReduceBool` (the
-  compiled evaluation `native_decide` trusts). No other axiom is admitted anywhere. -/
+  except the eight named exhaustive table theorems below, which are decided by `native_decide` and therefore depend on
+  `Lean.ofReduceBool` as well: the axiom that `Lean.reduceBool c = true` implies `c = true`, i.e. it trusts the
+  compiled evaluator (Lean's code generator and interpreter) for the evaluation of these closed Boolean terms. The
+  generated conformance cases (`RLKernels.Cases`) use kernel `decide` and need no such trust.
+
+The claim the policy enforces is therefore "Lean's standard axioms, plus `Lean.ofReduceBool` for eight named
+exhaustive table checks", never "standard axioms only". -/
 open Lean
 
 def standardAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
 def decidedAxiom : Name := ``Lean.ofReduceBool
-/-- The named `native_decide` theorems outside the generated cases: decided layout bijections and UE8M0 tables. -/
+/-- The named `native_decide` theorems: the decided layout bijections (6144 and 8320 offsets), the UE8M0 fixed points /
+roundings / saturation facts, and the three generated UE8M0 tables (531 magnitudes under three roundings; `Nat.log2`
+is defined by well-founded recursion, which kernel `decide` does not evaluate). -/
 def decidedTheorems : List Name :=
   [``RLK.MXQuant.layout128x4_bijective, ``RLK.MXQuant.layoutLinear_bijective, ``RLK.MXQuant.ue8m0_powers_fixed,
-   ``RLK.MXQuant.ue8m0_roundings, ``RLK.MXQuant.ue8m0_saturates]
-def casesModule : Name := `RLKernels.Cases
-
+   ``RLK.MXQuant.ue8m0_roundings, ``RLK.MXQuant.ue8m0_saturates,
+   ``RLK.ue8m0_model_matches_rp, ``RLK.ue8m0_model_matches_rz, ``RLK.ue8m0_model_matches_rn]
 def moduleOf (env : Environment) (n : Name) : Option Name :=
   match env.getModuleIdxFor? n with
   | some idx => env.header.moduleNames[idx.toNat]?
@@ -51,14 +56,14 @@ def main : IO UInt32 := do
     if st.axioms.contains ``sorryAx then
       sorries := sorries + 1
       failures := failures.push s!"{n}: depends on sorryAx"
-    let allowDecided := m == some casesModule || decidedTheorems.contains n
+    let allowDecided := decidedTheorems.contains n
     if st.axioms.contains decidedAxiom then decided := decided + 1
     for a in st.axioms do
       if a == ``sorryAx then continue
       if standardAxioms.contains a then continue
       if a == decidedAxiom && allowDecided then continue
       failures := failures.push s!"{n}: axiom {a} is outside the policy (module {m.getD .anonymous})"
-  IO.println s!"axioms check: {checked} user declarations of RLKernels.*, {decided} decided by native_decide (Lean.ofReduceBool), {sorries} with sorry, {failures.size} violations"
+  IO.println s!"axioms check: {checked} user declarations of RLKernels.*, {decided} named table theorems decided by native_decide (Lean.ofReduceBool), {sorries} with sorry, {failures.size} violations"
   for f in failures do
     IO.eprintln s!"  VIOLATION {f}"
   return (if failures.isEmpty then 0 else 1)
