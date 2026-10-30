@@ -332,7 +332,10 @@ def all_valid_configs(
 # a sweep that timed every valid config at every grid point, and is a property of a streaming row
 # kernel on this architecture, not of a shape.
 TILE_MAX_BYTES_PER_ROW = 2048  # the widest tile that ever measured best: 1024 bf16 / 512 fp32 elements per row per CTA (256 KB per CTA)
-TILE_MIN_CTAS_PER_SM = 1  # a tile grid is taken when it holds >= one 128-row x tile CTA per SM (the 32-block tile won at 256 CTAs)
+TILE_MIN_CTAS_PER_SM = None  # the 128-row tile tier is off: under cold-L2 kernel time the tile never beats the best row configuration by
+#                              more than 7 % and loses 1.2-5.4x below one CTA per SM (its serial row passes per CTA starve memory-level
+#                              parallelism); a number here re-enables the tier (a tile grid is then taken when it holds that many 128-row
+#                              CTAs per SM). The placement stays in the enumerated space, so the bits are covered either way.
 TILE_W16_MIN_CTAS_PER_SM = 4  # 16-warp tile CTAs when the grid is this deep; 8-warp CTAs (finer load balance) below
 TILE_TIERS = (
     (16, 2),
@@ -346,8 +349,9 @@ LANE_BYTES_MIN = 32  # never below two 16-byte vectors per lane per block (V >= 
 FRAG_BYTES_TARGET = 128  # the per-lane input fragment the best row configs keep: blocks per thread <= 128 / (V * elem_bytes)
 ROW_LANES_LARGE = (
     64,
-    256,
+    128,
 )  # bandwidth-bound rows (enough CTAs for the SMs): threads per row in this window, V = 64 B per lane
+#                              (128 lanes with two blocks per thread beat 256 lanes with one by 11-15 % at K >= 6144, M >= 4096)
 ROW_LANES_MAX = 512  # latency-bound rows (fewer CTAs than SMs): the most lanes per row the kernel allows
 CTA_THREADS_TARGET = (
     128  # rows per CTA fill a 128-thread CTA where the row has fewer lanes
@@ -397,7 +401,7 @@ def default_config(
     """The closed-form dispatcher: the expected-best member of
     :func:`all_valid_configs` from the problem sizes, the element width, the SM count and the layout.
 
-    1. **Tile tier** (128x4 layout only): the 128-row tile placement with the widest column tile whose input is at most
+    1. **Tile tier** (128x4 layout only; off while ``TILE_MIN_CTAS_PER_SM`` is ``None``): the 128-row tile placement with the widest column tile whose input is at most
        ``TILE_MAX_BYTES_PER_ROW`` per row per CTA (32 blocks for 16-bit inputs, 16 for fp32: wider tiles never measured
        best) and whose grid ``ceil(M / 128) x ceil(K / 32 / tile_blocks)`` holds ``TILE_MIN_CTAS_PER_SM x sm_count`` CTAs;
        16 warps per CTA when the grid holds ``TILE_W16_MIN_CTAS_PER_SM x sm_count``, 8 otherwise (finer load balance on
@@ -406,7 +410,7 @@ def default_config(
     2. **Row tier**: ``V = 64 / elem_bytes`` elements per lane (64 B per block per lane; 32 B when more lanes are needed) and
        a per-lane fragment of at most ``FRAG_BYTES_TARGET`` = 128 B (one or two blocks per thread for 64-byte lanes).
        Bandwidth-bound rows (the grid holds >= ``ROW_LARGE_CTAS_PER_SM x sm_count`` CTAs): the fewest blocks per thread that
-       keeps the threads per row within ``ROW_LANES_LARGE`` = [64, 256]. Latency-bound rows (a shallower grid): the most lanes per row
+       keeps the threads per row within ``ROW_LANES_LARGE`` = [64, 128]. Latency-bound rows (a shallower grid): the most lanes per row
        up to ``ROW_LANES_MAX`` = 512 (one block or half a block per lane: warps hide the latency, not per-thread ILP).
        ``rows_per_cta`` fills a 128-thread CTA where the row has fewer lanes.
     The SM count enters only through the CTA counts of 1 and 2 (no table: 148, 152, 204, 224 or any count); every pick is a
@@ -415,7 +419,7 @@ def default_config(
     layouts have no tile tier."""
     nb = num_blocks(K)
     swizzled = layout_name(swizzled)
-    if swizzled == "128x4":
+    if swizzled == "128x4" and TILE_MIN_CTAS_PER_SM is not None:
         row_tiles = -(-M // SF_ROW_TILE)
         for V, bpt in TILE_TIERS:
             tb = V * bpt

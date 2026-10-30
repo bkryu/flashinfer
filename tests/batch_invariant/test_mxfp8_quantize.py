@@ -555,12 +555,43 @@ def test_dispatcher_is_closed_form_and_the_compile_key_has_no_m():
                         names.add(name)
             reach[(dt, sw)] = len(names)
     assert all(v <= 40 for v in reach.values()), reach
-    assert (
-        C.default_config(16384, 2048, 2, 204).mode == "tile"
-        and C.default_config(4096, 2048, 2, 204).mode == "row"
-    )
+    # the 128-row tile tier is off: the placement stays in the space (bits, agreement tests), the dispatcher never picks it
+    assert C.TILE_MIN_CTAS_PER_SM is None
+    for eb in (2, 4):
+        for K in GRID_K:
+            for M in GRID_M + [32768]:
+                for sm in SM_COUNTS:
+                    assert C.default_config(M, K, eb, sm).mode == "row", (M, K, eb, sm)
     assert C.default_config(16384, 2048, 2, 204, swizzled="linear").mode == "row"
     assert C.default_config(16384, 2048, 2, 204, swizzled="8x4").mode == "row"
+    small = C.default_config(
+        1, 4096, 2, 204
+    )  # latency-bound: the most lanes per row, half a block each
+    assert (
+        small.threads_per_row == 256
+        and small.blocks_per_thread(4096) == 1
+        and small.elems_per_thread == 16
+    )
+    large = C.default_config(
+        16384, 4096, 2, 204, swizzled="linear"
+    )  # bandwidth-bound: 64..128 lanes, 64 B per lane per block
+    assert (
+        64 <= large.threads_per_row <= 128
+        and large.frag_bytes(4096, 2) <= C.FRAG_BYTES_TARGET
+        and large.elems_per_thread == 32
+    )
+    wide = C.default_config(
+        16384, 8192, 2, 204
+    )  # K = 8192: 128 lanes x two blocks per thread
+    assert (
+        wide.threads_per_row == 128
+        and wide.blocks_per_thread(8192) == 2
+        and wide.elems_per_thread == 32
+    )
+    f32 = C.default_config(16384, 16384, 4, 204, swizzled="linear")
+    assert (
+        f32.elems_per_thread == 16 and f32.frag_bytes(16384, 4) <= C.FRAG_BYTES_TARGET
+    )  # fp32: 64 B per lane per block
 
 
 def test_dispatcher_is_monotone_in_the_sm_count():
