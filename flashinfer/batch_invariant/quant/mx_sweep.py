@@ -77,7 +77,7 @@ def get_ue8m0_sweep():
 
 @dsl_user_op
 def _rcp_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
-    """FlashInfer's ``rcp.approx.ftz.f32`` (test probe only: rule I1 forbids it in our kernels)."""
+    """FlashInfer's ``rcp.approx.ftz.f32`` (a test probe only: the rounding-only rule forbids it in the kernels)."""
     return Float32(
         llvm.inline_asm(
             T.f32(),

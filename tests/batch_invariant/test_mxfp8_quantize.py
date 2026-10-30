@@ -1097,11 +1097,20 @@ def test_mm_mxfp8_consumes_the_output(precompiled):
     assert torch.equal(bq.view(torch.uint8), fb.view(torch.uint8)) and torch.equal(
         bsf, fbsf
     )
-    try:
-        ours = flashinfer.mm_mxfp8(aq, bq.t(), asf, bsf, out_dtype=torch.bfloat16)
-        theirs = flashinfer.mm_mxfp8(fa, fb.t(), fasf, fbsf, out_dtype=torch.bfloat16)
-    except Exception as e:  # noqa: BLE001 -- no MXFP8 GEMM backend for this device / environment
-        pytest.skip(f"mm_mxfp8 unavailable here: {type(e).__name__}: {str(e)[:120]}")
+    # the cute-dsl GEMM backend needs no host compiler; the default backend is tried when it is unavailable
+    for backend in ("cute-dsl", "auto"):
+        try:
+            ours = flashinfer.mm_mxfp8(
+                aq, bq.t(), asf, bsf, out_dtype=torch.bfloat16, backend=backend
+            )
+            theirs = flashinfer.mm_mxfp8(
+                fa, fb.t(), fasf, fbsf, out_dtype=torch.bfloat16, backend=backend
+            )
+            break
+        except Exception as e:  # noqa: BLE001 -- no MXFP8 GEMM backend for this device / environment
+            last = f"{type(e).__name__}: {str(e)[:120]}"
+    else:
+        pytest.skip(f"mm_mxfp8 unavailable here: {last}")
     assert torch.equal(ours, theirs)
 
 

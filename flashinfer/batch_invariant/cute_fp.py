@@ -1,4 +1,4 @@
-"""The only floating-point primitives an RL-ready CuTe-DSL kernel may use.
+"""The only floating-point primitives a batch-invariant CuTe-DSL kernel may use.
 
 Each one lowers to an NVVM intrinsic with an explicit ``.rn`` rounding mode
 (``add.rn.f32`` etc.). Unlike ``a + b`` on ``Float32`` (which lowers to ``arith``
@@ -157,7 +157,7 @@ def bitcast_i32_to_f32(bits):
 
 @dsl_user_op
 def ex2_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
-    """The one ``exp2`` an RL-ready kernel may use: PTX ``ex2.approx.ftz.f32`` (MUFU.EX2), deterministic
+    """The one ``exp2`` a batch-invariant kernel may use: PTX ``ex2.approx.ftz.f32`` (MUFU.EX2), deterministic
     per architecture; ``ex2(+0) = ex2(-0) = 1``, ``ex2(-inf) = +0``, results below ``2^-126`` flush to
     ``+0`` (the same bits as ``cute.math.exp2(fastmath=True)``; measured on SM107)."""
     return Float32(
@@ -175,7 +175,7 @@ def ex2_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def lg2_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
-    """The one ``log2`` an RL-ready kernel may use: PTX ``lg2.approx.ftz.f32`` (MUFU.LG2), deterministic per architecture;
+    """The one ``log2`` a batch-invariant kernel may use: PTX ``lg2.approx.ftz.f32`` (MUFU.LG2), deterministic per architecture;
     the MLA class's LSE member ``add(mul(m, c), lg2(l))``. Like ``ex2`` it has no CPU model: a
     device helper tabulates its values for the exact evaluator."""
     return Float32(

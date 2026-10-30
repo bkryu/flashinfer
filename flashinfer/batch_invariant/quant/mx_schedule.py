@@ -328,7 +328,7 @@ def all_valid_configs(
 
 
 # ----------------------------------------------------------------------------- the closed-form dispatcher
-# The constants below are the physics the rule reasons about; every one was set from the session-1 / session-2 sweeps of
+# The constants below are the physics the rule reasons about; every one was set from timing sweeps of
 # a sweep that timed every valid config at every grid point, and is a property of a streaming row
 # kernel on this architecture, not of a shape.
 TILE_MAX_BYTES_PER_ROW = 2048  # the widest tile that ever measured best: 1024 bf16 / 512 fp32 elements per row per CTA (256 KB per CTA)
