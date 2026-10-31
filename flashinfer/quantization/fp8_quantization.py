@@ -279,7 +279,7 @@ def mxfp8_quantize(
     is_sf_swizzled_layout: bool = True,
     alignment: int = 32,
     enable_pdl: Optional[bool] = None,
-    backend: Literal["auto", "cuda", "cute-dsl"] = "cuda",
+    backend: Literal["auto", "cuda", "cute-dsl"] = "auto",
     sf_swizzle_layout: Optional[SfLayout] = None,
     *,
     batch_invariant: bool = False,
@@ -307,10 +307,10 @@ def mxfp8_quantize(
     backend : {"auto", "cuda", "cute-dsl"}
         Backend to use:
 
-        - ``"cuda"``: stable JIT-compiled CUDA kernel (default).
+        - ``"cuda"``: stable JIT-compiled CUDA kernel.
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
-        - ``"auto"``: ``"cuda"``, unless ``batch_invariant=True`` (which
-          requires ``"auto"``).
+        - ``"auto"`` (default): ``"cuda"``, unless ``batch_invariant=True``
+          (which requires ``"auto"``).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``.
@@ -338,16 +338,6 @@ def mxfp8_quantize(
     """
     sf_vec_size = 32
 
-    assert input.shape[-1] % sf_vec_size == 0
-    assert backend in ("auto", "cuda", "cute-dsl"), (
-        f"backend must be 'auto', 'cuda' or 'cute-dsl', got '{backend}'"
-    )
-
-    if sf_swizzle_layout is None:
-        sf_swizzle_layout = (
-            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
-        )
-
     if batch_invariant:
         if backend != "auto":
             raise ValueError(
@@ -359,8 +349,27 @@ def mxfp8_quantize(
         )
 
         return mxfp8_quantize_batch_invariant(
-            input, sf_swizzle_layout, alignment, enable_pdl
+            input,
+            sf_swizzle_layout
+            if sf_swizzle_layout is not None
+            else (
+                SfLayout.layout_128x4
+                if is_sf_swizzled_layout
+                else SfLayout.layout_linear
+            ),
+            alignment,
+            enable_pdl,
         )
+    assert input.shape[-1] % sf_vec_size == 0
+    assert backend in ("auto", "cuda", "cute-dsl"), (
+        f"backend must be 'auto', 'cuda' or 'cute-dsl', got '{backend}'"
+    )
+
+    if sf_swizzle_layout is None:
+        sf_swizzle_layout = (
+            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+        )
+
     if backend == "auto":
         backend = "cuda"
 

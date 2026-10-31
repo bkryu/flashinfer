@@ -35,8 +35,8 @@ inductive Term where
   | div (a b : Term)
   | sqrt (a : Term)
   | cvt (fmt : String) (a : Term)
-  -- exact primitives of the block-scaled quantizer (`fp/term.py`): `fabs`, the order-sensitive
-  -- `fmin`, the commutativity-normalised max of non-negative values `fmaxc`, the select `nzor`
+  -- exact primitives (`fp/term.py`): `fabs`, the order-sensitive `fmin`, the commutativity-normalised max of
+  -- non-negative values `fmaxc`; the model keeps `sqrt`, `sym` and the select `nzor` as constructors
   | fabs (a : Term)
   | fmin (a b : Term)
   | fmaxc (a b : Term)
@@ -352,7 +352,7 @@ theorem dispatch_irrelevant (ds : List Nat) (ps₁ ps₂ : List (List Factor)) (
 digits use `fmaxc` (the max of non-negative values, bitwise commutative). `Comb` names the combines
 the Lean model knows; `treeC`, `bflyC`, `execC` are `tree`, `bfly`, `exec` with the combine as a
 parameter, and the theorems below are the same proofs. `treeC .add` is `tree` (`treeC_add`), so the
-row-norm statements are instances. -/
+sum-based statements are instances. -/
 
 inductive Comb where
   | add

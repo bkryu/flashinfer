@@ -21,6 +21,20 @@ Each class has one fixed dataflow, named and hashed into a **fingerprint**; `fla
 returns it, scoped to (fingerprint, FlashInfer version, architecture). Bitwise equality is the acceptance criterion of
 every test in `tests/batch_invariant`.
 
+## Where the bits differ from the default backends
+
+A batch-invariant class follows one specified dataflow; FlashInfer's default backends may round the edges differently,
+so switching the flag on can change bits at those edges. For `mxfp8_quantize` (TransformerEngine's MXFP8 chain) the
+differences are:
+
+| Input | Batch-invariant class | Default backends |
+|---|---|---|
+| a 32-element block whose amax is below `448 * 2^-127` | scale byte 0 and the values quantized under the exact inverse `2^127` (for example `2^-130` gives code `0x20`) | scale byte 0 and every code `0x00` |
+| a NaN element | the e4m3 NaN, `0x7F` | the clamp to `448`, `0x7E` |
+| a `-inf` element | `-448`, `0xFE` | `+448`, `0x7E` |
+
+Everything else is bit-identical, `+inf` (`448`) included.
+
 ## Tests
 
 ```bash

@@ -108,8 +108,7 @@ class TermAlgebra:
         """``max.f32`` (NVVM ``fmax``, maximumNumber) as a *commutative join*: on SM100-class parts it returns
         ``+0`` for both ``max(+0, -0)`` and ``max(-0, +0)`` (measured), so it is bitwise commutative on every
         non-NaN pair and the operand order is normalised like ``add`` (the engine's lane / warp placements then
-        verify canonical). Printed as ``(fmax a b)`` with the operands sorted; ``fmax`` below keeps the operand
-        order."""
+        verify canonical). Printed as ``(fmax a b)`` with the operands sorted."""
         a, b = self._sorted2(a, b)
         return self._mk("fmaxc", a, b)
 
@@ -128,15 +127,9 @@ class TermAlgebra:
         signed zero is returned; the specs only clamp against non-zero constants)."""
         return self._mk("fmin", a, b)
 
-    def fmax(self, a: Term, b: Term) -> Term:
-        return self._mk("fmax", a, b)
-
     def fabs(self, a: Term) -> Term:
         """``abs.f32`` (exact: the sign bit is cleared)."""
         return self._mk("fabs", a)
-
-    # ``fmaxc`` (the commutative max join) is defined above; the quantizer's leaves are ``fabs(x) >= +0``, where it
-    # coincides with the order-preserving ``fmax``.
 
     def leaf(self, name: str, *coords) -> Term:
         """A named input leaf with integer coordinates. Evaluation binds ``syms["leaf:" + name]`` to a
@@ -192,31 +185,12 @@ def evaluate(
             )
         elif op == "div":
             v = exact.div(memo[cur.args[0].uid], memo[cur.args[1].uid])
-        elif op == "sqrt":
-            v = exact.sqrt(memo[cur.args[0].uid])
         elif op == "fmaxc":
             v = exact.fmaxc(memo[cur.args[0].uid], memo[cur.args[1].uid])
-        elif op == "ex2":
-            fn = (syms or {}).get("ex2")
-            if fn is None:
-                raise NotImplementedError(
-                    "no CPU model for ex2.approx; bind syms['ex2'] to a device-produced function"
-                )
-            v = fn(memo[cur.args[0].uid])
-        elif op == "neg":
-            v = exact.neg(memo[cur.args[0].uid])
         elif op == "fmin":
             v = exact.fmin(memo[cur.args[0].uid], memo[cur.args[1].uid])
-        elif op == "fmax":
-            v = exact.fmax(memo[cur.args[0].uid], memo[cur.args[1].uid])
-        elif op == "exp2i":
-            v = exact.exp2i(memo[cur.args[0].uid])
-        elif op == "rowmax":
-            v = exact.rowmax(*[memo[a.uid] for a in cur.args])
         elif op == "fabs":
             v = exact.fabs(memo[cur.args[0].uid])
-        elif op == "nzor":
-            v = exact.nzor(memo[cur.args[0].uid], memo[cur.args[1].uid])
         elif op.startswith("leaf:"):
             fn = (syms or {}).get(op)
             if fn is None:
@@ -231,8 +205,6 @@ def evaluate(
             kind = cur.args[1]
             if kind in ("e4m3", "e5m2"):
                 v = exact.to_fp8(memo[cur.args[0].uid], kind)
-            elif kind == "e2m1":
-                v = exact.to_e2m1(memo[cur.args[0].uid])
             elif kind.startswith(
                 "ue8m0_"
             ):  # the MX quantizer's scale conversion, "ue8m0_<rp|rz|rn>"
@@ -315,7 +287,7 @@ def sexpr(t: Term) -> str:
             out = f"(fmax {a} {b})"
         elif op == "fabs":
             out = f"(fabs {A[0]})"
-        elif op in ("fmin", "fmax"):
+        elif op == "fmin":
             out = f"({op} {A[0]} {A[1]})"
         elif op.startswith("leaf:"):
             out = "(" + op[5:] + "".join(f" {a}" for a in A) + ")"

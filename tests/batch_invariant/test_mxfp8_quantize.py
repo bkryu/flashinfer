@@ -12,7 +12,10 @@ import torch
 
 import flashinfer
 from flashinfer import SfLayout
-from flashinfer.batch_invariant import is_supported_device
+from flashinfer.batch_invariant import (
+    BatchInvariantUnsupportedError,
+    is_supported_device,
+)
 from flashinfer.batch_invariant.quantization import layout as L
 from flashinfer.batch_invariant.quantization.mx_api import MXFP8_QUANT_ARCHS
 from tests.utils_fp8 import assert_mxfp8_quantize_exact
@@ -71,12 +74,8 @@ def _varied_inputs(M, K, dtype, seed=0):
 def _quantize(x, layout, **kw):
     """The batch-invariant path through the public API; codes as uint8 and the flat scale bytes, on the host."""
     q, sf = flashinfer.mxfp8_quantize(
-        x,
-        sf_swizzle_layout=FI_LAYOUTS[layout],
-        backend="auto",
-        batch_invariant=True,
-        **kw,
-    )
+        x, sf_swizzle_layout=FI_LAYOUTS[layout], batch_invariant=True, **kw
+    )  # the default backend ("auto")
     assert q.dtype == torch.float8_e4m3fn and sf.dtype == torch.uint8 and sf.dim() == 1
     return q.view(torch.uint8).cpu(), sf.cpu()
 
@@ -218,3 +217,34 @@ def test_layouts_and_widenings_agree():
                 dtype,
                 layout,
             )
+
+
+@needs_gpu
+def test_zero_rows_and_unsupported_inputs():
+    """M = 0 returns the documented shapes without a launch; inputs outside the class raise
+    BatchInvariantUnsupportedError through the public API (never an assertion, never a fallback)."""
+    for shape, layout, sf_len in (
+        ((0, 64), "128x4", 0),
+        ((0, 5, 96), "8x4", 0),
+        ((0, 64), "linear", 0),
+    ):
+        x0 = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+        q, sf = flashinfer.mxfp8_quantize(
+            x0, sf_swizzle_layout=FI_LAYOUTS[layout], batch_invariant=True
+        )
+        assert q.shape == shape and q.dtype == torch.float8_e4m3fn
+        assert sf.shape == (sf_len,) and sf.dtype == torch.uint8
+    x = _varied_inputs(4, 1024, torch.bfloat16)
+    with pytest.raises(ValueError, match="requires backend='auto'"):
+        flashinfer.mxfp8_quantize(x, backend="cuda", batch_invariant=True)
+    with pytest.raises(BatchInvariantUnsupportedError, match="multiple of 32"):
+        flashinfer.mxfp8_quantize(x[:, :48], batch_invariant=True)
+    with pytest.raises(BatchInvariantUnsupportedError, match="rows of at most"):
+        flashinfer.mxfp8_quantize(
+            torch.zeros(2, 131072, dtype=torch.bfloat16, device="cuda"),
+            batch_invariant=True,
+        )
+    with pytest.raises(BatchInvariantUnsupportedError, match="dtype"):
+        flashinfer.mxfp8_quantize(x.to(torch.float8_e4m3fn), batch_invariant=True)
+    with pytest.raises(BatchInvariantUnsupportedError, match="CUDA device"):
+        flashinfer.mxfp8_quantize(x.cpu(), batch_invariant=True)

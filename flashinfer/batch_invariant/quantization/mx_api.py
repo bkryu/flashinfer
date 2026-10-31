@@ -25,6 +25,8 @@ from .mx_spec import DEFAULT_RULE, FORMATS, MXFP8, MXFormat, ScaleRule
 CLASS_MXFP8 = "mxfp8.quant"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
 MXFP8_QUANT_ARCHS = ((10, 0), (10, 3), (10, 7))
+#: The enumerated configuration space covers rows of up to this many input bytes (K <= 65536 for bf16 / f16, 32768 for fp32).
+MAX_ROW_BYTES = 131072
 _DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 _LAYOUT_NAMES = {
     "128x4": "128x4",
@@ -179,6 +181,12 @@ def mxfp8_quantize_batch_invariant(
     K = int(input.shape[-1])
     if K <= 0 or K % BLOCK:
         raise unsupported(CLASS_MXFP8, f"K = {K}", f"K a positive multiple of {BLOCK}")
+    if K * input.element_size() > MAX_ROW_BYTES:
+        raise unsupported(
+            CLASS_MXFP8,
+            f"K = {K} for {input.dtype}",
+            f"rows of at most {MAX_ROW_BYTES} bytes (K <= {MAX_ROW_BYTES // input.element_size()})",
+        )
     if alignment <= 0 or alignment % BLOCK:
         raise unsupported(
             CLASS_MXFP8, f"alignment = {alignment}", f"a positive multiple of {BLOCK}"
@@ -213,6 +221,18 @@ def mxfp8_quantize_batch_invariant(
         x2 = x2.clone(memory_format=torch.contiguous_format)
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
+    if (
+        x2.shape[0] == 0
+    ):  # no rows: nothing to launch; the outputs keep their documented shapes
+        codes = torch.empty(
+            (*input.shape[:-1], padded_k),
+            dtype=torch.float8_e4m3fn,
+            device=input.device,
+        )
+        sf = torch.empty(
+            sf_numel(0, padded_k, BLOCK, layout), dtype=torch.uint8, device=input.device
+        )
+        return codes, sf
     codes, sf = mx_quantize(
         x2, MXFP8, layout, config=config, enable_pdl=bool(enable_pdl), sm_count=sm_count
     )

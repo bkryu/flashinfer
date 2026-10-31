@@ -129,7 +129,7 @@ theorem tree_pad (P : Prims α) (zt : Term) (z : α) (hz : eval P zt = z)
 `tree_pad` asks for a global identity `∀ a, add z a = a`. IEEE binary32 does not satisfy
 it: `(+0) + (-0) = +0`. What does hold is the restricted law `add(v, +0) = v` for every
 `v` that is not `-0` (every `v ≥ +0`, `+∞` included; NaN payloads are out of scope), and
-the row-norm sum of squares only ever produces such values: the accumulator starts at `+0`
+a sum of squares only ever produces such values: the accumulator starts at `+0`
 and every step `fma(x, x, acc)` adds a square. `Good : α → Prop` below is that predicate,
 kept abstract. The theorems need only
 
@@ -138,7 +138,7 @@ kept abstract. The theorems need only
 * the identity law on Good values,
 * every *present* leaf evaluating to a Good value.
 
-This is exactly what `Digit.identity_note` of the row-norm spec claims
+This is exactly what `Digit.identity_note` of a sum-based spec claims
 ("add(v, +0) == v for v >= +0"; "fma(0, 0, acc) == acc; acc starts at +0 and stays >= +0").
 The kernel pads at two levels, and both are covered:
 

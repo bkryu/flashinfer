@@ -7,8 +7,7 @@ import BIKernels.Support
 Mirrors `quantization/mx_spec.py`, `quantization/mx_schedule.py` and `quantization/layout.py` of `flashinfer/batch_invariant/`.
 
 * The block amax is one `pairwise` digit of radix 32 (`[5]`) combined with `fmaxc` over the leaf `fabs(x)`; every
-  placement `[(V, reg), (32 / V, lane)]` of the kernels (and of the fused norm -> quant kernels, through
-  `quantization.blocks.block_amax`) computes it: `config_invarianceC .fmaxc` (Canon.lean) instantiated. There is no row
+  placement `[(V, reg), (32 / V, lane)]` of the kernels (`quantization.blocks.block_amax`) computes it: `config_invarianceC .fmaxc` (Canon.lean) instantiated. There is no row
   digit: a block's bits depend on its 32 inputs alone (`block_locality`), which is why the MX classes are batch
   invariant without any global-scale argument.
 * The recipe is a template with **explicit constants** (`Rule`): the normalisation of the amax (`Norm`: TE's rounded

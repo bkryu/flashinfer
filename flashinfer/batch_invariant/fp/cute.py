@@ -47,15 +47,10 @@ class CuteF32:
         return cute.math.div(a, b, rounding=RN)
 
     @staticmethod
-    def fmax(a, b):
-        """``nvvm.fmax`` (PTX ``max.f32``, FMNMX): exact, no rounding; maximumNumber NaN rule; on
-        sm_107 ``max(+0, -0) = max(-0, +0) = +0`` (bitwise commutative on non-NaN inputs)."""
-        return cute.arch.fmax(a, b)
-
-    @staticmethod
     def fmaxc(a, b):
-        """``max.f32`` as a commutative join: the same instruction as ``fmax`` (the symbolic algebra normalises the
-        operand order; the CPU model uses the measured zero rule)."""
+        """``nvvm.fmax`` (PTX ``max.f32``, FMNMX) as a commutative join: exact, no rounding; maximumNumber NaN rule; on
+        SM100-class parts ``max(+0, -0) = max(-0, +0) = +0`` (bitwise commutative on non-NaN inputs). The symbolic
+        algebra normalises the operand order; the CPU model uses the measured zero rule."""
         return cute.arch.fmax(a, b)
 
     # -- exact (rounding-free) primitives ---------------------------------------
@@ -77,9 +72,6 @@ class CuteF32:
         from cutlass._mlir.dialects import nvvm
 
         return Float32(nvvm.fabs(Float32(a).ir_value(), ftz=False))
-
-    # ``fmaxc`` is the commutative max above (same ``max.f32``); the quantizer's amax trees use it on
-    # ``fabs(x) >= +0`` operands.
 
 
 # --- declared conversion primitives and the dtype table shared by the kernels ---------------------------------------

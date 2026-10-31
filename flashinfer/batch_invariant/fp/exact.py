@@ -148,10 +148,6 @@ def fmin(a: float, b: float) -> float:
     return a if a <= b else b
 
 
-def fmax(a: float, b: float) -> float:
-    return a if a >= b else b
-
-
 # ----------------------------------------------------------------------------- block-scaled quantization primitives
 F32_MAX = 3.4028234663852886e38  # FLT_MAX, 0x7F7FFFFF
 

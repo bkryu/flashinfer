@@ -325,17 +325,6 @@ class Plan:
     def describe(self) -> str:
         return " -> ".join(s.describe() for s in self.steps) + f"  units={self.units}"
 
-    def cost(self) -> Dict[str, int]:
-        """Shuffle / exchange multiplicity (how many entries are live at each non-reg step)."""
-        out = {"shuffles": 0, "exchanged_floats_per_thread": 0}
-        for i, s in enumerate(self.steps):
-            n = len(self.keys_at(i))
-            if s.level == "lane":
-                out["shuffles"] += n
-            elif s.level in ("warp", "cta"):
-                out["exchanged_floats_per_thread"] += n * s.radix
-        return out
-
 
 def plan(red: Reduction, pl: Placement) -> Plan:
     return Plan(red, pl)
@@ -529,61 +518,3 @@ def verify(p: Plan, fp) -> Any:
 # ---------------------------------------------------------------------------
 # Blocked lowering of a fold whose trip count is a runtime value
 # ---------------------------------------------------------------------------
-@dataclass(frozen=True)
-class BlockedFold:
-    """How a kernel issues a ``fold`` digit whose step count is a *runtime* value.
-
-    A kernel cannot unroll a fold over a runtime number of steps, so the plan's single
-    register-level fold step is lowered to a loop nest: the steps are issued in blocks of
-    ``inner`` (a static radix), blocks
-    ascending, steps ascending inside a block; the fold's very first step carries the digit's
-    ``init`` (the accumulator reset) and every later step accumulates. The kernel supplies the
-    loop idiom over blocks (its trip count is runtime) and the step op; this object supplies
-    everything that decides the order and the reset: the issue order inside a block
-    (:meth:`inner_steps`), the digit value of each issue (:meth:`step_index`) and the
-    accumulate predicate (:meth:`accumulate`). :meth:`trace` simulates the whole nest for a
-    concrete block count, so the term a kernel builds is conformed node for node against the
-    reduction's canonical term.
-    """
-
-    digit: str
-    inner: int
-
-    def __post_init__(self):
-        assert self.inner >= 1, self.inner
-
-    def inner_steps(self) -> range:
-        """Issue order inside a block: ascending."""
-        return range(self.inner)
-
-    def step_index(self, blk, j: int):
-        """Digit value of issue ``(blk, j)``; ``blk`` may be a runtime value."""
-        return blk * self.inner + j
-
-    def accumulate(self, blk, j: int):
-        """Accumulate predicate of issue ``(blk, j)``: false exactly on the fold's first step
-        (block 0, step 0), which carries the init. ``blk`` may be a runtime value, in which
-        case the predicate is the runtime comparison ``blk != 0``."""
-        if j > 0:
-            return True
-        return blk != 0
-
-    def blocks_for(self, steps: int) -> int:
-        """Blocks needed for ``steps`` fold steps (the last block may be padded with identity steps)."""
-        return -(-steps // self.inner)
-
-    def trace(
-        self, red: Reduction, fp, n_blocks: int, fixed: Optional[Dict[str, int]] = None
-    ):
-        """The term the nest builds over ``n_blocks`` blocks (``n_blocks * inner`` steps) for the
-        leaves of ``red`` with its other digits held at ``fixed``."""
-        d = red.digit(self.digit)
-        assert d.shape == "fold", d
-        fixed = dict(fixed or {})
-        acc = None
-        for blk in range(n_blocks):
-            for j in self.inner_steps():
-                x = red.leaf(fp, {**fixed, self.digit: self.step_index(blk, j)})
-                assert x is not None, "blocked folds have no absent leaves"
-                acc = d.step(fp, acc if self.accumulate(blk, j) else d.init(fp), x)
-        return acc
