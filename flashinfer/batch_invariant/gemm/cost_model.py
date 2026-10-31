@@ -82,10 +82,12 @@ class Arch:
 # B200 (sm_100, 148), GB200 (sm_100, 152), B300 (sm_103, 148), GB300 (sm_103, 152). Within a family the SM count is the only
 # difference the model sees (`P = SM // cluster`, the waves, the hot-line and aggregate bounds); the family carries the fitted
 # per-SM constants and the part the memory-system numbers. The first entry of a family is its canonical part (the one measured).
-# sm_100 numbers: 148 SMs, max SM clock 1.83 GHz (sustained ~1.75 under a GEMM load), HBM3e 8 TB/s nominal (7.4 measured-class),
-# 126 MB L2, 228 KB smem (232448 B as the DSL budgets it), 512 TMEM columns; sm_103 (B300 / GB300) the same memory system at the
-# same SM counts, public figures only (placeholder until measured; its fit falls back to sm_100's).
-_SM100 = dict(clock_ghz=1.75, hbm_tbps=7.4, l2_bytes=126 << 20, smem_bytes=232448)
+# sm_100 numbers: 148 SMs, max SM clock 1.83 GHz; the sustained rate under a GEMM load is what the B200 sweep measured: the best
+# record of the heatmap grid reaches 1.61 PF = 148 x 8192 x 1.55 GHz x 0.85 (the bf16 instruction efficiency), so 1.55 GHz is the
+# clock the per-SM constants carry over at (the part throttles further over a 32768-row point); HBM3e 8 TB/s nominal (7.4
+# measured-class), 126 MB L2, 228 KB smem (232448 B as the DSL budgets it), 512 TMEM columns; sm_103 (B300 / GB300) the same memory
+# system at the same SM counts, public figures only (placeholder until measured; its fit falls back to sm_100's).
+_SM100 = dict(clock_ghz=1.55, hbm_tbps=7.4, l2_bytes=126 << 20, smem_bytes=232448)
 ARCHS: Dict[str, Arch] = {
     # Rubin NVL8 (SM107): 204 SMs, 112 MB L2; the 256x256 2-CTA mainloop sustains 36 TFLOP/s per pair at 16384 x 8192^2
     # (`mma_eff` x 8192 FLOP / clk / SM x 2.3 GHz)
@@ -139,17 +141,17 @@ def arch_for(
 class Fit:
     """The empirical constants (fitted per architecture family; the defaults are first-principles
     guesses that the entries of `cost_model_fits.json` replace). Two kinds: **per-SM physics** -- the instruction efficiency
-    (`mma_eff`, `inst_min_ns`), the per-CTA TMA path (`ktile_ns`, `ktile_2cta_ns`, `cl4_ns`,
-    `fetch_gbps`, `oob_gbps`, `ingress_gbps`, `nmajor_pen`), the ring's latency (`latency_us`), the epilogue (`epi_gbps`,
-    `tile_us`, `fill_us`) and the cluster coupling (`cluster_pen`) -- which carry across the parts of a family (the SM count enters
-    only through the structure: P, waves, aggregate demand); and **part-level** -- the aggregate L2 (`l2_tbps`, `hot_gbps`,
-    `l2_frac`, `miss_cost`), the HBM efficiency (`hbm_eff`), the launch and fixup floors (`launch_us`, `fixup_us`) and the bounds'
-    interference (`softmax_p`) -- which a part with another memory system re-fits."""
+    (`mma_eff`, `inst_min_clk`), the per-CTA TMA path (`ktile_ns`, `ktile_2cta_ns`, `fetch_gbps`, `ingress_gbps`,
+    `smem_gbps`, `nmajor_pen`), the ring's latency (`latency_us`), the epilogue (`epi_gbps`, `tile_us`, `fill_us`) and the
+    cluster coupling (`cluster_pen`) -- which carry across the parts of a family and, measured on the B200, across the two
+    generations within ~25 % (the SM count enters only through the structure: P, waves, aggregate demand); and **part-level**
+    -- the aggregate L2 (`l2_tbps`, `hot_gbps`, `l2_frac`, `miss_cost`), the HBM efficiency (`hbm_eff`), the launch and fixup
+    floors (`launch_us`, `fixup_us`), the bounds' interference (`softmax_p`), the cluster-of-four fan-in (`cl4_ns`: 31 ns on
+    sm_107, 12.5 on the B200) and the TMA zero-fill rate (`oob_gbps`: 41 vs 81 GB/s) -- which a part re-fits."""
 
     mma_eff: float = 0.92  # sustained fraction of the instruction rate in a long mainloop (kind::f16)
-    inst_min_ns: float = (
-        8.0  # the smallest time one tcgen05.mma takes (issue-bound narrow tiles)
-    )
+    inst_min_clk: float = 18.0  # the smallest time one tcgen05.mma takes, in SM clocks (issue-bound narrow tiles; a per-SM constant
+    # that carries across clocks: sm_107 8.1 clk = 3.5 ns at 2.3 GHz, the B200's fit 7.9 clk = 5.1 ns at 1.55 GHz)
     ktile_ns: float = 60.0  # per k-tile per CTA: TMA issue + mbarrier hand-shakes, serial with the fetch on the TMA path
     ktile_2cta_ns: float = 60.0  # the same on the 2-CTA instruction (the pair's hand-shake overlaps the MMA in steady state)
     fetch_gbps: float = 140.0  # per-SM TMA fetch from L2 (the bytes this CTA's TMA unit requests: its multicast share), GB/s
@@ -300,7 +302,8 @@ def predict_arrays(
     # per k-tile time
     mma_eff = fit.mma_eff
     t_inst = np.maximum(
-        2.0 * ctm * ctn * inst_k / (fpc * arch.clock_ghz) / mma_eff, fit.inst_min_ns
+        2.0 * ctm * ctn * inst_k / (fpc * arch.clock_ghz) / mma_eff,
+        fit.inst_min_clk / arch.clock_ghz,
     )  # ns
     t_mma_kt = inner * t_inst * np.where(two, fit.two_cta_gain, 1.0)
     a_stage = ctm * kb * elem

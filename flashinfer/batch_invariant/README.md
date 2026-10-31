@@ -27,7 +27,9 @@ The flag replaces the backends with the batch-invariant class rather than adding
 is batch-variant, so the autotuner must never be free to pick one); it therefore requires `backend="auto"`. Inside the
 class the autotuner is free: under `flashinfer.autotune(True)` it profiles the cost model's top configurations for the
 shape, every one of which computes the same bits, so a tuned and an untuned process agree bit for bit and differ in
-speed only. Without autotuning the dispatcher's cost model picks the configuration.
+speed only. Without autotuning the dispatcher picks the configuration: a physics-informed cost model fitted per architecture
+family on full-space sweeps of Rubin NVL8 (SM107) and B200 (SM100), parametrised by the device's SM count, corrected by
+measured override cells per part (`gemm/model_overrides*.json`). Every candidate is a member of the enumerated space.
 
 | Input | Accepted |
 |---|---|
