@@ -1,7 +1,7 @@
-import RLKernels.Canon
+import BIKernels.Canon
 /-! Canonical S-expressions, textually identical to `term.sexpr` on the Python side (`flashinfer/batch_invariant/term.py`).
 Commutative nodes (add, mul, fma's first two operands, the commutative max) print their operands sorted. -/
-namespace RLK
+namespace BIK
 
 def sortPair (a b : String) : String × String := if compare a b == .gt then (b, a) else (a, b)
 
@@ -48,4 +48,4 @@ def PlacementOK.dec : (ds : List Nat) → (ps : List (List Factor)) → Decidabl
 
 instance (ds : List Nat) (ps : List (List Factor)) : Decidable (PlacementOK ds ps) := PlacementOK.dec ds ps
 
-end RLK
+end BIK

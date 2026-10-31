@@ -1,8 +1,7 @@
-"""Device building blocks of the block-scaled quantizers: the pieces a fused
-norm -> quant kernel composes, importable without the standalone kernels' launch closures (this module imports the
-engine core, ``cute_fp``, ``cvt_fp8``, ``layout`` and ``mx_spec``; never ``mx_kernel.py``).
+"""Device building blocks of the MX quantizer, importable without the kernel's launch closure (this module imports the
+engine core, ``fp.cute``, ``layout`` and ``mx_spec``; never ``mx_kernel.py``).
 
-Stable names: ``cvt_f32_to_ue8m0``, ``cvt_f32x2_to_fp8x2`` (re-exported from ``flashinfer.batch_invariant.cvt_fp8``), ``cvt_f32x8_to_e2m1x8``,
+Stable names: ``cvt_f32_to_ue8m0``, ``cvt_f32x2_to_fp8x2`` (re-exported from ``flashinfer.batch_invariant.fp.cute``),
 ``block_amax``, ``pack_block_codes``, ``sf_offset_128x4_dev``, ``sf_offset_linear_dev``, ``SfTileStage``; plumbing:
 ``predicate``, ``tiled_copy``, ``Span``, ``LanePeers``, ``st_global_v4_u32``, ``byte_address``.
 
@@ -19,14 +18,13 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .. import canon
-from ..cvt_fp8 import cvt_f32x2_to_fp8x2  # noqa: F401  (re-exported: the e4m3 / e5m2 pair conversion)
+from ..fp.cute import cvt_f32x2_to_fp8x2  # noqa: F401  (re-exported: the e4m3 / e5m2 pair conversion)
 from .layout import SF_COL_TILE, SF_ROW_TILE, SF_ROW_TILE_8X4
 from .mx_spec import BLOCK, block_amax_placement, block_reduction, leaf_value
 
 __all__ = [
     "cvt_f32_to_ue8m0",
     "cvt_f32x2_to_fp8x2",
-    "cvt_f32x8_to_e2m1x8",
     "block_amax",
     "pack_block_codes",
     "sf_offset_128x4_dev",
@@ -73,7 +71,7 @@ def cvt_f32_to_ue8m0(a: Float32, rnd: cutlass.Constexpr[str], *, loc=None, ip=No
     saturating at byte 254, values <= 2^-127 to byte 0); ``"rn"``: the nearest power of two in linear space, ties up,
     by exact integer arithmetic on the bits of the magnitude (normal: byte = exponent + [mantissa >= 1.5]; subnormal:
     byte = [value >= 1.5 x 2^-127]; >= 2^127 and inf -> 254; NaN -> 255). Every mode converts the magnitude, as the hardware
-    modes do (never reached on the domain: the amax is ``fabs(x) >= +0``). CPU model: ``flashinfer.batch_invariant.fp32.to_ue8m0``."""
+    modes do (never reached on the domain: the amax is ``fabs(x) >= +0``). CPU model: ``flashinfer.batch_invariant.fp.exact.to_ue8m0``."""
     head = (
         f"            cvt.{rnd}.satfinite.ue8m0x2.f32 pair, zero, $2;\n"
         if rnd in ("rp", "rz")
@@ -110,62 +108,17 @@ def cvt_f32_to_ue8m0(a: Float32, rnd: cutlass.Constexpr[str], *, loc=None, ip=No
     )
 
 
-@dsl_user_op
-def cvt_f32x8_to_e2m1x8(
-    v0: Float32,
-    v1: Float32,
-    v2: Float32,
-    v3: Float32,
-    v4: Float32,
-    v5: Float32,
-    v6: Float32,
-    v7: Float32,
-    *,
-    loc=None,
-    ip=None,
-) -> Uint32:
-    """Four ``cvt.rn.satfinite.e2m1x2.f32``: element ``2j`` in the low nibble of byte ``j``, the four
-    bytes packed little-endian into one 32-bit word (byte 0 = elements 0, 1); the NVFP4 classes' conversion primitive."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                Float32(v).ir_value(loc=loc, ip=ip)
-                for v in (v0, v1, v2, v3, v4, v5, v6, v7)
-            ],
-            """
-        {
-            .reg .b8 b0, b1, b2, b3;
-            cvt.rn.satfinite.e2m1x2.f32 b0, $2, $1;
-            cvt.rn.satfinite.e2m1x2.f32 b1, $4, $3;
-            cvt.rn.satfinite.e2m1x2.f32 b2, $6, $5;
-            cvt.rn.satfinite.e2m1x2.f32 b3, $8, $7;
-            mov.b32 $0, {b0, b1, b2, b3};
-        }
-        """,
-            "=r,f,f,f,f,f,f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
 def pack_block_codes(fp, ys, elem_fmt: str):
     """The element conversion of a thread's ``V`` pre-conversion values (``saturate(quant_pre(x, inv))``, fp32): the
-    packed 32-bit words of their codes, low byte first. ``e4m3``: 4 values per word (two
-    ``cvt.rn.satfinite.e4m3x2.f32``); ``e2m1``: 8 values per word (four ``cvt.rn.satfinite.e2m1x2.f32``)."""
+    packed 32-bit words of their codes, low byte first: 4 values per word (two ``cvt.rn.satfinite.e4m3x2.f32``)."""
     V = len(ys)
-    if elem_fmt == "e4m3":
-        assert V % 4 == 0, V
-        out = []
-        for q in range(V // 4):
-            p0 = cvt_f32x2_to_fp8x2(ys[4 * q], ys[4 * q + 1], "e4m3")
-            p1 = cvt_f32x2_to_fp8x2(ys[4 * q + 2], ys[4 * q + 3], "e4m3")
-            out.append(p0.to(Uint32) | (p1.to(Uint32) << 16))
-        return out
-    assert elem_fmt == "e2m1" and V % 8 == 0, (elem_fmt, V)
-    return [cvt_f32x8_to_e2m1x8(*ys[8 * q : 8 * q + 8]) for q in range(V // 8)]
+    assert elem_fmt == "e4m3" and V % 4 == 0, (elem_fmt, V)
+    out = []
+    for q in range(V // 4):
+        p0 = cvt_f32x2_to_fp8x2(ys[4 * q], ys[4 * q + 1], "e4m3")
+        p1 = cvt_f32x2_to_fp8x2(ys[4 * q + 2], ys[4 * q + 3], "e4m3")
+        out.append(p0.to(Uint32) | (p1.to(Uint32) << 16))
+    return out
 
 
 # ----------------------------------------------------------------------------- the block amax (the engine's plan)

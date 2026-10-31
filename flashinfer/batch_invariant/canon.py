@@ -430,7 +430,7 @@ def run_steps(
 ):
     """Apply the plan's steps from index ``start`` up to (not including) the first step of digit
     ``stop_before`` (or to the end). Returns ``(state, next_step_index)``. A kernel that needs an inner
-    digit's complete partials (the NVFP4 quantizer's block amaxes before the row amax) stops here, reads
+    digit's complete partials stops here, reads
     them from the state (one entry per remaining register key) and resumes with :func:`run`."""
     i = start
     while i < len(p.steps):
@@ -535,7 +535,7 @@ class BlockedFold:
 
     A kernel cannot unroll a fold over a runtime number of steps, so the plan's single
     register-level fold step is lowered to a loop nest: the steps are issued in blocks of
-    ``inner`` (a static radix; for the GEMM, the K-steps one smem stage holds), blocks
+    ``inner`` (a static radix), blocks
     ascending, steps ascending inside a block; the fold's very first step carries the digit's
     ``init`` (the accumulator reset) and every later step accumulates. The kernel supplies the
     loop idiom over blocks (its trip count is runtime) and the step op; this object supplies
@@ -543,8 +543,7 @@ class BlockedFold:
     (:meth:`inner_steps`), the digit value of each issue (:meth:`step_index`) and the
     accumulate predicate (:meth:`accumulate`). :meth:`trace` simulates the whole nest for a
     concrete block count, so the term a kernel builds is conformed node for node against the
-    reduction's canonical term (``GemmKernelPlan.verify``) and against the Lean loop model
-    (the GEMM classes' ``kblockLoop`` model and its generated cases).
+    reduction's canonical term.
     """
 
     digit: str

@@ -1,4 +1,4 @@
-import RLKernels.Canon
+import BIKernels.Canon
 /-!
 # From term equivalence to bit equality
 
@@ -12,7 +12,7 @@ are replaced by a term that evaluates to an additive identity, the padded tree
 evaluates like the tree that drops them. This is what makes a kernel compiled for a
 `Kp` bucket exact for every hidden size in the bucket.
 -/
-namespace RLK
+namespace BIK
 
 structure Prims (α : Type) where
   xv : Nat → α
@@ -109,8 +109,7 @@ with absent leaves dropped.
 WARNING: the hypotheses `hl`/`hr` are NOT satisfied by IEEE binary32 bit
 patterns, because `(+0) + (-0) = +0`: `+0` is not an identity for `-0`. This theorem is
 kept for reference only. The realistic statement, with the identity restricted to the
-values the sums of squares can take (`Good`, i.e. "not `-0`"), is `tree_pad_good` below,
-and the kernel-level composition is `RLK.rmsnorm_bits_equal_restricted`. -/
+values a sum of squares can take (`Good`, i.e. "not `-0`"), is `tree_pad_good` below. -/
 theorem tree_pad (P : Prims α) (zt : Term) (z : α) (hz : eval P zt = z)
     (hl : ∀ a, P.add z a = a) (hr : ∀ a, P.add a z = a) :
     ∀ (n : Nat) (f : List Bool → Option Term), evalO P z (tree n (pad zt f)) = evalO P z (tree n f)
@@ -254,7 +253,7 @@ end Restricted
 
 /-! ## Restricted identity padding for any commutative combine (`treeC` / `execC`)
 
-The same statements for `Comb` (used by the NVFP4 quantizer with `.fmaxc`, `z = +0`, `Good v := v >= +0
+The same statements for `Comb` (used by the MX quantizer's block amax with `.fmaxc`, `z = +0`, `Good v := v >= +0
 and v is not -0`: every leaf is `fabs(x)`, `fmaxc(v, +0) = v` for Good `v`, and the padded (absent) blocks
 and rows are present leaves evaluating to `fabs(+0) = +0`). -/
 section RestrictedC
@@ -365,4 +364,4 @@ theorem exec_some : ∀ (fs : List Factor) (leaf : List Bool → Option Term) (c
           simp only [exec, hk]
           exact exec_some fs _ cs.tail (fun _ => tree_some f.bits _ (fun _ => h _))
 
-end RLK
+end BIK

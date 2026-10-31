@@ -1,12 +1,9 @@
 """Batch-invariant mode: deterministic, batch-invariant kernels behind ``batch_invariant=True``.
 
-The package holds the engine of the RL-ready kernels (the canonical reduction plan, the rounding-only floating-point
-wrapper, the term language and its fingerprints, the exact binary32 CPU arithmetic), the first class wired into a
-FlashInfer API (``mxfp8.quant`` behind :func:`flashinfer.mxfp8_quantize`), and the Lean project that proves the
-engine's reduction orders. ``README.md`` next to this file is the contract: the guarantee (R1-R4), the flag semantics,
-the fingerprint receipt, the supported architectures, how the test tiers run and how Lean is checked.
-
-Importing this package is light (no CuTe DSL import); the kernels are imported and compiled on first use.
+The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
+in its symbolic, exact-CPU and device backends, the term language and its fingerprints), the kernel classes behind the
+FlashInfer operators that accept the flag, and the Lean project that proves the engine's reduction orders. ``README.md``
+next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
 from __future__ import annotations
@@ -15,12 +12,10 @@ from typing import Callable, Dict, NamedTuple
 
 from .support import (
     ARCH_NAMES,
-    BATCH_INVARIANT,
     SUPPORTED_ARCHS,
     BatchInvariantUnsupportedError,
     check_device,
     is_supported_device,
-    resolve_backend,
 )
 
 
@@ -34,7 +29,7 @@ class ClassInfo(NamedTuple):
 
 
 def _mxfp8_quant_fingerprint() -> str:
-    from .quant.mx_spec import FINGERPRINT_MXFP8
+    from .quantization.mx_spec import FINGERPRINT_MXFP8
 
     return FINGERPRINT_MXFP8
 
@@ -87,7 +82,6 @@ def class_name(op: str) -> str:
 
 __all__ = [
     "ARCH_NAMES",
-    "BATCH_INVARIANT",
     "CLASSES",
     "ClassInfo",
     "SUPPORTED_ARCHS",
@@ -96,5 +90,4 @@ __all__ = [
     "class_name",
     "fingerprint",
     "is_supported_device",
-    "resolve_backend",
 ]

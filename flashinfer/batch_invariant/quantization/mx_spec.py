@@ -1,7 +1,7 @@
-"""MX (MXFP8 / MXFP4) quantization on the canon engine.
+"""MXFP8 quantization on the canon engine.
 
-Everything numeric lives here once, parameterised by an ``fp`` backend (``TermAlgebra`` symbolic,
-``flashinfer.batch_invariant.quant.reference.ExactF32`` exact CPU, ``flashinfer.batch_invariant.quant.reference.TorchF32`` vectorised CPU, ``CuteF32`` kernel):
+Everything numeric lives here once, parameterised by an ``fp`` backend (``fp.term.TermAlgebra`` symbolic, ``fp.exact``
+exact CPU, ``fp.cute.CuteF32`` kernel):
 
 * ``block_reduction``: the per-block amax as a :class:`canon.Reduction` (one ``pairwise`` digit of radix 32 combined
   with ``fmaxc``, the commutativity-normalised max of non-negative values; the leaf is ``fabs(x)`` of the exactly
@@ -13,10 +13,9 @@ Everything numeric lives here once, parameterised by an ``fp`` backend (``TermAl
   the package README (the inverse scale at UE8M0 byte 0, the clamp of infinite inputs); the pinned fingerprints below
   name the default recipe, every other variant is a different class;
 * the chains ``scale_norm`` -> ``scale_quant`` -> ``inv_scale`` (``scale_chain``) and ``quant_pre`` -> ``quant_elem``,
-  written once and called by the symbolic spec, the tracer, the CPU references, the CuTe kernel and the fused
-  norm -> quant kernels of the row-norm family (rule I8).
+  written once and called by the symbolic spec, the exact CPU evaluation and the CuTe kernel.
 
-Stable names for the fused norm -> quant kernels: ``MXFP8``, ``MXFP4``, ``FORMATS``, ``ScaleRule``, ``DEFAULT_RULE``, ``BLOCK``,
+Stable names: ``MXFP8``, ``FORMATS``, ``ScaleRule``, ``DEFAULT_RULE``, ``BLOCK``,
 ``block_reduction``, ``block_amax_placement``, ``scale_norm``, ``scale_quant``, ``scale_chain``, ``inv_scale``,
 ``quant_pre``, ``quant_elem``, ``MXQuantSpec``, ``spec_fingerprint``.
 """
@@ -27,9 +26,9 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from .. import fp32
+from ..fp import exact
 from ..canon import Digit, Placement, Reduction
-from ..term import Term, TermAlgebra, sexpr
+from ..fp.term import Term, TermAlgebra, sexpr
 from .layout import num_blocks, padded_blocks
 
 BLOCK = 32  # elements per UE8M0 scale (sf_vec_size); fixed by the OCP MX formats
@@ -41,8 +40,8 @@ AMAX_IDENTITY_NOTE = (
 # ----------------------------------------------------------------------------- the formats
 @dataclass(frozen=True)
 class MXFormat:
-    """An MX element format: ``elem_fmt`` is the declared ``cvt.rn.satfinite`` conversion (``flashinfer.batch_invariant.fp32.to_fp8`` /
-    ``to_e2m1``), ``elem_max`` its largest finite magnitude, ``emax`` the exponent of its largest power of two."""
+    """An MX element format: ``elem_fmt`` is the declared ``cvt.rn.satfinite`` conversion (``fp.exact.to_fp8``),
+    ``elem_max`` its largest finite magnitude, ``emax`` the exponent of its largest power of two."""
 
     name: str
     elem_fmt: str
@@ -52,9 +51,9 @@ class MXFormat:
 
     @property
     def c_rcp(self) -> float:
-        """TE's ``max_norm_rcp``: the binary32 nearest to ``1 / elem_max`` (0x3B124925 for e4m3, 0x3E2AAAAB for e2m1;
-        both above the exact reciprocal, and ``elem_max * c_rcp`` rounds to exactly 1.0)."""
-        return fp32.to_f32(1.0 / self.elem_max)
+        """TE's ``max_norm_rcp``: the binary32 nearest to ``1 / elem_max`` (0x3B124925 for e4m3; above the exact
+        reciprocal, and ``elem_max * c_rcp`` rounds to exactly 1.0)."""
+        return exact.to_f32(1.0 / self.elem_max)
 
     @property
     def c_pow2(self) -> float:
@@ -63,13 +62,12 @@ class MXFormat:
 
 
 MXFP8 = MXFormat("mxfp8", "e4m3", 448.0, 8, 8)
-MXFP4 = MXFormat("mxfp4", "e2m1", 6.0, 2, 4)
-FORMATS = {"mxfp8": MXFP8, "mxfp4": MXFP4}
+FORMATS = {"mxfp8": MXFP8}
 
 
 # ----------------------------------------------------------------------------- the recipe constants
 SCALE_NORMS = ("rcp", "div", "pow2")
-SCALE_ROUNDS = fp32.UE8M0_ROUNDINGS  # rp (ceil), rz (floor), rn (nearest, software)
+SCALE_ROUNDS = exact.UE8M0_ROUNDINGS  # rp (ceil), rz (floor), rn (nearest, software)
 INV_RULES = (
     "exact",
 )  # FlashInfer's zero sentinel for bytes 0 / 254 is documented, not implemented
@@ -78,7 +76,7 @@ ZERO_RULES = (
     "keep",
     "positive",
 )  # the sign of a zero product: mul keeps it; TE's fma(x, inv, +0) forms turn -0 into +0
-DATA_ROUND = "rn"  # cvt.rn.satfinite.{e4m3x2,e2m1x2}.f32: the only hardware rounding of these conversions
+DATA_ROUND = "rn"  # cvt.rn.satfinite.e4m3x2.f32: the only hardware rounding of the conversion
 
 
 @dataclass(frozen=True)
@@ -297,12 +295,10 @@ class MXQuantSpec:
 
 # The pinned fingerprints. `mxfp8.quant`: TE's chain exactly -- the fp32(1/448) normaliser, RCEIL cvt.rp.satfinite.ue8m0,
 # the exact 2^(127 - e8) inverse at every byte incl. 0, the bare cvt.rn.satfinite e4m3 of an fp32 multiply, -0 products keep
-# their sign. `mxfp4.quant`: the same conventions carried to e2m1 (fp32(1/6), RCEIL, exact inverse, bare cvt.rn.satfinite
-# e2m1, fp32 multiply), for parity with FlashInfer / TensorRT-LLM. The OCP floor rule (`OCP_FLOOR_RULE`: lower
+# their sign. The OCP floor rule (`OCP_FLOOR_RULE`: lower
 # reconstruction error, but it clips the block maximum) is a documented, unpinned variant.
 FINGERPRINT_MXFP8 = "mxquant-mxfp8-9018bd1627b3e72a"
-FINGERPRINT_MXFP4 = "mxquant-mxfp4-af5e163620dac20c"
-FINGERPRINTS = {"mxfp8": FINGERPRINT_MXFP8, "mxfp4": FINGERPRINT_MXFP4}
+FINGERPRINTS = {"mxfp8": FINGERPRINT_MXFP8}
 
 
 def spec_fingerprint(fmt: MXFormat, rule: ScaleRule = DEFAULT_RULE) -> str:

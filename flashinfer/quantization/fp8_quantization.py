@@ -357,20 +357,20 @@ def mxfp8_quantize(
             SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
         )
 
-    if batch_invariant or backend == "auto":
-        from ..batch_invariant.support import BATCH_INVARIANT, resolve_backend
-
-        # batch_invariant=True is reachable only through backend="auto" (any other
-        # value raises); "auto" without the flag is the default backend, "cuda".
-        resolved = resolve_backend(
-            "mxfp8_quantize", backend, batch_invariant, default="cuda"
-        )
-        if resolved == BATCH_INVARIANT:
-            from ..batch_invariant.quant.mx_api import mxfp8_quantize_batch_invariant
-
-            return mxfp8_quantize_batch_invariant(
-                input, sf_swizzle_layout, alignment, enable_pdl
+    if batch_invariant:
+        if backend != "auto":
+            raise ValueError(
+                "mxfp8_quantize: batch_invariant=True requires backend='auto' "
+                f"(got backend={backend!r})"
             )
+        from ..batch_invariant.quantization.mx_api import (
+            mxfp8_quantize_batch_invariant,
+        )
+
+        return mxfp8_quantize_batch_invariant(
+            input, sf_swizzle_layout, alignment, enable_pdl
+        )
+    if backend == "auto":
         backend = "cuda"
 
     if backend == "cute-dsl":

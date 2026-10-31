@@ -1,7 +1,7 @@
 /-!
 # The canon engine, formalised
 
-This file mirrors `rlk/canon.py` and proves the unbounded version of what
+This file mirrors `canon.py` and proves the unbounded version of what
 `canon.verify` checks for individual sizes.
 
 * `Term`   : uninterpreted dataflow terms, one constructor per rounded primitive.
@@ -21,7 +21,7 @@ Model-to-code correspondence (not provable here): the kernel's reduction is the 
 `apply_step` sequence executed with hardware peers; only loads, shuffles, barriers and
 predicates are outside this model and are covered by the GPU tests.
 -/
-namespace RLK
+namespace BIK
 
 inductive Term where
   | x (i : Nat)
@@ -35,7 +35,7 @@ inductive Term where
   | div (a b : Term)
   | sqrt (a : Term)
   | cvt (fmt : String) (a : Term)
-  -- exact primitives of the NVFP4 quantization family (`rlk/term.py`): `fabs`, the order-sensitive
+  -- exact primitives of the block-scaled quantizer (`fp/term.py`): `fabs`, the order-sensitive
   -- `fmin`, the commutativity-normalised max of non-negative values `fmaxc`, the select `nzor`
   | fabs (a : Term)
   | fmin (a b : Term)
@@ -348,7 +348,7 @@ theorem dispatch_irrelevant (ds : List Nat) (ps₁ ps₂ : List (List Factor)) (
 
 /-! ## The engine for any bitwise-commutative combine
 
-`rlk.canon.Digit` accepts any `pairwise` combine; the row norms use `add`, the NVFP4 quantizer's amax
+`canon.Digit` accepts any `pairwise` combine; a sum uses `add`, the MX quantizer's amax
 digits use `fmaxc` (the max of non-negative values, bitwise commutative). `Comb` names the combines
 the Lean model knows; `treeC`, `bflyC`, `execC` are `tree`, `bfly`, `exec` with the combine as a
 parameter, and the theorems below are the same proofs. `treeC .add` is `tree` (`treeC_add`), so the
@@ -528,4 +528,4 @@ theorem dispatch_irrelevantC (c : Comb) (ds : List Nat) (ps₁ ps₂ : List (Lis
     OEquiv (execC c (flatten ps₁) leaf cs₁) (execC c (flatten ps₂) leaf cs₂) :=
   (config_invarianceC c ds ps₁ leaf cs₁ hp₁ hc₁).trans (config_invarianceC c ds ps₂ leaf cs₂ hp₂ hc₂).symm
 
-end RLK
+end BIK

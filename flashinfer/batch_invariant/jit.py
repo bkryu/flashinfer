@@ -4,9 +4,9 @@ The glue maps the engine's cache contract onto :mod:`flashinfer.jit.cute_dsl_cor
 family under ``FLASHINFER_JIT_DIR`` (``<module>_<arch>_cute_dsl/``), one exported ``.o`` per kernel specialization and
 one ``meta.json`` per module whose ``source_sha256`` is the hash of the **source closure** of the module's kernels: the
 transitive closure of relative imports (module- and function-level) from the module's root files (:data:`MODULE_ROOTS`)
-plus the ``__init__`` of every package touched. The closure of the MX quantizer is {``quant/mx_kernel.py``,
-``quant/blocks.py``, ``quant/mx_spec.py``, ``quant/mx_schedule.py``, ``quant/layout.py``, ``canon.py``, ``term.py``,
-``fp32.py``, ``cute_fp.py``, ``cvt_fp8.py``, ``dtypes.py``, this file and the two ``__init__`` files}; the API module is
+plus the ``__init__`` of every package touched. The closure of the MX quantizer is {``quantization/mx_kernel.py``,
+``quantization/blocks.py``, ``quantization/mx_spec.py``, ``quantization/mx_schedule.py``, ``quantization/layout.py``, ``canon.py``, ``fp/term.py``,
+``fp/exact.py``, ``fp/cute.py``, this file and the three ``__init__`` files}; the API module is
 outside it, so editing it keeps the compiled kernels valid.
 
 Two rules of the engine's cache are kept on top of :class:`flashinfer.jit.cute_dsl_core.JitSpecCuteDsl`:
@@ -53,7 +53,7 @@ _PKG_DIR = Path(__file__).resolve().parent
 
 #: Root files of every cache module; the module's closure is the transitive relative-import closure of these files.
 MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
-    "batch_invariant_mx_quant": ("quant/mx_kernel.py",),
+    "batch_invariant_mx_quant": ("quantization/mx_kernel.py",),
 }
 
 

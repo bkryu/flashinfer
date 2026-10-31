@@ -1,5 +1,5 @@
-"""The MX quantization kernel on the canon engine: classes ``mxfp8.quant`` and
-``mxfp4.quant`` (``mx_spec.MXFormat``) for bf16 / f16 / fp32 inputs, scale factors in the 128x4 swizzled or the linear
+"""The MX quantization kernel on the canon engine: the class ``mxfp8.quant`` (``mx_spec.MXFormat``) for bf16 / f16 / fp32
+inputs, scale factors in the 128x4 swizzled or the linear
 layout (a placement of the store).
 
 The reductions are not written here: the kernel builds a :class:`canon.Plan` from the config's placement of the
@@ -25,7 +25,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint32
 
 from .. import canon, jit
-from ..cute_fp import CuteF32
+from ..fp.cute import CuteF32
 from .blocks import (
     LanePeers,
     SfTileStage,
@@ -94,8 +94,8 @@ class _Loader:
 
 
 class MXQuantKernel:
-    """MX quantization for one ``Kbp`` bucket (K is a runtime argument). Outputs: the element codes (e4m3 bytes (M, K)
-    or packed e2m1 (M, K/2)) and the UE8M0 scale bytes in the chosen layout (flat)."""
+    """MX quantization for one ``Kbp`` bucket (K is a runtime argument). Outputs: the element codes (e4m3 bytes, (M, K))
+    and the UE8M0 scale bytes in the chosen layout (flat)."""
 
     def __init__(
         self,
@@ -500,7 +500,7 @@ def _compile_bucket(
     swizzled: str,
     enable_pdl: bool,
 ):
-    from ..dtypes import get_cutlass_dtype
+    from ..fp.cute import get_cutlass_dtype
 
     dtype = get_cutlass_dtype(dtype_str)
     elem_bytes = dtype.width // 8

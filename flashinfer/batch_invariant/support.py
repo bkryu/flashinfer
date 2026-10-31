@@ -1,6 +1,6 @@
 """The contract's gates: the supported architectures, the ``backend`` rule of the batch-invariant mode and the
-"unsupported raises" rule (``README.md``, "The flag"). Light imports only: this module is imported by the stable APIs on
-every call that names ``backend="auto"`` or ``batch_invariant=True``."""
+"unsupported raises" rule (``README.md``, "The flag"). Light imports only: the operators import it on every call with
+``batch_invariant=True``."""
 
 from __future__ import annotations
 
@@ -11,10 +11,6 @@ import torch
 #: The architectures the guarantee is stated for (tcgen05 parts): SM100 (B200), SM103 (B300), SM107 (Rubin).
 SUPPORTED_ARCHS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3), (10, 7))
 ARCH_NAMES = {(10, 0): "SM100", (10, 3): "SM103", (10, 7): "SM107"}
-
-#: The internal backend token the stable APIs dispatch on after :func:`resolve_backend`.
-BATCH_INVARIANT = "batch-invariant"
-
 
 class BatchInvariantUnsupportedError(ValueError):
     """``batch_invariant=True`` was asked for an input the batch-invariant class does not cover.
@@ -31,27 +27,6 @@ def unsupported(
         "The batch-invariant mode never falls back to another kernel; call without batch_invariant=True to use "
         "the regular backends."
     )
-
-
-def resolve_backend(
-    api_name: str, backend: str, batch_invariant: bool, *, default: str
-) -> str:
-    """The ``backend`` rule of the batch-invariant mode (README.md, "The flag").
-
-    * ``batch_invariant=True``: ``backend`` MUST be ``"auto"``; the batch-invariant kernel is reachable only through
-      it, any other value raises ``ValueError``. Returns :data:`BATCH_INVARIANT`.
-    * ``batch_invariant=False``: ``"auto"`` behaves exactly as the API's default did before the flag existed
-      (``default``); any other value is returned unchanged.
-    """
-    if batch_invariant:
-        if backend != "auto":
-            raise ValueError(
-                f"{api_name}: the batch-invariant kernel is reachable only through backend='auto' "
-                f"(got backend={backend!r} with batch_invariant=True). Pass backend='auto', or drop "
-                f"batch_invariant=True to select the {backend!r} backend."
-            )
-        return BATCH_INVARIANT
-    return default if backend == "auto" else backend
 
 
 def is_supported_device(device: torch.device) -> bool:

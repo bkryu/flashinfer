@@ -104,25 +104,8 @@ def div(a: float, b: float, fmt=F32) -> float:
     return round_to_format(fr, fmt, zero_sign_neg=(_is_neg(a) != _is_neg(b)))
 
 
-def sqrt(a: float, fmt=F32) -> float:
-    if not math.isfinite(a) or a == 0:
-        return math.sqrt(a) if a >= 0 or a == 0 else NAN
-    if a < 0:
-        return NAN
-    fr = Fraction(a)
-    # a = m * 2^e with m odd integer; make e even then sqrt(m) * 2^(e/2)
-    m, d = fr.numerator, fr.denominator
-    e = -(d.bit_length() - 1)  # d is a power of two
-    if e % 2:
-        m *= 2
-        e -= 1
-    getcontext().prec = 80
-    sm = Fraction(Decimal(m).sqrt())  # 80 significant digits >> any rounding boundary
-    return round_to_format(sm * Fraction(2) ** (e // 2), fmt)
-
-
 def fmaxc(a: float, b: float) -> float:
-    """The attention class's PTX ``max.f32`` (NVVM ``fmax``, IEEE maximumNumber): a NaN operand yields the other operand;
+    """PTX ``max.f32`` (NVVM ``fmax``, IEEE maximumNumber) as a commutative join: a NaN operand yields the other operand;
     zeros of opposite sign yield ``+0`` whatever the operand order (so ``fmax`` is bitwise
     commutative on non-NaN inputs and a join of the total order ``-inf < ... < -0 < +0 < ... < inf``);
     measured on SM107."""
@@ -160,11 +143,6 @@ def to_fp8(x: float, kind: str) -> float:
     return v
 
 
-def neg(a: float) -> float:
-    """``neg.f32``: a sign flip, exact (``-(+0) = -0``)."""
-    return -a
-
-
 def fmin(a: float, b: float) -> float:
     """``min.f32`` on non-NaN operands. Equal values (incl. ``+0`` / ``-0``) return ``a``; the specs
     only clamp against non-zero constants, so that case never reaches the bits."""
@@ -175,99 +153,13 @@ def fmax(a: float, b: float) -> float:
     return a if a >= b else b
 
 
-def exp2i(k: float) -> float:
-    """The binary32 value ``2^k`` for an integer-valued ``k`` in ``[-126, 127]`` (the device builds
-    the exponent field from the integer; both are exact)."""
-    n = int(k)
-    assert n == k and -126 <= n <= 127, k
-    return math.ldexp(1.0, n)
-
-
-def rowmax(*vals: float) -> float:
-    """``max`` of non-NaN values. Its value does not depend on the association; only the sign of a
-    zero maximum could, and the MoE spec shows that sign never reaches the bits."""
-    m = vals[0]
-    for v in vals[1:]:
-        if v > m:
-            m = v
-    return m
-
-
-# ----------------------------------------------------------------------------- NVFP4 quantization primitives
+# ----------------------------------------------------------------------------- block-scaled quantization primitives
 F32_MAX = 3.4028234663852886e38  # FLT_MAX, 0x7F7FFFFF
-
-E2M1_MAGNITUDES = (
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-)  # e2m1 code k (sign bit clear) = this magnitude
-E2M1_MAX = 6.0
-_E2M1_MIDPOINTS = (
-    0.25,
-    0.75,
-    1.25,
-    1.75,
-    2.5,
-    3.5,
-    5.0,
-)  # between codes k and k+1; exact binary32 values
-# `cvt.rn.satfinite.e2m1x2.f32` maps a NaN input to the positive maximum (code 0x7 = +6.0): measured on
-# SM107 and pinned by the exhaustive device sweep of the NVFP4 class. NaN inputs are
-# out of scope for the specification; the value is recorded so the CPU model is total.
-E2M1_NAN_CODE = 0x7
 
 
 def fabs(a: float) -> float:
     """``abs.f32``: clears the sign bit, exact (``fabs(-0) = +0``; NaN stays NaN)."""
     return abs(a)
-
-
-def nzor(a: float, b: float) -> float:
-    """``a`` if ``a != 0`` else ``b`` (``setp.ne`` + ``selp``): an exact select. Both signed zeros count
-    as zero; a NaN ``a`` is ``!= 0`` and is returned."""
-    return a if a != 0 else b
-
-
-def to_e2m1(x: float) -> float:
-    """``cvt.rn.satfinite.e2m1x2.f32`` on one value, as a value: round to the nearest e2m1 magnitude
-    {0, 0.5, 1, 1.5, 2, 3, 4, 6}, ties to the even code (0.25 -> 0, 0.75 -> 1, 1.25 -> 1, 1.75 -> 2,
-    2.5 -> 2, 3.5 -> 4, 5 -> 4), magnitudes beyond 6 (infinity included) saturate to 6, the sign is
-    kept (``-0`` and small negatives give ``-0``). NaN gives ``+6.0`` (code ``E2M1_NAN_CODE``), as the
-    device does. Verified bit for bit against the device conversion over all 2^32 inputs on SM107."""
-    if math.isnan(x):
-        return E2M1_MAX
-    s = math.copysign(1.0, x)
-    a = abs(x)
-    if a >= E2M1_MAX:
-        return s * E2M1_MAX
-    code = 0
-    for k, m in enumerate(_E2M1_MIDPOINTS):
-        if a > m:
-            code = k + 1
-        else:
-            if a == m:  # tie: the even code
-                code = k + 1 if (k + 1) % 2 == 0 else k
-            break
-    return s * E2M1_MAGNITUDES[code]
-
-
-def e2m1_code(v: float) -> int:
-    """The 4-bit code of an e2m1 value (sign in bit 3)."""
-    if math.isnan(v):
-        return E2M1_NAN_CODE
-    k = E2M1_MAGNITUDES.index(abs(v))
-    return k | (0x8 if math.copysign(1.0, v) < 0 else 0)
-
-
-def e2m1_value(code: int) -> float:
-    """The value of a 4-bit e2m1 code."""
-    v = E2M1_MAGNITUDES[code & 0x7]
-    return -v if code & 0x8 else v
 
 
 def _e4m3_table():

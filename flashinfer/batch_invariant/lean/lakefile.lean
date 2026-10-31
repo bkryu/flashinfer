@@ -1,10 +1,10 @@
 import Lake
 open Lake DSL
 
-package rlkernels
+package bikernels
 
 @[default_target]
-lean_lib RLKernels
+lean_lib BIKernels
 
 lean_exe conformance where
   root := `Main

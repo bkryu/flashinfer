@@ -1,4 +1,4 @@
-"""Torch-facing entry points of the MX quantizer classes.
+"""Torch-facing entry points of the MX quantizer.
 
 :func:`mxfp8_quantize_batch_invariant` is what :func:`flashinfer.mxfp8_quantize` runs under ``batch_invariant=True``
 (``backend="auto"``): the class ``mxfp8.quant`` with FlashInfer's output contract exactly (``x_q`` a ``float8_e4m3fn``
@@ -6,7 +6,7 @@ tensor of shape ``(*input.shape[:-1], padded_K)``, ``sf`` the flat ``uint8`` UE8
 ``alignment`` pads K to a multiple of ``alignment`` with zero columns, as FlashInfer's own backends do). Every
 unsupported input raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 
-:func:`mx_quantize` is the generic entry the tests drive (any format of :data:`FORMATS`, ``config=`` to force a member
+:func:`mx_quantize` is the generic entry the tests drive (``config=`` to force a member
 of the enumerated space, ``sm_count=`` to ask the dispatcher for another SKU's pick, ``out=`` for preallocated outputs).
 Inputs bf16 / f16 / fp32 (one class per format: the 16-bit inputs are exact widenings).
 """
@@ -94,8 +94,7 @@ def mx_quantize(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``x`` (bf16 / f16 / fp32, last dim ``K`` a multiple of 32) to the MX format ``fmt``.
 
-    Returns ``(codes, sf)``: ``codes`` uint8 of shape ``(..., K)`` (e4m3 bytes, mxfp8) or ``(..., K/2)`` (two e2m1 codes
-    per byte, element ``2j`` in the low nibble, mxfp4); ``sf`` the flat uint8 UE8M0 scale bytes in the layout ``swizzled``
+    Returns ``(codes, sf)``: ``codes`` uint8 of shape ``(..., K)`` (e4m3 bytes); ``sf`` the flat uint8 UE8M0 scale bytes in the layout ``swizzled``
     names: ``"128x4"`` (rows padded to 128, scale columns to 4, padding zero), ``"8x4"`` (rows padded to 8, columns to 4)
     or ``"linear"`` (``M x K/32``). Bitwise identical for every ``config`` in :func:`mx_schedule.all_valid_configs`, for
     every batch composition, every SM count and the three layouts."""

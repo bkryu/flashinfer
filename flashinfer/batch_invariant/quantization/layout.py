@@ -1,4 +1,4 @@
-"""Scale-factor layouts shared by the block-scaled quantizers and the fused norm -> quant kernels: pure integer logic, parameterised by the block size (16 elements per e4m3 scale for NVFP4, 32 per UE8M0 scale
+"""Scale-factor layouts of the block-scaled quantizer: pure integer logic, parameterised by the block size (16 elements per e4m3 scale for NVFP4, 32 per UE8M0 scale
 for MX), imported by the kernels at trace time, by the CPU references and mirrored by the Lean model.
 
 Two layouts of the same scale bytes:

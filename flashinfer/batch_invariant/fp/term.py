@@ -4,7 +4,7 @@ A term records *which* rounded operations were applied in *which* association,
 not their numeric value. Two configs are canonical-equivalent iff they build the
 same term for every output element. Commutative ops normalise their operand order
 (IEEE add/mul are bitwise commutative), so butterfly shuffles compare equal across
-lanes. Terms can also be evaluated bit-exactly with :mod:`flashinfer.batch_invariant.fp32`.
+lanes. Terms can also be evaluated bit-exactly with :mod:`flashinfer.batch_invariant.fp.exact`.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
-from . import fp32
+from . import exact
 
 
 @dataclass(frozen=True, eq=False)
@@ -71,7 +71,7 @@ class TermAlgebra:
 
     def const(self, value: float) -> Term:
         # constants are binary32 values; keyed on the bit pattern so +0.0 and -0.0 differ
-        value = fp32.to_f32(value)
+        value = exact.to_f32(value)
         return self._mk("const", value, math.copysign(1.0, value))
 
     def sym(self, name: str) -> Term:
@@ -104,35 +104,26 @@ class TermAlgebra:
     def div(self, a: Term, b: Term) -> Term:
         return self._mk("div", a, b)
 
-    def sqrt(self, a: Term) -> Term:
-        return self._mk("sqrt", a)
 
     def fmaxc(self, a: Term, b: Term) -> Term:
-        """The attention class's ``max.f32`` (NVVM ``fmax``, maximumNumber) as a *commutative join*: on
-        SM107 it returns ``+0`` for both ``max(+0, -0)`` and ``max(-0, +0)`` (measured), so it is
-        bitwise commutative on every non-NaN pair and the operand order is normalised like ``add``
-        (the engine's lane / warp placements then verify canonical). Printed as ``(fmax a b)`` with
-        the operands sorted; ``fmax`` below is the MoE family's order-preserving clamp."""
+        """``max.f32`` (NVVM ``fmax``, maximumNumber) as a *commutative join*: on SM100-class parts it returns
+        ``+0`` for both ``max(+0, -0)`` and ``max(-0, +0)`` (measured), so it is bitwise commutative on every
+        non-NaN pair and the operand order is normalised like ``add`` (the engine's lane / warp placements then
+        verify canonical). Printed as ``(fmax a b)`` with the operands sorted; ``fmax`` below keeps the operand
+        order."""
         a, b = self._sorted2(a, b)
         return self._mk("fmaxc", a, b)
 
-    def ex2(self, a: Term) -> Term:
-        """``ex2.approx.ftz.f32``: an opaque hardware primitive (no CPU model; a device helper
-        supplies its values to the exact evaluator). ``ex2(+0) = ex2(-0) = 1``, ``ex2(-inf) = 0``."""
-        return self._mk("ex2", a)
 
     def cvt_out(self, a: Term, fmt_name: str) -> Term:
         return self._mk("cvt_out", a, fmt_name)
 
     def op(self, name: str, *args) -> Term:
-        """An opaque, non-commutative primitive (e.g. one ``tcgen05.mma`` K-step, ``ex2.approx``).
-        Its internal rounding is hardware-defined; only the dataflow around it is specified."""
+        """An opaque, non-commutative primitive whose internal rounding is hardware-defined; only the dataflow
+        around it is specified."""
         return self._mk("op:" + name, *args)
 
-    # -- exact (rounding-free) primitives, added for the MoE family -------------
-    def neg(self, a: Term) -> Term:
-        """Sign flip (exact)."""
-        return self._mk("neg", a)
+    # -- exact (rounding-free) primitives ---------------------------------------
 
     def fmin(self, a: Term, b: Term) -> Term:
         """``min.f32`` (exact, not commutativity-normalised: the operand order decides which
@@ -142,32 +133,17 @@ class TermAlgebra:
     def fmax(self, a: Term, b: Term) -> Term:
         return self._mk("fmax", a, b)
 
-    def exp2i(self, k: Term) -> Term:
-        """The binary32 ``2^k`` for an integer-valued ``k`` in ``[-126, 127]`` (exact; built from
-        the exponent bits on the device, ``ldexp`` on the CPU)."""
-        return self._mk("exp2i", k)
 
-    def rowmax(self, *vals: Term) -> Term:
-        """The maximum of ``vals`` (n-ary, exact in value for every association; the sign of a
-        zero maximum is unspecified and, where the specs use it, immaterial: see
-        ``flashinfer/batch_invariant/moe/spec.py``)."""
-        return self._mk("rowmax", *vals)
-
-    # -- exact primitives added for the NVFP4 quantization family ---------------
     def fabs(self, a: Term) -> Term:
         """``abs.f32`` (exact: the sign bit is cleared)."""
         return self._mk("fabs", a)
 
-    # ``fmaxc`` (the commutative max join, shared with the attention class) is defined above; the
-    # quantizer's leaves are ``fabs(x) >= +0``, where it coincides with the MoE's order-sensitive ``fmax``.
+    # ``fmaxc`` (the commutative max join) is defined above; the quantizer's leaves are ``fabs(x) >= +0``, where it
+    # coincides with the order-preserving ``fmax``.
 
-    def nzor(self, a: Term, b: Term) -> Term:
-        """``a`` if ``a != 0`` else ``b`` (an exact comparison-and-select, ``setp.ne`` + ``selp``)."""
-        return self._mk("nzor", a, b)
 
     def leaf(self, name: str, *coords) -> Term:
-        """A named input leaf with integer coordinates (``leaf("l", e)``: a router logit;
-        ``leaf("y", r, h)``: an expert output). Evaluation binds ``syms["leaf:" + name]`` to a
+        """A named input leaf with integer coordinates. Evaluation binds ``syms["leaf:" + name]`` to a
         function of the coordinates."""
         return self._mk("leaf:" + name, *coords)
 
@@ -180,7 +156,7 @@ def evaluate(
     syms: Dict[str, Any] | None = None,
     r_val=None,
 ) -> float:
-    """Bit-exact evaluation of a term with :mod:`flashinfer.batch_invariant.fp32`.
+    """Bit-exact evaluation of a term with :mod:`flashinfer.batch_invariant.fp.exact`.
 
     ``x_val(row, i)`` and ``w_val(i)`` return the float32 value of the inputs;
     ``syms`` binds symbolic scalars created with :meth:`TermAlgebra.sym`.
@@ -211,19 +187,19 @@ def evaluate(
         elif op == "sym":
             v = float(syms[cur.args[0]])
         elif op == "add":
-            v = fp32.add(memo[cur.args[0].uid], memo[cur.args[1].uid])
+            v = exact.add(memo[cur.args[0].uid], memo[cur.args[1].uid])
         elif op == "mul":
-            v = fp32.mul(memo[cur.args[0].uid], memo[cur.args[1].uid])
+            v = exact.mul(memo[cur.args[0].uid], memo[cur.args[1].uid])
         elif op == "fma":
-            v = fp32.fma(
+            v = exact.fma(
                 memo[cur.args[0].uid], memo[cur.args[1].uid], memo[cur.args[2].uid]
             )
         elif op == "div":
-            v = fp32.div(memo[cur.args[0].uid], memo[cur.args[1].uid])
+            v = exact.div(memo[cur.args[0].uid], memo[cur.args[1].uid])
         elif op == "sqrt":
-            v = fp32.sqrt(memo[cur.args[0].uid])
+            v = exact.sqrt(memo[cur.args[0].uid])
         elif op == "fmaxc":
-            v = fp32.fmaxc(memo[cur.args[0].uid], memo[cur.args[1].uid])
+            v = exact.fmaxc(memo[cur.args[0].uid], memo[cur.args[1].uid])
         elif op == "ex2":
             fn = (syms or {}).get("ex2")
             if fn is None:
@@ -232,19 +208,19 @@ def evaluate(
                 )
             v = fn(memo[cur.args[0].uid])
         elif op == "neg":
-            v = fp32.neg(memo[cur.args[0].uid])
+            v = exact.neg(memo[cur.args[0].uid])
         elif op == "fmin":
-            v = fp32.fmin(memo[cur.args[0].uid], memo[cur.args[1].uid])
+            v = exact.fmin(memo[cur.args[0].uid], memo[cur.args[1].uid])
         elif op == "fmax":
-            v = fp32.fmax(memo[cur.args[0].uid], memo[cur.args[1].uid])
+            v = exact.fmax(memo[cur.args[0].uid], memo[cur.args[1].uid])
         elif op == "exp2i":
-            v = fp32.exp2i(memo[cur.args[0].uid])
+            v = exact.exp2i(memo[cur.args[0].uid])
         elif op == "rowmax":
-            v = fp32.rowmax(*[memo[a.uid] for a in cur.args])
+            v = exact.rowmax(*[memo[a.uid] for a in cur.args])
         elif op == "fabs":
-            v = fp32.fabs(memo[cur.args[0].uid])
+            v = exact.fabs(memo[cur.args[0].uid])
         elif op == "nzor":
-            v = fp32.nzor(memo[cur.args[0].uid], memo[cur.args[1].uid])
+            v = exact.nzor(memo[cur.args[0].uid], memo[cur.args[1].uid])
         elif op.startswith("leaf:"):
             fn = (syms or {}).get(op)
             if fn is None:
@@ -258,16 +234,16 @@ def evaluate(
         elif op == "cvt_out":
             kind = cur.args[1]
             if kind in ("e4m3", "e5m2"):
-                v = fp32.to_fp8(memo[cur.args[0].uid], kind)
+                v = exact.to_fp8(memo[cur.args[0].uid], kind)
             elif kind == "e2m1":
-                v = fp32.to_e2m1(memo[cur.args[0].uid])
+                v = exact.to_e2m1(memo[cur.args[0].uid])
             elif kind.startswith(
                 "ue8m0_"
             ):  # the MX quantizer's scale conversion, "ue8m0_<rp|rz|rn>"
-                v = fp32.to_ue8m0(memo[cur.args[0].uid], kind[6:])
+                v = exact.to_ue8m0(memo[cur.args[0].uid], kind[6:])
             else:
-                fmt = {"f32": fp32.F32, "bf16": fp32.BF16, "f16": fp32.F16}[kind]
-                v = fp32.to_format(memo[cur.args[0].uid], fmt)
+                fmt = {"f32": exact.F32, "bf16": exact.BF16, "f16": exact.F16}[kind]
+                v = exact.to_format(memo[cur.args[0].uid], fmt)
         else:  # pragma: no cover
             raise ValueError(op)
         memo[cur.uid] = v
@@ -338,50 +314,17 @@ def sexpr(t: Term) -> str:
             out = f"(fma {a} {b} {A[2]})"
         elif op == "div":
             out = f"(div {A[0]} {A[1]})"
-        elif op == "sqrt":
-            out = f"(sqrt {A[0]})"
         elif op == "fmaxc":
             a, b = sorted(A[:2])
             out = f"(fmax {a} {b})"
-        elif op == "ex2":
-            out = f"(ex2 {A[0]})"
-        elif op in ("neg", "exp2i", "fabs"):
-            out = f"({op} {A[0]})"
-        elif op in ("fmin", "fmax", "nzor"):
+        elif op == "fabs":
+            out = f"(fabs {A[0]})"
+        elif op in ("fmin", "fmax"):
             out = f"({op} {A[0]} {A[1]})"
-        elif op == "rowmax":
-            out = "(rowmax " + " ".join(A) + ")"
         elif op.startswith("leaf:"):
             out = "(" + op[5:] + "".join(f" {a}" for a in A) + ")"
         elif op == "cvt_out":
             out = f"(cvt {A[1]} {A[0]})"
-        elif op == "op:mma_bf16_k16":
-            out = f"(mma16 {A[0]} {A[1]})"
-        elif op == "op:mma_nvfp4_k64":
-            out = f"(mma64bs {A[0]} {A[1]})"
-        elif op == "op:mma_nvfp4_k128":
-            out = f"(mma128bs {A[0]} {A[1]})"
-        elif op == "op:mma_mxfp8_k32":
-            out = f"(mma32mx {A[0]} {A[1]})"  # the MX GEMM classes: UE8M0 scales per 32 elements
-        elif op == "op:mma_mxfp4_k64":
-            out = f"(mma64mx {A[0]} {A[1]})"
-        elif op == "op:mma_mxfp8_k64":
-            out = f"(mma64mx8 {A[0]} {A[1]})"  # the SM107 MX GEMM classes (K = 64 / 128 steps)
-        elif op == "op:mma_mxfp4_k128":
-            out = f"(mma128mx4 {A[0]} {A[1]})"
-
-        elif op == "op:ab_kslice":
-            out = f"(ab {A[0]} {A[1]})"
-        elif op == "op:absf_kslice":
-            out = f"(absf {A[0]} {A[1]} {A[2]} {A[3]})"
-        elif op == "op:sfa_rows":
-            out = f"(sfa {A[0]} {A[1]})"
-        elif op == "op:sfb_cols":
-            out = f"(sfb {A[0]} {A[1]})"
-        elif op == "op:a_rows":
-            out = f"(a {A[0]} {A[1]})"
-        elif op == "op:b_cols":
-            out = f"(b {A[0]} {A[1]})"
         else:
             out = "(" + op + " " + " ".join(map(str, A)) + ")"
         memo[cur.uid] = out

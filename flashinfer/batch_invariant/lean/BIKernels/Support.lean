@@ -1,12 +1,10 @@
-import RLKernels.Canon
+import BIKernels.Canon
 /-!
 # Shared helpers of the op files
 
 Little-endian bit lists as numbers, the prefix of a bit list and the zero-extended row (the kernels' view of a row
-beyond its runtime length), with the two bounds `MXQuant.lean` needs. In the source repository these live in
-`RMSNorm.lean` / `Quant.lean`; the FlashInfer package carries only the engine files the wired classes need, so the
-helpers are collected here. -/
-namespace RLK
+beyond its runtime length), with the two bounds `MXQuant.lean` needs. -/
+namespace BIK
 
 /-- little-endian bits to a number -/
 def bitsToNat : List Bool → Nat
@@ -34,4 +32,4 @@ theorem takeN_length_le : ∀ (n : Nat) (l : List Bool), (takeN n l).length ≤ 
   | _+1, [] => Nat.zero_le _
   | n+1, _ :: bs => Nat.succ_le_succ (takeN_length_le n bs)
 
-end RLK
+end BIK

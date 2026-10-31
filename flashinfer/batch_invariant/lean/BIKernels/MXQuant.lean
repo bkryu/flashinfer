@@ -1,14 +1,14 @@
-import RLKernels.Canon
-import RLKernels.Semantics
-import RLKernels.Support
+import BIKernels.Canon
+import BIKernels.Semantics
+import BIKernels.Support
 /-!
-# MX quantization on the engine: classes `mxfp8.quant` and `mxfp4.quant`
+# MX quantization on the engine: the class `mxfp8.quant`
 
-Mirrors `quant/mx_spec.py`, `quant/mx_schedule.py` and `quant/layout.py` of `flashinfer/batch_invariant/`.
+Mirrors `quantization/mx_spec.py`, `quantization/mx_schedule.py` and `quantization/layout.py` of `flashinfer/batch_invariant/`.
 
 * The block amax is one `pairwise` digit of radix 32 (`[5]`) combined with `fmaxc` over the leaf `fabs(x)`; every
   placement `[(V, reg), (32 / V, lane)]` of the kernels (and of the fused norm -> quant kernels, through
-  `quant.blocks.block_amax`) computes it: `config_invarianceC .fmaxc` (Canon.lean) instantiated. There is no row
+  `quantization.blocks.block_amax`) computes it: `config_invarianceC .fmaxc` (Canon.lean) instantiated. There is no row
   digit: a block's bits depend on its 32 inputs alone (`block_locality`), which is why the MX classes are batch
   invariant without any global-scale argument.
 * The recipe is a template with **explicit constants** (`Rule`): the normalisation of the amax (`Norm`: TE's rounded
@@ -29,8 +29,8 @@ Mirrors `quant/mx_spec.py`, `quant/mx_schedule.py` and `quant/layout.py` of `fla
   on the exact magnitude `a * 2^e` of a binary32 input (assumption A5): the Python model `fp32.to_ue8m0` and the device
   are each checked against it (conformance table; the exhaustive device sweep).
 -/
-namespace RLK.MXQuant
-open RLK
+namespace BIK.MXQuant
+open BIK
 
 /-! ## The block amax -/
 
@@ -76,34 +76,28 @@ theorem placementElem_ok (vb lb : Nat) (h : vb + lb = 5) : PlacementOK [5] (plac
 /-! ## The formats and the recipe constants
 
 Python prints binary32 constants as `repr(float(c))`: `fp32(1/448) = 0x3B124925` is `0.0022321429569274187`,
-`fp32(1/6) = 0x3E2AAAAB` is `0.1666666716337204`, `2^-8` is `0.00390625`, `2^-2` is `0.25`. -/
+`2^-8` is `0.00390625`. -/
 
 inductive Fmt where
   | mxfp8
-  | mxfp4
   deriving DecidableEq, Repr
 
 def Fmt.elemFmt : Fmt → String
   | .mxfp8 => "e4m3"
-  | .mxfp4 => "e2m1"
 
 def Fmt.elemMax : Fmt → String
   | .mxfp8 => "448.0"
-  | .mxfp4 => "6.0"
 
 def Fmt.negElemMax : Fmt → String
   | .mxfp8 => "-448.0"
-  | .mxfp4 => "-6.0"
 
 /-- TE's `max_norm_rcp`: the binary32 nearest to `1 / elem_max`. -/
 def Fmt.cRcp : Fmt → String
   | .mxfp8 => "0.0022321429569274187"
-  | .mxfp4 => "0.1666666716337204"
 
 /-- `2^-emax`: the exact normalisation of OCP's `floor(log2(amax)) - emax` rule. -/
 def Fmt.cPow2 : Fmt → String
   | .mxfp8 => "0.00390625"
-  | .mxfp4 => "0.25"
 
 inductive Norm where
   | rcp   -- `mul(amax, c_rcp)`: TE, FlashInfer's CuTe mxfp8 (the default)
@@ -140,7 +134,7 @@ structure Rule where
   deriving DecidableEq, Repr
 
 namespace Rule
-/-- TE's chain (the Python `DEFAULT_RULE`): the pinned recipe of `mxfp8.quant` and `mxfp4.quant`. -/
+/-- TE's chain (the Python `DEFAULT_RULE`): the pinned recipe of `mxfp8.quant`. -/
 def te : Rule := {}
 /-- OCP's shared exponent `floor(log2(amax)) - emax` (lower reconstruction error, clips the block maximum; declined for parity). -/
 def ocpFloor : Rule := { norm := .pow2, rnd := .rz }
@@ -386,4 +380,4 @@ theorem ue8m0_saturates : ue8m0Byte .rp 1 (-127) = 0 ∧ ue8m0Byte .rp 1 (-140) 
     ∧ ue8m0Byte .rn 3 (-128) = 1 ∧ ue8m0Byte .rp 1 127 = 254 ∧ ue8m0Byte .rp 3 126 = 254 ∧ ue8m0Byte .rz 3 127 = 254
     ∧ ue8m0Byte .rp 0 0 = 0 := by native_decide
 
-end RLK.MXQuant
+end BIK.MXQuant

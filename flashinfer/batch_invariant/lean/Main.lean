@@ -1,9 +1,9 @@
-import RLKernels.Export
-import RLKernels.Cases
+import BIKernels.Export
+import BIKernels.Cases
 /-! `lake exe conformance`: print the Lean model's terms for the generated cases. The Python test
 (`tests/batch_invariant/test_mxfp8_quantize.py`, the Lean tier) compares these strings with the Python engine's / spec's
 S-expressions. -/
-open RLK
+open BIK
 
 def main : IO Unit := do
   let qrow : Nat → Term := fun i => Term.x i
