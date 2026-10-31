@@ -14,6 +14,7 @@ import flashinfer
 from flashinfer import SfLayout
 from flashinfer.batch_invariant import is_supported_device
 from flashinfer.batch_invariant.quantization import layout as L
+from flashinfer.batch_invariant.quantization.mx_api import MXFP8_QUANT_ARCHS
 from tests.utils_fp8 import assert_mxfp8_quantize_exact
 
 DT = [torch.bfloat16, torch.float16, torch.float32]
@@ -36,7 +37,7 @@ FI_LAYOUTS = {
 
 def _gpu_ok():
     return torch.cuda.is_available() and is_supported_device(
-        torch.device("cuda", torch.cuda.current_device())
+        torch.device("cuda", torch.cuda.current_device()), MXFP8_QUANT_ARCHS
     )
 
 

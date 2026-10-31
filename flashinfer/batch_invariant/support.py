@@ -1,16 +1,11 @@
-"""The contract's gates: the supported architectures, the ``backend`` rule of the batch-invariant mode and the
-"unsupported raises" rule (``README.md``, "The flag"). Light imports only: the operators import it on every call with
-``batch_invariant=True``."""
+"""The gates of the batch-invariant mode: the device check of an operator's class and the "unsupported raises" rule.
+Light imports only: the operators import this module on every call with ``batch_invariant=True``."""
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Iterable, Tuple
 
 import torch
-
-#: The architectures the guarantee is stated for (tcgen05 parts): SM100 (B200), SM103 (B300), SM107 (Rubin).
-SUPPORTED_ARCHS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3), (10, 7))
-ARCH_NAMES = {(10, 0): "SM100", (10, 3): "SM103", (10, 7): "SM107"}
 
 
 class BatchInvariantUnsupportedError(ValueError):
@@ -30,14 +25,19 @@ def unsupported(
     )
 
 
-def is_supported_device(device: torch.device) -> bool:
-    """Whether ``device`` is a CUDA device of a supported architecture that the installed CuTe DSL can target."""
+def _arch_names(archs: Iterable[Tuple[int, int]]) -> str:
+    return " / ".join(f"SM{a}{b}" for a, b in archs)
+
+
+def is_supported_device(device: torch.device, archs: Iterable[Tuple[int, int]]) -> bool:
+    """Whether ``device`` is a CUDA device of one of the compute capabilities ``archs`` that the installed CuTe DSL can
+    target. Each class states its own ``archs``."""
     if device.type != "cuda":
         return False
     from ..utils import get_compute_capability
 
     cc = get_compute_capability(device)
-    if cc not in SUPPORTED_ARCHS:
+    if cc not in tuple(archs):
         return False
     from ..cute_dsl.availability import (
         is_cute_dsl_arch_supported,
@@ -47,21 +47,26 @@ def is_supported_device(device: torch.device) -> bool:
     return is_cute_dsl_available() and is_cute_dsl_arch_supported(*cc)
 
 
-def check_device(device: torch.device, class_name: str) -> Tuple[int, int]:
-    """The compute capability of ``device``, or :class:`BatchInvariantUnsupportedError` naming the limit."""
-    archs = " / ".join(ARCH_NAMES[a] for a in SUPPORTED_ARCHS)
+def check_device(
+    device: torch.device, class_name: str, archs: Iterable[Tuple[int, int]]
+) -> Tuple[int, int]:
+    """The compute capability of ``device``, or :class:`BatchInvariantUnsupportedError` naming the limit; ``archs`` are
+    the compute capabilities the class ``class_name`` supports."""
+    archs = tuple(archs)
     if device.type != "cuda":
         raise unsupported(
-            class_name, f"device {device}", f"a CUDA device of architecture {archs}"
+            class_name,
+            f"device {device}",
+            f"a CUDA device of architecture {_arch_names(archs)}",
         )
     from ..utils import get_compute_capability
 
     cc = get_compute_capability(device)
-    if cc not in SUPPORTED_ARCHS:
+    if cc not in archs:
         raise unsupported(
             class_name,
             f"compute capability {cc[0]}.{cc[1]}",
-            f"the architectures {archs}",
+            f"the architectures {_arch_names(archs)}",
         )
     from ..cute_dsl.availability import (
         is_cute_dsl_arch_supported,

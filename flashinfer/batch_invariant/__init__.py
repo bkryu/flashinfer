@@ -11,8 +11,6 @@ from __future__ import annotations
 from typing import Callable, Dict, NamedTuple
 
 from .support import (
-    ARCH_NAMES,
-    SUPPORTED_ARCHS,
     BatchInvariantUnsupportedError,
     check_device,
     is_supported_device,
@@ -81,10 +79,8 @@ def class_name(op: str) -> str:
 
 
 __all__ = [
-    "ARCH_NAMES",
     "CLASSES",
     "ClassInfo",
-    "SUPPORTED_ARCHS",
     "BatchInvariantUnsupportedError",
     "check_device",
     "class_name",

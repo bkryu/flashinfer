@@ -23,6 +23,8 @@ from .mx_schedule import BLOCK, MXQuantConfig, default_config, num_blocks
 from .mx_spec import DEFAULT_RULE, FORMATS, MXFP8, MXFormat, ScaleRule
 
 CLASS_MXFP8 = "mxfp8.quant"
+#: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
+MXFP8_QUANT_ARCHS = ((10, 0), (10, 3), (10, 7))
 _DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 _LAYOUT_NAMES = {
     "128x4": "128x4",
@@ -165,7 +167,7 @@ def mxfp8_quantize_batch_invariant(
     K not a multiple of 32, layout, device, architecture); it never falls back."""
     from ...utils import device_support_pdl
 
-    check_device(input.device, CLASS_MXFP8)
+    check_device(input.device, CLASS_MXFP8, MXFP8_QUANT_ARCHS)
     if input.dtype not in _DTYPE_STR:
         raise unsupported(
             CLASS_MXFP8, f"input dtype {input.dtype}", "bf16, f16 or fp32 inputs"

@@ -1,4 +1,4 @@
-"""Generate ``lean/BIKernels/Cases.lean`` from the Python side (the level-2 coupling of the README).
+"""Generate ``lean/BIKernels/Cases.lean`` from the Python side.
 
 For the MX quantizer the file carries
 

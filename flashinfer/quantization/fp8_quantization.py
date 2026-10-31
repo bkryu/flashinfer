@@ -309,27 +309,18 @@ def mxfp8_quantize(
 
         - ``"cuda"``: stable JIT-compiled CUDA kernel (default).
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
-        - ``"auto"``: with ``batch_invariant=False`` the same as ``"cuda"``;
-          the only value accepted with ``batch_invariant=True``.
+        - ``"auto"``: ``"cuda"``, unless ``batch_invariant=True`` (which
+          requires ``"auto"``).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``.
     batch_invariant : bool
-        Run the batch-invariant class ``mxfp8.quant`` of
-        :mod:`flashinfer.batch_invariant` (keyword-only; defaults to
-        ``False``). The output bits then depend on the input values alone:
-        the same row quantizes to the same bits in any batch, under any
-        configuration the dispatcher picks and in any scale-factor layout
-        (``flashinfer.batch_invariant.fingerprint("mxfp8_quantize")`` is
-        the receipt). Requires ``backend="auto"`` (any other value raises
-        ``ValueError``) and an SM100 / SM103 / SM107 device; an unsupported
-        input, dtype, layout or architecture raises
-        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
-        instead of falling back to another kernel. The dataflow is
-        TransformerEngine's MXFP8 chain; it differs from the ``"cuda"`` and
-        ``"cute-dsl"`` backends only on blocks whose amax is below
-        ``448 * 2**-127`` (kept, where those backends zero them) and on
-        ``-inf`` elements (see ``flashinfer/batch_invariant/README.md``).
+        Use the batch-invariant kernel of :mod:`flashinfer.batch_invariant`:
+        the output is deterministic and batch invariant (a row's bits do not
+        depend on the batch it is quantized in, so they are also permutation
+        and sub-batch invariant). Requires ``backend="auto"``; supported on
+        SM100 / SM103 / SM107; never falls back to a non-batch-invariant
+        kernel. The dataflow follows TransformerEngine's MXFP8 chain.
 
     Returns
     -------
