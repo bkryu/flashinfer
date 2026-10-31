@@ -18,7 +18,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.math import RoundingMode
 from cutlass.cutlass_dsl import T, dsl_user_op
 import cutlass
-from cutlass import Float32, Uint16
+from cutlass import Uint16
 
 RN = RoundingMode.NEAREST_EVEN
 
@@ -46,7 +46,6 @@ class CuteF32:
     def div(a, b):
         return cute.math.div(a, b, rounding=RN)
 
-
     @staticmethod
     def fmax(a, b):
         """``nvvm.fmax`` (PTX ``max.f32``, FMNMX): exact, no rounding; maximumNumber NaN rule; on
@@ -58,8 +57,6 @@ class CuteF32:
         """``max.f32`` as a commutative join: the same instruction as ``fmax`` (the symbolic algebra normalises the
         operand order; the CPU model uses the measured zero rule)."""
         return cute.arch.fmax(a, b)
-
-
 
     # -- exact (rounding-free) primitives ---------------------------------------
 
@@ -86,6 +83,7 @@ class CuteF32:
 
 
 # --- declared conversion primitives and the dtype table shared by the kernels ---------------------------------------
+
 
 # The declared fp8 conversion primitive shared by the kernels that quantize to e4m3 / e5m2: ``cvt.rn.satfinite.{e4m3,e5m2}x2.f32``
 # (RNE, saturating to the largest finite value; the exact CPU model is :func:`flashinfer.batch_invariant.fp.exact.to_fp8`).

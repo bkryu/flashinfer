@@ -76,7 +76,9 @@ ZERO_RULES = (
     "keep",
     "positive",
 )  # the sign of a zero product: mul keeps it; TE's fma(x, inv, +0) forms turn -0 into +0
-DATA_ROUND = "rn"  # cvt.rn.satfinite.e4m3x2.f32: the only hardware rounding of the conversion
+DATA_ROUND = (
+    "rn"  # cvt.rn.satfinite.e4m3x2.f32: the only hardware rounding of the conversion
+)
 
 
 @dataclass(frozen=True)

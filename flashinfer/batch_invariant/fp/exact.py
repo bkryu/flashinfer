@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 import struct
-from decimal import Decimal, getcontext
 from fractions import Fraction
 
 INF = float("inf")

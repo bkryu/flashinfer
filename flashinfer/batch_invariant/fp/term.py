@@ -104,7 +104,6 @@ class TermAlgebra:
     def div(self, a: Term, b: Term) -> Term:
         return self._mk("div", a, b)
 
-
     def fmaxc(self, a: Term, b: Term) -> Term:
         """``max.f32`` (NVVM ``fmax``, maximumNumber) as a *commutative join*: on SM100-class parts it returns
         ``+0`` for both ``max(+0, -0)`` and ``max(-0, +0)`` (measured), so it is bitwise commutative on every
@@ -113,7 +112,6 @@ class TermAlgebra:
         order."""
         a, b = self._sorted2(a, b)
         return self._mk("fmaxc", a, b)
-
 
     def cvt_out(self, a: Term, fmt_name: str) -> Term:
         return self._mk("cvt_out", a, fmt_name)
@@ -133,14 +131,12 @@ class TermAlgebra:
     def fmax(self, a: Term, b: Term) -> Term:
         return self._mk("fmax", a, b)
 
-
     def fabs(self, a: Term) -> Term:
         """``abs.f32`` (exact: the sign bit is cleared)."""
         return self._mk("fabs", a)
 
     # ``fmaxc`` (the commutative max join) is defined above; the quantizer's leaves are ``fabs(x) >= +0``, where it
     # coincides with the order-preserving ``fmax``.
-
 
     def leaf(self, name: str, *coords) -> Term:
         """A named input leaf with integer coordinates. Evaluation binds ``syms["leaf:" + name]`` to a

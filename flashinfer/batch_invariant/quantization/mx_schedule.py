@@ -337,7 +337,9 @@ TILE_MIN_CTAS_PER_SM = 1  # the 32-block, 16-warp tile once its grid holds one C
 #                           the best row configuration by 10-22 % at M >= 16384 x K >= 1024 and M >= 4096 x K >= 6144, on SM100 it is within
 #                           -7..+4 % there; below one CTA per SM it loses 1.2-5x on both (its serial row passes starve memory parallelism).
 TILE_W16_MIN_CTAS_PER_SM = 0  # always 16 warps per tile CTA (the 8-warp tile never measured better by more than a few percent)
-TILE_TIERS = ((16, 2),)  # (V, blocks per lane per pass): one tile shape, 32 blocks per pass; V >= LANE_BYTES_MIN / elem_bytes, so fp32
+TILE_TIERS = (
+    (16, 2),
+)  # (V, blocks per lane per pass): one tile shape, 32 blocks per pass; V >= LANE_BYTES_MIN / elem_bytes, so fp32
 #                          inputs (4 KB of input per row per CTA > TILE_MAX_BYTES_PER_ROW) have no tile tier
 ROW_LARGE_CTAS_PER_SM = 2  # a row grid with fewer CTAs per SM than this is latency-bound: the most lanes per row
 LANE_BYTES = 64  # bytes of input per lane per block in the row tier: V = 64 / elem_bytes (32 for bf16 / f16, 16 for fp32)

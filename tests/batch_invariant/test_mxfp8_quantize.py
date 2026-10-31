@@ -93,7 +93,10 @@ def test_matches_reference(dtype, layout):
     for M, K in SWEEP:
         x = _varied_inputs(M, K, dtype, seed=M + K)
         q, sf = flashinfer.mxfp8_quantize(
-            x, sf_swizzle_layout=FI_LAYOUTS[layout], backend="auto", batch_invariant=True
+            x,
+            sf_swizzle_layout=FI_LAYOUTS[layout],
+            backend="auto",
+            batch_invariant=True,
         )
         assert_mxfp8_quantize_exact(x, q, sf, sf_swizzle_layout=FI_LAYOUTS[layout])
     x = _varied_inputs(37, 96, dtype, seed=1)
@@ -169,7 +172,9 @@ def test_batch_permutation_subbatch_invariance(K, dtype, layout):
         xo = other.clone()
         xo[pos] = xb[i]
         got = _rows(xo, layout, K)
-        _assert_rows_equal((got[0][pos : pos + 1], got[1][pos : pos + 1]), full, torch.tensor([i]))
+        _assert_rows_equal(
+            (got[0][pos : pos + 1], got[1][pos : pos + 1]), full, torch.tensor([i])
+        )
     big = _varied_inputs(2048, K, dtype, seed=9)
     where = torch.randperm(2048, generator=g)[:M]
     big[where.cuda()] = xb

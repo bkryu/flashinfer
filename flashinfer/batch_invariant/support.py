@@ -12,6 +12,7 @@ import torch
 SUPPORTED_ARCHS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3), (10, 7))
 ARCH_NAMES = {(10, 0): "SM100", (10, 3): "SM103", (10, 7): "SM107"}
 
+
 class BatchInvariantUnsupportedError(ValueError):
     """``batch_invariant=True`` was asked for an input the batch-invariant class does not cover.
 
