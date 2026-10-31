@@ -216,8 +216,11 @@ def mxfp8_quantize_batch_invariant(
         )
         x2[:, :K] = rows
     required_align = 16
-    if x2.data_ptr() % required_align:
-        # a contiguous view with an under-aligned storage offset: the 16-byte vector loads need an aligned base
+    if x2.data_ptr() % required_align or (
+        x2.shape[0] > 1 and (x2.stride(0) * x2.element_size()) % required_align
+    ):
+        # an under-aligned storage offset or a row stride that is not a multiple of 16 bytes (a view into a wider
+        # tensor): the 16-byte vector loads need both; the copy is a placement, not numerics
         x2 = x2.clone(memory_format=torch.contiguous_format)
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)

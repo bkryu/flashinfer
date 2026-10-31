@@ -248,3 +248,9 @@ def test_zero_rows_and_unsupported_inputs():
         flashinfer.mxfp8_quantize(x.to(torch.float8_e4m3fn), batch_invariant=True)
     with pytest.raises(BatchInvariantUnsupportedError, match="CUDA device"):
         flashinfer.mxfp8_quantize(x.cpu(), batch_invariant=True)
+    wide = _varied_inputs(
+        8, 4100, torch.bfloat16, seed=7
+    )  # row stride 8200 bytes: not a multiple of 16
+    view = wide[:, :4096]
+    assert view.stride(0) * 2 % 16 != 0
+    assert _same(_quantize(view, "128x4"), _quantize(view.contiguous(), "128x4"))
