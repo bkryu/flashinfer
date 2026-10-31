@@ -37,6 +37,14 @@ def sm_count_of(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def part_of(device: torch.device) -> Tuple[int, str]:
+    """The part the dispatcher models for ``device``: its SM count and architecture family (`cost_model.family_of`)."""
+    from ..support import compute_capability
+    from .cost_model import family_of
+
+    return sm_count_of(device), family_of(compute_capability(device))
+
+
 def prepare_operands(
     a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor, str, int, int, int]:
@@ -124,7 +132,7 @@ def mm_bf16_batch_invariant(
             "each K chunk a whole number of 16-wide MMA steps",
         )
     if config is None:
-        config = default_config(M, N, K, C, b_major, sm_count_of(a.device))
+        config = default_config(M, N, K, C, b_major, *part_of(a.device))
     from .blocks.compile import get_compiled_gemm
 
     kernel = get_compiled_gemm(config, b_major, C)

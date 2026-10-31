@@ -29,7 +29,7 @@ from flashinfer.batch_invariant.gemm.schedule import (
     rank_topk,
 )
 
-_SM_COUNTS = (148, 204)
+_PARTS = (("sm_107", 204), ("sm_107", 224), ("sm_100", 148), ("sm_100", 152))
 _supported = torch.cuda.is_available() and bi.is_supported_device(
     torch.device("cuda"), MM_BF16_ARCHS
 )
@@ -119,8 +119,8 @@ def test_chunk_rule_takes_no_m():
         assert C & (C - 1) == 0 and K % (16 * C) == 0 and (C == 1 or K // C >= 256)
 
 
-@pytest.mark.parametrize("sm_count", _SM_COUNTS)
-def test_dispatcher_picks_are_members_of_the_space(sm_count):
+@pytest.mark.parametrize("family,sm_count", _PARTS)
+def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     """R3 membership: every configuration the dispatcher or the tuner's candidate list returns is a well-formed record
     the kernel accepts for the shape; the candidates are distinct and the default is their first."""
     space = set(enumerate_space(*REFERENCE_SHAPE))
@@ -134,9 +134,9 @@ def test_dispatcher_picks_are_members_of_the_space(sm_count):
         ]:
             C = chunks_for(N, K)
             for b_major in ("n", "k"):
-                top = rank_topk(M, N, K, C, b_major, sm_count, k=10)
+                top = rank_topk(M, N, K, C, b_major, sm_count, 10, family)
                 assert 1 <= len(top) <= 10 and len(set(top)) == len(top)
-                assert top[0] == default_config(M, N, K, C, b_major, sm_count)
+                assert top[0] == default_config(M, N, K, C, b_major, sm_count, family)
                 for cfg in top:
                     assert cfg.well_formed() and can_implement(
                         cfg, M, N, K, b_major, C
@@ -255,8 +255,8 @@ def test_config_agreement(M, N, K):
     tile) give identical bits."""
     a, b = adv_bf16(M, K, 61), adv_bf16(K, N, 62)
     cfgs = []
-    for sm in _SM_COUNTS:
-        cfgs += rank_topk(M, N, K, 1, "n", sm, k=10)
+    for family, sm in _PARTS:
+        cfgs += rank_topk(M, N, K, 1, "n", sm, 10, family)
     cfgs += [
         Knobs((64, 32), (1, 1), False, True, "m", 1),
         Knobs((128, 128), (1, 2), False, True, "n", 2),
@@ -286,7 +286,7 @@ def test_cta_chunk_fold_equals_workspace_split(M, N, K):
     a, b = adv_bf16(M, K, 71), adv_bf16(K, N, 72)
     ws = Knobs((128, 64), (1, 1), False, True, "m", 1)
     ref = bits(mm_bf16_batch_invariant(a, b, config=ws, chunks=C))
-    recs = [k for k in rank_topk(M, N, K, C, "n", 204, k=10) if k.cta_chunks]
+    recs = [k for k in rank_topk(M, N, K, C, "n", 204, 10, "sm_107") if k.cta_chunks]
     recs += [
         Knobs((64, 32), (1, 4), False, True, "m", 1, 0, True),
         Knobs((128, 64), (1, 1), False, True, "n", 1, 0, True),

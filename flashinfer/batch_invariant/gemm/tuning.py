@@ -26,9 +26,8 @@ from ...fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ...utils import get_compute_capability
 from ..support import unsupported
-from .api import CLASS, mm_bf16_batch_invariant, prepare_operands, sm_count_of
+from .api import CLASS, mm_bf16_batch_invariant, part_of, prepare_operands
 from .generator import Knobs
 from .schedule import chunks_for, default_config, rank_topk
 
@@ -99,19 +98,19 @@ TUNING_CONFIG = TuningConfig(
 
 
 class BatchInvariantBf16GemmRunner(TunableRunner):
-    """The class as one autotuner runner: fixed weight layout, chunk count (a function of the weight shape), part
-    (SM count) and compute capability; the tactics are the top configurations of the cost model for the profiled
+    """The class as one autotuner runner: fixed weight layout, chunk count (a function of the weight shape) and part (SM
+    count and architecture family); the tactics are the top configurations of the cost model for the profiled
     shape. Any tactic computes the class, so a cached tactic from another bucket or another process is as correct as
     the default; one the kernel cannot implement for the real shape falls back to the default configuration."""
 
-    def __init__(self, b_major: str, chunks: int, sm_count: int, cc: tuple) -> None:
+    def __init__(self, b_major: str, chunks: int, sm_count: int, family: str) -> None:
         self.b_major = b_major
         self.chunks = chunks
         self.sm_count = sm_count
-        self.cc = cc
+        self.family = family
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        return (self.b_major, self.chunks, self.sm_count, self.cc)
+        return (self.b_major, self.chunks, self.sm_count, self.family)
 
     def get_valid_tactics(
         self, inputs: List[torch.Tensor], profile: OptimizationProfile
@@ -122,7 +121,7 @@ class BatchInvariantBf16GemmRunner(TunableRunner):
         return [
             knobs_to_tactic(c)
             for c in rank_topk(
-                M, N, K, self.chunks, self.b_major, self.sm_count, k=TOP_K
+                M, N, K, self.chunks, self.b_major, self.sm_count, TOP_K, self.family
             )
         ]
 
@@ -135,7 +134,9 @@ class BatchInvariantBf16GemmRunner(TunableRunner):
             cfg = knobs_from_tactic(tactic)
             if can_implement(cfg, M, N, K, self.b_major, self.chunks):
                 return cfg
-        return default_config(M, N, K, self.chunks, self.b_major, self.sm_count)
+        return default_config(
+            M, N, K, self.chunks, self.b_major, self.sm_count, self.family
+        )
 
     def precompile_tactics(
         self,
@@ -167,9 +168,9 @@ class BatchInvariantBf16GemmRunner(TunableRunner):
 
 @functools.cache
 def _runner(
-    b_major: str, chunks: int, sm_count: int, cc: tuple
+    b_major: str, chunks: int, sm_count: int, family: str
 ) -> BatchInvariantBf16GemmRunner:
-    return BatchInvariantBf16GemmRunner(b_major, chunks, sm_count, cc)
+    return BatchInvariantBf16GemmRunner(b_major, chunks, sm_count, family)
 
 
 def mm_bf16_batch_invariant_auto(
@@ -197,8 +198,7 @@ def mm_bf16_batch_invariant_auto(
     a, out, b_major, M, N, K = prepare_operands(a, b, out)
     if M == 0:
         return out
-    cc = get_compute_capability(a.device)
-    runner = _runner(b_major, chunks_for(N, K), sm_count_of(a.device), cc)
+    runner = _runner(b_major, chunks_for(N, K), *part_of(a.device))
     inputs = [a, b, out]
     chosen, tactic = AutoTuner.get().choose_one(
         CUSTOM_OP, [runner], TUNING_CONFIG, inputs

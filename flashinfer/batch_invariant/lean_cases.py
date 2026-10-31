@@ -76,7 +76,14 @@ C4_SHAPE = (
 DISPATCH_MS = (1, 8, 64, 512, 4096, 16384)
 DISPATCH_NS = (64, 128, 256, 512, 1024, 2048, 4096, 8192)
 DISPATCH_BIG = (16384, 65536, 262144)
-DISPATCH_SM_COUNTS = (148, 204)  # B200 / Rubin NVL8 parts
+#: The parts the dispatcher serves, (family, SM count): Rubin NVL8 / Vera Rubin NVL72 (sm_107), B200 / GB200 (sm_100), B300 (sm_103)
+DISPATCH_PARTS = (
+    ("sm_107", 204),
+    ("sm_107", 224),
+    ("sm_100", 148),
+    ("sm_100", 152),
+    ("sm_103", 148),
+)
 #: The generated theorems closed by ``native_decide`` (the exhaustive checks over the configuration space); every
 #: other case is kernel ``decide``. ``lean/Axioms.lean`` pins exactly these names.
 DECIDED_THEOREMS = (
@@ -126,7 +133,7 @@ def spaces() -> Tuple[List[Knobs], List[Knobs]]:
 
 
 def dispatch_cases() -> Dict[Knobs, Tuple[int, int, int]]:
-    """Every record the dispatcher returns over the grid (both weight layouts, both parts), with the first shape that
+    """Every record the dispatcher returns over the grid (both weight layouts, every part of `DISPATCH_PARTS`), with the first shape that
     selects it."""
     disp: Dict[Knobs, Tuple[int, int, int]] = {}
     pairs = [(N, K) for N in DISPATCH_NS for K in DISPATCH_NS]
@@ -136,9 +143,9 @@ def dispatch_cases() -> Dict[Knobs, Tuple[int, int, int]]:
         C = chunks_for(N, K)
         for M in DISPATCH_MS:
             for b_major in ("n", "k"):
-                for sm in DISPATCH_SM_COUNTS:
+                for family, sm in DISPATCH_PARTS:
                     k = dataclasses.replace(
-                        default_config(M, N, K, C, b_major, sm), grid_clusters=0
+                        default_config(M, N, K, C, b_major, sm, family), grid_clusters=0
                     )
                     disp.setdefault(k, (M, N, K))
     return disp
@@ -272,7 +279,7 @@ def render() -> str:
     L.append("")
     disp = dispatch_cases()
     L.append(
-        "/-! Every knob record the dispatcher returns over the shape grid (both weight layouts, the 148- and 204-SM parts), "
+        "/-! Every knob record the dispatcher returns over the shape grid (both weight layouts; Rubin NVL8 / NVL72, B200 / GB200, B300), "
         "with the first shape that selects it; each is a member of the enumerated space (R3 membership). -/"
     )
     L.append(

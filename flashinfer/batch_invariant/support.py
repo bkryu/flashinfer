@@ -25,6 +25,13 @@ def unsupported(
     )
 
 
+def compute_capability(device: torch.device) -> Tuple[int, int]:
+    """The device's compute capability as FlashInfer reports it."""
+    from ..utils import get_compute_capability
+
+    return tuple(get_compute_capability(device))
+
+
 def _arch_names(archs: Iterable[Tuple[int, int]]) -> str:
     return " / ".join(f"SM{a}{b}" for a, b in archs)
 
