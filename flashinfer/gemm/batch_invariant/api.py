@@ -9,11 +9,13 @@ nothing falls back."""
 
 from __future__ import annotations
 
+import functools
 from typing import Optional, Tuple
 
 import torch
 
 from ...batch_invariant.support import check_device, unsupported
+from ...jit.core import logger
 from .generator import Knobs
 from .schedule import chunks_for, default_config
 from .spec import MMA_K
@@ -47,6 +49,48 @@ def part_of(device: torch.device) -> Tuple[int, str]:
     from .cost_model import family_of
 
     return sm_count_of(device), family_of(compute_capability(device))
+
+
+@functools.cache
+def _co_resident_clusters(device_index: int, cluster_size: int, sm_count: int) -> int:
+    """How many clusters of ``cluster_size`` CTAs the device can host at once for a one-CTA-per-SM body: the CuTe DSL's
+    GPC-aware occupancy query (what FlashInfer's CuTe-DSL GEMMs size their persistent grids with), after a CUDA context
+    on the device has been made current (the query fails without one); ``sm_count // cluster_size`` if the query fails,
+    which is logged."""
+    import cutlass.utils as cutlass_utils
+
+    try:
+        torch.cuda.synchronize(device_index)  # a current context on the device
+        with torch.cuda.device(device_index):
+            n = int(
+                cutlass_utils.HardwareInfo(
+                    device_id=device_index
+                ).get_max_active_clusters(cluster_size)
+            )
+        if n <= 0:
+            raise RuntimeError(f"the occupancy query returned {n}")
+        return n
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "batch_invariant: the co-resident cluster query failed on device %d (%s: %s); the persistent grid falls back to "
+            "SMs // cluster size",
+            device_index,
+            type(e).__name__,
+            e,
+        )
+        return sm_count // cluster_size
+
+
+def persistent_clusters(device: torch.device, cfg: Knobs) -> int:
+    """The persistent grid in clusters for ``cfg`` on ``device``: the device's co-resident cluster count for the knobs'
+    cluster shape (cached per device and cluster size), so that the compiled grid is what the device can run at once;
+    a launch parameter that decides which CTA computes which tile and nothing else (the bits never depend on it). A
+    grid of ``SMs // size`` would leave its surplus clusters to run as a serial tail under the static persistent
+    assignment whenever a GPC cannot host a whole cluster of every SM."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _co_resident_clusters(
+        index, cfg.cluster_m * cfg.cluster_n, sm_count_of(device)
+    )
 
 
 def prepare_operands(
@@ -192,7 +236,11 @@ def mm_bf16_batch_invariant(
 
     direct = C == 1 or config.cta_chunks
     kernel = get_compiled_gemm(
-        config, b_major, C, sm_count_of(a.device), bias is not None and direct
+        config,
+        b_major,
+        C,
+        persistent_clusters(a.device, config),
+        bias is not None and direct,
     )
     # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk (1 for the unsplit class and the in-CTA
     # fold's output); every stride handed over is a multiple of the declared 16-byte alignment, the size-1 l stride included

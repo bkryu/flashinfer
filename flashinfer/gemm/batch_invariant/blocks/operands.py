@@ -233,7 +233,8 @@ class TmaSetup:
 
 def build_grid(st: StaticPlan, c: cute.Tensor, max_active_clusters):
     """Tile count from C and the CTA tile; persistent grid = min(tiles, max_active_clusters x
-    cluster). The grid is a launch parameter only (I10): no fold bound depends on it."""
+    cluster), ``max_active_clusters`` being the clusters the launch device hosts at once. The grid is a launch
+    parameter only (I10): no fold bound depends on it."""
     gc = cute.zipped_divide(
         c, tiler=cute.slice_(st.cta_tile_shape_mnk, (None, None, 0))
     )
