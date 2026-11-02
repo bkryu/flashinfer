@@ -212,3 +212,5 @@ flashinfer/moe_ep/backends/split/comm/nixl_ep/_vendored/
 .sqsh_build_logs/
 *.sqsh
 .fi_workspace/
+csrc/*.tar.xz
+build/csrc_archive_stash/

@@ -1114,6 +1114,105 @@ def _create_data_dir(use_symlinks=True):
     ln("include", "include")
 
 
+# Kernel-source families shipped as one solid .tar.xz each instead of plain
+# files. A wheel compresses each file separately, so these generated families of
+# near-identical expansions (csrc/cake_sampling: 18 files of ~3 MB, 87% identical)
+# cost their full size per file and pushed the wheel past PyPI's 100 MB limit;
+# a solid stream stores the repetition once (10-25x smaller). The runtime
+# extracts them into the JIT workspace on first import (jit/csrc_archive.py).
+#
+# The "flashinfer.data" package maps to the repo root, so the wheel takes
+# csrc/** from the real csrc/ tree: for the duration of build_wheel the family
+# directories are moved aside to build/csrc_archive_stash/ and replaced by
+# csrc/<family>.tar.xz, then restored (also on failure, and on the next build
+# if a previous one died). sdist and editable installs are untouched.
+# Override with FLASHINFER_CSRC_ARCHIVE_FAMILIES=<comma list> ("" disables).
+_CSRC_ARCHIVE_FAMILIES = (
+    "cake_sampling",
+    "kda",
+    "cake_dsv4",
+    "cake_mamba_ssd_combined",
+    "cake_fp4_allreduce",
+)
+_csrc_root = _root / "csrc"
+_csrc_stash = _root / "build" / "csrc_archive_stash"
+
+
+def _csrc_archive_families() -> tuple[str, ...]:
+    override = os.environ.get("FLASHINFER_CSRC_ARCHIVE_FAMILIES")
+    if override is None:
+        return _CSRC_ARCHIVE_FAMILIES
+    return tuple(f for f in (x.strip() for x in override.split(",")) if f)
+
+
+def _restore_csrc_families() -> None:
+    """Undo _archive_csrc_families: delete the archives, move the families back."""
+    if _csrc_stash.is_dir():
+        for stashed in _csrc_stash.iterdir():
+            target = _csrc_root / stashed.name
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.move(str(stashed), str(target))
+        shutil.rmtree(_csrc_stash, ignore_errors=True)
+    for archive in _csrc_root.glob("*.tar.xz"):
+        archive.unlink()
+
+
+def _archive_csrc_families() -> None:
+    import lzma
+    import tarfile
+
+    _restore_csrc_families()  # a previous build may have died mid-way
+    families = _csrc_archive_families()
+    if not families:
+        return
+    _csrc_stash.mkdir(parents=True, exist_ok=True)
+    for family in families:
+        src = _csrc_root / family
+        if not src.is_dir():
+            print(
+                f"[flashinfer build] csrc family {family!r} not found; not archived",
+                file=sys.stderr,
+            )
+            continue
+        out = _csrc_root / f"{family}.tar.xz"
+
+        def _normalize(info: tarfile.TarInfo) -> tarfile.TarInfo:
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mtime = 0
+            return info
+
+        with (
+            lzma.open(out, "wb", preset=9 | lzma.PRESET_EXTREME) as xz,
+            tarfile.open(fileobj=xz, mode="w|") as tar,
+        ):
+            for path in sorted(src.rglob("*")):
+                if path.is_file():
+                    tar.add(
+                        path,
+                        arcname=str(path.relative_to(_csrc_root)),
+                        filter=_normalize,
+                    )
+        shutil.move(str(src), str(_csrc_stash / family))
+        # packages.find runs with namespaces=true and sees the flashinfer/data/
+        # staging copy as package flashinfer.data.csrc.<family>, which package-dir
+        # maps back to the (now stashed) ./csrc/<family>; drop the copy so no such
+        # package is discovered. The copy is rebuilt from scratch by every build.
+        shutil.rmtree(_data_dir / "csrc" / family, ignore_errors=True)
+        # setuptools' build_py copies incrementally and never deletes, so a plain
+        # copy left in build/lib by an earlier build would be zipped alongside the
+        # archive; purge it (fresh CI checkouts have no build/lib at all).
+        shutil.rmtree(
+            _root / "build" / "lib" / "flashinfer" / "data" / "csrc" / family,
+            ignore_errors=True,
+        )
+        print(
+            f"[flashinfer build] archived csrc/{family} -> {out.name} "
+            f"({out.stat().st_size / 1e6:.2f} MB)"
+        )
+
+
 def _prepare_for_wheel():
     # For wheel, copy actual files instead of symlinks so they are included in the wheel
     _install_cuda_tile_compile_deps()
@@ -1187,4 +1286,8 @@ def build_sdist(sdist_directory, config_settings=None):
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     _prepare_for_wheel()
-    return orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    _archive_csrc_families()
+    try:
+        return orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    finally:
+        _restore_csrc_families()

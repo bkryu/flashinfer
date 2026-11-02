@@ -497,7 +497,7 @@ One subclass per compilation toolchain:
 |-----------|----------|---------|
 | `FLASHINFER_GEN_SRC_DIR` | ✓ Yes | Generated source files (Jinja output, copied .cu files) |
 | `FLASHINFER_JIT_DIR` | ✓ Yes | Compiled `.so` outputs |
-| `FLASHINFER_CSRC_DIR` | ✗ No | Read-only source templates |
+| `FLASHINFER_CSRC_DIR` | ✗ No | Read-only source templates. In installed wheels the heaviest kernel-source families ship as solid `.tar.xz` archives, and this resolves to a workspace overlay (`<workspace>/csrc`) that symlinks the plain families and extracts the archived ones on first import (`flashinfer/jit/csrc_archive.py`) |
 | `FLASHINFER_AOT_DIR` | ✗ No | Read-only pre-compiled binaries |
 
 ### Compilation Context: Architecture-Specific Compilation
@@ -832,6 +832,7 @@ match what the code uses today; values are strings unless noted.
 
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
+| `FLASHINFER_CSRC_ARCHIVE_FAMILIES` | the five heaviest `csrc/` families | `build_backend.py` (wheel build only) | Comma-separated `csrc/<family>` directories to ship as one solid `.tar.xz` each instead of plain files, so near-identical generated kernels stop costing their full size per file in the zip; `""` disables. Extracted into the JIT workspace on first import. |
 | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
 | `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` extends each CuTe-DSL disk-cache key from the caller's `extra_key_files` to their in-package import closure, so editing an imported helper invalidates the kernel. Changes every key, so the first run after enabling recompiles. Set by CI's persistent compile cache. |

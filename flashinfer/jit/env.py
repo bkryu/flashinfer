@@ -397,7 +397,13 @@ FLASHINFER_JIT_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "cached_ops"
 FLASHINFER_GEN_SRC_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "generated"
 FLASHINFER_DATA: pathlib.Path = _package_root / "data"
 FLASHINFER_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "include"
-FLASHINFER_CSRC_DIR: pathlib.Path = _package_root / "data" / "csrc"
+# Wheels ship the heaviest kernel-source families as solid archives; when present
+# the JIT reads from a workspace overlay instead (see jit/csrc_archive.py).
+from .csrc_archive import resolve_csrc_dir as _resolve_csrc_dir  # noqa: E402
+
+FLASHINFER_CSRC_DIR: pathlib.Path = _resolve_csrc_dir(
+    _package_root / "data" / "csrc", FLASHINFER_WORKSPACE_DIR
+)
 # FLASHINFER_SRC_DIR = _package_root / "data" / "src"
 CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = [
     _package_root / "data" / "cutlass" / "include",
