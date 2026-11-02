@@ -11,6 +11,7 @@ def GTerm.sexpr : GTerm → String
   | .mma16 acc a t b => s!"(mma16 {acc.sexpr} (ab (a {a.id} {t}) (b {t} {b.id})))"
   | .add acc p => let (x, y) := sortPair acc.sexpr p.sexpr; s!"(add {x} {y})"
   | .cvt f x => s!"(cvt {f} {x.sexpr})"
+  | .bias n => s!"(bias {n.id})"
 end GEMM
 
 end BIK
