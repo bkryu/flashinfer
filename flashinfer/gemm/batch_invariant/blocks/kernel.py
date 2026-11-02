@@ -1,10 +1,14 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """The kernel body: scaffolding (smem, pipelines, barriers, TMEM), the role dispatch and the composition of
-the blocks. ``BlockGemm`` is the bf16 body: the engine's fold in the mainloop, ``cvt.rn`` in the epilogue.
+the blocks. ``BlockGemm`` is the bf16 body: the engine's fold in the mainloop, ``cvt.rn`` in the epilogue;
+``BiasBlockGemm`` the same body with the biased chain (the bias of the output column added once in fp32 before the
+``cvt.rn``; ``spec.BIAS_NOTE``), which takes the (N,) bias as one more operand.
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -41,14 +45,19 @@ from .producer import tma_producer_loop
 class BlockGemm:
     """``C[m, n, l] = cvt(sum_k A[m, k, l] B[n, k, l])`` for the knobs; M, N, K (and L) dynamic. ``chunks > 1`` with
     ``knobs.cta_chunks``: the in-CTA chunk fold of the split class (A and B as the split class's ``(rows, Kc, C)`` views,
-    C with ``L = 1``; the chunk partials folded in order through the TMEM running sum)."""
+    C with ``L = 1``; the chunk partials folded in order through the TMEM running sum). ``bias``: the biased chain
+    (``cvt(add(fold, bias[n]))``), a body that stores the class's output directly (never the split's fp32 partials)."""
 
-    def __init__(self, knobs: Knobs, out_fmt: str, chunks: int = 1):
+    def __init__(self, knobs: Knobs, out_fmt: str, chunks: int = 1, bias: bool = False):
         self.knobs = knobs
         self.chunks = chunks if knobs.cta_chunks else 1
         assert self.chunks == 1 or chunks > 1, (knobs, chunks)
         self.cluster_shape_mn = knobs.cluster_shape_mn
         self.out_fmt = out_fmt
+        self.bias = bias
+        assert not bias or out_fmt != "f32", (
+            "the split's partials are bias-free: the fixup adds the bias"
+        )
 
     @cute.jit
     def __call__(
@@ -59,10 +68,10 @@ class BlockGemm:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        self._launch(a, b, c, max_active_clusters, stream)
+        self._launch(a, b, c, max_active_clusters, stream, None)
 
     # host side (trace time)
-    def _launch(self, a, b, c, max_active_clusters, stream):
+    def _launch(self, a, b, c, max_active_clusters, stream, bias):
         if cutlass.const_expr(a.element_type != b.element_type):
             raise TypeError(
                 f"A and B must have one type: {a.element_type} != {b.element_type}"
@@ -101,6 +110,7 @@ class BlockGemm:
             st.c_smem_layout_staged,
             st.epi_tile,
             params,
+            bias,
         ).launch(
             grid=grid,
             block=[THREADS, 1, 1],
@@ -125,6 +135,7 @@ class BlockGemm:
         c_smem_layout_staged,
         epi_tile: cute.Tile,
         tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+        mBias: Optional[cute.Tensor],
     ):
         st = self.st
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -224,6 +235,16 @@ class BlockGemm:
         tCgA = thr_mma.partition_A(gA_mkl)
         tCgB = thr_mma.partition_B(gB_nkl)
         tCgC = thr_mma.partition_C(gC_mnl)
+        tCcC = None
+        if cutlass.const_expr(self.bias):
+            # the output coordinates, tiled and partitioned exactly like C: the epilogue reads the bias of each
+            # element's column through them (and skips the columns of a partial tile that the store clips)
+            cC_mnl = cute.local_tile(
+                cute.make_identity_tensor(mC_mnl.shape),
+                cute.slice_(st.mma_tiler, (None, None, 0)),
+                (None, None, None),
+            )
+            tCcC = thr_mma.partition_C(cC_mnl)
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
@@ -320,6 +341,28 @@ class BlockGemm:
                 epi_tile,
                 acc_pipeline,
                 st.cta_chunks,
+                mBias,
+                tCcC,
             )
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+
+
+class BiasBlockGemm(BlockGemm):
+    """``C[m, n] = cvt(add(sum_k A[m, k] B[n, k], bias[n]))``: the body with the biased chain; ``bias`` is the (N,) bf16
+    vector, read in the epilogue (unsplit class and in-CTA chunk fold)."""
+
+    def __init__(self, knobs: Knobs, out_fmt: str, chunks: int = 1):
+        super().__init__(knobs, out_fmt, chunks, bias=True)
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        bias: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        self._launch(a, b, c, max_active_clusters, stream, bias)

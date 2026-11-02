@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Epilogue block: the spec's elementwise chain after the fold, then the store.
 
-Per epilogue subtile: TMEM -> registers (fp32), then the chain's single ``cvt.rn`` as the vector
+Per epilogue subtile: TMEM -> registers (fp32), with a bias the chain's ``add.rn`` of the bias of each element's
+column (``bias_add``, the bf16 bias widened exactly) once per element, then the chain's single ``cvt.rn`` as the vector
 conversion to the output type, registers -> smem
 -> TMA store (clipped at the tensor bounds). The subtile order, the C smem buffer rotation and
 the barriers are placements. Built from the library's epilogue atoms (``get_tmem_load_op``,
@@ -20,6 +21,8 @@ inter-warp exchange and works for every tile shape the epilogue already handles.
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -42,6 +45,23 @@ def tmem_store_atom_for(load_atom: cute.CopyAtom, elem_ty) -> cute.CopyAtom:
     assert name.startswith("Ld") and name.endswith("Op"), name
     st_cls = getattr(tcgen05.copy, "St" + name[2:])
     return cute.make_copy_atom(st_cls(op.repeat), elem_ty)
+
+
+@cute.jit
+def bias_add(
+    mBias: cute.Tensor,
+    tTR_cC_s: cute.Tensor,
+    rA: cute.Tensor,
+    N: cutlass.Int32,
+):
+    """The chain's bias step on one subtile's fp32 fragment: ``rA[e] = add.rn(rA[e], widen(bias[n]))`` with ``n`` the output
+    column of element ``e`` (``tTR_cC_s``: the output coordinates partitioned like the accumulator), once per element,
+    after the whole fold and before the conversion. Columns at or beyond ``N`` belong to the clipped part of a partial
+    tile: the store drops them, so they are left alone (no read past the bias)."""
+    for e in cutlass.range_constexpr(cute.size(rA)):
+        n = tTR_cC_s[e][1]
+        if n < N:
+            rA[e] = CuteF32.add(rA[e], CuteF32.widen(mBias[n]))
 
 
 @cute.jit
@@ -99,10 +119,14 @@ def epilogue_loop(
     epi_tile: cute.Tile,
     acc_pipeline,
     chunks: cutlass.Constexpr = 1,
+    mBias: Optional[cute.Tensor] = None,
+    tCcC_base: Optional[cute.Tensor] = None,
 ):
     """``chunks > 1``: the in-CTA chunk fold (module docstring) -- the mainloop commits one accumulator stage per chunk,
     the first ``chunks - 1`` are folded into the TMEM running sum (``st.sum_stage``) and released, the last one receives
-    the fold and is stored through the ordinary subtile loop below."""
+    the fold and is stored through the ordinary subtile loop below. ``mBias`` (the (N,) bias) with ``tCcC_base`` (the
+    output coordinates partitioned like C): the biased chain, ``bias_add`` on every subtile fragment before the
+    conversion -- after the whole fold, chunked or not, so the bias enters exactly once."""
     # ((ATOM_M, MMA_M), (ATOM_N, MMA_N), ...)
     tCgC = transform_partitioned_tensor_layout(tCgC_base)
     tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
@@ -129,6 +153,12 @@ def epilogue_loop(
         tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, ACC_DTYPE
     )
     tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, st.c_dtype)
+    # the biased chain: the output coordinates in the accumulator's partition, so element e of a fragment knows its column
+    tTR_cC_all = None
+    if cutlass.const_expr(mBias is not None):
+        tTR_cC_all = thr_t2r.partition_D(
+            cute.flat_divide(transform_partitioned_tensor_layout(tCcC_base), epi_tile)
+        )
     # the in-CTA chunk fold: the running sum's TMEM partitions (the stage `st.sum_stage`), the store twin of the load atom, a second fragment
     tiled_copy_r2t = tTR_tSum = tTR_tSumSt = tTR_rSum = None
     if cutlass.const_expr(chunks > 1):
@@ -239,8 +269,17 @@ def epilogue_loop(
         bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
         num_prev_subtiles = num_tiles_executed * subtile_cnt
+        tTR_cC = None
+        if cutlass.const_expr(mBias is not None):
+            tTR_cC = cute.group_modes(
+                tTR_cC_all[(None, None, None, None, None, *mnl)], 3, 5
+            )  # this tile's coordinates per subtile
         for s in range(subtile_cnt):
             cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
+            if cutlass.const_expr(mBias is not None):
+                bias_add(
+                    mBias, tTR_cC[(None, None, None, s)], tTR_rAcc, mBias.shape[0]
+                )  # the chain's add.rn of the bias, once, after the fold
             acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
             tRS_rC.store(
                 acc_vec.to(st.c_dtype)
