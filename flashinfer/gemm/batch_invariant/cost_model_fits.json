@@ -7,7 +7,7 @@
       "cuda": "13.2",
       "cutlass_dsl": "4.8.1",
       "method": "Least-squares fit of the model's constants to CUPTI kernel timings (L2 flushed before every iteration, median of 30 after 5 warm-ups) of every record of the 888-record configuration space at 22 row counts (1 .. 32768) x 12 (N, K) weight shapes, both weight layouts. The sweep harness and the fitting script are not part of this package.",
-      "fp8": "The three fp8 constants (mma_eff_fp8, fp8_swz64_pen, fp8_swz32_pen) are provisional values carried from an earlier fit of the same model on the fp8 space; they are replaced by the fp8 sweep's fit with every bf16 constant held fixed."
+      "fp8": "The four fp8 constants (mma_eff_fp8, two_cta_gain_fp8, fp8_swz64_pen, fp8_swz32_pen) are provisional values (three carried from an earlier fit of the same model on the fp8 space, the 2-CTA multiplier at 1); they are replaced by the fp8 sweep's fit with every bf16 constant held fixed."
     },
     "cl4_ns": 8.706448361036513,
     "cluster_pen": 0.015834343690646197,
@@ -35,7 +35,8 @@
     "smem_gbps": 379.4606629665384,
     "softmax_p": 2.2013204440183385,
     "tile_us": 0.3533730510751796,
-    "two_cta_gain": 1.0
+    "two_cta_gain": 1.0,
+    "two_cta_gain_fp8": 1.0
   },
   "sm_107": {
     "_meta": {
@@ -45,7 +46,7 @@
       "cuda": "13.2",
       "cutlass_dsl": "4.8.1",
       "method": "Least-squares fit of the model's constants to CUPTI kernel timings (L2 flushed before every iteration, median of 30 after 5 warm-ups) of every record of the 888-record configuration space at 22 row counts (1 .. 32768) x 12 (N, K) weight shapes, both weight layouts. The sweep harness and the fitting script are not part of this package.",
-      "fp8": "The three fp8 constants (mma_eff_fp8, fp8_swz64_pen, fp8_swz32_pen) are provisional values carried from an earlier fit of the same model on the fp8 space; they are replaced by the fp8 sweep's fit with every bf16 constant held fixed."
+      "fp8": "The four fp8 constants (mma_eff_fp8, two_cta_gain_fp8, fp8_swz64_pen, fp8_swz32_pen) are provisional values (three carried from an earlier fit of the same model on the fp8 space, the 2-CTA multiplier at 1); they are replaced by the fp8 sweep's fit with every bf16 constant held fixed."
     },
     "cl4_ns": 31.32737148705333,
     "cluster_pen": 0.01379972780948768,
@@ -73,6 +74,7 @@
     "smem_gbps": 444.5021793766413,
     "softmax_p": 2.4156911618080166,
     "tile_us": 0.5245734557856919,
-    "two_cta_gain": 1.0
+    "two_cta_gain": 1.0,
+    "two_cta_gain_fp8": 1.0
   }
 }

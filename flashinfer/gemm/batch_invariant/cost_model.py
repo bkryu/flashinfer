@@ -6,8 +6,9 @@ For one knob record at one shape the model predicts the device time (us) from th
 constants (`Fit`); `rank` evaluates a whole configuration space at once and `schedule.default_config` takes the argmin.
 Nothing here reaches the bits: every record of the space computes the class (R3), the model only orders them. The
 operand format enters through its structure (element width, K step, the 8-bit kind's doubled instruction rate) and
-three format-specific constants (the fp8 instruction's sustained efficiency and the smem-swizzle penalties of an
-MN-major fp8 B whose tile row is narrower than 128 bytes); every other constant is shared by the formats.
+four format-specific constants (the fp8 instruction's sustained efficiency, its 2-CTA per-k-tile multiplier and the
+smem-swizzle penalties of an MN-major fp8 B whose tile row is narrower than 128 bytes); every other constant is shared by
+the formats.
 
 The time is a soft maximum of four bounds -- the per-CTA tile time (waves of tiles, each the slowest of the MMA, TMA,
 smem and latency paths per k-tile, plus the epilogue), the HBM traffic under the persistent raster's L2 footprint rule,
@@ -127,6 +128,7 @@ class Fit:
 
     mma_eff: float = 0.92  # sustained fraction of the MMA instruction rate (kind::f16)
     mma_eff_fp8: float = 0.86  # the same for kind::f8f6f4 (twice the rate per clock, its own issue / operand-delivery efficiency)
+    two_cta_gain_fp8: float = 1.0  # per-k-tile time multiplier of the 2-CTA kind::f8f6f4 instruction (the pair shares B: its operand delivery per CTA is lighter)
     fp8_swz64_pen: float = 1.08  # kind::f8f6f4 with an MN-major B whose per-CTA tile row is 64 bytes (64-byte smem swizzle atom)
     fp8_swz32_pen: float = 1.25  # ... a 32- or 96-byte row (32-byte swizzle atom): the narrower swizzle feeds the fp8 instruction slower
     inst_min_clk: float = 18.0  # minimum time of one tcgen05.mma, in SM clocks
@@ -289,7 +291,11 @@ def predict_arrays(
         2.0 * ctm * ctn * inst_k / (fpc * arch.clock_ghz) / mma_eff,
         fit.inst_min_clk / arch.clock_ghz,
     )  # ns
-    t_mma_kt = inner * t_inst * np.where(two, fit.two_cta_gain, 1.0)
+    t_mma_kt = (
+        inner
+        * t_inst
+        * np.where(two, fit.two_cta_gain_fp8 if fp8 else fit.two_cta_gain, 1.0)
+    )
     a_stage = ctm * kb * elem
     b_stage = ctn * kb * elem / cta_div
     # the `n` layout's B box: a row narrower than a 128-byte line still costs the line (times a fitted penalty)
