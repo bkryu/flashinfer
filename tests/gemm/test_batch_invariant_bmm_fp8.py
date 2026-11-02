@@ -20,21 +20,21 @@ import torch
 import flashinfer
 from flashinfer import batch_invariant as bi
 from flashinfer.autotuner import AutoTuner, autotune
-from flashinfer.batch_invariant.gemm import tuning
-from flashinfer.batch_invariant.gemm.api import (
+from flashinfer.gemm.batch_invariant import tuning
+from flashinfer.gemm.batch_invariant.api import (
     BMM_FP8_ARCHS,
     bmm_fp8_batch_invariant,
     mm_fp8_batch_invariant,
 )
-from flashinfer.batch_invariant.gemm.blocks.operands import can_implement
-from flashinfer.batch_invariant.gemm.cost_model import PARTS
-from flashinfer.batch_invariant.gemm.generator import (
+from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
+from flashinfer.gemm.batch_invariant.cost_model import PARTS
+from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
     Knobs,
     enumerate_space,
     knob_product,
 )
-from flashinfer.batch_invariant.gemm.schedule import (
+from flashinfer.gemm.batch_invariant.schedule import (
     chunks_for,
     default_config,
     rank_topk,

@@ -869,7 +869,7 @@ def mm_bf16(
     """
 
     if batch_invariant:
-        from ..batch_invariant.gemm.tuning import mm_bf16_batch_invariant_auto
+        from .batch_invariant.tuning import mm_bf16_batch_invariant_auto
 
         return mm_bf16_batch_invariant_auto(a, b, bias, pdl, out, out_dtype, backend)
 
@@ -10555,7 +10555,7 @@ def bmm_fp8(
     """
 
     if batch_invariant:
-        from ..batch_invariant.gemm.tuning import bmm_fp8_batch_invariant_auto
+        from .batch_invariant.tuning import bmm_fp8_batch_invariant_auto
 
         return bmm_fp8_batch_invariant_auto(A, B, A_scale, B_scale, dtype, out, backend)
 

@@ -24,7 +24,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.tensor_utils import LayoutEnum
 
-from ...fp.cute import CuteF32
+from ....batch_invariant.fp_interface.cute import CuteF32
 from ..generator import Knobs, MainloopBlock
 from ..spec import EpilogueChain
 from .epilogue import epilogue_loop

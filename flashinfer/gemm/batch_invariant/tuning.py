@@ -29,7 +29,7 @@ from ...fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ..support import unsupported
+from ...batch_invariant.support import unsupported
 from .api import (
     CLASS,
     CLASS_FP8,

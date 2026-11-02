@@ -1,7 +1,7 @@
 /-!
 # GEMM on tcgen05: the numerical specifications and the batch-invariance guarantees
 
-Mirrors `flashinfer/batch_invariant/gemm/spec.py`. Per output element the dataflow is a sequential fold over K-steps
+Mirrors `flashinfer/gemm/batch_invariant/spec.py`. Per output element the dataflow is a sequential fold over K-steps
 through an opaque hardware primitive: `mma16` for the bf16 class (one `tcgen05.mma.kind::f16` K-step of 16 bf16
 elements, fp32 accumulator) and `mma32` for the fp8 classes (one `kind::f8f6f4` K-step of 32 e4m3 / e5m2 elements).
 No commutativity is used anywhere, so equality is plain `=`.

@@ -15,7 +15,7 @@ Two consistency classes per format:
 
 * ``gemm.<fmt>.kfold``: one fold over all K-steps from +0;
 * ``gemm.<fmt>.kchunk[C]``: K cut into ``C`` equal chunks (``C`` a function of the weight shape and the format only,
-  never of M: :func:`flashinfer.batch_invariant.gemm.schedule.chunks_for`), each chunk an MMA fold from +0, the
+  never of M: :func:`flashinfer.gemm.batch_invariant.schedule.chunks_for`), each chunk an MMA fold from +0, the
   chunk partials folded in chunk order with ``add.rn`` from +0. A split kernel computes the chunks on different
   CTAs and folds them in a fixup pass; the in-CTA chunk fold computes the same boundaries inside one CTA.
 
@@ -29,8 +29,8 @@ import hashlib
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from ..canon import Digit, Reduction
-from ..fp.term import Term, TermAlgebra, fingerprint
+from ...batch_invariant.canon import Digit, Reduction
+from ...batch_invariant.fp_interface.term import Term, TermAlgebra, fingerprint
 
 #: The operand formats of the dense classes and their opaque K-step: bf16 on ``kind::f16`` (16 elements per step),
 #: the two fp8 formats on ``kind::f8f6f4`` (32 elements per step).
