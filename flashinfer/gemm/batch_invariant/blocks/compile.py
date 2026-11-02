@@ -1,8 +1,9 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Compile wrapper for the block-built GEMM: one TVM-FFI object per (knobs, B major, chunks, SM count) with dynamic M, N, K;
-cache module ``batch_invariant_gemm_bf16`` in FlashInfer's CuTe-DSL disk cache. Operand conventions: A (M, K)
-K-major, B (K, N) N-major (torch row-major) or K-major (a transposed weight), C (M, N) N-major, fp32 accumulate.
+"""Compile wrapper for the block-built GEMM: one TVM-FFI object per (knobs, B major, chunks, SM count, bias) with dynamic
+M, N, K; cache module ``batch_invariant_gemm_bf16`` in FlashInfer's CuTe-DSL disk cache. Operand conventions: A (M, K)
+K-major, B (K, N) N-major (torch row-major) or K-major (a transposed weight), C (M, N) N-major, fp32 accumulate; the
+biased body takes the (N,) bf16 bias as a fourth operand.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..generator import Knobs
-from .kernel import BlockGemm
+from .kernel import BiasBlockGemm, BlockGemm
 from .operands import ALIGN, IN_DT, OUT_DT, can_implement  # noqa: F401  (re-exported)
 
 MODULE = "batch_invariant_gemm_bf16"
@@ -26,23 +27,31 @@ def max_active_clusters(cfg: Knobs, sm_count: int) -> int:
     return sm_count // (cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1])
 
 
-def kernel_name(cfg: Knobs, b_major: str, chunks: int, sm_count: int) -> str:
+def kernel_name(
+    cfg: Knobs, b_major: str, chunks: int, sm_count: int, bias: bool = False
+) -> str:
     return jit.sanitize_symbol_name(
         f"bf16_b{b_major}_C{chunks}_{cfg.describe()}_sm{sm_count}"
+        + ("_bias" if bias else "")
     )
 
 
 @functools.cache
-def get_compiled_gemm(cfg: Knobs, b_major: str, chunks: int, sm_count: int):
+def get_compiled_gemm(
+    cfg: Knobs, b_major: str, chunks: int, sm_count: int, bias: bool = False
+):
     """``kernel(a3, b3, c3)``: the unsplit class (``chunks == 1``, L = 1), the fixed-chunk split (batch index = K chunk,
     fp32 partials) or, with ``cfg.cta_chunks``, the in-CTA chunk fold (the same operand views, the output direct with
-    L = 1). ``sm_count`` sizes the persistent grid (the launch device's) and is part of the cache key."""
+    L = 1). ``bias``: the biased chain, ``kernel(a3, b3, c3, bias)`` with the (N,) bf16 bias; a body that stores the
+    class's output directly (the split's partial kernel never takes it: its fixup adds the bias). ``sm_count`` sizes the
+    persistent grid (the launch device's) and is part of the cache key."""
     in_dt, al = IN_DT["bf16"], ALIGN["bf16"]
     in_cta = cfg.cta_chunks and chunks > 1
     direct = chunks == 1 or in_cta
+    assert not bias or direct, "the split's fp32 partials are bias-free"
     out_dt = OUT_DT["bf16"] if direct else cutlass.Float32
     oal = ALIGN["bf16"] if direct else ALIGN["f32"]
-    name = kernel_name(cfg, b_major, chunks, sm_count)
+    name = kernel_name(cfg, b_major, chunks, sm_count, bias)
 
     def compile_fn():
         sym_m, sym_n, sym_kc = (
@@ -80,6 +89,20 @@ def get_compiled_gemm(cfg: Knobs, b_major: str, chunks: int, sm_count: int):
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = cfg.grid_clusters or max_active_clusters(cfg, sm_count)
+        if bias:
+            bias_fake = cute.runtime.make_fake_tensor(
+                in_dt, (sym_n,), (1,), assumed_align=16
+            )
+            return cute.compile(
+                BiasBlockGemm(cfg, "bf16", chunks),
+                a_fake,
+                b_fake,
+                c_fake,
+                bias_fake,
+                grid,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
         return cute.compile(
             BlockGemm(cfg, "bf16" if direct else "f32", chunks),
             a_fake,

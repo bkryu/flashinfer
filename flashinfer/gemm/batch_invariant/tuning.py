@@ -29,7 +29,13 @@ from ...fused_moe.utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from ...batch_invariant.support import unsupported
-from .api import CLASS, mm_bf16_batch_invariant, part_of, prepare_operands
+from .api import (
+    CLASS,
+    mm_bf16_batch_invariant,
+    part_of,
+    prepare_bias,
+    prepare_operands,
+)
 from .generator import Knobs
 from .schedule import chunks_for, default_config, rank_topk
 
@@ -79,8 +85,9 @@ def knobs_from_tactic(t: Any) -> Knobs:
     )
 
 
-# inputs = [a, b, out]: a's row count is the tuned dimension (the hybrid token buckets of the bf16 GEMM backends),
-# out follows it; b is static and lives in the profiling arena so that its layout is the caller's.
+# inputs = [a, b, out, bias]: a's row count is the tuned dimension (the hybrid token buckets of the bf16 GEMM backends),
+# out follows it; b is static and lives in the profiling arena so that its layout is the caller's; bias is the (N,)
+# vector or None (the autotuner keeps a None input as is), so the biased kernels are what the profiling times.
 TUNING_CONFIG = TuningConfig(
     use_cuda_graph=True,
     use_cold_l2_graph_replay=True,
@@ -117,7 +124,7 @@ class BatchInvariantBf16GemmRunner(TunableRunner):
     def get_valid_tactics(
         self, inputs: List[torch.Tensor], profile: OptimizationProfile
     ) -> List[Any]:
-        a, b, _ = inputs
+        a, b = inputs[0], inputs[1]
         M, K = a.shape
         N = b.shape[1]
         return [
@@ -162,9 +169,14 @@ class BatchInvariantBf16GemmRunner(TunableRunner):
         do_preparation: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        a, b, out = inputs
+        a, b, out, bias = inputs
         return mm_bf16_batch_invariant(
-            a, b, out, config=self.config_for(a, b, tactic), chunks=self.chunks
+            a,
+            b,
+            out,
+            bias=bias,
+            config=self.config_for(a, b, tactic),
+            chunks=self.chunks,
         )
 
 
@@ -185,23 +197,24 @@ def mm_bf16_batch_invariant_auto(
     backend: str,
 ) -> torch.Tensor:
     """``flashinfer.mm_bf16(a, b, ..., batch_invariant=True)``: the class behind the FlashInfer API's autotuner.
-    ``pdl`` is accepted and launches nothing differently: the class's kernels run in plain stream order."""
+    ``bias`` (bf16, (N,)) selects the biased chain (the bias added once in fp32 to the reduced accumulator before the
+    single rounding); ``pdl`` is accepted and launches nothing differently: the class's kernels run in plain stream
+    order."""
     if backend != "auto":
         raise unsupported(
             CLASS,
             f"backend={backend!r} together with batch_invariant=True",
             'backend="auto" (the flag selects the batch-invariant class in place of the backends)',
         )
-    if bias is not None:
-        raise unsupported(CLASS, "a bias", "bias=None (no fused epilogue)")
     if out_dtype != torch.bfloat16:
         raise unsupported(CLASS, f"out_dtype={out_dtype}", "bf16 output")
     # every typed check runs before the autotuner sees the shape: it only ever profiles shapes the class accepts
     a, out, b_major, M, N, K = prepare_operands(a, b, out)
+    bias = prepare_bias(bias, N, a)
     if M == 0:
         return out
     runner = _runner(b_major, chunks_for(N, K), *part_of(a.device))
-    inputs = [a, b, out]
+    inputs = [a, b, out, bias]
     chosen, tactic = AutoTuner.get().choose_one(
         CUSTOM_OP, [runner], TUNING_CONFIG, inputs
     )

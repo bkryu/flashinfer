@@ -1,9 +1,10 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """Torch-facing entry of the bf16 GEMM class: ``mm_bf16_batch_invariant`` is what :func:`flashinfer.mm_bf16` runs
-under ``batch_invariant=True``. C = A @ B in bf16 with fp32 accumulation; A is (M, K) row-major, B is (K, N) either
-row-major or the transpose of a row-major (N, K) tensor (FlashInfer's documented "column-major" weight), C is (M, N)
-row-major bf16. Every unsupported input raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`;
+under ``batch_invariant=True``. C = A @ B (+ bias) in bf16 with fp32 accumulation; A is (M, K) row-major, B is (K, N)
+either row-major or the transpose of a row-major (N, K) tensor (FlashInfer's documented "column-major" weight), the
+optional bias is a bf16 (N,) vector added once in fp32 to the reduced accumulator before the single rounding, C is
+(M, N) row-major bf16. Every unsupported input raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`;
 nothing falls back."""
 
 from __future__ import annotations
@@ -127,21 +128,54 @@ def prepare_operands(
     return a, out, b_major, M, N, K
 
 
+def prepare_bias(
+    bias: Optional[torch.Tensor], N: int, a: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """The class's typed checks of the bias (what the operator's backends accept): a bf16 vector of ``N`` elements on
+    A's device, contiguous, at a 16-byte-aligned base; ``None`` is the unbiased chain. Raises
+    :class:`BatchInvariantUnsupportedError`; never copies (a bias is an operand the kernel reads as given)."""
+    if bias is None:
+        return None
+    if bias.dtype != torch.bfloat16:
+        raise unsupported(CLASS, f"a {bias.dtype} bias", "a bf16 bias")
+    if bias.dim() != 1 or bias.shape[0] != N:
+        raise unsupported(
+            CLASS, f"a bias of shape {tuple(bias.shape)}", f"a bias of shape ({N},)"
+        )
+    if bias.device != a.device:
+        raise unsupported(CLASS, "a bias on another device", "the bias on A's device")
+    if bias.stride(0) != 1:
+        raise unsupported(
+            CLASS, f"a bias with stride {bias.stride(0)}", "a contiguous bias"
+        )
+    if bias.data_ptr() % _ALIGN_BYTES:
+        raise unsupported(
+            CLASS,
+            "a bias at a base address that is not 16-byte aligned",
+            "a 16-byte-aligned bias",
+        )
+    return bias
+
+
 def mm_bf16_batch_invariant(
     a: torch.Tensor,
     b: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     *,
+    bias: Optional[torch.Tensor] = None,
     config: Optional[Knobs] = None,
     chunks: Optional[int] = None,
     workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """``C = A @ B`` by the class ``gemm.bf16``: ``kfold`` when the weight shape's chunk rule gives 1, else
-    ``kchunk[C]`` with ``C = chunks_for(N, K)``, a function of the weight shape only, so a row's bits never depend on
-    the batch. ``config`` forces a configuration (a member of the enumerated space: the bits never depend on it);
-    ``chunks`` forces the class's chunk count (tests); ``workspace`` (fp32, at least ``chunks * M * N`` elements) is the
-    split class's partials buffer, otherwise allocated per call from the caching allocator (stream-ordered)."""
+    """``C = A @ B`` (``+ bias`` when given) by the class ``gemm.bf16``: ``kfold`` when the weight shape's chunk rule
+    gives 1, else ``kchunk[C]`` with ``C = chunks_for(N, K)``, a function of the weight shape only, so a row's bits never
+    depend on the batch. ``bias`` (bf16, (N,)) selects the biased chain: ``cvt(add(fold, bias[n]))``, the add once in
+    fp32 after the whole fold (in the epilogue, or in the fixup for the workspace split). ``config`` forces a
+    configuration (a member of the enumerated space: the bits never depend on it); ``chunks`` forces the class's
+    chunk count (tests); ``workspace`` (fp32, at least ``chunks * M * N`` elements) is the split class's partials
+    buffer, otherwise allocated per call from the caching allocator (stream-ordered)."""
     a, out, b_major, M, N, K = prepare_operands(a, b, out)
+    bias = prepare_bias(bias, N, a)
     if M == 0:
         return out  # no rows: nothing to launch
     C = chunks if chunks is not None else chunks_for(N, K)
@@ -156,15 +190,22 @@ def mm_bf16_batch_invariant(
     from .blocks.compile import get_compiled_gemm
     from .fixup import MAX_GRID_Y, get_fixup
 
-    kernel = get_compiled_gemm(config, b_major, C, sm_count_of(a.device))
+    direct = C == 1 or config.cta_chunks
+    kernel = get_compiled_gemm(
+        config, b_major, C, sm_count_of(a.device), bias is not None and direct
+    )
     # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk (1 for the unsplit class and the in-CTA
     # fold's output); every stride handed over is a multiple of the declared 16-byte alignment, the size-1 l stride included
     Kc = K // C
     a3 = a.as_strided((M, Kc, C), (a.stride(0), 1, Kc))
     bt = b.t()  # (N, K) view with strides (1, N) or (K, 1)
     b3 = bt.as_strided((N, Kc, C), (bt.stride(0), bt.stride(1), Kc * bt.stride(1)))
-    if C == 1 or config.cta_chunks:
-        kernel(a3, b3, out.as_strided((M, N, 1), (out.stride(0), 1, N)))
+    if direct:
+        c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
+        if bias is None:
+            kernel(a3, b3, c3)
+        else:
+            kernel(a3, b3, c3, bias)  # the biased chain in the epilogue
         return out
     # the fixed-chunk split with the partials in an fp32 workspace, folded in chunk order by the fixup kernel
     if workspace is None:
@@ -184,6 +225,12 @@ def mm_bf16_batch_invariant(
             )
         ws = workspace.reshape(-1)[: C * M * N].view(C, M, N)
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
-    kernel(a3, b3, ws)
-    get_fixup(C, "bf16")(ws, out, M, N, min(M, MAX_GRID_Y))
+    kernel(a3, b3, ws)  # the bias-free partials
+    rows = min(M, MAX_GRID_Y)
+    if bias is None:
+        get_fixup(C, "bf16")(ws, out, M, N, rows)
+    else:
+        get_fixup(C, "bf16", bias=True)(
+            ws, out, bias, M, N, rows
+        )  # the chunk fold, then the biased chain
     return out
