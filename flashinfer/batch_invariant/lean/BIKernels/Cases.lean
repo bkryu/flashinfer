@@ -29,6 +29,11 @@ theorem gemmout1 : (outputKfold "bf16" ⟨0⟩ ⟨0⟩ 8).sexpr = "(cvt bf16 (mm
 theorem gemmout2 : (outputKfold "f32" ⟨0⟩ ⟨0⟩ 4).sexpr = "(cvt f32 (mma16 (mma16 (mma16 (mma16 (const 0.0) (ab (a 0 0) (b 0 0))) (ab (a 0 1) (b 1 0))) (ab (a 0 2) (b 2 0))) (ab (a 0 3) (b 3 0))))" := by decide
 def gemmOutCases : List (Nat × String) := [(4, "bf16"), (8, "bf16"), (4, "f32")]
 
+/-! The biased chain (`spec.output_elem` with a bias column): `outputElemBias` against the Python spec's biased output term, on both classes: the bias leaf added once to the whole fold, then the conversion. -/
+theorem gemmbias0_spec : (outputElemBias "bf16" (kfold ⟨0⟩ ⟨0⟩ 4) ⟨0⟩).sexpr = "(cvt bf16 (add (bias 0) (mma16 (mma16 (mma16 (mma16 (const 0.0) (ab (a 0 0) (b 0 0))) (ab (a 0 1) (b 1 0))) (ab (a 0 2) (b 2 0))) (ab (a 0 3) (b 3 0)))))" := by decide  -- K=64 C=1
+theorem gemmbias1_spec : (outputElemBias "bf16" (kchunk ⟨0⟩ ⟨0⟩ 2 8) ⟨0⟩).sexpr = "(cvt bf16 (add (add (add (const 0.0) (mma16 (mma16 (mma16 (mma16 (mma16 (mma16 (mma16 (mma16 (const 0.0) (ab (a 0 0) (b 0 0))) (ab (a 0 1) (b 1 0))) (ab (a 0 2) (b 2 0))) (ab (a 0 3) (b 3 0))) (ab (a 0 4) (b 4 0))) (ab (a 0 5) (b 5 0))) (ab (a 0 6) (b 6 0))) (ab (a 0 7) (b 7 0)))) (mma16 (mma16 (mma16 (mma16 (mma16 (mma16 (mma16 (mma16 (const 0.0) (ab (a 0 8) (b 8 0))) (ab (a 0 9) (b 9 0))) (ab (a 0 10) (b 10 0))) (ab (a 0 11) (b 11 0))) (ab (a 0 12) (b 12 0))) (ab (a 0 13) (b 13 0))) (ab (a 0 14) (b 14 0))) (ab (a 0 15) (b 15 0)))) (bias 0)))" := by decide  -- K=256 C=2
+def gemmBiasCases : List (Nat × Nat) := [(4, 1), (16, 2)]
+
 /-- `chunks_for(N, K)` as the Python dispatcher computes it; Lean re-derives it. -/
 def chunkTable : List (Nat × Nat × Nat) := [(0, 4096, 1), (64, 64, 1), (64, 8192, 8), (64, 262144, 128), (256, 131072, 32), (512, 65536, 8), (1024, 8192, 1), (4096, 4096, 1), (8192, 8192, 1), (8192, 262144, 1), (2048, 2048, 1), (128, 4096, 2)]
 theorem chunk_rule_matches : chunkTable.all (fun ⟨N, K, C⟩ => chunksFor N K == C) = true := by decide

@@ -15,3 +15,6 @@ def main : IO Unit := do
     IO.println s!"gemmout {steps} {fmt} {(outputKfold fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
   for (N, K, _) in chunkTable do
     IO.println s!"chunks {N} {K} {chunksFor N K}"
+  for (steps, C) in gemmBiasCases do
+    let t := if C == 1 then kfold ⟨0⟩ ⟨0⟩ steps else kchunk ⟨0⟩ ⟨0⟩ C (steps / C)
+    IO.println s!"gemmbias {steps} {C} {(outputElemBias "bf16" t ⟨0⟩).sexpr}"

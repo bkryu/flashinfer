@@ -20,24 +20,26 @@ from .support import (
 
 
 class ClassInfo(NamedTuple):
-    """A consistency class behind a FlashInfer API: its name, the fixed dimensions its fingerprint takes, and the
-    function computing the fingerprint from them."""
+    """A consistency class behind a FlashInfer API: its name, the fixed dimensions its fingerprint takes, the
+    function computing the fingerprint from them, and the optional dimensions (flags of the specification with a
+    default, such as a bias) the function also accepts."""
 
     name: str
     dims: tuple
     fingerprint: Callable[..., str]
+    optional: tuple = ()
 
 
-def _mm_bf16_fingerprint(N: int, K: int) -> str:
+def _mm_bf16_fingerprint(N: int, K: int, bias: bool = False) -> str:
     from ..gemm.batch_invariant.schedule import chunks_for
     from ..gemm.batch_invariant.spec import spec_fingerprint
 
-    return spec_fingerprint(K, "bf16", chunks_for(N, K))
+    return spec_fingerprint(K, "bf16", chunks_for(N, K), bool(bias))
 
 
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
-    "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint),
+    "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
 }
 
 
@@ -50,20 +52,24 @@ def fingerprint(op: str, **dims) -> str:
     the dispatcher picked or the API path. A fingerprint change is a release-note item.
 
     ``mm_bf16`` takes the weight shape ``N, K``: the K steps of the fold and the chunk count (a function of the
-    weight shape alone) are the specification; M, the configuration and the weight's layout do not enter it.
+    weight shape alone) are the specification; M, the configuration and the weight's layout do not enter it. The
+    optional ``bias=True`` names the biased specification (the bias added once in fp32 to the reduced accumulator
+    before the single rounding); without it, the unbiased one.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
+    >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
+    'gemm-bf16-kfold-bias-...'
     """
     info = CLASSES.get(op)
     if info is None:
         raise ValueError(
             f"no batch-invariant class behind {op!r}; the APIs with one are {sorted(CLASSES)}"
         )
-    unknown = sorted(set(dims) - set(info.dims))
+    unknown = sorted(set(dims) - set(info.dims) - set(info.optional))
     if unknown:
         raise TypeError(
-            f"fingerprint({op!r}) takes the fixed dimensions {list(info.dims)}, not {unknown}"
+            f"fingerprint({op!r}) takes the fixed dimensions {list(info.dims)} and the optional {list(info.optional)}, not {unknown}"
         )
     missing = [d for d in info.dims if d not in dims]
     if missing:
