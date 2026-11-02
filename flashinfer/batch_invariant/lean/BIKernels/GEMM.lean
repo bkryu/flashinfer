@@ -9,6 +9,8 @@ Two consistency classes:
 * `kfold`      : one fold over all K-steps from +0 (`gemm.bf16.kfold`);
 * `kchunk C`   : K cut into `C` chunks (a function of the weight shape only), each chunk a fold from +0, the partials
                  folded in chunk order with `add` from +0 (`gemm.bf16.kchunk[C]`).
+Each has a biased chain (`outputElemBias`): the bias of the output column, a leaf, added once to the whole fold before the
+single conversion; every identity below lifts to it by congruence.
 
 What is modelled: the per-element dataflow, the split kernel's index-addressed workspace, and the batched launch
 (rows -> per-row kernel). What is *not* modelled, and is covered by the hardware tests: that the tile shape / cluster
