@@ -49,6 +49,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+# The ranks build their context with the KDA training package's KCP plan, which this tree does not ship.
+pytest.importorskip("flashinfer.experimental.cake_kda_train")
+
 WIDTH = 4
 
 # (document lengths, W, layout, C)

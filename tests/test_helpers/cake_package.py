@@ -26,7 +26,6 @@ PACKAGES: dict[str, str] = {
     "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
     "cake_lm_head_loss": "flashinfer.experimental.cake_lm_head_loss",
     "cake_moe_grouped_gemm": "flashinfer.experimental.cake_moe_grouped_gemm",
-    "cake_kda_train": "flashinfer.experimental.cake_kda_train",
     "cake_gdn_train": "flashinfer.experimental.cake_gdn_train",
     "cake_kimi_k3_attn_res": "flashinfer.experimental.cake_kimi_k3_attn_res",
     "cake_stepfun_moe": "flashinfer.experimental.cake_stepfun_moe",

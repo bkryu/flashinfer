@@ -345,7 +345,7 @@ def cake_causal_conv1d_kcp(
     weight : torch.Tensor
         FP32 ``[C, 4]`` contiguous taps.
     ctx : KcpContext
-        From ``flashinfer.kda_train.build_kcp_context`` (the same context the KDA step of the rank uses).
+        From ``flashinfer.gdn_train.build_kcp_context`` (the same context the GDN step of the rank uses).
     recompute_handle : KcpRecomputeHandle, optional
         Keyword-only, default ``None`` (unchanged behavior).  A handle (any object with an ``entries`` dict, such as
         ``flashinfer.cake_causal_conv1d_train.KcpRecomputeHandle``) makes the checkpoint recompute of
