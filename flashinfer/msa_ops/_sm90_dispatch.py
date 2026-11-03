@@ -1,40 +1,34 @@
 """SM90 (Hopper) dispatch for the MSA ops.
 
-Routes each operation / shape class to the backend that serves it: the Cake
-programs of ``cake_hopper_sm90`` or the Hopper CuTe DSL backends in
+Routes each operation / shape class to the Hopper CuTe DSL backends in
 ``cute_dsl/*_sm90.py``. Selection is on capability, never on measured shape
-thresholds: a Cake program is chosen where one exists for the class
-(``*_route_available``), and the surface's raise rules apply before any
-backend is reached.
+thresholds, and the surface's raise rules apply before any backend is
+reached.
 
-Cake-served classes:
+Served classes:
 
-* sparse decode: every admitted coordinate;
-* proxy score, decode regime (``max_seqlen_q <= 4``): fp8 and bf16 q with a
-  one-head index cache, Hq in {1, 2, 4};
+* sparse decode: bf16 ``q`` over an interleaved fp8 / bf16 paged cache with a
+  dense packed layout;
+* proxy score, decode regime (``max_seqlen_q <= 4``): bf16 q and index cache
+  for any head count, fp8 q with a one-head index cache and Hq in {1, 2, 4};
 * proxy score, prefill regime: fp8 q with a one-head index cache, in both
   accumulation precisions (``use_fp32_acc``);
-* top-k select: every (Hq, max_k_tiles, total_q) whose planner coordinate
-  (columns per CTA, tile groups, index bits, mask form) is a delivered
-  program;
-* sparse prefill: GQA groups 4, 8 and 16 with at most 4096 pages per sequence.
+* top-k select: topk 16 with per-token validity;
+* sparse prefill: the union schedule up to 800 pages per sequence and 16
+  sequences, the one-token-per-CTA schedule above 800 pages for GQA groups 8
+  and 16.
 
-Both sparse routes serve bf16 ``q`` only: the Cake programs reject other
-dtypes and the CuTe DSL prefill kernels type their q / out pointers bf16
-without checking, so fp16 raises at the dispatch instead of being misread.
-
-The remaining classes keep the CuTe DSL kernels (proxy-score decode of a bf16
-index cache for Hq outside {1, 2, 4} or with several index heads, top-k
-planner coordinates without a program, sparse prefill of GQA groups 1 / 2 /
-32 / 64 or above 4096 pages).  The fp8 proxy-score CuTe kernels re-view the
-index cache with a one-head page stride and select no KV head, so an fp8
-index cache with several heads raises in both regimes instead of scoring the
-wrong pages. Both proxy-score prefill backends support f32 accumulation by
-default and explicit f16 accumulation through ``use_fp32_acc=False``.
+Both sparse routes serve bf16 ``q`` only: the CuTe DSL prefill kernels type
+their q / out pointers bf16 without checking, so fp16 raises at the dispatch
+instead of being misread.  The fp8 proxy-score CuTe kernels re-view the index
+cache with a one-head page stride and select no KV head, so an fp8 index
+cache with several heads raises in both regimes instead of scoring the wrong
+pages. The proxy-score prefill backend supports f32 accumulation by default
+and explicit f16 accumulation through ``use_fp32_acc=False``.
 """
 
 import functools
-from typing import Iterable, Optional
+from typing import Optional
 
 import torch
 
@@ -72,13 +66,6 @@ def is_sm90a_device(device: torch.device) -> bool:
     from ..utils import is_sm90a_supported
 
     return bool(is_sm90a_supported(device))
-
-
-@functools.lru_cache(maxsize=64)
-def _sm_count(device: torch.device) -> int:
-    from ..utils import get_device_sm_count
-
-    return int(get_device_sm_count(device))
 
 
 def _i32(t: torch.Tensor) -> torch.Tensor:
@@ -145,26 +132,6 @@ def _fold_scales(q, out_scale, softmax_scale, head_dim):
     return q * (softmax_scale / default)
 
 
-def preload_sm90_programs(kinds: Optional[Iterable[str]] = None) -> dict[str, int]:
-    """Build and load the Cake Hopper MSA programs of the op kinds ``kinds``
-    (default: all) now, outside CUDA graph capture.
-
-    Explicit opt-in.  By default each program is JIT-built at the first eager
-    use of its route, and a program first needed while a CUDA graph is being
-    captured raises instead of building inside the capture; a per-geometry
-    eager warm-up before capture (vLLM's capture loop) therefore needs no
-    preloading.  Frameworks that capture geometries they never ran eagerly,
-    or that want the build cost at model load, call this once per process.
-    Kinds: ``sparse_decode``, ``proxy_decode``, ``proxy_prefill``,
-    ``topk_select``, ``sparse_prefill``; about 4 s per program not yet in the
-    JIT cache (89 programs in all), ~10 ms per prebuilt one.  Returns the
-    programs loaded per kind.
-    """
-    from .cake_hopper_sm90 import preload_programs
-
-    return preload_programs(kinds)
-
-
 def proxy_score_sm90(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -222,33 +189,6 @@ def proxy_score_sm90(
                 raise NotImplementedError(
                     f"SM90 fp8 proxy decode supports Hq in (1, 2, 4), got {q.shape[1]}"
                 )
-        from .cake_hopper_sm90 import (
-            hopper_msa_proxy_score_decode,
-            proxy_decode_route_available,
-        )
-
-        # Cake programs serve fp8 and bf16 decode scoring of a one-head index
-        # cache for Hq in (1, 2, 4) and max_seqlen_q in (1, 2, 3, 4); bf16 Hq
-        # outside that set and bf16 multi-head index caches keep the CuTe DSL
-        # decode schedules.
-        if not _cute_proxy_decode_preferred(
-            q, k, kv_fp8
-        ) and proxy_decode_route_available(
-            q_dtype=q.dtype,
-            num_q_heads=q.shape[1],
-            num_kv_heads=k.shape[1],
-            max_seqlen_q=max_seqlen_q,
-        ):
-            return hopper_msa_proxy_score_decode(
-                q,
-                k,
-                page_table=pt,
-                seqused_k=sk,
-                per_head=per_head,
-                max_seqlen_q=max_seqlen_q,
-                batch_size=batch_size,
-                q_offset=(_i32(q_offset) if q_offset is not None else None),
-            )
         if kv_fp8:
             if k.shape[1] != 1:
                 # The fp8 CuTe decode schedule re-views the cache as consecutive
@@ -269,29 +209,6 @@ def proxy_score_sm90(
         raise NotImplementedError(
             "SM90 proxy-score prefill requires an fp8 e4m3 index cache; "
             "bf16 is supported for decode only"
-        )
-    from .cake_hopper_sm90 import (
-        hopper_msa_proxy_score_prefill,
-        proxy_prefill_route_available,
-    )
-
-    # Cake programs serve fp8 prefill scoring of a one-head index cache in
-    # both accumulation precisions; the CuTe DSL kernel serves the same
-    # one-head class in both precisions, so several index heads raise in both.
-    if proxy_prefill_route_available(
-        q_dtype=q.dtype, num_kv_heads=k.shape[1], use_fp32_acc=use_fp32_acc
-    ):
-        return hopper_msa_proxy_score_prefill(
-            q,
-            k,
-            cu,
-            page_table=pt,
-            seqused_k=sk,
-            per_head=per_head,
-            max_seqlen_q=max_seqlen_q,
-            batch_size=batch_size,
-            q_offset=(_i32(q_offset) if q_offset is not None else None),
-            use_fp32_acc=use_fp32_acc,
         )
     if k.shape[1] != 1:
         # The CuTe prefill kernel rebuilds K as (page, d, num_pages) with a
@@ -347,9 +264,8 @@ def topk_select_sm90(
         isinstance(num_valid_pages, int) and num_valid_pages == max_score.shape[1]
     ):
         if not isinstance(num_valid_pages, torch.Tensor):
-            # Neither the Cake programs nor the CuTe DSL kernel read a
-            # batch-wide count: both take the per-token (total_q,) int32
-            # tensor at the score load. A scalar equal to the score width is
+            # The CuTe DSL kernel reads no batch-wide count: it takes the
+            # per-token (total_q,) int32 tensor at the score load. A scalar equal to the score width is
             # the unclamped case and is accepted above.
             raise NotImplementedError(
                 "SM90 msa_topk_select takes num_valid_pages as a per-token "
@@ -359,27 +275,6 @@ def topk_select_sm90(
         nvp = _i32(num_valid_pages)
 
     hq, tiles, total_q = (int(x) for x in max_score.shape)
-    from .cake_hopper_sm90 import hopper_msa_topk_select, topk_route_available
-
-    # The Cake program writes the op's (total_q, Hq, topk) layout directly, so
-    # it needs neither the permuted view nor the staging copy below.
-    if topk_route_available(
-        num_heads=hq,
-        tiles=tiles,
-        total_q=total_q,
-        num_sms=_sm_count(max_score.device),
-        masked=force_begin_blocks > 0 or force_end_blocks > 0,
-        nvp=nvp is not None,
-    ):
-        return hopper_msa_topk_select(
-            max_score,
-            topk,
-            output,
-            num_valid_pages=nvp,
-            force_begin_blocks=force_begin_blocks,
-            force_end_blocks=force_end_blocks,
-        )
-
     from .cute_dsl.topk_select_sm90 import run as _topk
 
     # The CuTe kernel emits (Hq, total_q, topk); this op returns (total_q, Hq, topk).
@@ -409,8 +304,7 @@ def _as_packed_kv(
     vLLM stores MSA K and V interleaved in one allocation and hands out halves;
     when that is what we were given the packed view is free. Materializing it
     otherwise would copy the whole cache every call, so refuse instead.
-    ``require_dense`` applies the CuTe kernels' stricter stride contract; Cake
-    reads the tensor strides and also admits interleaved pool views.
+    ``require_dense`` applies the CuTe kernels' stricter stride contract.
     """
     if k.dim() != 4:
         raise NotImplementedError(
@@ -460,22 +354,6 @@ def _as_packed_kv(
     return base
 
 
-def _cake_decode_available(q, k, v) -> bool:
-    """Whether the Cake decode program admits this geometry.
-
-    Mirrors its ``_admit_sparse_decode`` checks so an unadmitted shape picks the
-    CuTe DSL schedule instead of raising: head_dim and page size are fixed, q is
-    contiguous bf16 and the paged cache is fp8 e4m3 with matching k/v shapes.
-    """
-    if q.dtype != torch.bfloat16 or not q.is_contiguous():
-        return False
-    if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
-        return False
-    if k.ndim != 4 or k.shape != v.shape:
-        return False
-    return int(k.shape[2]) == _BLK_KV and int(k.shape[3]) == int(q.shape[-1])
-
-
 def sparse_decode_sm90(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -491,94 +369,34 @@ def sparse_decode_sm90(
 ) -> torch.Tensor:
     """MSA sparse decode attention on Hopper. Writes ``out``.
 
-    Served by the Cake Hopper decode program: it takes ``softmax_scale`` as a
-    kernel parameter (no q pre-scaling launch) and reads K and V through their
-    own strides, so the interleaved halves are passed as given once the
-    surface's layout contract (``_as_packed_kv``) has admitted them.  Query
+    Served by the CuTe DSL schedule, which takes ``softmax_scale`` as a
+    compile-time constant and reads the interleaved halves through the packed
+    view the surface's layout contract (``_as_packed_kv``) rebuilds.  Query
     ``i`` of a sequence attends at position ``seqused_k - seqlen_q + i``
-    (right-aligned causal, the surface's decode semantics) with the caller's
-    ``seqlen_q``, which the program checks against ``q``, ``seqused_k`` and
-    ``page_table``; the public entry rejects ``causal=False`` and ``q_offset``
-    and validates the paged metadata before reaching this function.  The
-    program consumes bf16 ``q`` only, so any other ``q`` dtype raises here.
-
-    The Cake program is the default: it is 2-10% faster than the CuTe DSL
-    schedule on every measured shape and needs no dense-packed rebuild. The
-    CuTe schedule is kept as the fallback for geometries Cake does not admit,
-    so this op is not single-sourced.
+    (right-aligned causal, the surface's decode semantics); the public entry
+    rejects ``causal=False`` and ``q_offset`` and validates the paged metadata
+    before reaching this function.  The schedule consumes bf16 ``q`` only, so
+    any other ``q`` dtype raises here.
     """
-    from .cake_hopper_sm90 import hopper_msa_sparse_decode_attention
-
     if q.dtype != torch.bfloat16:
         raise NotImplementedError(
             f"SM90 msa_sparse_decode_attention serves bf16 q; got {q.dtype}"
         )
     _check_packed_kv(k, v)
-    if _cake_decode_available(q, k, v):
-        hopper_msa_sparse_decode_attention(
-            q,
-            k,
-            v,
-            _i32(q2k_indices),
-            page_table=_i32(page_table),
-            seqused_k=_i32(seqused_k),
-            seqlen_q=seqlen_q,
-            softmax_scale=softmax_scale,
-            out=out,
-        )
-    else:
-        from .cute_dsl.sparse_decode_sm90 import run as _decode
+    from .cute_dsl.sparse_decode_sm90 import run as _decode
 
-        _decode(
-            q,
-            _as_packed_kv(k, v),
-            _i32(q2k_indices),
-            _i32(page_table),
-            _i32(seqused_k),
-            out,
-            softmax_scale=softmax_scale,
-        )
+    _decode(
+        q,
+        _as_packed_kv(k, v),
+        _i32(q2k_indices),
+        _i32(page_table),
+        _i32(seqused_k),
+        out,
+        softmax_scale=softmax_scale,
+    )
     if v_global_scale is not None and v_global_scale != 1.0:
         out.mul_(v_global_scale)
     return out
-
-
-def _cute_proxy_decode_preferred(q, k, kv_fp8) -> bool:
-    """Whether to serve proxy-score decode from the CuTe DSL schedule.
-
-    Measured on H100 against the Cake program (kernel time, outputs agreeing):
-    0.86-0.90x at batch 1-8 and 1.00x from batch 8 up, i.e. tie-or-better at
-    every size measured. Only the fp8 one-head schedule was covered, so bf16
-    and multi-head index caches stay on Cake.
-    """
-    return bool(kv_fp8) and int(k.shape[1]) == 1
-
-
-# Mean query tokens per sequence from which the CuTe union schedule beats Cake.
-_CUTE_PREFILL_MIN_SQ = 8192
-
-
-def _cute_prefill_preferred(q, k, v, page_table) -> bool:
-    """Whether the CuTe DSL union schedule should serve this call over Cake.
-
-    Measured on H100 (kernel time at matched accuracy, ~2e-3 rel-L2 vs fp32;
-    fp8 KV, one KV head): at 8192 query tokens per sequence the union
-    schedule takes 0.73-1.0x Cake's time over 80-848 pages, for GQA groups 8
-    and 16. With 512-4096 tokens per sequence it takes 0.85-1.27x, losing on
-    most shapes, so Cake keeps those.
-    """
-    if int(page_table.shape[1]) > _MPG_UNION_MAX:
-        return False
-    nb = int(page_table.shape[0])
-    if nb > _MAX_BATCH or int(q.shape[0]) < _CUTE_PREFILL_MIN_SQ * nb:
-        return False
-    if int(q.shape[1]) // max(1, int(k.shape[1])) not in (8, 16):
-        return False
-    try:
-        _as_packed_kv(k, v, q.shape[-1], require_dense=True)
-    except NotImplementedError:
-        return False
-    return True
 
 
 def sparse_prefill_sm90(
@@ -597,50 +415,16 @@ def sparse_prefill_sm90(
 ) -> torch.Tensor:
     """MSA sparse prefill attention on Hopper. Writes ``out``.
 
-    The Cake programs take ``softmax_scale`` as a kernel parameter, derive the
-    query positions from ``seqused_k`` in the kernel when no ``q_offset`` is
-    given, and read K and V through their own strides, so they allocate
-    nothing per call (CUDA-graph capturable as is).  Query ``i`` of sequence
-    ``b`` attends the keys of its selected blocks at positions
-    ``<= q_offset[b] + i``.  Every SM90 sparse-prefill schedule reads ``q``
-    and writes ``out`` as bf16 -- the Cake programs reject other dtypes and
-    the CuTe DSL kernels type the raw pointers bf16 without checking -- so
-    fp16 raises here, before a route is chosen.
+    Query ``i`` of sequence ``b`` attends the keys of its selected blocks at
+    positions ``<= q_offset[b] + i``; without ``q_offset`` the positions follow
+    from ``seqused_k``.  Every SM90 sparse-prefill schedule reads ``q`` and
+    writes ``out`` as bf16 -- the CuTe DSL kernels type the raw pointers bf16
+    without checking -- so fp16 raises here, before a route is chosen.
     """
-    from .cake_hopper_sm90 import hopper_msa_sparse_attention, prefill_route_available
-
     if q.dtype != torch.bfloat16:
         raise NotImplementedError(
             f"SM90 msa_sparse_attention serves bf16 q; got {q.dtype}"
         )
-    # The CuTe DSL schedules feed Q and P to fp8 WGMMAs as hi / lo pairs to
-    # match Cake's accuracy (~2e-3 rel-L2 vs fp32, against ~3e-2 with single
-    # fp8 operands). At that precision the union schedule wins only on long
-    # chunks (_cute_prefill_preferred); Cake takes the rest of its classes, and
-    # the CuTe DSL kernels serve what Cake does not: more than 4096 pages, and
-    # GQA groups 32 / 64.
-    if not _cute_prefill_preferred(q, k, v, page_table) and prefill_route_available(
-        num_q_heads=q.shape[1],
-        num_kv_heads=k.shape[1],
-        max_pages=int(page_table.shape[1]),
-    ):
-        _check_packed_kv(k, v)
-        hopper_msa_sparse_attention(
-            q,
-            k,
-            v,
-            _i32(q2k_indices),
-            _i32(cu_seqlens_q),
-            page_table=_i32(page_table),
-            seqused_k=_i32(seqused_k),
-            out=out,
-            q_offset=(_i32(q_offset) if q_offset is not None else None),
-            softmax_scale=softmax_scale,
-        )
-        if v_global_scale is not None and v_global_scale != 1.0:
-            out.mul_(v_global_scale)
-        return out
-
     if int(page_table.shape[1]) > _MPG_UNION_MAX:
         # The single-token copy-out moves g * (D // 8) vectors with one
         # warpgroup, so g < 8 gives the loop zero iterations and never writes

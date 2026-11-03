@@ -765,85 +765,6 @@ def test_prefill_pipeline_replays_bitwise_from_cuda_graph():
 
 
 @sm90_only
-def test_program_first_needed_under_capture_raises_instead_of_building(monkeypatch):
-    """A program no eager call has loaded is not JIT-built inside a CUDA graph
-    capture: the launch raises, naming the program and the remedies, and the
-    loader is not called.  An eager call of the geometry then loads it and the
-    same capture replays bitwise."""
-    from flashinfer.jit import cake_hopper_msa as jm
-    from flashinfer.msa_ops import cake_hopper_sm90 as ch
-
-    nsm = flashinfer.utils.get_device_sm_count(torch.device("cuda"))
-    plan = ch.plan_topk_select(
-        num_heads=1, tiles=8, total_q=256, num_sms=nsm, masked=True, nvp=True
-    )
-    name = jm.ROUTES.get(plan.route)
-    if name is None:
-        pytest.skip(f"no Cake top-k program for {plan.route} on this tree")
-    scores = torch.randn(1, 8, 256, dtype=torch.float32, device="cuda")
-    nvp = torch.randint(1, 9, (256,), dtype=torch.int32, device="cuda")
-    sel = torch.empty((256, 1, TOPK), dtype=torch.int32, device="cuda")
-
-    def topk():
-        msa_topk_select(
-            scores, TOPK, num_valid_pages=nvp, output=sel, force_begin_blocks=1
-        )
-
-    # the geometry's program leaves the process registry; the templates that cached it are reset
-    monkeypatch.delitem(ch._loaded_modules, name, raising=False)
-    ch._program.cache_clear()
-    ch._topk_template.cache_clear()
-    misses = jm.load_hopper_msa_module.cache_info().misses
-    graph = torch.cuda.CUDAGraph()
-    with (
-        pytest.raises(RuntimeError, match="is not loaded") as info,
-        torch.cuda.graph(graph),
-    ):
-        topk()
-    assert name in str(info.value)
-    assert "preload_programs" in str(info.value)
-    assert jm.load_hopper_msa_module.cache_info().misses == misses
-    topk()  # the eager call loads it (outside capture)
-    torch.cuda.synchronize()
-    eager = sel.clone()
-    sel.fill_(-7)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        topk()
-    sel.fill_(-7)
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(sel, eager)
-
-
-@sm90_only
-def test_preload_loads_every_program_of_a_kind_outside_capture():
-    """The explicit opt-in loads every delivered program of the named kinds,
-    reports what it loaded, and refuses unknown kinds and capture."""
-    from flashinfer.msa_ops import cake_hopper_sm90 as ch
-    from flashinfer.msa_ops._sm90_dispatch import preload_sm90_programs
-
-    names = ch._programs_of_kind("proxy_prefill")
-    assert names
-    loaded = preload_sm90_programs(("proxy_prefill",))
-    assert set(loaded) == {"proxy_prefill"}
-    assert 0 <= loaded["proxy_prefill"] <= len(names)
-    assert all(name in ch._loaded_modules for name in names)
-    assert preload_sm90_programs(("proxy_prefill",)) == {"proxy_prefill": 0}
-    with pytest.raises(ValueError, match="unknown"):
-        preload_sm90_programs(("no_such_kind",))
-    graph = torch.cuda.CUDAGraph()
-    with (
-        pytest.raises(RuntimeError, match="must not run under CUDA graph capture"),
-        torch.cuda.graph(graph),
-    ):
-        preload_sm90_programs(("proxy_prefill",))
-
-
-# ---------------------------------------------------------------------------
-# restrictions -- each raises instead of returning plausible, wrong numbers
-# ---------------------------------------------------------------------------
-@sm90_only
 def test_lse_is_rejected_not_ignored():
     q, k, v, idx, page_table, seqused_k = _decode_inputs()
     with pytest.raises(NotImplementedError, match="does not return an LSE"):
@@ -1163,27 +1084,12 @@ def test_sm90_is_advertised_as_supporting_packed_kv():
     assert flashinfer.msa_ops.SUPPORTS_PACKED_KV is True
 
 
-# PR regressions: also exercise the retained CuTe implementations.
+# PR regressions on the CuTe DSL implementations.
 
 
-@pytest.fixture(params=["cake", "cute"])
-def sm90_regression_backend(request, monkeypatch):
-    """Exercise the public Cake route and the retained CuTe fallback separately."""
-    from flashinfer.msa_ops import _sm90_dispatch, cake_hopper_sm90
-
-    if request.param == "cute":
-        for route in (
-            "prefill_route_available",
-            "topk_route_available",
-            "proxy_prefill_route_available",
-        ):
-            monkeypatch.setattr(cake_hopper_sm90, route, lambda **kwargs: False)
-    else:
-        # proxy-score decode and long-chunk sparse prefill prefer the CuTe
-        # schedules, so the Cake arm has to turn those preferences off or this
-        # fixture would run CuTe on both arms.
-        for pref in ("_cute_prefill_preferred", "_cute_proxy_decode_preferred"):
-            monkeypatch.setattr(_sm90_dispatch, pref, lambda *a, **k: False)
+@pytest.fixture(params=["cute"])
+def sm90_regression_backend(request):
+    """The SM90 backend under test; every route is served by the CuTe DSL kernels."""
     return request.param
 
 
@@ -1806,18 +1712,12 @@ def test_sparse_decode_rejects_dropped_arguments(kwargs, match):
 
 
 @sm90_only
-def test_single_token_prefill_rejects_unsupported_gqa(monkeypatch):
+def test_single_token_prefill_rejects_unsupported_gqa():
     """g < 8 leaves the single-token copy-out with zero iterations.
 
     The loop is sized g * (HEAD_DIM // 8) // 128, so Hq/Hkv of 4 moves nothing
-    and the caller would get its uninitialised output buffer back. Cake supports
-    this GQA group, so force the CuTe fallback to check its narrower contract.
+    and the caller would get its uninitialised output buffer back.
     """
-    from flashinfer.msa_ops import cake_hopper_sm90
-
-    monkeypatch.setattr(
-        cake_hopper_sm90, "prefill_route_available", lambda **kwargs: False
-    )
     torch.manual_seed(0)
     qlen, hq, hkv, mkt = 8, 4, 1, 1024
     base = (torch.randn(mkt, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
@@ -1845,7 +1745,7 @@ def test_single_token_prefill_rejects_unsupported_gqa(monkeypatch):
 
 
 @sm90_only
-@pytest.mark.parametrize("backend", ["cake", "cute"])
+@pytest.mark.parametrize("backend", ["public", "cute"])
 def test_sparse_decode_ignores_poisoned_page_tail(backend):
     """Bytes past seqused_k are uninitialised in vLLM and must not reach the output.
 
@@ -2010,17 +1910,11 @@ def test_sparse_prefill_honours_non_default_softmax_scale(
 
 @sm90_only
 @pytest.mark.parametrize("mult", [1.0, 2.0])
-def test_sparse_decode_cute_fallback_matches_reference(monkeypatch, mult):
-    """Sparse decode must not be single-sourced on the Cake program.
-
-    Force the CuTe DSL schedule the way an unadmitted geometry would, and check
-    it still matches the dense reference -- including a non-default
-    softmax_scale, which it now takes as a compile-time constant rather than by
-    pre-scaling q.
+def test_sparse_decode_cute_fallback_matches_reference(mult):
+    """The CuTe DSL decode schedule matches the dense reference -- including a
+    non-default softmax_scale, which it takes as a compile-time constant rather
+    than by pre-scaling q.
     """
-    from flashinfer.msa_ops import _sm90_dispatch
-
-    monkeypatch.setattr(_sm90_dispatch, "_cake_decode_available", lambda *a, **k: False)
     q, k, v, idx, page_table, seqused_k = _decode_inputs(
         batch=2, num_qo_heads=8, num_kv_heads=1, max_k_tiles=32, seed=int(mult) + 3
     )
