@@ -10,7 +10,7 @@ through FlashInfer.  The package registries (``cake_jit.py`` / ``jit.py`` /
 ``library`` stem: entry ``<library>[<specialization tag>]_<arch>``.
 
 The manifest's ``package`` field is the dotted import path of the package
-directory (``flashinfer.experimental.cake_mok_bf16``,
+directory (``flashinfer.experimental.cake_dsa_train``,
 ``flashinfer.cake_rmsnorm_train_backend``): the one spelling every exporter
 writes and this checker compares (``Package.name``); a directory path is not
 accepted.  ``name`` is the unique key of ``libraries``; ``closure_sha256`` is
@@ -303,15 +303,6 @@ def refs_shipped_modules(package_dir: Path, loader: str) -> set[str]:
     return generic_library_refs(module_literals(package_dir / loader)["MODULES"])
 
 
-def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
-    """``sources.json``: role -> {library, arches, arguments}."""
-    registry = json.loads((package_dir / loader).read_text())
-    return {
-        f"{record['library']}_{arch}"
-        for record in registry.values()
-        for arch in record["arches"]
-    }
-
 
 @dataclass(frozen=True)
 class Package:
@@ -423,12 +414,6 @@ PACKAGES: tuple[Package, ...] = (
         "flashinfer/experimental/cake_lm_head_loss",
         "cake_jit.py",
         refs_lm_head_loss,
-    ),
-    Package(
-        "flashinfer.experimental.cake_mok_bf16",
-        "flashinfer/experimental/cake_mok_bf16",
-        "sources.json",
-        refs_mok_bf16,
     ),
     Package(
         "flashinfer.experimental.dense_projection_gemm",
