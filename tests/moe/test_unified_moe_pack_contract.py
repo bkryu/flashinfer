@@ -24,16 +24,13 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.runners import (
-    CakeStepFunRunner,
     CuteDslRunner,
     MoERunner,
     PrimsTsRunner,
     TrtllmFp4RoutedRunner,
 )
 
-# CakeStepFunRunner dispatches to its NVFP4 family, whose kernels read the scale.
 _PER_TOKEN_RUNNERS = {
-    CakeStepFunRunner,
     CuteDslRunner,
     PrimsTsRunner,
     TrtllmFp4RoutedRunner,

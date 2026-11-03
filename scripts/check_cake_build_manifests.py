@@ -285,23 +285,10 @@ def refs_moe_grouped_gemm(package_dir: Path, loader: str) -> set[str]:
     return refs
 
 
-def refs_stepfun(package_dir: Path, loader: str) -> set[str]:
-    """Compact rows keyed by the 20-hex program digest (``_PROGRAMS``; the library stem is
-    ``_PREFIX + digest``), every program built for every architecture of ``ARCHES``."""
-    literals = module_literals(package_dir / loader)
-    prefix, arches = literals["_PREFIX"], literals["ARCHES"]
-    return {
-        f"{prefix}{digest}_{arch}"
-        for digest in literals["_PROGRAMS"]
-        for arch in arches
-    }
-
-
 def refs_shipped_modules(package_dir: Path, loader: str) -> set[str]:
     """A registry whose ``MODULES`` literal holds the shipped records and whose other tables (``TEST_MODULES``)
     hold programs of a side manifest ``build.json`` never lists: the generic walk over ``MODULES`` alone."""
     return generic_library_refs(module_literals(package_dir / loader)["MODULES"])
-
 
 
 @dataclass(frozen=True)
@@ -408,12 +395,6 @@ PACKAGES: tuple[Package, ...] = (
         "flashinfer/experimental/cake_lm_head_loss",
         "cake_jit.py",
         refs_lm_head_loss,
-    ),
-    Package(
-        "flashinfer.experimental.cake_stepfun_moe",
-        "flashinfer/experimental/cake_stepfun_moe",
-        "cake_jit.py",
-        refs_stepfun,
     ),
     Package(
         "flashinfer.cake_nvfp4_svdquant_gemm_backend",

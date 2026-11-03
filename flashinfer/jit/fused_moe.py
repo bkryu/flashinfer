@@ -337,9 +337,8 @@ def trtllm_gen_fused_moe_build_inputs(
     """Host sources, nvcc flags, and include paths of a trtllm-gen fused-MoE module.
 
     Resolves the BMM artifact (manifest header, export headers) into the
-    per-module export root ``module_name`` so the public module and the Cake
-    StepFun module (which compiles the same host sources with its own flags)
-    share one plumbing. ``nvcc_flags`` defaults to the current compilation
+    per-module export root ``module_name`` so every module compiling these host
+    sources shares one plumbing. ``nvcc_flags`` defaults to the current compilation
     context's Blackwell/Rubin architecture flags.
     """
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
