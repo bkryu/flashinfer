@@ -17,7 +17,7 @@ _EXPERIMENTAL = Path(__file__).resolve().parents[2] / "flashinfer" / "experiment
 _FAMILIES = ("deepgemm_", "mega_moe_v3")
 # Families that ship their own architecture table instead of the shared loader's
 # ARCHES; their catalogs are checked against that table.
-_FAMILY_ARCHES = {"deepgemm_sm120_paged_mqa_logits": {"sm_120a"}}
+_FAMILY_ARCHES: dict[str, set[str]] = {}
 
 
 def _per_arch_catalog():
