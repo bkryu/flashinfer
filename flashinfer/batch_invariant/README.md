@@ -52,7 +52,10 @@ The MoE classes' grouped GEMMs are the dense class under a different scheduler (
 their dispatcher is the dense ranking at `M =` the average rows per active expert, mapped onto the grouped space (the
 records of swizzle band 1 whose N tile the staged epilogue lays out) and filtered by the grouped body's acceptance
 (`fused_moe/batch_invariant/schedule.py`). The autotuner's tactics are the pairs of the top records of the two GEMMs;
-every pair computes the class. The persistent grid of a grouped GEMM is the same launch parameter as the dense one's.
+every pair computes the class. The persistent grid of a grouped GEMM is the same launch parameter as the dense one's. The NVFP4 MoE classes' dispatcher (`fused_moe/batch_invariant/schedule_nvfp4.py`) ranks the same way at the
+dense 4-bit class's instruction class with `M =` the rows of one active expert rounded up to the 128-row scale-factor atom (the
+grouped kernel computes whole atoms per group), and keeps only the records whose M tile fits that padded group: a taller
+tile computes padding the dense estimate does not price.
 
 ## How to check the proofs
 

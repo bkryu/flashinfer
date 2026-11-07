@@ -10,9 +10,11 @@ nominal constants, no measured tables) at the dense shape whose tiles and operan
 the rows of one active expert rounded up to the scale-factor atom (the grouped kernel computes whole atoms per group,
 whether or not their rows are real), ``N`` = the active experts' weight rows side by side (every group's tiles count, and the
 weights are read once per group). The ranking is mapped onto the grouped block-scaled space (the dense records at swizzle 1:
-no in-cluster split, no operand swap, no B-reuse tile) and filtered by the grouped body's acceptance. Numerics-neutral: every
-record of the space is canonical (the same bits), so the dispatcher may depend on anything; the ranked list is what the
-autotuner profiles under ``batch_invariant``.
+no in-cluster split, no operand swap, no B-reuse tile), filtered by the grouped body's acceptance and by the tile-fit guard: a
+record whose M tile is taller than the group's padded rows is not a candidate (the group scheduler's tiles never span groups,
+so the rows past the group are padding the tile computes for nothing; the dense estimate, which prices such a tile as a dense
+M tail, overrates it there). Numerics-neutral: every record of the space is canonical (the same bits), so the dispatcher may
+depend on anything; the ranked list is what the autotuner profiles under ``batch_invariant``.
 """
 
 from __future__ import annotations
@@ -98,15 +100,17 @@ def rank_grouped_nvfp4(
     n_active: Optional[int] = None,
 ) -> List[Knobs]:
     """The ranked grouped records for one GEMM: the dense ranking of the instruction class at ``(M = padded rows, N =
-    n_active * N)`` mapped onto the grouped space, in rank order, de-duplicated, at least ``k`` records when the space has
-    them (the ranking is extended by the rest of the space in its enumeration order, so the list is never empty for an
-    implementable shape)."""
+    n_active * N)`` mapped onto the grouped space, in rank order, de-duplicated, the records whose M tile fits the padded
+    rows of a group (a taller tile computes padding only), at least ``k`` records when the space has them (the ranking is
+    extended by the rest of the space in its enumeration order, so the list is never empty for an implementable shape: the
+    128-row tiles always fit)."""
     from .blocks.compile_nvfp4 import can_implement_grouped_nvfp4
 
     out: List[Knobs] = []
     seen = set()
+    m = padded_rows(rows)
     ranked = rank_topk(
-        padded_rows(rows),
+        m,
         (n_active or E) * N,
         K,
         1,
@@ -118,8 +122,10 @@ def rank_grouped_nvfp4(
         nominal,
     )
     for cand in [_grouped(c) for c in ranked] + grouped_knobs_blockscaled():
-        if cand in seen or not can_implement_grouped_nvfp4(
-            cand, N, K, E, chain, in_fmt
+        if (
+            cand in seen
+            or cand.tile_m > m
+            or not can_implement_grouped_nvfp4(cand, N, K, E, chain, in_fmt)
         ):
             continue
         seen.add(cand)

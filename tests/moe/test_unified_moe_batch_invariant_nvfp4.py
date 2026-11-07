@@ -456,6 +456,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
         all_valid_configs_nvfp4,
         default_configs_nvfp4,
         grouped_knobs_blockscaled,
+        padded_rows,
         rank_grouped_nvfp4,
         rows_per_expert,
     )
@@ -529,6 +530,20 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     and len(set(ranked)) == len(ranked)
                     and all(c in s2 for c in ranked)
                 )
+                # the tile-fit guard: at a group of one padded atom the picks and the ranked list are 128-row tiles (a
+                # 256-row 2-CTA tile would compute a second atom of padding); at taller groups every tile is a candidate
+                if padded_rows(rows_per_expert(T, k, E)) == 128:
+                    assert c1.tile_m == 128 and c2.tile_m == 128, (
+                        family,
+                        T,
+                        H,
+                        I,
+                        E,
+                        k,
+                        c1.describe(),
+                        c2.describe(),
+                    )
+                    assert all(c.tile_m == 128 for c in ranked)
 
 
 def test_unsupported_device_raises_before_any_kernel():
