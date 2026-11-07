@@ -51,8 +51,10 @@ cases are the nominal parts' (`nominal=True`).
 The MoE classes' grouped GEMMs are the dense class under a different scheduler (one segment of rows per expert), so
 their dispatcher is the dense ranking at `M =` the average rows per active expert, mapped onto the grouped space (the
 records of swizzle band 1 whose N tile the staged epilogue lays out) and filtered by the grouped body's acceptance
-(`fused_moe/batch_invariant/schedule.py`). The autotuner's tactics are the pairs of the top records of the two GEMMs;
-every pair computes the class. The persistent grid of a grouped GEMM is the same launch parameter as the dense one's.
+(`fused_moe/batch_invariant/schedule.py`); the MXFP8 class ranks the grouped MX space itself by the dense estimate at
+that shape (`schedule_mxfp8.py`: the dense MX class's own decode candidates are its swapped records, a body the grouped
+kernel does not have). The autotuner's tactics are the pairs of the top records of the two GEMMs; every pair computes
+the class. The persistent grid of a grouped GEMM is the same launch parameter as the dense one's.
 
 ## How to check the proofs
 

@@ -394,6 +394,8 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
         grouped_knobs_mx,
         rank_grouped_mx,
     )
+    from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
+    from flashinfer.gemm.batch_invariant.heuristic import DECODE_M
     from flashinfer.gemm.batch_invariant.schedule import mx_class_for
 
     ks = grouped_knobs_mx("mxfp8")
@@ -450,6 +452,16 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     c1.describe(),
                     c2.describe(),
                 )
+                if rows_per_expert(T, k, E) <= DECODE_M:
+                    # the grouped space has no swapped decode body: at a decode-sized group the candidates are the
+                    # 1-CTA tiles in an N-cluster (the dense dispatcher's guard for such a space), never the dense
+                    # class's swapped decode records read in the grouped orientation
+                    for c in (c1, c2):
+                        assert (
+                            not c.use_2cta_instrs
+                            and c.cluster_shape_mn[0] == 1
+                            and c.tile_n >= 64
+                        ), (family, T, H, I, E, c.describe())
                 ranked = rank_grouped_mx(
                     max(1, T * k // E),
                     n1,

@@ -1,14 +1,17 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The MXFP8 grouped GEMMs' dispatcher: the dense MX class's ranking heuristic at the grouped launch's shape.
+"""The MXFP8 grouped GEMMs' dispatcher: the dense MX class's estimate over the grouped space at the grouped launch's shape.
 
 As for the bf16 classes (:mod:`.schedule`), a grouped GEMM is the dense class under a different scheduler, so its records
-are ranked by the dense dispatcher's model (`flashinfer.gemm.batch_invariant.schedule.rank_topk` for the MX class of the
-part: the part's roofline with nominal constants, no measured tables) at the dense shape whose tiles, M tail and operand
-bytes are the grouped launch's (``M`` = the rows of one active expert, ``N`` = the active experts' weight rows side by
-side), filtered by the grouped block-scaled body's acceptance and the grouped MX space (the dense block-scaled records at
-swizzle 1 without in-cluster split, operand swap or B-reuse tile). Numerics-neutral: every record of the space computes
-the class.
+are ranked by the dense dispatcher's model (`flashinfer.gemm.batch_invariant.heuristic.estimate_cycles` for the MX class
+of the part: the part's roofline with nominal constants, no measured tables) at the dense shape whose tiles, M tail and
+operand bytes are the grouped launch's (``M`` = the rows of one active expert, ``N`` = the active experts' weight rows
+side by side). The records ranked are the grouped MX space itself (the dense block-scaled records at swizzle 1 without
+in-cluster split, operand swap or B-reuse tile, filtered by the grouped block-scaled body's acceptance), not the dense
+ranking's list mapped record by record: the dense MX class's own candidates at a decode-sized ``M`` are its swapped
+decode records (the weights on the MMA's M side), a body the grouped kernel does not have, and their cluster and tile
+knobs read in the grouped orientation name records the estimate itself ranks last. Numerics-neutral: every record of the
+space computes the class.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from ...gemm.batch_invariant.generator import (
     Knobs,
     knob_product,
 )
-from ...gemm.batch_invariant.schedule import rank_topk
+from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
 from .blocks.epilogue import GroupedChain
 from .schedule import TOP_K, active_experts, rows_per_expert
 
@@ -45,19 +48,6 @@ def grouped_knobs_mx(in_fmt: str = "mxfp8", clusters=None) -> List[Knobs]:
         and not k.cta_chunks
         and k.tile_n in TILES_N_BLOCKSCALED
     ]
-
-
-def _grouped_mx(cfg: Knobs) -> Knobs:
-    """A dense MX record as a grouped one: the instruction's M (the B-reuse tile halved), the N tile clamped into the
-    block-scaled tiles (a swapped decode record's token tile has no grouped layout), swizzle 1, no grid cap, no split."""
-    return Knobs(
-        (cfg.inst_m, max(cfg.tile_n, TILES_N_BLOCKSCALED[0])),
-        cfg.cluster_shape_mn,
-        cfg.use_2cta_instrs,
-        True,
-        cfg.raster_along,
-        1,
-    )
 
 
 def all_valid_configs_mx(
@@ -86,35 +76,56 @@ def rank_grouped_mx(
     nominal: bool = False,
     n_active: Optional[int] = None,
 ) -> List[Knobs]:
-    """The ranked grouped records for one GEMM: the dense MX class's ranking at ``(M = rows, N = n_active * N)`` mapped
-    onto the grouped space, in rank order, de-duplicated, at least ``k`` records when the space has them (the ranking is
-    extended by the rest of the space in its enumeration order, so the list is never empty for an implementable shape)."""
+    """The ranked grouped records for one GEMM: the grouped MX space the body accepts for the weight shape and the chain,
+    ordered by the dense MX class's estimate at ``(M = rows, N = n_active * N, K)`` (``n_active`` the active experts, ``E``
+    by default), best first, ties in the space's enumeration order; at a decode-sized ``rows`` the dense dispatcher's
+    structural guard for a space without swapped records (`heuristic.decode_sane`: 1-CTA tiles in an N-cluster) selects
+    the candidates, as it does for the bf16 classes. As in the dense ``rank_topk``, each of the best ceil(k/2) records is
+    followed by its raster twin (the one knob the estimate does not price), then the rank order fills the list: distinct
+    records, at most ``k``, never empty for an implementable shape."""
+    import dataclasses
+
     from .blocks.compile_mxfp8 import can_implement_grouped_mxfp8
 
+    fam = family or "sm_107"
+    dense_n = (n_active or E) * N
+    space = [
+        c
+        for c in grouped_knobs_mx(in_fmt)
+        if can_implement_grouped_mxfp8(c, N, K, E, chain, in_fmt)
+    ]
+    guarded = [c for c in space if decode_sane(c, rows, False)]
+    ranked = [
+        c
+        for _t, _i, c in sorted(
+            (
+                estimate_cycles(
+                    c, rows, dense_n, K, 1, "k", in_fmt, fam, sm_count, nominal=nominal
+                ),
+                i,
+                c,
+            )
+            for i, c in enumerate(guarded or space)
+        )
+    ]
+    members = set(space)
     out: List[Knobs] = []
     seen = set()
-    ranked = rank_topk(
-        rows,
-        (n_active or E) * N,
-        K,
-        1,
-        "k",
-        sm_count,
-        max(k, 10),
-        family,
-        in_fmt,
-        nominal,
-    )
-    for cand in [_grouped_mx(c) for c in ranked] + grouped_knobs_mx(in_fmt):
-        if cand in seen or not can_implement_grouped_mxfp8(
-            cand, N, K, E, chain, in_fmt
-        ):
-            continue
-        seen.add(cand)
-        out.append(cand)
+    for rec in ranked[: -(-k // 2)]:
+        twin = dataclasses.replace(
+            rec, raster_along="n" if rec.raster_along == "m" else "m"
+        )
+        for cand in (rec, twin):
+            if cand not in seen and (cand is rec or cand in members):
+                out.append(cand)
+                seen.add(cand)
+    for rec in ranked:
         if len(out) >= k:
             break
-    return out
+        if rec not in seen:
+            out.append(rec)
+            seen.add(rec)
+    return out[:k]
 
 
 def default_configs_mx(
