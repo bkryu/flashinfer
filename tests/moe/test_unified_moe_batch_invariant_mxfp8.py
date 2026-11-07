@@ -20,6 +20,8 @@ bf16 chains, the plain GEMM2 conversion), the shape rules and the dispatcher's m
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -1063,6 +1065,62 @@ def test_routing_methods_from_logits_match_the_cpu_model():
         )
         ref = layer(_routed_pack(x, ex.cuda(), w.cuda()), W)
         assert torch.equal(bits(out), bits(ref)), method
+
+
+def _poison_allocator(byte: int):
+    """Fill the caching allocator's cached blocks (the large pool and 256 small-pool segments) with one byte pattern, so the
+    ``torch.empty`` intermediates of the next op call start with it (0x7F / 0xFF: e4m3 and bf16 NaN patterns; 0x00: zeros)."""
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    free = torch.cuda.mem_get_info()[0]
+    blocks = [
+        torch.empty(
+            int(min(free // 2, 8 << 30)), dtype=torch.uint8, device="cuda"
+        ).fill_(byte)
+    ]
+    blocks += [
+        torch.empty(1 << 19, dtype=torch.uint8, device="cuda").fill_(byte)
+        for _ in range(256)
+    ]
+    torch.cuda.synchronize()
+    del blocks
+
+
+@needs_device
+@pytest.mark.parametrize("requant", ["fused", "standalone"])
+@pytest.mark.parametrize("gated", [False, True], ids=["relu2", "silu"])
+def test_poisoned_intermediates_do_not_reach_the_bits(requant, gated):
+    """Unspecified bytes and timing never reach the output: the op's intermediates (``x_perm`` and its scales with their
+    padding rows, GEMM1's output or its fused codes and scales, GEMM2's output, the output itself) come from ``torch.empty``;
+    with the caching allocator's blocks filled with NaN patterns before every call and a bandwidth-bound kernel running on a
+    side stream of the same device during the call, both requantization spellings give the bits of a clean run, each other's
+    bits and the layer's, ``RLK_STRESS_ITERS`` times (default 20) at a shape whose GEMM2 K is one k-tile."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.api import route
+
+    T, k, H, I, E = 64, 8, 256, 128, 256
+    x, logits, w1, w2 = _problem(
+        T, k, H, I, E, seed=T + 3 * E, gated=gated, adversarial=True
+    )
+    xq, xsf = _quant(x)
+    W = F.MoEWeightsMXFP8.prepare(w1, w2, gated=gated, act="silu" if gated else "relu2")
+    ids, weights = route(logits, k)
+    ref = bits(F.fused_moe_mxfp8((xq, xsf), ids, weights, W, requant=requant))
+    other = "standalone" if requant == "fused" else "fused"
+    assert torch.equal(
+        bits(F.fused_moe_mxfp8((xq, xsf), ids, weights, W, requant=other)), ref
+    )
+    side = torch.cuda.Stream()
+    junk = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
+    for i in range(int(os.environ.get("RLK_STRESS_ITERS", "20"))):
+        for byte in (0x7F, 0xFF, 0x00):
+            _poison_allocator(byte)
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    junk.add_(1)
+            out = F.fused_moe_mxfp8((xq, xsf), ids, weights, W, requant=requant)
+            assert torch.equal(bits(out), ref), (i, hex(byte))
+    torch.cuda.synchronize()
 
 
 @needs_device
