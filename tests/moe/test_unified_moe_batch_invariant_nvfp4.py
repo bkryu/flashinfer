@@ -1,0 +1,1185 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""The batch-invariant NVFP4 MoE backend of the unified MoE layer (``BatchInvariantMoeNvfp4Config``): the W4A4 classes
+``moe.nvfp4.<act>`` (NVFP4 experts with one per-tensor global scale per expert and GEMM, per-token NVFP4 activations), one
+per typed activation of the layer.
+
+The class has exact CPU models of everything but the tensor-core steps (the routing, the W4A4 chains on the fp32
+accumulators, the slot-order combine) and the quantizer class's own reference for the two per-token quantizations, so the
+tests are bit comparisons: the layer's output against the class composed from its own pieces (routing on the CPU, the dense
+batch-invariant ``mm_fp4`` per expert with the instruction class the part runs, the CPU chains, the quantizer's reference on
+the materialised intermediate, the CPU combine) for every activation, run-to-run determinism including CUDA-graph replay,
+the two packings of the expanded rows, the three routing input modes and the pre-quantized pack forms, batch / permutation /
+sub-batch / hot-expert invariance, agreement of every tactic the autotuner may pick, the shape rules and the error contract
+(an unsupported configuration raises before any kernel runs), and a plausibility observation against the fp64 evaluation of
+the same quantized pipeline and FlashInfer's torch reference of the unquantized model. The device-free tests pin the
+registration, the fingerprint's dimensions (the architecture among them), the agreement of the vectorised and the exact CPU
+chains on adversarial accumulators and scales, and the dispatcher's membership in the grouped block-scaled space.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from flashinfer import batch_invariant as bi
+from flashinfer.fused_moe import (
+    GELU,
+    BackendOptions,
+    BatchInvariantMoeNvfp4Config,
+    ExecutionConfig,
+    ExpertConfig,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
+    MoEActivationPack,
+    MoEConfig,
+    MoEFinalizeConfig,
+    MoELayer,
+    MoEWeightPack,
+    PowLU,
+    QuantConfig,
+    QuantFormat,
+    ReLU,
+    ReLU2,
+    RoutingConfig,
+    RoutingInputMode,
+    SiLU,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+)
+from flashinfer.fused_moe.api import ALL_BACKEND_CONFIGS, _DEFAULT_BACKEND
+from flashinfer.fused_moe.batch_invariant.runner_nvfp4 import (
+    MOE_NVFP4_ARCHS,
+    BatchInvariantMoeNvfp4Runner,
+)
+from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.tllm_enums import RoutingMethodType
+
+_supported = torch.cuda.is_available() and bi.is_supported_device(
+    torch.device("cuda"), MOE_NVFP4_ARCHS
+)
+needs_device = pytest.mark.skipif(
+    not _supported,
+    reason="needs a CUDA device of SM100 / SM103 / SM107 with the CuTe DSL",
+)
+
+_SWIGLU = SwiGLU()
+_NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+ACTIVATIONS = [
+    SwiGLU(),
+    SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+    SwiGLUStep(),
+    SwiGLUStep(limit=3.0),
+    GeGLU(),
+    GeGLUTanh(),
+    SiTU(),
+    SiTU(gate_scale=2.0, linear_scale=None, clamp_limit=5.0),
+    PowLU(),
+    PowLU(m=1.5, limit=4.0),
+    ReLU2(),
+    Identity(),
+    GELU(),
+    ReLU(),
+    SiLU(),
+]
+ACTIVATION_IDS = [
+    "swiglu",
+    "swiglu_oai",
+    "swiglu_step",
+    "swiglu_step_limit3",
+    "geglu",
+    "geglu_tanh",
+    "situ",
+    "situ_clamped",
+    "powlu",
+    "powlu_limit4",
+    "relu2",
+    "identity",
+    "gelu",
+    "relu",
+    "silu",
+]
+
+
+def bits(t: torch.Tensor) -> torch.Tensor:
+    if t.dtype == torch.bfloat16:
+        return t.contiguous().view(torch.int16)
+    return t.contiguous().view(torch.int32)
+
+
+def _family() -> str:
+    from flashinfer.gemm.batch_invariant.api import part_of
+
+    return part_of(torch.device("cuda"))[1]
+
+
+def _problem(
+    T: int,
+    k: int,
+    H: int,
+    I: int,
+    E: int,
+    seed: int,
+    gated: bool = True,
+    adversarial: bool = True,
+):
+    """Activations, logits and canonical bf16 weights (``w1 [E, 2I, H]`` rows ``[up, gate]``; ``[E, I, H]`` ungated): spread
+    exponents and per-expert magnitude spans, so the per-token and per-expert scales and the fp4 codes span the formats."""
+    g = torch.Generator().manual_seed(seed)
+    if adversarial:
+        x = (
+            torch.randn(T, H, generator=g)
+            * torch.exp2(torch.randint(-8, 6, (T, 1), generator=g).float())
+        ).to(torch.bfloat16)
+        logits = (torch.randn(T, E, generator=g) * 2).float()
+        logits[0, : min(k, E)] = 1.0
+        span = torch.exp2(torch.randint(-3, 3, (E, 1, 1), generator=g).float())
+    else:
+        x = (torch.randn(T, H, generator=g) * 0.5).to(torch.bfloat16)
+        logits = (torch.randn(T, E, generator=g) * 2).float()
+        span = 1.0
+    n1 = 2 * I if gated else I
+    w1 = (torch.randn(E, n1, H, generator=g) * 0.05 * span).to(torch.bfloat16)
+    w2 = (torch.randn(E, H, I, generator=g) * 0.05 * span).to(torch.bfloat16)
+    return x.cuda(), logits.cuda(), w1.cuda(), w2.cuda()
+
+
+def _config(
+    k: int,
+    E: int,
+    I: int,
+    act=_SWIGLU,
+    method=RoutingMethodType.Renormalize,
+    tune_max: int = 4096,
+    quant=_NVFP4,
+):
+    return MoEConfig(
+        routing=RoutingConfig(num_experts=E, top_k=k, method=method),
+        quant=quant,
+        experts=ExpertConfig(intermediate_size=I),
+        activation=act,
+        backend=BackendOptions((BatchInvariantMoeNvfp4Config(),)),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=tune_max),
+        finalize=MoEFinalizeConfig(do_finalize=True),
+    )
+
+
+def _layer(*args, device="cuda", **kw):
+    return MoELayer(_config(*args, **kw), device=torch.device(device))
+
+
+def _weights(w1: torch.Tensor, w2: torch.Tensor, act=_SWIGLU) -> MoEWeightPack:
+    pack = MoEWeightPack({})
+    view = BatchInvariantMoeNvfp4Config.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=w1.shape[0],
+        hidden_size=w1.shape[2],
+        intermediate_size=w2.shape[2],
+        activation=act,
+    )
+    pack.prepare_for(BatchInvariantMoeNvfp4Runner.backend_key, view)
+    return pack
+
+
+def _logits_pack(x, logits, bias=None, sf=None, pts=None) -> MoEActivationPack:
+    return MoEActivationPack(
+        x,
+        sf,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=logits,
+        routing_bias=bias,
+        per_token_scale=pts,
+    )
+
+
+def _routed_pack(x, ids, weights, packed: bool = False) -> MoEActivationPack:
+    if packed:
+        return MoEActivationPack(
+            x,
+            None,
+            topk_ids=ids.contiguous(),
+            topk_weights=weights.float().contiguous(),
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        )
+    return MoEActivationPack(
+        x,
+        None,
+        topk_ids=ids.contiguous(),
+        topk_weights=weights.contiguous(),
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+
+
+# ----------------------------------------------------------------------------- device-free
+
+
+def test_backend_is_registered_and_never_a_default_candidate():
+    assert BatchInvariantMoeNvfp4Config in ALL_BACKEND_CONFIGS
+    assert (
+        _BACKEND_RUNNERS[BatchInvariantMoeNvfp4Config] is BatchInvariantMoeNvfp4Runner
+    )
+    assert not any(
+        isinstance(c, BatchInvariantMoeNvfp4Config) for c in _DEFAULT_BACKEND.candidates
+    )
+    assert [
+        a
+        for a in (89, 90, 100, 103, 107, 110, 120, 121)
+        if BatchInvariantMoeNvfp4Config.supported(a)
+    ] == [100, 103, 107]
+    assert BatchInvariantMoeNvfp4Runner.supported_quant_variants == (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+    )
+    assert BatchInvariantMoeNvfp4Runner.supports_per_token_scale
+    assert set(BatchInvariantMoeNvfp4Runner.supported_activation_classes) == {
+        type(a) for a in ACTIVATIONS
+    }
+    assert set(BatchInvariantMoeNvfp4Runner.supported_routing_modes) == {
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    }
+    assert repr(BatchInvariantMoeNvfp4Config()) == "BatchInvariantMoeNvfp4Config()"
+
+
+def test_fingerprint_dimensions_and_classes():
+    """``fingerprint("fused_moe_nvfp4", ...)`` takes the geometry, the routing method, the activation and the architecture
+    (the instruction class per expert weight shape); the classes differ from the bf16 ones, between activations, between
+    the methods and between the parts; an unimplemented method and an unknown chain are refused."""
+    dims = dict(H=2048, I=768, top_k=8, num_experts=128)
+    fp = bi.fingerprint("fused_moe_nvfp4", arch="sm_107", **dims)
+    assert fp.startswith("moe-") and len(fp) == 20
+    assert (
+        bi.fingerprint(
+            "fused_moe_nvfp4", arch="sm_107", method="Renormalize", act="swiglu", **dims
+        )
+        == fp
+    )
+    assert bi.fingerprint("fused_moe_nvfp4", arch="sm_107", act=SwiGLU(), **dims) == fp
+    assert (
+        bi.fingerprint("fused_moe_nvfp4", arch="sm_100", **dims) != fp
+    )  # the K = 64 instruction class: another class
+    assert bi.fingerprint("fused_moe_nvfp4", arch="sm_103", **dims) == bi.fingerprint(
+        "fused_moe_nvfp4", arch="sm_100", **dims
+    )
+    assert bi.fingerprint("fused_moe_nvfp4", arch=(10, 7), **dims) == fp
+    assert bi.fingerprint("fused_moe_nvfp4", arch="sm_107", act=ReLU2(), **dims) != fp
+    assert bi.fingerprint(
+        "fused_moe_nvfp4", arch="sm_107", act="relu2", **dims
+    ) == bi.fingerprint("fused_moe_nvfp4", arch="sm_107", act=ReLU2(), **dims)
+    assert (
+        bi.fingerprint(
+            "fused_moe_nvfp4", arch="sm_107", method=RoutingMethodType.Default, **dims
+        )
+        != fp
+    )
+    assert bi.fingerprint("fused_moe_nvfp4", arch="sm_107", **dims) != bi.fingerprint(
+        "fused_moe", **dims
+    )
+    fps = {
+        bi.fingerprint("fused_moe_nvfp4", arch="sm_107", act=a, **dims)
+        for a in ACTIVATIONS
+    }
+    assert len(fps) == len(ACTIVATIONS)
+    with pytest.raises(ValueError):
+        bi.fingerprint(
+            "fused_moe_nvfp4", arch="sm_107", method=RoutingMethodType.Llama4, **dims
+        )
+    with pytest.raises(ValueError):
+        bi.fingerprint("fused_moe_nvfp4", arch="sm_107", act="tanh", **dims)
+    with pytest.raises(ValueError):
+        bi.fingerprint("fused_moe_nvfp4", arch="sm_90", **dims)
+    assert bi.class_name("fused_moe_nvfp4") == "moe.nvfp4"
+
+
+def test_shape_rules_accept_the_model_grid_and_raise_elsewhere():
+    """The complete acceptance rule of the class: the real-model geometries pass; shapes outside it raise the mode's error at
+    weight preparation and at the op's entry, naming the limit; the class never routes a shape elsewhere."""
+    import itertools
+
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import check_shape_nvfp4
+
+    Es, ks = (8, 16, 32, 64, 128, 256, 384, 512, 1024), (1, 2, 4, 6, 8, 10, 16)
+    Is, Hs = (
+        (256, 512, 640, 768, 1024, 1408, 1536, 2048, 2816, 4096, 14336),
+        (2048, 2560, 3072, 4096, 5120, 7168),
+    )
+    n = 0
+    for I, H, E, k in itertools.product(Is, Hs, Es, ks):
+        if k > E:
+            continue
+        check_shape_nvfp4(H, I, E, k)
+        check_shape_nvfp4(H, I, E, k, gated=False)
+        n += 1
+    assert n == len(Is) * len(Hs) * sum(1 for E in Es for k in ks if k <= E)
+    for args, why in (
+        ((2048 + 16, 768, 128), "multiples of 32"),
+        ((2048, 768 + 16, 128), "multiples of 32"),
+        ((2048, 768, 0), "num_experts"),
+        ((2048, 768, 1025), "num_experts"),
+        ((2048, 768, 8, 9), "top_k"),
+        ((2048, 768, 128, 17), "top_k"),
+        ((2048, 768, 128, 0), "top_k"),
+        ((4096, 64, 8), "unsplit"),
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError, match=why):
+            check_shape_nvfp4(*args)
+    check_shape_nvfp4(4096, 128, 8)
+    with pytest.raises(BatchInvariantUnsupportedError, match="unsplit"):
+        check_shape_nvfp4(
+            4096, 128, 8, gated=False
+        )  # the ungated GEMM1 weight (I, H) is the narrower one
+
+
+def _adversarial(n: int, seed: int) -> torch.Tensor:
+    f32 = torch.float32
+    special = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            2.0**-149,
+            -(2.0**-149),
+            2.0**-127,
+            1e-30,
+            -1e-30,
+            1e-3,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            2.0,
+            -2.0,
+            8.0,
+            87.0,
+            -87.0,
+            88.0,
+            -88.0,
+            89.0,
+            1e4,
+            -1e4,
+            1e30,
+            -1e30,
+            3.0e38,
+            -3.0e38,
+        ],
+        dtype=f32,
+    )
+    g = torch.Generator().manual_seed(seed)
+    rnd = torch.randn(n, generator=g) * torch.exp2(
+        torch.randint(-12, 12, (n,), generator=g).float()
+    )
+    return torch.cat([special, rnd.to(f32)])
+
+
+@pytest.mark.parametrize("act", ACTIVATIONS, ids=ACTIVATION_IDS)
+def test_vectorised_and_exact_chains_agree_on_adversarial_accumulators(act):
+    """The vectorised W4A4 chains (the GPU suites' oracle) and the exact scalar model give the same bf16 bits on adversarial
+    accumulators, alphas and per-token scales for every activation; the row scale enters once, before the chain."""
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import reference_nvfp4 as RQ
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.fused_moe.batch_invariant import spec_nvfp4 as Q
+
+    a = S.activation_of(act)
+    g = _adversarial(200, 40)
+    u = torch.roll(_adversarial(200, 41), 5)
+    n = g.numel()
+    gen = torch.Generator().manual_seed(42)
+    alpha = torch.exp2((torch.rand(n, generator=gen) * 2 - 1) * 10).float()
+    pts = torch.exp2((torch.rand(n, generator=gen) * 2 - 1) * 10).float()
+    if a.gated:
+        vec = RQ.w4a4_gemm1_cpu(
+            g.view(-1, 1), u.view(-1, 1), alpha, pts, a.act, a.params
+        ).view(-1)
+        exact = [
+            Q.glu_scaled_elem(
+                R.ExactF32,
+                gi,
+                ui,
+                Q.w4a4_row_scale(R.ExactF32, al, p),
+                a.act,
+                "bf16",
+                a.params,
+            )
+            for gi, ui, al, p in zip(
+                g.tolist(), u.tolist(), alpha.tolist(), pts.tolist(), strict=True
+            )
+        ]
+    else:
+        vec = RQ.w4a4_act_cpu(g.view(-1, 1), alpha, pts, a.act, a.params).view(-1)
+        exact = [
+            Q.act_scaled_elem(
+                R.ExactF32,
+                gi,
+                Q.w4a4_row_scale(R.ExactF32, al, p),
+                a.act,
+                "bf16",
+                a.params,
+            )
+            for gi, al, p in zip(g.tolist(), alpha.tolist(), pts.tolist(), strict=True)
+        ]
+    ex = torch.tensor(exact, dtype=torch.float32).to(torch.bfloat16)
+    bad = (bits(vec) != bits(ex)).nonzero().flatten()[:8].tolist()
+    assert not bad, [
+        (i, g[i].item(), alpha[i].item(), pts[i].item(), vec[i].item(), ex[i].item())
+        for i in bad
+    ]
+    vec2 = RQ.w4a4_gemm2_cpu(g.view(-1, 1), alpha, pts).view(-1)
+    ex2 = torch.tensor(
+        [
+            Q.scaled_out_elem(R.ExactF32, gi, Q.w4a4_row_scale(R.ExactF32, al, p))
+            for gi, al, p in zip(g.tolist(), alpha.tolist(), pts.tolist(), strict=True)
+        ],
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
+    assert torch.equal(bits(vec2), bits(ex2))
+
+
+@pytest.mark.parametrize(
+    "family,sm_count",
+    [("sm_107", 212), ("sm_107", 204), ("sm_100", 148), ("sm_103", 152)],
+)
+def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
+    """The dispatcher's pick for the bench geometries and token counts lies in the grouped block-scaled space of its GEMM at
+    the part's instruction class, for the gated and the ungated chains, at the nominal parts; the space has the dense
+    nvfp4 records at swizzle 1 and no other."""
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        GEMM2_CHAIN,
+        MoEWeightsNVFP4,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        all_valid_configs_nvfp4,
+        default_configs_nvfp4,
+        grouped_knobs_blockscaled,
+        rank_grouped_nvfp4,
+        rows_per_expert,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+
+    space = grouped_knobs_blockscaled()
+    assert len(space) == 72 and all(
+        k.swizzle_size == 1 and k.cluster_k == 1 and not k.swap_ab and not k.b_reuse
+        for k in space
+    )
+    assert {k.tile_n for k in space} == {64, 128, 192, 256} and {
+        k.tile_m for k in space
+    } == {128, 256}
+    for H, I, E, k in (
+        (2048, 768, 128, 8),
+        (4096, 14336, 8, 2),
+        (7168, 2048, 256, 8),
+        (2560, 640, 512, 10),
+        (2048, 1024, 128, 6),
+        (512, 256, 64, 6),
+    ):
+        for gated in (True, False):
+            in1, in2 = expert_classes(H, I, family, gated)
+            assert (in1 == "nvfp4_k128") == (family == "sm_107") and in1 == in2
+            chain1 = MoEWeightsNVFP4(
+                *([None] * 6), H, I, gated, "silu" if gated else "relu2"
+            ).chain1
+            n1 = 2 * I if gated else I
+            s1 = set(all_valid_configs_nvfp4(n1, H, E, chain1, in1))
+            s2 = set(all_valid_configs_nvfp4(H, I, E, GEMM2_CHAIN, in2))
+            assert len(s1) == 72 and len(s2) == 72
+            for T in (1, 7, 64, 300, 800, 4096, 16384):
+                c1, c2 = default_configs_nvfp4(
+                    T,
+                    k,
+                    H,
+                    I,
+                    E,
+                    (in1, in2),
+                    chain1,
+                    GEMM2_CHAIN,
+                    sm_count,
+                    family,
+                    nominal=True,
+                )
+                assert c1 in s1 and c2 in s2, (
+                    family,
+                    T,
+                    H,
+                    I,
+                    E,
+                    k,
+                    gated,
+                    c1.describe(),
+                    c2.describe(),
+                )
+                ranked = rank_grouped_nvfp4(
+                    rows_per_expert(T, k, E),
+                    H,
+                    I,
+                    E,
+                    GEMM2_CHAIN,
+                    in2,
+                    sm_count,
+                    family,
+                    3,
+                    nominal=True,
+                )
+                assert (
+                    1 <= len(ranked) <= 3
+                    and len(set(ranked)) == len(ranked)
+                    and all(c in s2 for c in ranked)
+                )
+
+
+def test_unsupported_device_raises_before_any_kernel():
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    runner = BatchInvariantMoeNvfp4Runner(_config(8, 64, 256), torch.device("cpu"))
+    with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+        runner._check_support()
+    assert "moe.nvfp4" in str(excinfo.value) and "cpu" in str(excinfo.value)
+
+
+# ----------------------------------------------------------------------------- GPU
+
+
+def _reference_route(logits: torch.Tensor, k: int, method):
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    return R.route_cpu(logits.cpu(), k, S.METHOD_OF_FLASHINFER[method])
+
+
+def _dense_fp4(a4, sf, w, wsf, in_fmt):
+    """The dense batch-invariant NVFP4 GEMM (``mm_fp4``'s class, the instruction class pinned) with a unit alpha and the fp32
+    output: the raw accumulators of the class."""
+    from flashinfer.gemm.batch_invariant.api import mm_fp4_batch_invariant
+
+    return mm_fp4_batch_invariant(
+        a4,
+        w.t(),
+        sf,
+        wsf,
+        torch.ones(1, device=a4.device),
+        torch.float32,
+        in_fmt=in_fmt,
+    )
+
+
+def _reference_ffn(x_q, ids, weights, W, act, in_fmts, gs_inv=None):
+    """The class composed from its own pieces, independently of the fused op: the (given) per-token quantized rows, per
+    expert the dense batch-invariant ``mm_fp4`` on the expert's rows (the instruction class pinned, a unit alpha, fp32), the
+    CPU W4A4 GEMM1 chain of the activation, the quantizer class's exact reference on the bf16 intermediate rows, ``mm_fp4``
+    per expert for GEMM2 with the CPU GEMM2 chain, the CPU slot-order combine. Bit for bit what the fused op must produce."""
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        quantize_reference,
+        swizzle_sf_128x4,
+        unswizzle_sf_128x4,
+    )
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import reference_nvfp4 as RQ
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import TE_GS_INV
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GROUP
+
+    gs_inv = TE_GS_INV if gs_inv is None else gs_inv
+    x4, x_sf, x_pts = x_q
+    T, Hh = x4.shape
+    H, I, E, k = 2 * Hh, W.intermediate_size, W.num_experts, ids.shape[1]
+    dev = x4.device
+    sf_rows = unswizzle_sf_128x4(x_sf.reshape(-1).cpu(), T, H)
+    ids_c = ids.cpu()
+    y = torch.zeros(T, k, H, dtype=torch.bfloat16)
+    for e in range(E):
+        tok, slot = (ids_c == e).nonzero(as_tuple=True)
+        if tok.numel() == 0:
+            continue
+        rows = tok.to(dev)
+        acc1 = _dense_fp4(
+            x4[rows].contiguous(),
+            swizzle_sf_128x4(sf_rows[tok], tok.numel(), H).to(dev),
+            W.w1[e],
+            W.w1_sf[e],
+            in_fmts[0],
+        ).cpu()
+        al1 = torch.full((tok.numel(),), W.w1_alpha[e].item())
+        pts1 = x_pts.cpu()[tok]
+        if act.gated:
+            u = acc1.view(-1, I // GROUP, 2, GROUP)[:, :, 0, :].reshape(-1, I)
+            g = acc1.view(-1, I // GROUP, 2, GROUP)[:, :, 1, :].reshape(-1, I)
+            a = RQ.w4a4_gemm1_cpu(g, u, al1, pts1, act.act, act.params)
+        else:
+            a = RQ.w4a4_act_cpu(acc1, al1, pts1, act.act, act.params)
+        a4, a_sf, a_pts = quantize_reference(a, gs_inv, per_token=True)
+        acc2 = _dense_fp4(
+            a4.to(dev), a_sf.reshape(-1).to(dev), W.w2[e], W.w2_sf[e], in_fmts[1]
+        ).cpu()
+        y[tok, slot] = RQ.w4a4_gemm2_cpu(
+            acc2, torch.full((tok.numel(),), W.w2_alpha[e].item()), a_pts
+        )
+    ident = torch.arange(T * k, dtype=torch.int32).view(T, k)
+    return R.combine_cpu(y.view(T * k, H), ident, weights.cpu())
+
+
+def _quantized(x: torch.Tensor, check: bool = True):
+    """The class's per-token quantization of the activations on the device, checked against the quantizer's exact reference."""
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        quantize_reference,
+    )
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        TE_GS_INV,
+        quantize_activations,
+    )
+
+    x4, sf, pts = quantize_activations(x)
+    if check:
+        q_ref, sf_ref, pts_ref = quantize_reference(x, TE_GS_INV, per_token=True)
+        assert (
+            torch.equal(x4.cpu(), q_ref)
+            and torch.equal(sf.cpu(), sf_ref.reshape(-1))
+            and torch.equal(bits(pts.cpu()), bits(pts_ref))
+        )
+    return x4, sf, pts
+
+
+def _weights_of(pack: MoEWeightPack):
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import MoEWeightsNVFP4
+
+    return MoEWeightsNVFP4.from_view(
+        pack.get_view(BatchInvariantMoeNvfp4Runner.backend_key)
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("act", ACTIVATIONS, ids=ACTIVATION_IDS)
+def test_layer_matches_the_class_composition(act):
+    """The layer (from logits, bf16 activations) == the class's routing on the CPU, the class's per-token quantization (==
+    the quantizer's reference), the dense batch-invariant ``mm_fp4`` per expert with the CPU W4A4 chain of the activation,
+    the quantizer's reference on the intermediate, ``mm_fp4`` + the CPU GEMM2 chain, the CPU combine: bit for bit, for
+    every activation of the layer, at the instruction class the part runs."""
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+
+    T, k, H, I, E = 120, 4, 512, 256, 16
+    chain = activation_of(act)
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=1, gated=chain.gated)
+    layer = _layer(k, E, I, act)
+    W_pack = _weights(w1, w2, act)
+    out = layer(_logits_pack(x, logits), W_pack)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    W = _weights_of(W_pack)
+    ref = _reference_ffn(
+        _quantized(x),
+        ids.cuda(),
+        weights,
+        W,
+        chain,
+        expert_classes(H, I, _family(), chain.gated),
+    )
+    assert torch.equal(bits(out.cpu()), bits(ref))
+
+
+@needs_device
+def test_both_packings_and_the_prequantized_pack_forms_give_the_bits():
+    """The dense and the padded packing of the expanded rows are placements (the same bits); the pack forms agree: bf16 rows
+    (quantized by the class), the per-token quantized pack with the 128x4 swizzled scales and with the linear scales, and the
+    per-tensor pack of ``TrtllmFp4Config.prepare_activations`` (unit global scale, no per-token scale), which the class takes
+    at unit per-token scales and which equals the class composed on those bytes."""
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        unswizzle_sf_128x4,
+    )
+    from flashinfer.fused_moe import TrtllmFp4Config
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import fused_moe_nvfp4
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+
+    T, k, H, I, E = 257, 6, 512, 256, 32
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=2)
+    layer = _layer(k, E, I)
+    W_pack = _weights(w1, w2)
+    W = _weights_of(W_pack)
+    out = layer(_logits_pack(x, logits), W_pack)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    # the two packings of the op
+    out_d = fused_moe_nvfp4(x, ids, weights, W, path="dense")
+    out_p = fused_moe_nvfp4(x, ids, weights, W, path="padded")
+    assert torch.equal(bits(out_d), bits(out_p)) and torch.equal(bits(out_d), bits(out))
+    # the pre-quantized packs: the class's own quantization in both scale layouts
+    x4, sf, pts = _quantized(x)
+    out_q = layer(
+        _routed_pack(x4, ids, weights)._replace(hidden_states_scale=sf)
+        if False
+        else MoEActivationPack(
+            x4,
+            sf,
+            topk_ids=ids,
+            topk_weights=weights,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+            per_token_scale=pts,
+        ),
+        W_pack,
+    )
+    assert torch.equal(bits(out_q), bits(out))
+    sf_lin = unswizzle_sf_128x4(sf.cpu(), T, H).cuda().view(torch.float8_e4m3fn)
+    out_l = layer(
+        MoEActivationPack(
+            x4,
+            sf_lin,
+            topk_ids=ids,
+            topk_weights=weights,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+            per_token_scale=pts,
+        ),
+        W_pack,
+    )
+    assert torch.equal(bits(out_l), bits(out))
+    # the per-tensor pack of the TRTLLM backends (unit global scale, linear scales, no per-token scale): the class at unit pts
+    q_t, sf_t = TrtllmFp4Config.prepare_activations(x, quant=_NVFP4)
+    out_t = layer(
+        MoEActivationPack(
+            q_t,
+            sf_t,
+            topk_ids=ids,
+            topk_weights=weights,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        ),
+        W_pack,
+    )
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import swizzle_sf_128x4
+
+    sf_t_sw = swizzle_sf_128x4(sf_t.view(torch.uint8).cpu(), T, H).cuda()
+    ref_t = _reference_ffn(
+        (q_t.view(torch.uint8), sf_t_sw, torch.ones(T, device="cuda")),
+        ids,
+        weights,
+        W,
+        activation_of(_SWIGLU),
+        expert_classes(H, I, _family()),
+    )
+    assert torch.equal(bits(out_t.cpu()), bits(ref_t))
+    assert not torch.equal(
+        bits(out_t), bits(out)
+    )  # another quantization of the input: another function of x (an observation)
+
+
+@needs_device
+def test_three_routing_modes_agree_and_runs_are_deterministic():
+    T, k, H, I, E = 257, 8, 1024, 512, 128
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=3)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2)
+    out_l = layer(_logits_pack(x, logits), W)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    out_u = layer(_routed_pack(x, ids.cuda(), weights.cuda()), W)
+    assert torch.equal(bits(out_l), bits(out_u))
+    w16 = weights.to(torch.bfloat16)
+    out_u16 = layer(_routed_pack(x, ids.cuda(), w16.cuda()), W)
+    out_p = layer(_routed_pack(x, ids.cuda(), w16.cuda(), packed=True), W)
+    assert torch.equal(bits(out_u16), bits(out_p))
+    for _ in range(3):
+        assert torch.equal(bits(layer(_logits_pack(x, logits), W)), bits(out_l))
+    stream = torch.cuda.Stream()
+    pack = _logits_pack(x, logits)
+    with torch.cuda.stream(stream):
+        layer(pack, W)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out_g = layer(pack, W)
+    torch.cuda.synchronize()
+    for _ in range(2):
+        out_g.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out_g), bits(out_l))
+
+
+@needs_device
+def test_batch_permutation_and_subbatch_invariance():
+    """A token's bits do not depend on the batch size, its position, its neighbours or the expert loads the other tokens
+    create: prefixes, permutations, sub-batches, one token alone, and a hot expert group around a probe token (groups spanning
+    several 128-row scale-factor atoms)."""
+    T, k, H, I, E = 500, 8, 512, 256, 64
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=4)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2)
+    full = bits(layer(_logits_pack(x, logits), W))
+    for n in (1, 2, 7, 64, 200, 333):
+        assert torch.equal(bits(layer(_logits_pack(x[:n], logits[:n]), W)), full[:n]), n
+    perm = torch.randperm(T, generator=torch.Generator().manual_seed(5)).cuda()
+    assert torch.equal(
+        bits(layer(_logits_pack(x[perm].contiguous(), logits[perm].contiguous()), W)),
+        full[perm],
+    )
+    for n in (1, 7, 64, 200):
+        idx = torch.randperm(T, generator=torch.Generator().manual_seed(n))[:n].cuda()
+        assert torch.equal(
+            bits(layer(_logits_pack(x[idx].contiguous(), logits[idx].contiguous()), W)),
+            full[idx],
+        ), n
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    base = bits(layer(_routed_pack(x, ids, weights), W))
+    g = torch.Generator().manual_seed(6)
+    x_extra = (torch.randn(556, H, generator=g) * 0.5).to(torch.bfloat16).cuda()
+    w_extra = torch.rand(556, k, generator=g).cuda()
+    for t in (0, T // 2, T - 1):
+        hot = ids[t : t + 1].expand(556, k).contiguous()
+        out = layer(
+            _routed_pack(
+                torch.cat([x[t : t + 1], x_extra]),
+                torch.cat([ids[t : t + 1], hot]),
+                torch.cat([weights[t : t + 1], w_extra]),
+            ),
+            W,
+        )
+        assert torch.equal(bits(out)[:1], base[t : t + 1]), ("hot group", t)
+        mine = set(ids[t].tolist())
+        others = (
+            torch.tensor(
+                [e for e in range(E) if e not in mine][:k],
+                dtype=torch.int32,
+                device="cuda",
+            )
+            .view(1, k)
+            .expand(556, k)
+            .contiguous()
+        )
+        out = layer(
+            _routed_pack(
+                torch.cat([x[t : t + 1], x_extra]),
+                torch.cat([ids[t : t + 1], others]),
+                torch.cat([weights[t : t + 1], w_extra]),
+            ),
+            W,
+        )
+        assert torch.equal(bits(out)[:1], base[t : t + 1]), ("unrelated hot experts", t)
+
+
+@needs_device
+def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
+    from flashinfer.autotuner import autotune
+
+    T, k, H, I, E = 300, 6, 1024, 512, 64
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=7)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2)
+    runner = layer.runners[0]
+    assert isinstance(runner, BatchInvariantMoeNvfp4Runner)
+    pack = _logits_pack(x, logits)
+    ref = bits(layer(pack, W))
+    inputs = runner.pack_inputs(pack, W)
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
+    for t in tactics:
+        out = runner.forward(runner.pack_inputs(pack, W), tactic=t)
+        assert torch.equal(bits(out), ref), t
+    with autotune(True):
+        assert torch.equal(bits(layer(pack, W)), ref)
+    assert torch.equal(bits(layer(pack, W)), ref)
+
+
+@needs_device
+def test_instruction_classes_on_the_part():
+    """The part's default instruction class is the dense rule's (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere)
+    and the op follows it; on SM107 the K = 64 class stays reachable by name, computes a different fp32 fold of the same
+    operands, and its op equals its own composition."""
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        F32_CHAIN,
+        fused_moe_nvfp4,
+        grouped_gemm_nvfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+
+    T, k, H, I, E = 96, 2, 1024, 512, 8
+    # per-element exponent spreads inside every row and weight: the scaled products differ in magnitude, so the fp32 folds of
+    # the two steps are not exact and separate (operands of one scale give exactly representable sums in either order)
+    g = torch.Generator().manual_seed(8)
+    x = (
+        (
+            torch.randn(T, H, generator=g)
+            * torch.exp2(torch.randint(-10, 10, (T, H), generator=g).float())
+        )
+        .to(torch.bfloat16)
+        .cuda()
+    )
+    logits = (torch.randn(T, E, generator=g) * 2).float().cuda()
+    w1 = (
+        (
+            torch.randn(E, 2 * I, H, generator=g)
+            * 0.05
+            * torch.exp2(torch.randint(-6, 7, (E, 2 * I, H), generator=g).float())
+        )
+        .to(torch.bfloat16)
+        .cuda()
+    )
+    w2 = (
+        (
+            torch.randn(E, H, I, generator=g)
+            * 0.05
+            * torch.exp2(torch.randint(-6, 7, (E, H, I), generator=g).float())
+        )
+        .to(torch.bfloat16)
+        .cuda()
+    )
+    W = _weights_of(_weights(w1, w2))
+    family = _family()
+    fmts = expert_classes(H, I, family)
+    assert fmts == (
+        ("nvfp4_k128", "nvfp4_k128") if family == "sm_107" else ("nvfp4", "nvfp4")
+    )
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    out, im = fused_moe_nvfp4(x, ids, weights, W, return_intermediates=True)
+    assert im["in_fmts"] == fmts
+    if family != "sm_107":
+        return
+    out64 = fused_moe_nvfp4(x, ids, weights, W, in_fmts=("nvfp4", "nvfp4"))
+    ref64 = _reference_ffn(
+        _quantized(x, check=False),
+        ids,
+        weights,
+        W,
+        activation_of(_SWIGLU),
+        ("nvfp4", "nvfp4"),
+    )
+    assert torch.equal(bits(out64.cpu()), bits(ref64))
+    accs = [
+        grouped_gemm_nvfp4(
+            im["x_perm4"],
+            im["x_perm_sf"],
+            im["x_perm_pts"],
+            W.w1,
+            W.w1_sf,
+            W.w1_alpha,
+            im["counts"],
+            im["config1"],
+            F32_CHAIN,
+            f,
+            dense_a=True,
+        ).cpu()
+        for f in ("nvfp4_k128", "nvfp4")
+    ]
+    assert not torch.equal(bits(accs[0]), bits(accs[1]))  # two folds: two classes
+
+
+@needs_device
+def test_routing_methods_from_logits_match_the_cpu_model():
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    T, k, H, I, E = 64, 4, 512, 256, 32
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=9)
+    bias = (
+        (torch.randn(E, generator=torch.Generator().manual_seed(10)) * 0.1)
+        .float()
+        .cuda()
+    )
+    for method in (
+        RoutingMethodType.Default,
+        RoutingMethodType.SigmoidRenorm,
+        RoutingMethodType.DeepSeekV3,
+    ):
+        rm = S.METHOD_OF_FLASHINFER[method]
+        kwargs = {"routed_scaling_factor": 1.75} if rm.scaled else {}
+        layer = MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(num_experts=E, top_k=k, method=method, **kwargs),
+                quant=_NVFP4,
+                experts=ExpertConfig(intermediate_size=I),
+                activation=SwiGLU(),
+                backend=BackendOptions((BatchInvariantMoeNvfp4Config(),)),
+                execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=T),
+            ),
+            device=torch.device("cuda"),
+        )
+        W = _weights(w1, w2)
+        b = bias if rm.bias else None
+        out = layer(_logits_pack(x, logits, b), W)
+        ex, w = R.route_cpu(
+            logits.cpu(),
+            k,
+            rm,
+            b.cpu() if b is not None else None,
+            1.75 if rm.scaled else None,
+        )
+        assert torch.equal(
+            bits(out), bits(layer(_routed_pack(x, ex.cuda(), w.cuda()), W))
+        ), method
+
+
+@needs_device
+def test_plausibility_against_the_fp64_pipeline_and_flashinfers_reference():
+    """An observation, not a promise: the class's output is within the fp32-vs-fp64 accumulation difference of the fp64
+    evaluation of the same quantized pipeline (the dequantized operands, the spec's rounding points), and within the NVFP4
+    quantization error of FlashInfer's torch reference of the unquantized model (cosine similarity, a loose bound)."""
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        dequantize,
+        quantize_reference,
+    )
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import TE_GS_INV
+    from tests.moe.utils import compute_reference_moe_fp4
+
+    T, k, H, I, E = 64, 4, 512, 256, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=11, adversarial=False)
+    layer = _layer(k, E, I)
+    W_pack = _weights(w1, w2)
+    out = layer(_logits_pack(x, logits), W_pack).float().cpu()
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    W = _weights_of(W_pack)
+    # the fp64 pipeline on the dequantized operands
+    x4, xsf, xpts = quantize_reference(x, TE_GS_INV, per_token=True)
+    xd = dequantize(x4, xsf, 1.0, T, H, xpts)
+    ref64 = torch.zeros(T, H, dtype=torch.float64)
+    for e in range(E):
+        tok, slot = (ids == e).nonzero(as_tuple=True)
+        if tok.numel() == 0:
+            continue
+        w1d = (
+            dequantize(W.w1[e].cpu(), W.w1_sf[e].cpu(), 1.0, 2 * I, H)
+            * W.w1_alpha[e].item()
+        )
+        w2d = (
+            dequantize(W.w2[e].cpu(), W.w2_sf[e].cpu(), 1.0, H, I)
+            * W.w2_alpha[e].item()
+        )
+        acc = (xd[tok] @ w1d.t()).float()
+        u = acc.view(-1, I // 8, 2, 8)[:, :, 0, :].reshape(-1, I)
+        g = acc.view(-1, I // 8, 2, 8)[:, :, 1, :].reshape(-1, I)
+        a = S.glu_elem(R.TorchF32, g, u, "silu", "bf16")
+        a4, asf, apts = quantize_reference(a, TE_GS_INV, per_token=True)
+        ad = dequantize(a4, asf, 1.0, tok.numel(), I, apts)
+        y = (ad @ w2d.t()).float().to(torch.bfloat16).double()
+        ref64.index_add_(0, tok, weights[tok, slot].double().view(-1, 1) * y)
+    err = ((out.double() - ref64).abs().max() / ref64.abs().max()).item()
+    assert err < 2e-2, err
+    # FlashInfer's torch reference of the unquantized model (fp32, canonical [up, gate] weights)
+    ref_fi = (
+        compute_reference_moe_fp4(x, w1, w2, ids.cuda(), weights.cuda(), T, E, k, H, I)
+        .float()
+        .cpu()
+    )
+    cos = torch.nn.functional.cosine_similarity(
+        out.flatten(), ref_fi.flatten(), dim=0
+    ).item()
+    assert cos > 0.95, (
+        cos
+    )  # W4A4 of random weights and activations: an observation of the quantization error, not a promise
+
+
+@needs_device
+def test_unsupported_inputs_raise_and_nothing_falls_back():
+    """The error contract: a configuration outside the class raises the mode's error at build or at the first call (top_k /
+    num_experts outside the bounds, an intermediate size that is not a multiple of 32, fused shared experts, an expert-parallel
+    shard, group-limited routing, no finalize, the wrong quantization pair, weights of the other chain, scales with bf16 rows,
+    packed rows without scales, an unimplemented routing method from logits); a zero-token call returns an empty output."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    k, H, I, E = 6, 512, 256, 64
+    errors = (
+        BatchInvariantUnsupportedError,
+        RuntimeError,
+        NotImplementedError,
+        ValueError,
+    )
+    for cfg_kw, what in (
+        (dict(k=17), "top_k"),
+        (dict(E=1025), "num_experts"),
+        (dict(I=264), "multiples of 32"),
+    ):
+        with pytest.raises(errors) as excinfo:
+            _layer(cfg_kw.get("k", k), cfg_kw.get("E", E), cfg_kw.get("I", I))
+        assert what in str(excinfo.value) or "moe.nvfp4" in str(excinfo.value), what
+    routing = RoutingConfig(num_experts=E, top_k=k)
+    experts = ExpertConfig(intermediate_size=I)
+    for kw, what in (
+        (
+            dict(
+                routing=RoutingConfig(
+                    num_experts=E, top_k=k, method=RoutingMethodType.DeepSeekV3
+                ),
+                experts=ExpertConfig(intermediate_size=I, num_fused_shared_experts=1),
+            ),
+            "shared",
+        ),
+        (
+            dict(
+                experts=ExpertConfig(
+                    intermediate_size=I,
+                    local_expert_offset=E // 2,
+                    local_num_experts=E // 2,
+                )
+            ),
+            "parallel",
+        ),
+        (
+            dict(
+                routing=RoutingConfig(num_experts=E, top_k=k, n_group=2, topk_group=1)
+            ),
+            "n_group",
+        ),
+        (dict(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize"),
+        (dict(quant=QuantConfig()), "BF16"),
+    ):
+        with pytest.raises(errors) as excinfo:
+            MoELayer(
+                MoEConfig(
+                    routing=kw.get("routing", routing),
+                    quant=kw.get("quant", _NVFP4),
+                    experts=kw.get("experts", experts),
+                    backend=BackendOptions((BatchInvariantMoeNvfp4Config(),)),
+                    finalize=kw.get("finalize", MoEFinalizeConfig(do_finalize=True)),
+                ),
+                device=torch.device("cuda"),
+            )
+        assert what in str(excinfo.value) or "moe.nvfp4" in str(excinfo.value), what
+    layer = _layer(k, E, I)
+    x, logits, w1, w2 = _problem(8, k, H, I, E, seed=12)
+    W = _weights(w1, w2)
+    with pytest.raises(errors):
+        layer(
+            _logits_pack(x.to(torch.float16), logits), W
+        )  # fp16 rows: no runner accepts the pack
+    with pytest.raises(BatchInvariantUnsupportedError):
+        layer(
+            _logits_pack(x, logits), _weights(w1[:, :I].contiguous(), w2, ReLU2())
+        )  # the ungated chain's weights
+    with pytest.raises(BatchInvariantUnsupportedError):
+        layer(
+            _logits_pack(
+                x, logits, sf=torch.zeros(8, H // 16, dtype=torch.uint8, device="cuda")
+            ),
+            W,
+        )  # scales with bf16 rows
+    x4, sf, pts = _quantized(x, check=False)
+    with pytest.raises(BatchInvariantUnsupportedError):
+        layer(_logits_pack(x4, logits), W)  # packed rows without their scales
+    with pytest.raises(BatchInvariantUnsupportedError):
+        BatchInvariantMoeNvfp4Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=E,
+            hidden_size=H,
+            intermediate_size=I,
+            quant=QuantConfig(),
+        )
+    llama = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E, top_k=1, method=RoutingMethodType.Llama4
+            ),
+            quant=_NVFP4,
+            experts=ExpertConfig(intermediate_size=I),
+            backend=BackendOptions((BatchInvariantMoeNvfp4Config(),)),
+        ),
+        device=torch.device("cuda"),
+    )
+    with pytest.raises(BatchInvariantUnsupportedError):
+        llama(_logits_pack(x, logits), W)
+    ids = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
+    assert llama(_routed_pack(x, ids, torch.ones(8, 1, device="cuda")), W).shape == (
+        8,
+        H,
+    )
+    out = layer(_logits_pack(x[:0], logits[:0]), W)
+    assert out.shape == (0, H) and out.dtype == torch.bfloat16
