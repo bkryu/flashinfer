@@ -454,11 +454,14 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     )
     from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
         all_valid_configs_nvfp4,
+        all_valid_configs_nvfp4_swapped,
         default_configs_nvfp4,
         grouped_knobs_blockscaled,
         padded_rows,
         rank_grouped_nvfp4,
         rows_per_expert,
+        swapped_knobs_blockscaled,
+        token_tile_default,
     )
     from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
 
@@ -470,6 +473,29 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     assert {k.tile_n for k in space} == {64, 128, 192, 256} and {
         k.tile_m for k in space
     } == {128, 256}
+    # the swapped decode space: one 1-CTA record per narrow token tile, disjoint from the grouped space
+    swap_space = swapped_knobs_blockscaled()
+    assert [k.tile_n for k in swap_space] == [8, 16, 32] and all(
+        k.swap_ab
+        and k.tile_m == 128
+        and k.cluster_shape_mn == (1, 1)
+        and not k.use_2cta_instrs
+        and k.well_formed("nvfp4")
+        and k.well_formed("nvfp4_k128")
+        for k in swap_space
+    )
+    assert not set(swap_space) & set(space)
+    assert [token_tile_default(r) for r in (1, 6, 7, 12, 13, 24, 25, 32, 128)] == [
+        8,
+        8,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
     for H, I, E, k in (
         (2048, 768, 128, 8),
         (4096, 14336, 8, 2),
@@ -488,6 +514,9 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
             s1 = set(all_valid_configs_nvfp4(n1, H, E, chain1, in1))
             s2 = set(all_valid_configs_nvfp4(H, I, E, GEMM2_CHAIN, in2))
             assert len(s1) == 72 and len(s2) == 72
+            w1 = set(all_valid_configs_nvfp4_swapped(n1, H, E, chain1, in1))
+            w2 = set(all_valid_configs_nvfp4_swapped(H, I, E, GEMM2_CHAIN, in2))
+            assert len(w1) == 3 and len(w2) == 3
             for T in (1, 7, 64, 300, 800, 4096, 16384):
                 c1, c2 = default_configs_nvfp4(
                     T,
@@ -502,7 +531,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     family,
                     nominal=True,
                 )
-                assert c1 in s1 and c2 in s2, (
+                assert c1 in s1 | w1 and c2 in s2 | w2, (
                     family,
                     T,
                     H,
@@ -513,6 +542,27 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     c1.describe(),
                     c2.describe(),
                 )
+                # the structural rule: the swapped decode body iff the rows per active expert fit a narrow token tile, its
+                # record the narrowest such tile; the padded body's records with the body forbidden
+                tn = token_tile_default(rows_per_expert(T, k, E))
+                assert c1.swap_ab == c2.swap_ab == (tn is not None) and (
+                    tn is None or c1.tile_n == c2.tile_n == tn
+                ), (family, T, H, I, E, k, c1.describe())
+                d1, d2 = default_configs_nvfp4(
+                    T,
+                    k,
+                    H,
+                    I,
+                    E,
+                    (in1, in2),
+                    chain1,
+                    GEMM2_CHAIN,
+                    sm_count,
+                    family,
+                    nominal=True,
+                    swap=False,
+                )
+                assert d1 in s1 and d2 in s2 and not d1.swap_ab and not d2.swap_ab
                 ranked = rank_grouped_nvfp4(
                     rows_per_expert(T, k, E),
                     H,
@@ -528,8 +578,13 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                 assert (
                     1 <= len(ranked) <= 3
                     and len(set(ranked)) == len(ranked)
-                    and all(c in s2 for c in ranked)
+                    and all(c in s2 | w2 for c in ranked)
                 )
+                assert (
+                    sum(1 for c in ranked if c.swap_ab) == (1 if tn is not None else 0)
+                ) and (
+                    tn is None or ranked[0].swap_ab
+                )  # the swapped record leads the ranking where the rule picks it
                 # the tile-fit guard: at a group of one padded atom the picks and the ranked list are 128-row tiles (a
                 # 256-row 2-CTA tile would compute a second atom of padding); at taller groups every tile is a candidate
                 if padded_rows(rows_per_expert(T, k, E)) == 128:
@@ -694,6 +749,194 @@ def test_layer_matches_the_class_composition(act):
 
 
 @needs_device
+def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
+    """The swapped decode body (weights on the MMA's M side, the dense packing's token rows as a narrow N tile, their scale
+    factors gathered from the padded positions): at every token tile (8 / 16 / 32) its fp32 accumulators == the dense
+    batch-invariant ``mm_fp4`` on the group's rows per expert, the GEMM1 chains (the gated chain, the ungated smoke chain,
+    the per-column token scale) and the GEMM2 chain == the CPU W4A4 chains of those accumulators. Groups spanning several
+    token tiles (uneven loads), one-row groups (T = 1), empty groups, E = 256, N not a multiple of 128; rows past the live
+    rows are never stored."""
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        swizzle_sf_128x4,
+        unswizzle_sf_128x4,
+    )
+    from flashinfer.fused_moe.batch_invariant import reference_nvfp4 as RQ
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        DENSE_TAIL,
+        GEMM2_CHAIN,
+        grouped_gemm_nvfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.compile_nvfp4 import (
+        can_implement_swapped_nvfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GROUP
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_nvfp4 import W4A4Chain
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        swapped_knobs_blockscaled,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+
+    f32_chain = W4A4Chain("plain", "silu", "f32", (), "none")
+    relu2_chain = W4A4Chain("act", "relu2", "bf16", (), "w4a4")
+    for counts, I, K, kk in (
+        ([5, 0, 70, 1, 33, 64, 0, 3], 128, 512, 2),
+        ([1] * 16, 96, 1024, 1),
+        ([0] * 200 + [40] + [0] * 55, 160, 256, 3),
+        ([3, 7, 11, 13] * 16, 512, 128, 1),
+        ([1], 128, 2048, 1),
+    ):
+        E, Tk, N = len(counts), sum(counts), 2 * I
+        T = -(-Tk // kk)
+        x, _, w1, w2 = _problem(T, kk, K, I, E, seed=E + 3)
+        W = _weights_of(_weights(w1, w2))
+        in1, _ = expert_classes(K, I, _family())
+        x4, sf, pts = _quantized(x)
+        g = torch.Generator().manual_seed(E + 7)
+        src = torch.randperm(T * kk, generator=g)[:Tk]
+        tok = src // kk
+        off = [0]
+        offp = [0]
+        for c in counts:
+            off.append(off[-1] + c)
+            offp.append(offp[-1] + -(-c // 128) * 128)
+        Tk_pad = offp[-1]
+        pos_pad = torch.cat(
+            [torch.arange(offp[e], offp[e] + c) for e, c in enumerate(counts) if c]
+        )
+        a_dense = torch.zeros(Tk + DENSE_TAIL, K // 2, dtype=torch.uint8, device="cuda")
+        a_dense[:Tk] = x4[tok.cuda()]
+        sf_rows = unswizzle_sf_128x4(sf.cpu(), T, K)
+        sf_pad_rows = torch.zeros(
+            Tk_pad + DENSE_TAIL, sf_rows.shape[1], dtype=sf_rows.dtype
+        )
+        sf_pad_rows[pos_pad] = sf_rows[tok]
+        sf_pad = swizzle_sf_128x4(sf_pad_rows, Tk_pad + DENSE_TAIL, K).cuda()
+        pts_pad = torch.zeros(Tk_pad + DENSE_TAIL, dtype=torch.float32)
+        pts_pad[pos_pad] = pts.cpu()[tok]
+        pts_pad = pts_pad.cuda()
+        cnt = torch.tensor(counts, dtype=torch.int32, device="cuda")
+        ref32 = torch.zeros(Tk, N, dtype=torch.float32)
+        alpha_rows = torch.zeros(Tk)
+        for e, c in enumerate(counts):
+            if c:
+                rows = tok[off[e] : off[e + 1]]
+                ref32[off[e] : off[e + 1]] = _dense_fp4(
+                    x4[rows.cuda()].contiguous(),
+                    swizzle_sf_128x4(sf_rows[rows], rows.numel(), K).cuda(),
+                    W.w1[e],
+                    W.w1_sf[e],
+                    in1,
+                ).cpu()
+                alpha_rows[off[e] : off[e + 1]] = W.w1_alpha[e].item()
+        pts_dense = pts.cpu()[tok]
+        u = ref32.view(-1, I // GROUP, 2, GROUP)[:, :, 0, :].reshape(-1, I)
+        gt = ref32.view(-1, I // GROUP, 2, GROUP)[:, :, 1, :].reshape(-1, I)
+        ref_glu = RQ.w4a4_gemm1_cpu(gt, u, alpha_rows, pts_dense, "silu", ())
+        ref_act = RQ.w4a4_act_cpu(ref32, alpha_rows, pts_dense, "relu2", ())
+        ref_plain = RQ.w4a4_gemm2_cpu(ref32, alpha_rows, pts_dense)
+        for cfg in swapped_knobs_blockscaled():
+            assert can_implement_swapped_nvfp4(cfg, N, K, E, f32_chain, in1), (
+                cfg.describe(),
+                N,
+                K,
+                E,
+            )
+            out32 = torch.full(
+                (Tk + DENSE_TAIL, N), float("nan"), dtype=torch.float32, device="cuda"
+            )
+            grouped_gemm_nvfp4(
+                a_dense,
+                sf_pad,
+                pts_pad,
+                W.w1,
+                W.w1_sf,
+                W.w1_alpha,
+                cnt,
+                cfg,
+                f32_chain,
+                in1,
+                out=out32,
+                dense_a=True,
+            )
+            assert torch.equal(bits(out32[:Tk].cpu()), bits(ref32)), (
+                counts[:4],
+                cfg.describe(),
+                in1,
+            )
+            assert torch.isnan(
+                out32[Tk:]
+            ).all()  # rows past the live rows are never stored
+            got = grouped_gemm_nvfp4(
+                a_dense,
+                sf_pad,
+                pts_pad,
+                W.w1,
+                W.w1_sf,
+                W.w1_alpha,
+                cnt,
+                cfg,
+                W.chain1,
+                in1,
+                dense_a=True,
+            )
+            assert torch.equal(bits(got[:Tk].cpu()), bits(ref_glu)), (
+                counts[:4],
+                cfg.describe(),
+                "glu",
+            )
+            got = grouped_gemm_nvfp4(
+                a_dense,
+                sf_pad,
+                pts_pad,
+                W.w1,
+                W.w1_sf,
+                W.w1_alpha,
+                cnt,
+                cfg,
+                relu2_chain,
+                in1,
+                dense_a=True,
+            )
+            assert torch.equal(bits(got[:Tk].cpu()), bits(ref_act)), (
+                counts[:4],
+                cfg.describe(),
+                "relu2",
+            )
+            got = grouped_gemm_nvfp4(
+                a_dense,
+                sf_pad,
+                pts_pad,
+                W.w1,
+                W.w1_sf,
+                W.w1_alpha,
+                cnt,
+                cfg,
+                GEMM2_CHAIN,
+                in1,
+                dense_a=True,
+            )
+            assert torch.equal(bits(got[:Tk].cpu()), bits(ref_plain)), (
+                counts[:4],
+                cfg.describe(),
+                "plain",
+            )
+            # a swapped record needs the dense packing
+            with pytest.raises(ValueError):
+                grouped_gemm_nvfp4(
+                    a_dense,
+                    sf_pad,
+                    pts_pad,
+                    W.w1,
+                    W.w1_sf,
+                    W.w1_alpha,
+                    cnt,
+                    cfg,
+                    f32_chain,
+                    in1,
+                )
+
+
+@needs_device
 def test_both_packings_and_the_prequantized_pack_forms_give_the_bits():
     """The dense and the padded packing of the expanded rows are placements (the same bits); the pack forms agree: bf16 rows
     (quantized by the class), the per-token quantized pack with the 128x4 swizzled scales and with the linear scales, and the
@@ -715,10 +958,15 @@ def test_both_packings_and_the_prequantized_pack_forms_give_the_bits():
     out = layer(_logits_pack(x, logits), W_pack)
     ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
     ids, weights = ids.cuda(), weights.cuda()
-    # the two packings of the op
+    # the two packings of the op, and the two bodies of the dense packing (the swapped decode body on every GEMM, the padded body)
     out_d = fused_moe_nvfp4(x, ids, weights, W, path="dense")
     out_p = fused_moe_nvfp4(x, ids, weights, W, path="padded")
     assert torch.equal(bits(out_d), bits(out_p)) and torch.equal(bits(out_d), bits(out))
+    out_s = fused_moe_nvfp4(x, ids, weights, W, path="dense", swap=True)
+    out_n = fused_moe_nvfp4(x, ids, weights, W, path="dense", swap=False)
+    assert torch.equal(bits(out_s), bits(out)) and torch.equal(bits(out_n), bits(out))
+    with pytest.raises(ValueError):
+        fused_moe_nvfp4(x, ids, weights, W, path="padded", swap=True)
     # the pre-quantized packs: the class's own quantization in both scale layouts
     x4, sf, pts = _quantized(x)
     out_q = layer(
@@ -880,10 +1128,22 @@ def test_batch_permutation_and_subbatch_invariance():
 
 
 @needs_device
-def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
+@pytest.mark.parametrize("T", [300, 8], ids=["mid", "decode"])
+def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
+    """Every autotuner tactic (the dispatcher's top records of the two GEMMs, both record spaces) computes the class; the tactic
+    round-trips its record (the swapped-record flag included: at decode the list leads with the swapped body's record and the
+    rest are dense records), and autotuning keeps the bits."""
     from flashinfer.autotuner import autotune
+    from flashinfer.fused_moe.batch_invariant.runner_nvfp4 import (
+        _configs_from_tactic_nvfp4,
+        _tactic_nvfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        rows_per_expert,
+        token_tile_default,
+    )
 
-    T, k, H, I, E = 300, 6, 1024, 512, 64
+    k, H, I, E = 6, 1024, 512, 64
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=7)
     layer = _layer(k, E, I)
     W = _weights(w1, w2)
@@ -894,6 +1154,14 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
     inputs = runner.pack_inputs(pack, W)
     tactics = runner.get_valid_tactics(inputs, None)
     assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
+    swapped = token_tile_default(rows_per_expert(T, k, E)) is not None
+    c1, c2 = _configs_from_tactic_nvfp4(tactics[0])
+    assert (
+        _tactic_nvfp4(c1, c2) == tactics[0] and c1.swap_ab == c2.swap_ab == swapped
+    ), (T, c1.describe(), c2.describe())
+    assert any(
+        not _configs_from_tactic_nvfp4(t)[0].swap_ab for t in tactics
+    )  # the dense records follow in the list
     for t in tactics:
         out = runner.forward(runner.pack_inputs(pack, W), tactic=t)
         assert torch.equal(bits(out), ref), t

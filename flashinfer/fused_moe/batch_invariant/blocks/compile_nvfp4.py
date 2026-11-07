@@ -26,6 +26,7 @@ from .epilogue import GROUP
 from .epilogue_nvfp4 import W4A4Chain
 from .kernel_nvfp4 import GROUP_ALIGN, GroupedBlockScaledGemm
 from .scheduler import MAX_E
+from .swap_nvfp4 import SwappedBlockScaledGemm, is_swapped_record
 
 MODULE = "batch_invariant_moe_nvfp4"
 GRID_PLACEHOLDER = 1  # the compile-time value of the grid argument: a dynamic Int32 of the kernel, never compiled in
@@ -79,6 +80,142 @@ def can_implement_grouped_nvfp4(
         and N % 8 == 0
         and n_out % ALIGN[chain.out_fmt] == 0
         and 1 <= E <= MAX_E
+    )
+
+
+def swapped_kernel_name(cfg: Knobs, chain: W4A4Chain, in_fmt: str) -> str:
+    """The swapped decode body's object: the instruction class, the chain and the swapped record (its token tile)."""
+    knobs = dataclasses.replace(cfg, grid_clusters=0)
+    tag = "nvfp4k128" if in_fmt == "nvfp4_k128" else "nvfp4"
+    return jit.sanitize_symbol_name(
+        f"swapped_{tag}_{chain.describe()}_{knobs.describe()}"
+    )
+
+
+def can_implement_swapped_nvfp4(
+    knobs: Knobs, N: int, K: int, E: int, chain: W4A4Chain, in_fmt: str = "nvfp4"
+) -> bool:
+    """Acceptance of the swapped decode body (:mod:`.swap_nvfp4`): a swapped record of the dense block-scaled space at a narrow
+    token tile (128 weight rows x 8 / 16 / 32 tokens, 1-CTA, no cluster, swizzle 1) and the grouped operand rules (a whole scale
+    block per 16 bytes of K, the gated chain on whole ``2 x GROUP`` column blocks, the output's alignment, at most ``MAX_E``
+    experts, a W4A4 or an unscaled oracle chain). The body reads the dense packing only."""
+    if in_fmt not in NVFP4_FMTS or not isinstance(chain, W4A4Chain):
+        return False
+    if not is_swapped_record(knobs) or not knobs.well_formed(in_fmt):
+        return False
+    if chain.out_fmt not in OUT_FMTS:
+        return False
+    if chain.pair and N % (2 * GROUP):
+        return False
+    n_out = N // 2 if chain.pair else N
+    return (
+        K % ALIGN[in_fmt] == 0
+        and N % 8 == 0
+        and n_out % ALIGN[chain.out_fmt] == 0
+        and 1 <= E <= MAX_E
+    )
+
+
+def can_implement_nvfp4(
+    knobs: Knobs, N: int, K: int, E: int, chain: W4A4Chain, in_fmt: str = "nvfp4"
+) -> bool:
+    """A record either block-scaled grouped body takes: the padded / dense-A body (a dense record) or the swapped decode body
+    (a narrow swapped record); the two spaces are disjoint."""
+    return can_implement_grouped_nvfp4(
+        knobs, N, K, E, chain, in_fmt
+    ) or can_implement_swapped_nvfp4(knobs, N, K, E, chain, in_fmt)
+
+
+def compile_swapped_nvfp4_fn(
+    cfg: Knobs, chain: W4A4Chain, in_fmt: str
+) -> Callable[[], Any]:
+    """The zero-argument compile closure of one swapped specialisation: ``kernel(a3, sfa, w3, sfw, out2, counts, alpha, pts,
+    grid)`` -- A ``(rows, K/2, 1)`` the dense rows (at least the token tile past the live rows), ``sfa`` their scale factors at
+    the padded positions, W ``(N, K/2, E)``, ``sfw``, out ``(rows', Nout)``, ``pts`` at the padded positions (a multiple of 128)."""
+    out_dt, oal = OUT_DT[chain.out_fmt], ALIGN[chain.out_fmt]
+
+    def compile_fn():
+        sym_r, sym_m, sym_n, sym_kh, sym_e = (
+            cute.sym_int(32),
+            cute.sym_int(32),
+            cute.sym_int(32, divisibility=8),
+            cute.sym_int(32, divisibility=16),
+            cute.sym_int(32),
+        )
+        sym_mp = cute.sym_int(32, divisibility=GROUP_ALIGN)
+        sym_no = cute.sym_int(32, divisibility=oal)
+        a_fake = cute.runtime.make_fake_tensor(
+            cutlass.Uint8,
+            (sym_r, sym_kh, 1),
+            (cute.sym_int64(divisibility=16), 1, cute.sym_int64(divisibility=16)),
+            assumed_align=16,
+        )
+        sfa_fake = cute.runtime.make_fake_tensor(
+            cutlass.Uint8,
+            (cute.sym_int(32, divisibility=SF_BUFFER_DIVISIBILITY),),
+            (1,),
+            assumed_align=16,
+        )
+        w_fake = cute.runtime.make_fake_tensor(
+            cutlass.Uint8,
+            (sym_n, sym_kh, sym_e),
+            (cute.sym_int64(divisibility=16), 1, cute.sym_int64(divisibility=16)),
+            assumed_align=16,
+        )
+        sfw_fake = cute.runtime.make_fake_tensor(
+            cutlass.Uint8,
+            (cute.sym_int(32, divisibility=SF_BUFFER_DIVISIBILITY),),
+            (1,),
+            assumed_align=16,
+        )
+        o_fake = cute.runtime.make_fake_tensor(
+            out_dt,
+            (sym_m, sym_no),
+            (cute.sym_int64(divisibility=oal), 1),
+            assumed_align=16,
+        )
+        c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+        alpha_fake = cute.runtime.make_fake_tensor(
+            Float32, (sym_e,), (1,), assumed_align=4
+        )
+        pts_fake = cute.runtime.make_fake_tensor(
+            Float32, (sym_mp,), (1,), assumed_align=4
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        grid = GRID_PLACEHOLDER
+        return cute.compile(
+            SwappedBlockScaledGemm(cfg, chain, in_fmt),
+            a_fake,
+            sfa_fake,
+            w_fake,
+            sfw_fake,
+            o_fake,
+            c_fake,
+            alpha_fake,
+            pts_fake,
+            grid,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return compile_fn
+
+
+@functools.cache
+def get_compiled_swapped_nvfp4(
+    cfg: Knobs, chain: W4A4Chain, in_fmt: str = "nvfp4"
+) -> Any:
+    """The swapped decode body's object for a swapped record, chain and instruction class (``compile_swapped_nvfp4_fn``)."""
+    assert (
+        in_fmt in NVFP4_FMTS
+        and isinstance(chain, W4A4Chain)
+        and chain.out_fmt in OUT_FMTS
+        and is_swapped_record(cfg)
+    ), (in_fmt, chain, cfg.describe())
+    return jit.build_and_load(
+        MODULE,
+        swapped_kernel_name(cfg, chain, in_fmt),
+        compile_swapped_nvfp4_fn(cfg, chain, in_fmt),
     )
 
 

@@ -292,10 +292,15 @@ def grouped_gemm_nvfp4(
     ``a4 [rows, K/2]`` the groups' rows back to back (any row count), ``a_sf`` and ``a_pts`` at the padded positions
     (``a_pts`` of the padded row count), ``out [rows]`` dense. ``w4 [E, N, K/2]`` uint8, ``w_sf [E, sf_bytes(N, K)]``,
     ``alpha [E]`` f32. ``chain``: the W4A4 GEMM1 / GEMM2 chains or the unscaled oracle (``scale == "none"``: ``alpha`` and
-    ``pts`` ignored). The persistent grid is a launch argument: the device's co-resident cluster capacity for the record."""
+    ``pts`` ignored). The record selects the body: a dense record runs the padded body on either packing, a swapped record
+    (``config.swap_ab``: 128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap_nvfp4`) runs
+    the swapped decode body on the dense packing (``a4`` carries at least the token tile's rows past the live rows: the op's
+    ``DENSE_TAIL``). The persistent grid is a launch argument: the device's co-resident cluster capacity for the record."""
     from .blocks.compile_nvfp4 import (
         can_implement_grouped_nvfp4,
+        can_implement_swapped_nvfp4,
         get_compiled_grouped_nvfp4,
+        get_compiled_swapped_nvfp4,
     )
 
     if (
@@ -346,7 +351,16 @@ def grouped_gemm_nvfp4(
         raise ValueError(
             "grouped_gemm_nvfp4: the grouped class takes unsplit expert weight shapes"
         )
-    if not can_implement_grouped_nvfp4(config, N, K, E, chain, in_fmt):
+    if config.swap_ab:
+        if not dense_a:
+            raise ValueError(
+                "grouped_gemm_nvfp4: the swapped decode body reads the dense packing (dense_a=True)"
+            )
+        if not can_implement_swapped_nvfp4(config, N, K, E, chain, in_fmt):
+            raise ValueError(
+                f"grouped_gemm_nvfp4: swapped record {config.describe()} does not implement ({N}, {K}, {E}, {chain}, {in_fmt})"
+            )
+    elif not can_implement_grouped_nvfp4(config, N, K, E, chain, in_fmt):
         raise ValueError(
             f"grouped_gemm_nvfp4: record {config.describe()} does not implement ({N}, {K}, {E}, {chain}, {in_fmt})"
         )
@@ -363,9 +377,22 @@ def grouped_gemm_nvfp4(
         raise ValueError(
             "grouped_gemm_nvfp4: out must be a 16-byte-aligned row-major [rows, n_out] of the chain's dtype"
         )
-    kernel = get_compiled_grouped_nvfp4(config, chain, in_fmt, dense_a)
     if rows == 0:
         return out
+    if config.swap_ab:
+        get_compiled_swapped_nvfp4(config, chain, in_fmt)(
+            a4.unsqueeze(-1),
+            a_sf.reshape(-1),
+            w4.permute(1, 2, 0),
+            w_sf.reshape(-1),
+            out,
+            counts,
+            alpha.reshape(-1),
+            a_pts.reshape(-1),
+            persistent_clusters(a4.device, config),
+        )
+        return out
+    kernel = get_compiled_grouped_nvfp4(config, chain, in_fmt, dense_a)
     kernel(
         a4.unsqueeze(-1),
         w4.permute(1, 2, 0),
@@ -559,13 +586,17 @@ def fused_moe_nvfp4(
     path: str = "dense",
     gs_inv: Union[float, torch.Tensor] = TE_GS_INV,
     return_intermediates: bool = False,
+    swap: Optional[bool] = None,
 ):
     """The W4A4 MoE FFN for pre-routed tokens: ``x`` bf16 ``[T, H]`` (quantized here per token with the class and
     ``gs_inv``) or the quantized triple ``(x4 [T, H/2] uint8, x_sf (128x4 swizzled, uint8), x_pts [T] f32)``;
     ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` f32; the output bf16 ``[T, H]`` in token order.
     ``in_fmts`` names the instruction class per GEMM (default: the dense rule on each expert weight shape and the device's
     family); ``config1`` / ``config2`` the grouped records (any record of the space gives the same bits; the dispatcher's pick
-    by default); ``path`` the packing of the expanded rows (``"dense"`` / ``"padded"``: placements)."""
+    by default); ``path`` the packing of the expanded rows (``"dense"`` / ``"padded"``: placements); ``swap`` the dense path's
+    body -- None: the dispatcher's structural rule (the swapped decode body when the rows per active expert fit a narrow token
+    tile), True / False: the swapped / the padded body on both GEMMs (placements: the same bits); explicit records select the
+    body themselves (a swapped record needs the dense path)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute_nvfp4 import get_compiled_scatter_fp4, get_compiled_scatter_sf
     from .schedule_nvfp4 import default_configs_nvfp4
@@ -644,9 +675,23 @@ def fused_moe_nvfp4(
     chain1 = w.chain1
     if config1 is None or config2 is None:
         c1, c2 = default_configs_nvfp4(
-            T, k, H, I, E, (in1, in2), chain1, GEMM2_CHAIN, sm_count, family
+            T,
+            k,
+            H,
+            I,
+            E,
+            (in1, in2),
+            chain1,
+            GEMM2_CHAIN,
+            sm_count,
+            family,
+            swap=swap if path == "dense" else False,
         )
         config1, config2 = config1 or c1, config2 or c2
+    if path != "dense" and (swap or config1.swap_ab or config2.swap_ab):
+        raise ValueError(
+            "fused_moe_nvfp4: the swapped decode body reads the dense packing (path='dense')"
+        )
     Tk = T * k
     Tk_pad = padded_rows_bound(T, k, E)
     pcols_h, pcols_i = padded_sf_cols(H), padded_sf_cols(I)

@@ -69,4 +69,25 @@ def groupedBlockScaledOK (cfg : GEMM.Config) : Bool :=
 theorem grouped_blockscaled_in_dense (cfg : GEMM.Config) (h : groupedBlockScaledOK cfg = true) : GEMM.ConfigOKNvfp4 cfg = true :=
   (Bool.and_eq_true _ _).mp h |>.1
 
+/-- The swapped decode space of the grouped block-scaled classes (`blocks/swap_nvfp4.py`): the dense class's swapped 1-CTA
+records at a narrow token tile (128 weight rows x 8 / 16 / 32 tokens), no cluster, swizzle 1, no in-cluster split. The
+block-scaled step is symmetric in its operands, so each is a placement of the class (the dense class's swapped decode
+records). Disjoint from `groupedBlockScaledOK` (`swapAb`). -/
+def groupedBlockScaledSwapOK (cfg : GEMM.Config) : Bool :=
+  GEMM.ConfigOKNvfp4 cfg && (cfg.swizzle == 1 && (cfg.clusterK == 1 && (cfg.swapAb && (cfg.tm == 128 && (cfg.tn ≤ 32 &&
+    (cfg.clusterM == 1 && (cfg.clusterN == 1 && (!cfg.twoCta && !cfg.ctaChunks))))))))
+
+/-- A swapped decode record is a record of the dense NVFP4 class (the swapped grouped kernel is a placement of it). -/
+theorem grouped_blockscaled_swap_in_dense (cfg : GEMM.Config) (h : groupedBlockScaledSwapOK cfg = true) : GEMM.ConfigOKNvfp4 cfg = true :=
+  (Bool.and_eq_true _ _).mp h |>.1
+
+/-- The two spaces are disjoint: no record is both. -/
+theorem grouped_spaces_disjoint (cfg : GEMM.Config) (h : groupedBlockScaledOK cfg = true) : groupedBlockScaledSwapOK cfg = false := by
+  unfold groupedBlockScaledOK at h
+  unfold groupedBlockScaledSwapOK
+  simp only [Bool.and_eq_true] at h
+  obtain ⟨_, _, _, hswap, _⟩ := h
+  simp [Bool.not_eq_true'] at hswap
+  simp [hswap]
+
 end BIK.MoE

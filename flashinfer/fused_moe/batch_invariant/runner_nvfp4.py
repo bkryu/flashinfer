@@ -42,7 +42,7 @@ from ..api import (
     SwiGLUStep,
 )
 from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
-from .runner import MOE_BF16_ARCHS, _configs_from_tactic, _tactic
+from .runner import MOE_BF16_ARCHS
 from .spec_nvfp4 import CLASS
 
 #: The compute capabilities the classes are stated for (the dense 4-bit GEMM class's parts).
@@ -66,6 +66,41 @@ def _no_scales(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
             torch.empty(1, dtype=torch.float32, device=device),
         )
     return t
+
+
+def _tactic_nvfp4(c1, c2) -> tuple:
+    """A pair of records as a flat tuple of scalars (JSON round-trip safe for the autotuner's cache): the bf16 runner's six
+    per record plus the swapped-record flag (the dispatcher's two record spaces)."""
+    return tuple(
+        int(v) if isinstance(v, bool) else v
+        for cfg in (c1, c2)
+        for v in (
+            cfg.mma_tiler_mn[0],
+            cfg.mma_tiler_mn[1],
+            cfg.cluster_shape_mn[0],
+            cfg.cluster_shape_mn[1],
+            cfg.use_2cta_instrs,
+            cfg.raster_along,
+            cfg.swap_ab,
+        )
+    )
+
+
+def _configs_from_tactic_nvfp4(t: tuple):
+    from ...gemm.batch_invariant.generator import Knobs
+
+    def one(v):
+        return Knobs(
+            (int(v[0]), int(v[1])),
+            (int(v[2]), int(v[3])),
+            bool(v[4]),
+            True,
+            str(v[5]),
+            1,
+            swap_ab=bool(v[6]),
+        )
+
+    return one(t[:7]), one(t[7:14])
 
 
 class BatchInvariantMoeNvfp4Runner(MoERunner):
@@ -377,10 +412,10 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
         self._require_built()
         r1, r2 = self._ranked(int(inputs[_X].shape[0]), self._hidden_of(inputs[_X]))
-        return [_tactic(c1, c2) for c1 in r1 for c2 in r2]
+        return [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + ("moe.nvfp4-v1",)
+        return super()._cache_key_extras() + ("moe.nvfp4-v2",)
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(
@@ -399,7 +434,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             r1, r2 = self._ranked(int(x.shape[0]), H)
             c1, c2 = r1[0], r2[0]
         else:
-            c1, c2 = _configs_from_tactic(tuple(tactic))
+            c1, c2 = _configs_from_tactic_nvfp4(tuple(tactic))
         a = self._activation()
         w = MoEWeightsNVFP4(
             w1,

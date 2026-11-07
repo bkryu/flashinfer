@@ -55,7 +55,14 @@ records of swizzle band 1 whose N tile the staged epilogue lays out) and filtere
 every pair computes the class. The persistent grid of a grouped GEMM is the same launch parameter as the dense one's. The NVFP4 MoE classes' dispatcher (`fused_moe/batch_invariant/schedule_nvfp4.py`) ranks the same way at the
 dense 4-bit class's instruction class with `M =` the rows of one active expert rounded up to the 128-row scale-factor atom (the
 grouped kernel computes whole atoms per group), and keeps only the records whose M tile fits that padded group: a taller
-tile computes padding the dense estimate does not price.
+tile computes padding the dense estimate does not price. At few rows per active expert the ranking is led by the swapped
+decode body (`fused_moe/batch_invariant/blocks/swap_nvfp4.py`: the weights on the MMA's M side, the group's tokens a narrow
+N tile of 8 / 16 / 32 rows read from the dense packing, their scale factors gathered from the padded positions), chosen by a
+structural rule -- the narrowest swapped tile when the rows per active expert fill it to at most three quarters, the padded body
+otherwise -- so the
+GEMM traffic at decode is the weights read once instead of a 128-row token atom per weight tile. Both bodies compute the same
+bits (the block-scaled step is symmetric in its operands); the dense record and the swapped record are two placements the
+autotuner may profile.
 
 ## How to check the proofs
 
