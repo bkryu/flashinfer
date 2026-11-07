@@ -24,30 +24,21 @@ import torch
 
 from flashinfer import batch_invariant as bi
 from flashinfer.fused_moe import (
-    GELU,
     BackendOptions,
     BatchInvariantMoeNvfp4Config,
     ExecutionConfig,
     ExpertConfig,
-    GeGLU,
-    GeGLUTanh,
-    Identity,
     MoEActivationPack,
     MoEConfig,
     MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
-    PowLU,
     QuantConfig,
     QuantFormat,
-    ReLU,
     ReLU2,
     RoutingConfig,
     RoutingInputMode,
-    SiLU,
-    SiTU,
     SwiGLU,
-    SwiGLUStep,
 )
 from flashinfer.fused_moe.api import ALL_BACKEND_CONFIGS, _DEFAULT_BACKEND
 from flashinfer.fused_moe.batch_invariant.runner_nvfp4 import (
@@ -67,40 +58,12 @@ needs_device = pytest.mark.skipif(
 
 _SWIGLU = SwiGLU()
 _NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
-ACTIVATIONS = [
-    SwiGLU(),
-    SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
-    SwiGLUStep(),
-    SwiGLUStep(limit=3.0),
-    GeGLU(),
-    GeGLUTanh(),
-    SiTU(),
-    SiTU(gate_scale=2.0, linear_scale=None, clamp_limit=5.0),
-    PowLU(),
-    PowLU(m=1.5, limit=4.0),
-    ReLU2(),
-    Identity(),
-    GELU(),
-    ReLU(),
-    SiLU(),
-]
-ACTIVATION_IDS = [
-    "swiglu",
-    "swiglu_oai",
-    "swiglu_step",
-    "swiglu_step_limit3",
-    "geglu",
-    "geglu_tanh",
-    "situ",
-    "situ_clamped",
-    "powlu",
-    "powlu_limit4",
-    "relu2",
-    "identity",
-    "gelu",
-    "relu",
-    "silu",
-]
+# the activations the suites cover (every typed activation of the layer, the parameterised ones once more with scalars that
+# move every branch): the bf16 backend's list, each its own class of this backend too
+from tests.moe.test_unified_moe_batch_invariant import (  # noqa: E402
+    ACTIVATION_IDS,
+    ACTIVATIONS,
+)
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:
