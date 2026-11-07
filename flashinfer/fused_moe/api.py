@@ -3346,6 +3346,84 @@ class BatchInvariantMoeConfig:
         return "BatchInvariantMoeConfig()"
 
 
+@dataclass(frozen=True)
+class BatchInvariantMoeNvfp4Config:
+    """The batch-invariant NVFP4 MoE backend: the W4A4 classes ``moe.nvfp4.<act>`` of the mode documented in
+    ``flashinfer/batch_invariant/README.md`` (``QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)``:
+    NVFP4 experts with one per-tensor global scale per expert and GEMM, per-token NVFP4 activations; one class per typed
+    activation and parameter set, as the bf16 backend), on SM100 / SM103 / SM107.
+
+    The guarantee, the routing input modes, the finalize contract and the error contract are the bf16 backend's
+    (:class:`BatchInvariantMoeConfig`): a token's output bits depend on its own row, its ``top_k`` experts and routing weights
+    and the expert weights only; the backend never falls back and is not a default candidate. The dataflow (the proofs are the
+    ``MoENvfp4`` Lean module of the mode): the input row quantized per token by the mode's NVFP4 quantizer (TransformerEngine's
+    recipe), GEMM1 as the dense NVFP4 GEMM class per expert with the chain ``cvt_bf16(act(mul(g, s)) * mul(u, s))``,
+    ``s = mul(alpha1[e], pts[token])``, the bf16 intermediate quantized per token by the same class, GEMM2 with
+    ``cvt_bf16(mul(acc, mul(alpha2[e], pts2)))``, the slot-order combine. The instruction class of each expert weight shape
+    is the dense 4-bit class rule's (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere), so the architecture is a
+    dimension of ``fingerprint("fused_moe_nvfp4", ...)``.
+
+    Weights: ``prepare_weights`` takes the canonical bf16 ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or ``[E, I, H]`` for the
+    ungated activations, and ``w2 [E, H, I]``, and quantizes every expert with the mode's per-tensor NVFP4 quantizer (global
+    scale ``448 * 6 / amax``, 128x4 swizzled scales); ``H`` and ``I`` multiples of 32, the expert weight shapes unsplit by the
+    dense class's chunk rule. Activations: bf16 ``[num_tokens, H]`` as given (``prepare_activations``: the class quantizes
+    them per token itself), or packed fp4 ``uint8 [num_tokens, H / 2]`` with ``hidden_states_scale`` (the 128x4 swizzled
+    scales of ``nvfp4_quantize(..., per_token_activation=True, batch_invariant=True)`` or the linear ``[num_tokens, H / 16]``
+    layout) and ``per_token_scale`` (unit scales when absent: the per-tensor pack of :class:`TrtllmFp4Config`).
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        *,
+        quant: Optional["QuantConfig"] = None,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view: every expert quantized to NVFP4 with its own per-tensor global scale (the gate / up rows
+        interleaved first for a gated activation), the 128x4 swizzled block scales, the alphas (``1 / global scale``) and the
+        activation's chain (``activation`` defaults to ``SwiGLU()``)."""
+        from .batch_invariant.api_nvfp4 import MoEWeightsNVFP4
+        from .batch_invariant.spec import activation_of
+
+        if quant is not None and quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            from ..batch_invariant.support import unsupported
+
+            raise unsupported(
+                "moe.nvfp4",
+                f"the quantization {quant!r}",
+                "QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)",
+            )
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        w1 = w1.to(device=device) if device is not None else w1
+        w2 = w2.to(device=device) if device is not None else w2
+        return MoEWeightsNVFP4.prepare(
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states: torch.Tensor, *, quant: Optional["QuantConfig"] = None
+    ) -> Tuple[torch.Tensor, None]:
+        """bf16 activations as given (no scale): the class's per-token quantization is part of the op."""
+        return hidden_states.to(torch.bfloat16).contiguous(), None
+
+    def __repr__(self) -> str:
+        return "BatchInvariantMoeNvfp4Config()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
     BatchInvariantMoeConfig,
@@ -3391,6 +3469,7 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantMoeNvfp4Config,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3437,6 +3516,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantMoeNvfp4Config,
 )
 
 
