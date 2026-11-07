@@ -19,7 +19,9 @@ import cutlass.cute as cute
 from cutlass import Int32
 
 from ....batch_invariant import jit
-from ....gemm.batch_invariant.blocks.operands import ALIGN, IN_DT, OUT_DT
+from ....gemm.batch_invariant.blocks.operands import ALIGN as _ALIGN
+from ....gemm.batch_invariant.blocks.operands import IN_DT
+from ....gemm.batch_invariant.blocks.operands import OUT_DT as _OUT_DT
 from ....gemm.batch_invariant.generator import TILES_N_BLOCKSCALED, Knobs
 from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC
 from ..mx_permute import get_compiled_scatter_mx  # noqa: F401  (the scatter kernel shares the module)
@@ -28,6 +30,11 @@ from .epilogue import GROUP, GroupedChain
 from .scheduler import MAX_E
 
 MODULE = "batch_invariant_moe_mxfp8"
+OUT_DT = {
+    **_OUT_DT,
+    "mxfp8": cutlass.Uint8,
+}  # the fused requantization's codes (the scales a second output)
+ALIGN = {**_ALIGN, "mxfp8": 32}  # ... whole 32-element blocks per output row
 GRID_PLACEHOLDER = 1  # the compile-time value of the grid argument: a dynamic Int32 of the kernel, never compiled in
 SF_BUFFER_DIVISIBILITY = (
     SF_ATOM_ROWS * SF_ATOM_KBLOCKS
@@ -129,8 +136,29 @@ def compile_grouped_mxfp8_fn(
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
+        obj = GroupedBlockScaledGemmMX(cfg, chain, in_fmt)
+        if chain.out_fmt == "mxfp8":
+            osf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8,
+                (cute.sym_int(32, divisibility=512),),
+                (1,),
+                assumed_align=16,
+            )
+            return cute.compile(
+                obj.call_quant,
+                a_fake,
+                b_fake,
+                sfa_fake,
+                sfb_fake,
+                o_fake,
+                osf_fake,
+                c_fake,
+                grid,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
         return cute.compile(
-            GroupedBlockScaledGemmMX(cfg, chain, in_fmt),
+            obj,
             a_fake,
             b_fake,
             sfa_fake,

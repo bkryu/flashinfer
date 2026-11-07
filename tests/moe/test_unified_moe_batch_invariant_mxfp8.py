@@ -1066,6 +1066,48 @@ def test_routing_methods_from_logits_match_the_cpu_model():
 
 
 @needs_device
+@pytest.mark.parametrize("act", ACTIVATIONS, ids=ACTIVATION_IDS)
+def test_fused_requantization_equals_the_standalone_spelling(act):
+    """GEMM1's quantizing epilogue (the ``mxfp8.quant`` class applied to the bf16-rounded chain in place, codes and 128x4 block
+    scales out) is a placement of the standalone pass: the codes, the scales, GEMM2's output and the op are bit-equal on the
+    live rows for every typed activation; the op's default is the fused spelling."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.api import route
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    T, k, H, I, E = 300, 6, 512, 256, 64
+    chain = activation_of(act)
+    x, logits, w1, w2 = _problem(
+        T, k, H, I, E, seed=3, gated=chain.gated, adversarial=True
+    )
+    xq, xsf = _quant(x)
+    W = F.MoEWeightsMXFP8.prepare(
+        w1, w2, gated=chain.gated, act=chain.act, params=chain.params
+    )
+    ids, weights = route(logits, k)
+    out_s, im_s = F.fused_moe_mxfp8(
+        (xq, xsf), ids, weights, W, return_intermediates=True, requant="standalone"
+    )
+    out_f, im_f = F.fused_moe_mxfp8(
+        (xq, xsf), ids, weights, W, return_intermediates=True, requant="fused"
+    )
+    live = (im_s["src"] >= 0).cpu()
+    Tk_pad = im_s["Tk_pad"]
+    assert im_f["a"] is None and im_s["a"] is not None
+    assert torch.equal(
+        im_f["aq"].view(torch.uint8).cpu()[live],
+        im_s["aq"].view(torch.uint8).cpu()[live],
+    )
+    assert torch.equal(
+        _unswizzle(im_f["a_sf"], Tk_pad, I).cpu()[live],
+        _unswizzle(im_s["a_sf"], Tk_pad, I).cpu()[live],
+    )
+    assert torch.equal(bits(im_f["y"].cpu())[live], bits(im_s["y"].cpu())[live])
+    assert torch.equal(bits(out_f), bits(out_s))
+    assert torch.equal(bits(F.fused_moe_mxfp8((xq, xsf), ids, weights, W)), bits(out_f))
+
+
+@needs_device
 def test_grouped_routing_config_takes_prerouted_ids_and_refuses_logits():
     """A group-limited routing configuration (``n_group`` / ``topk_group`` > 1) constructs; from logits it is refused (the
     class has no grouped routing term); with pre-routed ids the group structure is irrelevant and the output is the

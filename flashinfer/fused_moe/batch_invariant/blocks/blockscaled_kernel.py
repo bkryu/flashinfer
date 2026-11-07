@@ -18,13 +18,15 @@ off_e + counts[e])`` and the padding rows (whatever bytes they hold) are compute
 
 from __future__ import annotations
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as bs_layout
-from cutlass import Int32
+from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.tensor_utils import LayoutEnum
@@ -57,6 +59,12 @@ MX_FMTS = ("mxfp8", "mxfp8_k64")
 #: The padded group alignment (rows): one 128-row scale-factor atom.
 GROUP_ALIGN = SF_ATOM_ROWS
 #: Epilogue warpgroups of the block-scaled grouped kernel (the chains are the epilogue leg once the stores are vectors).
+from .epilogue_mx import (  # noqa: E402
+    grouped_epilogue_quant_loop,
+    xch_bytes,
+    xch_layout,
+)
+
 EPI_WARPGROUPS_MX = 4
 EPILOGUE_WARPS, MMA_WARP, TMA_WARP, THREADS = warp_roles(EPI_WARPGROUPS_MX)
 TABLE_BYTES = 2 * (MAX_E + 1) * 4  # the two group tables
@@ -228,8 +236,27 @@ class GroupedBlockScaledGemmMX:
     ):
         self._launch(a, b, sfa, sfb, out, counts, max_active_clusters, stream)
 
+    @cute.jit
+    def call_quant(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        sfa: cute.Tensor,
+        sfb: cute.Tensor,
+        out: cute.Tensor,
+        out_sf: cute.Tensor,
+        counts: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The fused-requantization chains (``out_fmt == "mxfp8"``): ``out`` the e4m3 codes (uint8 ``[Tk_pad, N_out]``),
+        ``out_sf`` the flat uint8 UE8M0 bytes in the 128x4 layout of ``(Tk_pad, N_out)``."""
+        self._launch(a, b, sfa, sfb, out, counts, max_active_clusters, stream, out_sf)
+
     # host side (trace time)
-    def _launch(self, a, b, sfa, sfb, out, counts, max_active_clusters, stream):
+    def _launch(
+        self, a, b, sfa, sfb, out, counts, max_active_clusters, stream, out_sf=None
+    ):
         pc = self.plan_cls
         assert a.element_type is pc.A_DT and b.element_type is pc.B_DT, (
             a.element_type,
@@ -250,7 +277,8 @@ class GroupedBlockScaledGemmMX:
                 staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_MX)
                 if self.staged
                 else 0
-            ),
+            )
+            + xch_bytes(self.chain, EPI_WARPGROUPS_MX),
         )
         self.st = st
         self.c_smem_layout_staged = (
@@ -282,6 +310,7 @@ class GroupedBlockScaledGemmMX:
             tma.tensor_sfb,
             out,
             counts,
+            out_sf,
             st.cluster_layout_vmnk,
             st.cluster_layout_sfb_vmnk,
             st.a_smem_layout_staged,
@@ -314,6 +343,7 @@ class GroupedBlockScaledGemmMX:
         mSFB_nkl: cute.Tensor,
         mOut: cute.Tensor,
         counts: cute.Tensor,
+        mOutSf: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -423,6 +453,14 @@ class GroupedBlockScaledGemmMX:
         sSFB = smem.allocate_tensor(
             element_type=st.sf_dtype, layout=sfb_smem_layout_staged, byte_alignment=128
         )
+        sX = None
+        if cutlass.const_expr(xch_bytes(self.chain, EPI_WARPGROUPS_MX) > 0):
+            # the fused requantization's half-block amax exchange
+            sX = smem.allocate_tensor(
+                element_type=Float32,
+                layout=xch_layout(EPI_WARPGROUPS_MX),
+                byte_alignment=16,
+            )
         sC = None
         if cutlass.const_expr(self.staged):  # one output subtile per epilogue warpgroup
             if cutlass.const_expr(
@@ -622,23 +660,44 @@ class GroupedBlockScaledGemmMX:
                 mma_m_in_cluster,
                 cta_n_in_cluster,
             )
-            grouped_epilogue_loop(
-                st,
-                self.chain,
-                tidx,
-                tile_sched,
-                tCtAcc_base,
-                thr_mma,
-                mOut,
-                Tk,
-                N,
-                epi_tile,
-                acc_pipeline,
-                mma_m_in_cluster,
-                EPI_WARPGROUPS_MX,
-                sC=sC,
-                cta_v=mma_tile_coord_v,
-            )
+            if cutlass.const_expr(self.chain.out_fmt == "mxfp8"):
+                # the MXFP8 class's fused requantization: the codes and the 128x4 block scales of the bf16-rounded chain
+                grouped_epilogue_quant_loop(
+                    st,
+                    self.chain,
+                    tidx,
+                    tile_sched,
+                    tCtAcc_base,
+                    thr_mma,
+                    mOut,
+                    mOutSf,
+                    Tk,
+                    N,
+                    epi_tile,
+                    acc_pipeline,
+                    mma_m_in_cluster,
+                    EPI_WARPGROUPS_MX,
+                    sX,
+                    cta_v=mma_tile_coord_v,
+                )
+            else:
+                grouped_epilogue_loop(
+                    st,
+                    self.chain,
+                    tidx,
+                    tile_sched,
+                    tCtAcc_base,
+                    thr_mma,
+                    mOut,
+                    Tk,
+                    N,
+                    epi_tile,
+                    acc_pipeline,
+                    mma_m_in_cluster,
+                    EPI_WARPGROUPS_MX,
+                    sC=sC,
+                    cta_v=mma_tile_coord_v,
+                )
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 

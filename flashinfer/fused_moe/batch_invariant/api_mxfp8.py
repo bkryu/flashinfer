@@ -221,6 +221,14 @@ class MoEWeightsMXFP8:
             "glu" if self.gated else "act", self.act, "bf16", self.params
         )
 
+    @property
+    def chain1_quant(self) -> GroupedChain:
+        """The fused-requantization spelling of ``chain1``: the same chain, its bf16-rounded value quantized by the
+        ``mxfp8.quant`` class in the epilogue (codes and 128x4 block scales out, no bf16 intermediate)."""
+        return GroupedChain(
+            "glu" if self.gated else "act", self.act, "mxfp8", self.params
+        )
+
     def view(self) -> Dict[str, object]:
         """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for this backend."""
         return {
@@ -330,6 +338,27 @@ def grouped_gemm_mxfp8(
             f"grouped_gemm_mxfp8: record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
         )
     n_out = N // 2 if chain.pair else N
+    if chain.out_fmt == "mxfp8":
+        # the fused requantization: the codes and the 128x4 scale bytes of the bf16-rounded chain, written by the epilogue
+        if out is not None:
+            raise ValueError(
+                "grouped_gemm_mxfp8: the fused requantization allocates its two outputs"
+            )
+        codes = torch.empty(Tk, n_out, dtype=torch.uint8, device=a.device)
+        sf = torch.empty(sf_numel(Tk, n_out), dtype=torch.uint8, device=a.device)
+        kernel = get_compiled_grouped_mxfp8(config, chain, in_fmt)
+        if Tk:
+            kernel(
+                a.unsqueeze(-1),
+                w.permute(1, 2, 0),
+                a_sf,
+                w_sf,
+                codes,
+                sf,
+                counts,
+                persistent_clusters(a.device, config),
+            )
+        return codes.view(torch.float8_e4m3fn), sf
     out_dtype = _OUT[chain.out_fmt]
     if out is None:
         out = torch.empty(Tk, n_out, dtype=out_dtype, device=a.device)
@@ -408,6 +437,7 @@ def fused_moe_mxfp8(
     config2: Optional[Knobs] = None,
     in_fmt: Optional[str] = None,
     return_intermediates: bool = False,
+    requant: str = "fused",
 ) -> Any:
     """The MXFP8 x MXFP8 MoE FFN for pre-routed tokens: ``x`` a bf16 ``[T, H]`` (quantized here per token by the
     ``mxfp8.quant`` class) or the quantized pack ``(xq [T, H] e4m3, xsf [T, H / 32] uint8 / UE8M0)`` taken as given;
@@ -506,12 +536,21 @@ def fused_moe_mxfp8(
         nb,
         pcols,
     )
-    a = grouped_gemm_mxfp8(
-        x_perm, x_perm_sf, w.w1, w.w1_sf, counts, config1, w.chain1, in_fmt
-    )  # [Tk_pad, I] bf16
-    aq, a_sf = quantize_mxfp8_rows(
-        a, swizzled=True, enable_pdl=True, valid=src
-    )  # the quantizer class, second pass, the live rows
+    if requant not in ("fused", "standalone"):
+        raise ValueError(f"requant must be 'fused' or 'standalone', got {requant!r}")
+    if requant == "fused":
+        # the class's second quantization inside GEMM1's epilogue: no bf16 intermediate
+        a = None
+        aq, a_sf = grouped_gemm_mxfp8(
+            x_perm, x_perm_sf, w.w1, w.w1_sf, counts, config1, w.chain1_quant, in_fmt
+        )
+    else:
+        a = grouped_gemm_mxfp8(
+            x_perm, x_perm_sf, w.w1, w.w1_sf, counts, config1, w.chain1, in_fmt
+        )  # [Tk_pad, I] bf16
+        aq, a_sf = quantize_mxfp8_rows(
+            a, swizzled=True, enable_pdl=True, valid=src
+        )  # the quantizer class, second pass, the live rows
     y = grouped_gemm_mxfp8(
         aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt
     )  # [Tk_pad, H] bf16
