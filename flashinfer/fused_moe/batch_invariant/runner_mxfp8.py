@@ -136,14 +136,8 @@ class BatchInvariantMoeMxfp8Runner(MoERunner):
             raise unsupported(
                 CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
             )
-        if routing.n_group not in (None, 0, 1) or routing.topk_group not in (
-            None,
-            0,
-            1,
-        ):
-            raise unsupported(
-                CLASS, "group-limited routing (n_group > 1)", "n_group in (None, 0, 1)"
-            )
+        # group-limited routing (n_group / topk_group > 1) is refused only from logits (the class has no grouped routing
+        # term); with pre-routed ids the group structure is irrelevant, the output is the ungrouped configuration's
         self._method = METHOD_OF_FLASHINFER.get(routing.method)
         if not cfg.finalize.do_finalize:
             raise unsupported(
@@ -231,6 +225,20 @@ class BatchInvariantMoeMxfp8Runner(MoERunner):
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
+            if cfg.routing.n_group not in (
+                None,
+                0,
+                1,
+            ) or cfg.routing.topk_group not in (
+                None,
+                0,
+                1,
+            ):
+                raise unsupported(
+                    CLASS,
+                    "group-limited routing (n_group > 1) from logits",
+                    "n_group in (None, 0, 1) from logits, or pre-routed ids for grouped routing",
+                )
             if self._method is None:
                 raise unsupported(
                     CLASS,

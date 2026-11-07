@@ -538,7 +538,7 @@ def _quant_ref(x: torch.Tensor):
 
 def _reference_ffn(xq, xsf, ids, weights, w1, w2, act):
     """The class composed from its own pieces on the quantized activation pack: the padded permutation of the class, the
-    scatter by indexing (padding rows zero), GEMM1 as the dense batch-invariant MXFP8 GEMM (``mm_mxfp8_batch_invariant``, what ``mm_mxfp8(..., batch_invariant=True)``
+    scatter by indexing (the padding rows unspecified), GEMM1 as the dense batch-invariant MXFP8 GEMM (``mm_mxfp8_batch_invariant``, what ``mm_mxfp8(..., batch_invariant=True)``
     runs; the fp32 output the oracle needs, the instruction class pinned: the same fold) per expert, the CPU chain ``act`` on those accumulators, the quantizer's CPU reference on the
     bf16 intermediate, GEMM2 as the dense ``mm_mxfp8`` (bf16 out) per expert, the CPU slot-order combine. Bit for bit what the
     fused op must produce."""
@@ -1066,6 +1066,42 @@ def test_routing_methods_from_logits_match_the_cpu_model():
 
 
 @needs_device
+def test_grouped_routing_config_takes_prerouted_ids_and_refuses_logits():
+    """A group-limited routing configuration (``n_group`` / ``topk_group`` > 1) constructs; from logits it is refused (the
+    class has no grouped routing term); with pre-routed ids the group structure is irrelevant and the output is the
+    ungrouped configuration's bit for bit on the same ids and weights."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    T, k, H, I, E = 64, 8, 512, 256, 64
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=5)
+    xq, xsf = _quant(x)
+    W = _weights(w1, w2)
+    grouped = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E,
+                top_k=k,
+                method=RoutingMethodType.Renormalize,
+                n_group=8,
+                topk_group=4,
+            ),
+            quant=_QUANT,
+            experts=ExpertConfig(intermediate_size=I),
+            backend=BackendOptions((BatchInvariantMoeMxfp8Config(),)),
+            execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=4096),
+        ),
+        device=torch.device("cuda"),
+    )
+    with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+        grouped(_logits_pack((xq, xsf), logits), W)
+    assert "n_group" in str(excinfo.value)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    out = grouped(_routed_pack((xq, xsf), ids.cuda(), weights.cuda()), W)
+    ref = _layer(k, E, I)(_routed_pack((xq, xsf), ids.cuda(), weights.cuda()), W)
+    assert torch.equal(bits(out), bits(ref))
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     """The error contract: a configuration outside the classes raises the mode's error at build or at the first call (top_k /
     num_experts outside the bounds, an intermediate size that is not a multiple of 32, fused shared experts, an expert-parallel
@@ -1111,12 +1147,6 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                 )
             ),
             "parallel",
-        ),
-        (
-            dict(
-                routing=RoutingConfig(num_experts=E, top_k=k, n_group=2, topk_group=1)
-            ),
-            "n_group",
         ),
         (dict(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize"),
     ):
