@@ -107,13 +107,17 @@ def check_shape_mxfp8(H: int, I: int, E: int, k: Optional[int] = None) -> None:
 
 
 def quantize_mxfp8_rows(
-    x: torch.Tensor, swizzled: bool, enable_pdl: bool = False
+    x: torch.Tensor,
+    swizzled: bool,
+    enable_pdl: bool = False,
+    valid: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """The ``mxfp8.quant`` class on bf16 rows ``[M, K]``: ``(codes [M, K] float8_e4m3fn, sf)`` with ``sf`` the flat uint8
     UE8M0 bytes in the 128x4 swizzled layout (``sf_numel(M, K)``: the block-scaled GEMMs' operand) or the token-major
-    ``[M, K / 32]`` bytes (the activation pack)."""
+    ``[M, K / 32]`` bytes (the activation pack). ``valid`` (int32 ``[M]``, negative = skip): only the rows marked live are
+    read and written (the padded operand's padding rows hold unspecified bytes no stored value depends on)."""
     codes, sf = mxfp8_quantize_batch_invariant(
-        x, "128x4" if swizzled else "linear", BLOCK, enable_pdl
+        x, "128x4" if swizzled else "linear", BLOCK, enable_pdl, valid=valid
     )
     sf = sf.view(torch.uint8)
     return codes, sf.reshape(-1) if swizzled else sf.reshape(x.shape[0], -1)
@@ -506,8 +510,8 @@ def fused_moe_mxfp8(
         x_perm, x_perm_sf, w.w1, w.w1_sf, counts, config1, w.chain1, in_fmt
     )  # [Tk_pad, I] bf16
     aq, a_sf = quantize_mxfp8_rows(
-        a, swizzled=True, enable_pdl=True
-    )  # the quantizer class, second pass
+        a, swizzled=True, enable_pdl=True, valid=src
+    )  # the quantizer class, second pass, the live rows
     y = grouped_gemm_mxfp8(
         aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt
     )  # [Tk_pad, H] bf16
