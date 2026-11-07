@@ -65,6 +65,7 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_moe_nvfp4": (
         "fused_moe/batch_invariant/blocks/compile_nvfp4.py",
         "fused_moe/batch_invariant/permute_nvfp4.py",
+        "fused_moe/batch_invariant/route_plan_nvfp4.py",
     ),
     # the NVFP4 MoE classes' row-mapped per-token quantization (the quantizer class's kernel with a destination row map)
     "batch_invariant_moe_nvfp4_quant": (

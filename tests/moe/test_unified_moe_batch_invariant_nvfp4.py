@@ -1066,6 +1066,63 @@ def test_three_routing_modes_agree_and_runs_are_deterministic():
 
 
 @needs_device
+@pytest.mark.parametrize(
+    "T,k,E",
+    [(1, 1, 8), (3, 8, 64), (16, 16, 128), (16, 8, 1024), (7, 4, 1000), (0, 4, 16)],
+)
+@pytest.mark.parametrize("method", ["softmax_renorm", "sigmoid_bias_renorm_scaled"])
+def test_route_plan_dual_equals_route_and_the_dual_plan(T, k, E, method):
+    """``api_nvfp4.route_plan_dual`` (the routing and the dense packing's dual permutation plan in one launch for small token
+    counts) gives the route kernel's bits and the dual plan's integers: experts, weights, counts, dest, src, dest_pad and
+    pos_pad equal those of ``route`` followed by ``permute_plan_dual``, up to the fused kernel's slot bound and expert count."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import api_nvfp4 as A
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    meth = (
+        S.SOFTMAX_RENORM if method == "softmax_renorm" else S.SIGMOID_BIAS_RENORM_SCALED
+    )
+    g = torch.Generator().manual_seed(T * 7 + E)
+    logits = (torch.randn(max(T, 1), E, generator=g) * 2).float()[:T].cuda()
+    bias = (torch.randn(E, generator=g) * 0.1).float().cuda() if meth.bias else None
+    scale = 2.5 if meth.scaled else None
+    ex, w = api.route(logits, k, meth, bias, scale)
+    counts, dest, src, dest_pad, pos_pad = A.permute_plan_dual(ex, E)
+    ex2, w2, counts2, dest2, src2, dest_pad2, pos_pad2 = A.route_plan_dual(
+        logits, k, meth, bias, scale
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(ex, ex2) and torch.equal(bits(w), bits(w2))
+    assert torch.equal(counts, counts2) and torch.equal(dest, dest2)
+    assert torch.equal(src, src2)
+    assert torch.equal(dest_pad, dest_pad2) and torch.equal(pos_pad, pos_pad2)
+
+
+@needs_device
+def test_layer_fused_routing_at_small_t_matches_prerouted_routing():
+    """From logits at a small token count the runner routes and plans in one launch; the output equals the pre-routed modes'
+    (the same ids and weights from ``route``) bit for bit, and the op given the fused plan equals the op planning itself."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import api_nvfp4 as A
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    T, k, H, I, E = 5, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=3)
+    layer, W_pack = _layer(k, E, I), _weights(w1, w2)
+    out = layer(_logits_pack(x, logits), W_pack)
+    ids, wts = api.route(logits, k, S.SOFTMAX_RENORM)
+    out2 = layer(_routed_pack(x, ids, wts), W_pack)
+    assert torch.equal(bits(out), bits(out2))
+    W = _weights_of(W_pack)
+    ids3, wts3, *plan = A.route_plan_dual(logits, k, S.SOFTMAX_RENORM)
+    out3 = A.fused_moe_nvfp4(x, ids3, wts3, W, plan=tuple(plan))
+    out4 = A.fused_moe_nvfp4(x, ids, wts, W)
+    assert torch.equal(bits(out3), bits(out)) and torch.equal(bits(out4), bits(out))
+    with pytest.raises(ValueError):
+        A.fused_moe_nvfp4(x, ids3, wts3, W, path="padded", plan=tuple(plan))
+
+
+@needs_device
 def test_batch_permutation_and_subbatch_invariance():
     """A token's bits do not depend on the batch size, its position, its neighbours or the expert loads the other tokens
     create: prefixes, permutations, sub-batches, one token alone, and a hot expert group around a probe token (groups spanning

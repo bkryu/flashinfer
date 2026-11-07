@@ -261,9 +261,11 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         self._validate_pack_contract(act)
         self._require_built()
         from .api import route
+        from .api_nvfp4 import route_plan_dual
         from .api_nvfp4 import MoEWeightsNVFP4, check_shape_nvfp4
 
         cfg = self.config
+        plan: List[torch.Tensor] = []
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype not in (torch.bfloat16, torch.uint8):
             raise unsupported(
@@ -339,7 +341,21 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             scale = cfg.routing.routed_scaling_factor if self._method.scaled else None
             if self._method.scaled and scale is None:
                 scale = 1.0
-            ids, wts = route(act.routing_logits, k, self._method, bias, scale)
+            from .blocks.scheduler import MAX_E
+            from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
+
+            if (
+                0 < T <= ROUTE_PLAN_MAX_TOKENS
+                and T * k <= ROUTE_PLAN_MAX_SLOTS
+                and E <= MAX_E
+            ):
+                # routing and the dense packing's dual plan in one launch (a placement: the same bits and integers)
+                ids, wts, counts, dest, src, dest_pad, pos_pad = route_plan_dual(
+                    act.routing_logits, k, self._method, bias, scale
+                )
+                plan = [counts, dest, src, dest_pad, pos_pad]
+            else:
+                ids, wts = route(act.routing_logits, k, self._method, bias, scale)
         else:
             _validate_prerouted_inputs(
                 act,
@@ -370,7 +386,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             w.w2_sf,
             w.w2_alpha,
             out,
-        ]
+        ] + plan
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int, H: int) -> Tuple[list, list]:
@@ -429,6 +445,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         from .api_nvfp4 import MoEWeightsNVFP4, fused_moe_nvfp4
 
         x, sf, pts, ids, wts, w1, w1sf, w1a, w2, w2sf, w2a, out = inputs[:12]
+        plan = tuple(inputs[12:17]) if len(inputs) >= 17 else None
         H = self._hidden_of(x)
         if tactic == -1 or tactic is None:
             r1, r2 = self._ranked(int(x.shape[0]), H)
@@ -450,5 +467,5 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             a.params,
         )
         xin = x if x.dtype == torch.bfloat16 else (x, sf, pts)
-        fused_moe_nvfp4(xin, ids, wts, w, out=out, config1=c1, config2=c2)
+        fused_moe_nvfp4(xin, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan)
         return out
