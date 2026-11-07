@@ -12,7 +12,8 @@ chain, the quantizer's CPU reference on the intermediate, the dense ``mm_mxfp8``
 activation, run-to-run determinism including CUDA-graph replay, batch / permutation / sub-batch / hot-expert invariance,
 agreement of every tactic the autotuner may pick, the three routing input modes giving the same bits, the error contract
 (an unsupported configuration raises before any kernel runs), zero tokens, the largest expert count, and the plausibility
-of the op against an fp64 evaluation of the same quantized pipeline. The device-free tests pin the registration, the
+of the op against FlashInfer's dequantized MXFP8 MoE reference (the one its TRTLLM-Gen MXFP8 tests use) under its accuracy
+discipline; no test compares against another backend's kernels. The device-free tests pin the registration, the
 fingerprint dimensions (the instruction class of the part among them), the specification terms (no scale symbol: the
 bf16 chains, the plain GEMM2 conversion), the shape rules and the dispatcher's membership in the enumerated space.
 """
@@ -629,42 +630,69 @@ def _reference_ffn(xq, xsf, ids, weights, w1, w2, act):
     return R.combine_cpu(y, dest.cpu(), weights.cpu())
 
 
-def _ref64(xq, xsf, ids, weights, w1, w2, act):
-    """An fp64 evaluation of the same quantized pipeline (the quantizer's reference at both passes, fp64 GEMMs, the chain in
-    binary32 from fp64 accumulators, bf16 ``y``): the yardstick of the fp32-vs-fp64 accumulation alone."""
+def _fi_reference(xq, xsf, ids, weights, w1, w2, activation):
+    """FlashInfer's dequantized MXFP8 MoE reference, as ``tests/moe/test_unified_moe_fp8.py::_block_fp8_reference`` computes it
+    for the TRTLLM-Gen MXFP8 tests: the activation pack dequantized (``mxfp8_dequantize_host``), each expert's canonical weights
+    quantized and dequantized through ``mxfp8_quantize(is_sf_swizzled_layout=False)``, fp32 GEMMs, the activation on the
+    canonical (up, gate) halves, the intermediate requantized the same way, the routing weights narrowed to bf16, the slots
+    accumulated per expert in fp32. SwiGLU / GeGLU / ReLU2 are that reference's own cases; the layer's other typed activations
+    take their documented semantics (``spec.activation_of`` evaluated in fp32 by ``reference.glu_cpu_act`` / ``act_cpu``)."""
+    import torch.nn.functional as F
+
+    from flashinfer.fused_moe import GeGLU, ReLU2, SwiGLU
     from flashinfer.fused_moe.batch_invariant import reference as R
-    from flashinfer.fused_moe.batch_invariant.api import interleave_fc1
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GROUP
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+    from flashinfer.quantization.fp8_quantization import (
+        mxfp8_dequantize_host,
+        mxfp8_quantize,
+    )
+
+    def deq(q, sf):
+        return mxfp8_dequantize_host(
+            q.detach().cpu().view(torch.uint8),
+            sf.detach().cpu().view(torch.uint8).reshape(-1),
+            False,
+        ).float()
+
+    def qdq(w):
+        q, sf = mxfp8_quantize(w, is_sf_swizzled_layout=False)
+        return deq(q, sf.view(torch.uint8).reshape(w.shape[0], w.shape[1] // BLOCK))
 
     T, H = xq.shape
     I = w2.shape[2]
-    dev = xq.device
-
-    def deq(codes8, sf_rows, K):
-        return codes8.view(torch.float8_e4m3fn).float().double() * torch.exp2(
-            sf_rows.double() - 127
-        ).repeat_interleave(BLOCK, 1)
-
-    xd = deq(xq.view(torch.uint8), xsf.view(torch.uint8).reshape(T, -1), H)
-    w1i = interleave_fc1(w1) if act.gated else w1
-    out = torch.zeros(T, H, dtype=torch.float64, device=dev)
-    wd = weights.double()
+    x = deq(xq, xsf.view(torch.uint8).reshape(T, -1))
+    spec = activation_of(activation)
+    wts = weights.to(torch.bfloat16).float().cpu()
+    ids = ids.cpu()
+    out = torch.zeros(T, H, dtype=torch.float32)
     for e in torch.unique(ids).tolist():
-        pk1, sf1 = _quant_ref(w1i[e])
-        pk2, sf2 = _quant_ref(w2[e])
-        w1d, w2d = deq(pk1, sf1, H).to(dev), deq(pk2, sf2, I).to(dev)
-        tok, slot = (ids == e).nonzero(as_tuple=True)
-        acc = (xd[tok] @ w1d.t()).float().cpu()
-        if act.gated:
-            u = acc.view(-1, I // GROUP, 2, GROUP)[:, :, 0, :].reshape(-1, I)
-            g = acc.view(-1, I // GROUP, 2, GROUP)[:, :, 1, :].reshape(-1, I)
-            a = R.glu_cpu_act(g, u, act.act, act.params)
+        tok, slot = torch.where(ids == e)
+        fc1 = x[tok] @ qdq(w1[e]).t()
+        if isinstance(activation, ReLU2):
+            act = F.relu(fc1) ** 2
+        elif isinstance(activation, SwiGLU) and activation == SwiGLU():
+            up, gate = fc1[:, :I], fc1[:, I:]
+            act = F.silu(gate) * up
+        elif isinstance(activation, GeGLU):
+            up, gate = fc1[:, :I], fc1[:, I:]
+            act = F.gelu(gate) * up
+        elif spec.gated:
+            up, gate = fc1[:, :I], fc1[:, I:]
+            act = R.glu_cpu_act(gate, up, spec.act, spec.params).float()
         else:
-            a = R.act_cpu(acc, act.act, act.params)
-        pka, sfa = _quant_ref(a)
-        y = (deq(pka, sfa, I).to(dev) @ w2d.t()).float().to(torch.bfloat16).double()
-        out.index_add_(0, tok, wd[tok, slot].view(-1, 1) * y)
-    return out.cpu()
+            act = R.act_cpu(fc1, spec.act, spec.params).float()
+        inter = qdq(act.to(torch.bfloat16).to(xq.device))
+        out[tok] += wts[tok, slot, None] * (inter @ qdq(w2[e]).t())
+    return out
+
+
+def _assert_plausible(actual, expected):
+    """FlashInfer's accuracy discipline for the MXFP8 MoE backends (``tests/moe/test_unified_moe_fp8.py::_assert_fp8_close``)."""
+    from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
+
+    check_accuracy(
+        expected.float(), actual.float().cpu(), atol=0.05, rtol=0.3, percent=0.99
+    )
 
 
 @needs_device
@@ -672,8 +700,8 @@ def _ref64(xq, xsf, ids, weights, w1, w2, act):
 def test_layer_matches_the_class_composition(act):
     """The layer (from logits) == the class's own routing on the CPU, the dense batch-invariant MXFP8 GEMM per expert with the
     CPU chain of the activation, the quantizer's reference on the intermediate, and the combine: the oracle ladder of the
-    class, bit for bit, for every activation of the layer; and the op is plausible against the fp64 evaluation of the same
-    quantized pipeline."""
+    class, bit for bit, for every activation of the layer; and the op is plausible against FlashInfer's dequantized MXFP8 MoE
+    reference under FlashInfer's own accuracy discipline for this quant pair."""
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
 
     T, k, H, I, E = 300, 6, 512, 256, 64
@@ -687,20 +715,16 @@ def test_layer_matches_the_class_composition(act):
     ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
     ref = _reference_ffn(xq, xsf, ids.cuda(), weights.cuda(), w1, w2, chain)
     assert torch.equal(bits(out.cpu()), bits(ref))
-    ref64 = _ref64(xq, xsf, ids.cuda(), weights.cuda(), w1, w2, chain)
-    err = (
-        (out.double().cpu() - ref64).abs().max() / ref64.abs().max().clamp_min(1e-30)
-    ).item()
-    assert err < 2e-2, err
+    _assert_plausible(out, _fi_reference(xq, xsf, ids, weights, w1, w2, act))
 
 
 @needs_device
 def test_activation_pack_is_the_quantizer_class_and_other_producers_packs_are_taken_as_given():
     """``prepare_activations`` is the batch-invariant MXFP8 quantizer (codes and token-major UE8M0 bytes == the class's CPU
-    reference, == ``mxfp8_quantize(..., batch_invariant=True)``); the pack of another producer (TRTLLM-Gen's) is taken as
-    given: the layer's bits on it are the class's composition from those bytes."""
+    reference, == ``mxfp8_quantize(..., batch_invariant=True)``); the pack of another producer (FlashInfer's own MXFP8
+    quantizer, the one the other MXFP8 backends' activation preparation calls) is taken as given: the layer's bits on it are
+    the class's composition from those bytes."""
     import flashinfer
-    from flashinfer.fused_moe import TrtllmFp8BlockConfig
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
 
     T, k, H, I, E = 200, 4, 512, 256, 32
@@ -722,12 +746,8 @@ def test_activation_pack_is_the_quantizer_class_and_other_producers_packs_are_ta
     layer = _layer(k, E, I)
     W = _weights(w1, w2)
     ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
-    try:
-        tq, tsf = TrtllmFp8BlockConfig.prepare_activations(x, quant=_QUANT)
-    except Exception as e:  # noqa: BLE001
-        pytest.skip(
-            f"TRTLLM-Gen's MXFP8 activation preparation is unavailable here: {str(e)[:120]}"
-        )
+    # another producer's pack: FlashInfer's own MXFP8 quantizer (the one the other MXFP8 backends' activation preparation calls)
+    tq, tsf = flashinfer.mxfp8_quantize(x, is_sf_swizzled_layout=False)
     tsf8 = tsf.view(torch.uint8).reshape(T, -1)
     out = layer(_routed_pack((tq, tsf8), ids.cuda(), weights.cuda()), W)
     ref = _reference_ffn(
