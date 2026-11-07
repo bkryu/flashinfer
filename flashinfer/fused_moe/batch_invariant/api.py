@@ -23,6 +23,24 @@ from ...gemm.batch_invariant.generator import Knobs
 from . import spec as S
 from .blocks.epilogue import GroupedChain
 
+_CONST: Dict[Tuple[int, int, float], torch.Tensor] = {}
+
+
+def _const(dev: torch.device, n: int, value: float) -> torch.Tensor:
+    """A cached fp32 constant tensor (``value`` repeated ``n`` times) per device: the route kernel reads an absent bias
+    or scale from it instead of a per-call fill (a fill is one more kernel in the caller's stream or graph)."""
+    key = (
+        dev.index if dev.index is not None else torch.cuda.current_device(),
+        n,
+        value,
+    )
+    t = _CONST.get(key)
+    if t is None:
+        t = torch.full((n,), value, dtype=torch.float32, device=dev)
+        _CONST[key] = t
+    return t
+
+
 _IN = {torch.float32: "f32", torch.bfloat16: "bf16"}
 _OUT = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 _DTYPE_OF = {v: k for k, v in _OUT.items()}
@@ -268,16 +286,16 @@ def route(
     b = (
         bias.to(device=dev, dtype=torch.float32).contiguous()
         if bias is not None
-        else torch.zeros(E, dtype=torch.float32, device=dev)
+        else _const(dev, E, 0.0)
     )
     if tuple(b.shape) != (E,):
         raise ValueError(f"route: bias must be [E] = [{E}]")
     if scaling_factor is None:
-        s = torch.ones(1, dtype=torch.float32, device=dev)
+        s = _const(dev, 1, 1.0)
     elif isinstance(scaling_factor, torch.Tensor):
         s = scaling_factor.to(device=dev, dtype=torch.float32).reshape(1)
     else:
-        s = torch.full((1,), float(scaling_factor), dtype=torch.float32, device=dev)
+        s = _const(dev, 1, float(scaling_factor))
     if experts is None:
         experts = torch.empty(T, top_k, dtype=torch.int32, device=dev)
     if weights is None:
@@ -341,7 +359,7 @@ def fused_moe(
     slot order in fp32 and converted once. ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space
     gives the same bits; the dispatcher's pick by default)."""
     from .combine import get_compiled_combine, warps_per_token
-    from .permute import get_compiled_gather
+    from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
 
     if not isinstance(w, MoEWeights):
@@ -383,7 +401,9 @@ def fused_moe(
     Tk = T * k
     x_perm = torch.empty(Tk, H, dtype=torch.bfloat16, device=x.device)
     if Tk:
-        get_compiled_gather(k)(x, src, x_perm, Tk, H)
+        get_compiled_gather(
+            k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
+        )(x, src, x_perm, Tk, H)
     a = grouped_gemm(x_perm, w.w1i, counts, config1, w.chain1)  # [Tk, I] bf16
     y = grouped_gemm(a, w.w2, counts, config2, "plain", torch.bfloat16)  # [Tk, H] bf16
     if T:

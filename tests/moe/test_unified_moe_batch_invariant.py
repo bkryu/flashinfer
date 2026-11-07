@@ -948,8 +948,8 @@ def test_routing_methods_from_logits_match_the_cpu_model():
 @needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     """The error contract: a configuration outside the classes raises the mode's error at build or at the first call
-    (top_k / num_experts outside the bounds, fused shared experts, an expert-parallel shard, group-limited routing, no
-    finalize, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
+    (top_k / num_experts outside the bounds, fused shared experts, an expert-parallel shard, group-limited routing from
+    logits, no finalize, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
     non-default ``SwiGLU`` is a class of the backend (the ``swiglu_oai`` chain), not an error; a zero-token call returns
     an empty output."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
@@ -984,12 +984,6 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ),
             "parallel",
         ),
-        (
-            dict(
-                routing=RoutingConfig(num_experts=E, top_k=k, n_group=2, topk_group=1)
-            ),
-            "n_group",
-        ),
         (dict(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize"),
     ):
         with pytest.raises(errors) as excinfo:
@@ -1013,6 +1007,31 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # the ungated weights with the gated class: refused at the call, not computed
     with pytest.raises(BatchInvariantUnsupportedError):
         layer(_logits_pack(x, logits), _weights(w1[:, :I].contiguous(), w2, ReLU2()))
+    # group-limited routing is refused from logits only: with pre-routed ids the group structure never enters the
+    # computation, and the output equals the ungrouped configuration's on the same ids and weights
+    grouped = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E,
+                top_k=k,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=2,
+                topk_group=1,
+            ),
+            quant=QuantConfig(),
+            experts=ExpertConfig(intermediate_size=I),
+            backend=BackendOptions((BatchInvariantMoeConfig(),)),
+        ),
+        device=torch.device("cuda"),
+    )
+    with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+        grouped(_logits_pack(x, logits), W)
+    assert "n_group" in str(excinfo.value)
+    g_ids, g_wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    assert torch.equal(
+        bits(grouped(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
+        bits(layer(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
+    )
     # an unimplemented routing method from logits is refused; the same layer takes pre-routed inputs
     llama = MoELayer(
         MoEConfig(
@@ -1035,3 +1054,59 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # zero tokens
     out = layer(_logits_pack(x[:0], logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
+
+
+@needs_device
+def test_combine_and_gather_warp_placements_keep_the_bits():
+    """The combine's warps per token and the gather's warps per row are placements: every count gives the bits of one warp
+    per token / row (each output vector's slot fold stays on one lane; the gather moves the same bytes), the gather is its
+    definition ``x_perm[p] = x[src[p] // k]`` for bf16 and e4m3 rows, and the rules pick members of those sets at every T."""
+    from flashinfer.fused_moe.batch_invariant.combine import (
+        get_compiled_combine,
+        warps_per_token,
+    )
+    from flashinfer.fused_moe.batch_invariant.permute import (
+        get_compiled_gather,
+        warps_per_row,
+    )
+    from flashinfer.gemm.batch_invariant.api import sm_count_of
+
+    sms = sm_count_of(torch.device("cuda"))
+    g = torch.Generator(device="cuda").manual_seed(3)
+    for T, k, H in (
+        (1, 8, 2048),
+        (7, 4, 512),
+        (300, 8, 2048),
+        (1000, 8, 7168),
+        (4096, 2, 4096),
+    ):
+        Tk = T * k
+        perm = torch.randperm(Tk, device="cuda", generator=g).to(torch.int32)
+        dest = perm.view(T, k)
+        y = torch.randn(Tk, H, device="cuda", generator=g).to(torch.bfloat16)
+        w = torch.rand(T, k, device="cuda", generator=g)
+        outs = []
+        for wpt in (1, 2, 4, 8, 16):
+            out = torch.empty(T, H, dtype=torch.bfloat16, device="cuda")
+            get_compiled_combine(k, "bf16", "bf16", wpt)(y, dest, w, out, T, H)
+            outs.append(out)
+        torch.cuda.synchronize()
+        assert all(torch.equal(bits(outs[0]), bits(o)) for o in outs[1:]), (T, k, H)
+        assert warps_per_token(T, H, sms) in (1, 2, 4, 8, 16)
+        src = perm  # expanded row i = src[p] sits at position p: token i // k
+        for fmt, x in (
+            ("bf16", torch.randn(T, H, device="cuda", generator=g).to(torch.bfloat16)),
+            (
+                "e4m3",
+                torch.randn(T, H, device="cuda", generator=g).to(torch.float8_e4m3fn),
+            ),
+        ):
+            xps = []
+            for wpr in (1, 2, 4, 8):
+                xp = torch.empty(Tk, H, dtype=x.dtype, device="cuda")
+                get_compiled_gather(k, fmt, wpr)(x, src, xp, Tk, H)
+                xps.append(xp)
+            torch.cuda.synchronize()
+            assert torch.equal(bits(xps[0]), bits(x[(src // k).long()])), (fmt, T)
+            assert all(torch.equal(bits(xps[0]), bits(xp)) for xp in xps[1:]), (fmt, T)
+            assert warps_per_row(Tk, H // (16 // x.element_size()), sms) in (1, 2, 4, 8)
