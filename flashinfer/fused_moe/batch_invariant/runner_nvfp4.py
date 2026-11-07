@@ -18,7 +18,7 @@ unsupported configuration raises :class:`flashinfer.batch_invariant.BatchInvaria
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -50,6 +50,22 @@ MOE_NVFP4_ARCHS: Tuple[Tuple[int, int], ...] = MOE_BF16_ARCHS
 #: Positions of the packed inputs: the activation rows (bf16, or packed fp4), their scale factors and per-token scales (or
 #: 1-element placeholders), the expert ids, the routing weights, the six weight tensors and the output.
 _X, _SF, _PTS, _IDS, _W, _W1, _W1SF, _W1A, _W2, _W2SF, _W2A, _OUT = range(12)
+
+
+_NO_SCALES: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _no_scales(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The placeholder scale operands of a bf16 activation (never read: the class quantizes the rows itself), one pair
+    per device so a call launches no fill."""
+    key = str(device)
+    t = _NO_SCALES.get(key)
+    if t is None:
+        t = _NO_SCALES[key] = (
+            torch.empty(1, dtype=torch.uint8, device=device),
+            torch.empty(1, dtype=torch.float32, device=device),
+        )
+    return t
 
 
 class BatchInvariantMoeNvfp4Runner(MoERunner):
@@ -258,8 +274,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
                     "scales with bf16 activations",
                     "no scale (the class quantizes bf16 rows per token itself)",
                 )
-            sf = torch.zeros(1, dtype=torch.uint8, device=x.device)
-            pts = torch.zeros(1, dtype=torch.float32, device=x.device)
+            sf, pts = _no_scales(x.device)
         else:
             sf, pts = self._activation_scales(act, T, H)
         mode = act.routing_input_mode

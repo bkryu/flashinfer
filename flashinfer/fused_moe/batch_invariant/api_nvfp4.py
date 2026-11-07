@@ -407,10 +407,21 @@ def permute_plan_dual(
     return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
 
 
+_GS_INV: Dict[
+    Tuple[str, float], torch.Tensor
+] = {}  # the recipe's constant per device, filled once (no fill launch per call)
+
+
 def _gs_inv(gs_inv: Union[float, torch.Tensor], device: torch.device) -> torch.Tensor:
     if isinstance(gs_inv, torch.Tensor):
         return gs_inv.to(device=device, dtype=torch.float32).reshape(1)
-    return torch.full((1,), float(gs_inv), dtype=torch.float32, device=device)
+    key = (str(torch.device(device)), float(gs_inv))
+    t = _GS_INV.get(key)
+    if t is None:
+        t = _GS_INV[key] = torch.full(
+            (1,), float(gs_inv), dtype=torch.float32, device=device
+        )
+    return t
 
 
 def quantize_activations(
@@ -577,7 +588,7 @@ def fused_moe_nvfp4(
         # the class's second pass over the live rows: the codes stay dense; the scale factors and the row scales are re-tiled
         # to the padded positions for GEMM2's atom-aligned scale boxes (a byte move)
         a4 = torch.empty(Tk_a, I // 2, dtype=torch.uint8, device=dev)
-        a_sf = torch.zeros(sf_numel(Tk, I), dtype=torch.uint8, device=dev)
+        a_sf = torch.empty(sf_numel(Tk, I), dtype=torch.uint8, device=dev)
         a_pts = torch.empty(Tk, dtype=torch.float32, device=dev)
         a_sf_pad = torch.empty(sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
         a_pts_pad = torch.empty(Tk_sf, dtype=torch.float32, device=dev)

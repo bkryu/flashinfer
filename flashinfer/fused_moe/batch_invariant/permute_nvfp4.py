@@ -24,6 +24,9 @@ from .permute import LANES, WARPS
 
 MODULE = "batch_invariant_moe_nvfp4"
 SF_COL_TILE = 4  # scale columns per contiguous 4-byte group of the 128x4 layout
+# blocks past which the scatter kernels' warps stride over the rows: the block launch rate, not the bytes, bounds a
+# one-row-per-warp grid at the large batches
+SCATTER_GRID_CAP = 4096
 
 
 def _sf_group_offset(row: Int32, g: Int32, pcols: Int32) -> Int64:
@@ -37,8 +40,9 @@ def _sf_group_offset(row: Int32, g: Int32, pcols: Int32) -> Int64:
 class ScatterFp4Kernel:
     """The packed fp4 row of token ``t = i // k`` to row ``dest[i]`` (``B`` bytes), its swizzled scale-factor groups and its
     per-token scale to row ``dest_sf[i]`` (the padded position; the same tensor as ``dest`` for the padded packing). One
-    warp per expanded row: lanes stride over the 16-byte row chunks, then over the 4-byte scale groups; lane 0 moves the
-    per-token scale."""
+    warp per expanded row, the warps of a capped grid striding over the rows (``SCATTER_GRID_CAP``: a block per row would
+    be bound by the block launch rate at the large batches); lanes stride over the 16-byte row chunks, then over the
+    4-byte scale groups; lane 0 moves the per-token scale."""
 
     def __init__(self, k: int):
         self.k = k
@@ -62,7 +66,7 @@ class ScatterFp4Kernel:
         self.kernel(
             mX, mSf, mPts, mDest, mDestSf, mXp, mSfp, mPtsp, Tk, B, pcols
         ).launch(
-            grid=[cute.ceil_div(Tk, WARPS), 1, 1],
+            grid=[scatter_grid(Tk), 1, 1],
             block=[WARPS * LANES, 1, 1],
             stream=stream,
             use_pdl=True,
@@ -85,29 +89,19 @@ class ScatterFp4Kernel:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
-        i_raw = bidx * WARPS + tidx // LANES
-        valid = i_raw < Tk
-        i = cutlass.min(i_raw, Tk - Int32(1))
-        t = i // Int32(self.k)
-        p = mDest[i]
-        ps = mDestSf[i]
-        if valid & (lane == 0):
-            mPtsp[ps] = mPts[t]
+        w = bidx * WARPS + tidx // LANES
+        stride = gdim * WARPS
+        # this warp's rows: w, w + stride, ...
+        n_rows = cutlass.max((Tk - w + stride - Int32(1)) // stride, Int32(0))
         atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), Uint8, num_bits_per_copy=128
         )
         n_vec = B // Int32(16)
-        frag = cute.make_rmem_tensor((16,), Uint8)
-        row_x = mX[(t, None)]
-        row_p = mXp[(p, None)]
         n_mine = (n_vec - lane + Int32(LANES - 1)) // Int32(LANES)
-        for jj in cutlass.range(0, n_mine, 1):
-            j = jj * LANES + lane
-            cute.copy(atom, cute.local_tile(row_x, (16,), (j,)), frag)
-            if valid:
-                cute.copy(atom, frag, cute.local_tile(row_p, (16,), (j,)))
+        frag = cute.make_rmem_tensor((16,), Uint8)
         src32 = cute.make_tensor(
             cute.recast_ptr(mSf.iterator, dtype=Uint32),
             cute.make_layout((cute.size(mSf) // 4,)),
@@ -118,11 +112,24 @@ class ScatterFp4Kernel:
         )
         n_groups = pcols // Int32(SF_COL_TILE)
         n_sf = (n_groups - lane + Int32(LANES - 1)) // Int32(LANES)
-        for jj in cutlass.range(0, n_sf, 1):
-            g = jj * LANES + lane
-            v = src32[_sf_group_offset(t, g, pcols) // 4]
-            if valid:
-                dst32[_sf_group_offset(ps, g, pcols) // 4] = v
+        for r in cutlass.range(0, n_rows, 1):
+            i = w + r * stride
+            t = i // Int32(self.k)
+            p = mDest[i]
+            ps = mDestSf[i]
+            if lane == 0:
+                mPtsp[ps] = mPts[t]
+            row_x = mX[(t, None)]
+            row_p = mXp[(p, None)]
+            for jj in cutlass.range(0, n_mine, 1):
+                j = jj * LANES + lane
+                cute.copy(atom, cute.local_tile(row_x, (16,), (j,)), frag)
+                cute.copy(atom, frag, cute.local_tile(row_p, (16,), (j,)))
+            for jj in cutlass.range(0, n_sf, 1):
+                g = jj * LANES + lane
+                dst32[_sf_group_offset(ps, g, pcols) // 4] = src32[
+                    _sf_group_offset(t, g, pcols) // 4
+                ]
         cute.arch.griddepcontrol_launch_dependents()
 
 
@@ -130,7 +137,7 @@ class ScatterSfKernel:
     """The scale factors of row ``t = i // k`` moved to row ``dest[i]`` (4-byte groups of the 128x4 layout; the source and
     the destination with the same ``pcols``), and ``pts_perm[dest[i]] = pts[t]``: the re-tiling of the intermediate's scale
     factors and row scales from the dense rows to the padded positions (``k = 1``, ``dest`` the padded position of every
-    dense row). One lane per 4-byte group, one warp per row."""
+    dense row). One lane per 4-byte group, one warp per row, the warps of a capped grid striding over the rows."""
 
     def __init__(self, k: int):
         self.k = k
@@ -148,7 +155,7 @@ class ScatterSfKernel:
         stream,
     ):
         self.kernel(mSf, mPts, mDest, mSfp, mPtsp, Tk, pcols).launch(
-            grid=[cute.ceil_div(Tk, WARPS), 1, 1],
+            grid=[scatter_grid(Tk), 1, 1],
             block=[WARPS * LANES, 1, 1],
             stream=stream,
             use_pdl=True,
@@ -167,15 +174,12 @@ class ScatterSfKernel:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
-        i_raw = bidx * WARPS + tidx // LANES
-        valid = i_raw < Tk
-        i = cutlass.min(i_raw, Tk - Int32(1))
-        t = i // Int32(self.k)
-        p = mDest[i]
-        if valid & (lane == 0):
-            mPtsp[p] = mPts[t]
+        w = bidx * WARPS + tidx // LANES
+        stride = gdim * WARPS
+        n_rows = cutlass.max((Tk - w + stride - Int32(1)) // stride, Int32(0))
         src32 = cute.make_tensor(
             cute.recast_ptr(mSf.iterator, dtype=Uint32),
             cute.make_layout((cute.size(mSf) // 4,)),
@@ -186,12 +190,24 @@ class ScatterSfKernel:
         )
         n_groups = pcols // Int32(SF_COL_TILE)
         n_mine = (n_groups - lane + Int32(LANES - 1)) // Int32(LANES)
-        for jj in cutlass.range(0, n_mine, 1):
-            g = jj * LANES + lane
-            v = src32[_sf_group_offset(t, g, pcols) // 4]
-            if valid:
-                dst32[_sf_group_offset(p, g, pcols) // 4] = v
+        for r in cutlass.range(0, n_rows, 1):
+            i = w + r * stride
+            t = i // Int32(self.k)
+            p = mDest[i]
+            if lane == 0:
+                mPtsp[p] = mPts[t]
+            for jj in cutlass.range(0, n_mine, 1):
+                g = jj * LANES + lane
+                dst32[_sf_group_offset(p, g, pcols) // 4] = src32[
+                    _sf_group_offset(t, g, pcols) // 4
+                ]
         cute.arch.griddepcontrol_launch_dependents()
+
+
+def scatter_grid(Tk: Int32) -> Int32:
+    """Blocks of a scatter launch: one warp per row up to ``SCATTER_GRID_CAP`` blocks, beyond which the warps stride over
+    the rows (a placement: the same bytes move whatever the grid)."""
+    return cutlass.min(cute.ceil_div(Tk, WARPS), Int32(SCATTER_GRID_CAP))
 
 
 @functools.cache
