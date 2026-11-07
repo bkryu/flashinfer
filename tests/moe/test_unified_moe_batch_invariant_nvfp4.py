@@ -697,12 +697,12 @@ def test_layer_matches_the_class_composition(act):
 def test_both_packings_and_the_prequantized_pack_forms_give_the_bits():
     """The dense and the padded packing of the expanded rows are placements (the same bits); the pack forms agree: bf16 rows
     (quantized by the class), the per-token quantized pack with the 128x4 swizzled scales and with the linear scales, and the
-    per-tensor pack of ``TrtllmFp4Config.prepare_activations`` (unit global scale, no per-token scale), which the class takes
+    per-tensor pack of the TRTLLM backends (FlashInfer's quantizer at a unit global scale, no per-token scale), which the class takes
     at unit per-token scales and which equals the class composed on those bytes."""
     from flashinfer.batch_invariant.quantization.nvfp4_reference import (
         unswizzle_sf_128x4,
     )
-    from flashinfer.fused_moe import TrtllmFp4Config
+    from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.fused_moe.batch_invariant.api_nvfp4 import fused_moe_nvfp4
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
     from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
@@ -749,7 +749,16 @@ def test_both_packings_and_the_prequantized_pack_forms_give_the_bits():
     )
     assert torch.equal(bits(out_l), bits(out))
     # the per-tensor pack of the TRTLLM backends (unit global scale, linear scales, no per-token scale): the class at unit pts
-    q_t, sf_t = TrtllmFp4Config.prepare_activations(x, quant=_NVFP4)
+    # the per-tensor pack of the TRTLLM backends (what their ``prepare_activations`` produces: FlashInfer's quantizer at a unit
+    # global scale, the linear scale layout), built here from the quantizer itself
+    q_t, sf_t = fp4_quantize(
+        x,
+        global_scale=torch.ones(1, device=x.device),
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=False,
+    )
+    sf_t = sf_t.view(torch.float8_e4m3fn).reshape(T, -1)
     out_t = layer(
         MoEActivationPack(
             q_t,
@@ -1204,8 +1213,11 @@ def test_routing_methods_from_logits_match_the_cpu_model():
 @needs_device
 def test_plausibility_against_the_fp64_pipeline_and_flashinfers_reference():
     """An observation, not a promise: the class's output is within the fp32-vs-fp64 accumulation difference of the fp64
-    evaluation of the same quantized pipeline (the dequantized operands, the spec's rounding points), and within the NVFP4
-    quantization error of FlashInfer's torch reference of the unquantized model (cosine similarity, a loose bound)."""
+    evaluation of the same quantized pipeline (the dequantized operands, the spec's rounding points), and passes FlashInfer's
+    own MoE accuracy check (``tests.moe.utils.check_accuracy``) against FlashInfer's torch reference
+    (``compute_reference_moe_fp4``: the fp32 MoE on the quantized-and-dequantized operands, the intermediate requantized per
+    token by FlashInfer's quantizer reference) -- the same reference and tolerance discipline FlashInfer's fp4 MoE tests use.
+    Nothing here compares against another backend's kernels."""
     from flashinfer.batch_invariant.quantization.nvfp4_reference import (
         dequantize,
         quantize_reference,
@@ -1213,7 +1225,11 @@ def test_plausibility_against_the_fp64_pipeline_and_flashinfers_reference():
     from flashinfer.fused_moe.batch_invariant import reference as R
     from flashinfer.fused_moe.batch_invariant import spec as S
     from flashinfer.fused_moe.batch_invariant.api_nvfp4 import TE_GS_INV
-    from tests.moe.utils import compute_reference_moe_fp4
+    from tests.moe.utils import (
+        check_accuracy,
+        compute_reference_moe_fp4,
+        quant_dequant_fp4_reference,
+    )
 
     T, k, H, I, E = 64, 4, 512, 256, 16
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=11, adversarial=False)
@@ -1248,18 +1264,34 @@ def test_plausibility_against_the_fp64_pipeline_and_flashinfers_reference():
         ref64.index_add_(0, tok, weights[tok, slot].double().view(-1, 1) * y)
     err = ((out.double() - ref64).abs().max() / ref64.abs().max()).item()
     assert err < 2e-2, err
-    # FlashInfer's torch reference of the unquantized model (fp32, canonical [up, gate] weights)
-    ref_fi = (
-        compute_reference_moe_fp4(x, w1, w2, ids.cuda(), weights.cuda(), T, E, k, H, I)
-        .float()
-        .cpu()
+    # FlashInfer's torch reference on the quantized-and-dequantized operands: the experts through FlashInfer's per-tensor
+    # quant-dequant at this backend's global scales (1 / alpha), the activations through its per-token quant-dequant, the
+    # intermediate requantized per token inside the reference; checked with FlashInfer's accuracy rule
+    gs1 = (1.0 / W.w1_alpha.float()).cuda()
+    gs2 = (1.0 / W.w2_alpha.float()).cuda()
+    w1_deq = torch.stack(
+        [quant_dequant_fp4_reference(w1[e], gs1[e : e + 1]) for e in range(E)]
     )
-    cos = torch.nn.functional.cosine_similarity(
-        out.flatten(), ref_fi.flatten(), dim=0
-    ).item()
-    assert cos > 0.95, (
-        cos
-    )  # W4A4 of random weights and activations: an observation of the quantization error, not a promise
+    w2_deq = torch.stack(
+        [quant_dequant_fp4_reference(w2[e], gs2[e : e + 1]) for e in range(E)]
+    )
+    x_deq = xd.float().cuda()
+    ref_fi = compute_reference_moe_fp4(
+        x_deq,
+        w1_deq,
+        w2_deq,
+        ids.cuda(),
+        weights.cuda(),
+        T,
+        E,
+        k,
+        H,
+        I,
+        fc2_input_scale=torch.tensor([TE_GS_INV], device="cuda"),
+        use_per_token_activation=True,
+    )
+    ok, pct, atol = check_accuracy(out.cuda(), ref_fi)
+    assert ok, (pct, atol)
 
 
 @needs_device
