@@ -158,14 +158,6 @@ class BatchInvariantMoeRunner(MoERunner):
             raise unsupported(
                 CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
             )
-        if routing.n_group not in (None, 0, 1) or routing.topk_group not in (
-            None,
-            0,
-            1,
-        ):
-            raise unsupported(
-                CLASS, "group-limited routing (n_group > 1)", "n_group in (None, 0, 1)"
-            )
         if routing.method not in METHOD_OF_FLASHINFER:
             # the pre-routed modes never consult the method; the logits mode does (pack_inputs raises there too)
             self._method = None
@@ -193,9 +185,10 @@ class BatchInvariantMoeRunner(MoERunner):
     ) -> List[torch.Tensor]:
         self._validate_pack_contract(act)
         self._require_built()
-        from .api import MoEWeights, route
+        from .api import MoEWeights, route, route_plan
 
         cfg = self.config
+        plan: List[torch.Tensor] = []
         x = act.hidden_states_q
         if x.dtype != torch.bfloat16 or x.ndim != 2:
             raise unsupported(
@@ -232,6 +225,22 @@ class BatchInvariantMoeRunner(MoERunner):
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
+            # group-limited selection is a routing term the class does not have; with pre-routed ids the group
+            # structure never enters the computation, so only the logits mode refuses it
+            if cfg.routing.n_group not in (
+                None,
+                0,
+                1,
+            ) or cfg.routing.topk_group not in (
+                None,
+                0,
+                1,
+            ):
+                raise unsupported(
+                    CLASS,
+                    "group-limited routing (n_group > 1) from logits",
+                    "n_group in (None, 0, 1) from logits, or pre-routed ids for grouped routing",
+                )
             if self._method is None:
                 raise unsupported(
                     CLASS,
@@ -248,7 +257,21 @@ class BatchInvariantMoeRunner(MoERunner):
             scale = cfg.routing.routed_scaling_factor if self._method.scaled else None
             if self._method.scaled and scale is None:
                 scale = 1.0
-            ids, wts = route(act.routing_logits, k, self._method, bias, scale)
+            from .blocks.scheduler import MAX_E
+            from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
+
+            if (
+                0 < T <= ROUTE_PLAN_MAX_TOKENS
+                and T * k <= ROUTE_PLAN_MAX_SLOTS
+                and cfg.routing.num_experts <= MAX_E
+            ):
+                # routing and the permutation plan in one launch (a placement: the same bits and integers)
+                ids, wts, counts, dest, src = route_plan(
+                    act.routing_logits, k, self._method, bias, scale
+                )
+                plan = [counts, dest, src]
+            else:
+                ids, wts = route(act.routing_logits, k, self._method, bias, scale)
         else:
             _validate_prerouted_inputs(
                 act,
@@ -266,7 +289,7 @@ class BatchInvariantMoeRunner(MoERunner):
                 wts = wts.to(torch.bfloat16)
             wts = wts.to(torch.float32).contiguous()
         out = torch.empty(T, x.shape[1], dtype=torch.bfloat16, device=x.device)
-        return [x, ids, wts, w.w1i, w.w2, out]
+        return [x, ids, wts, w.w1i, w.w2, out] + plan
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int) -> Tuple[list, list]:
@@ -313,6 +336,7 @@ class BatchInvariantMoeRunner(MoERunner):
         from .api import MoEWeights, fused_moe
 
         x, ids, wts, w1i, w2, out = inputs[:6]
+        plan = tuple(inputs[6:9]) if len(inputs) >= 9 else None
         self._hidden = int(x.shape[1])
         if tactic == -1 or tactic is None:
             r1, r2 = self._ranked(int(x.shape[0]))
@@ -321,5 +345,5 @@ class BatchInvariantMoeRunner(MoERunner):
             c1, c2 = _configs_from_tactic(tuple(tactic))
         a = self._activation()
         w = MoEWeights(w1i, w2, a.gated, a.act, a.params)
-        fused_moe(x, ids, wts, w, out=out, config1=c1, config2=c2)
+        fused_moe(x, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan)
         return out
