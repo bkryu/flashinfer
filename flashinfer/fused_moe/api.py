@@ -3346,6 +3346,78 @@ class BatchInvariantMoeConfig:
         return "BatchInvariantMoeConfig()"
 
 
+@dataclass(frozen=True)
+class BatchInvariantMoeMxfp8Config:
+    """The batch-invariant MXFP8 x MXFP8 MoE backend: the classes ``moe.mxfp8.<act>`` of the mode documented in
+    ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set, as the bf16 backend), on
+    SM100 / SM103 / SM107.
+
+    The expert weights and the activations are MXFP8 (e4m3 values, one UE8M0 scale per 32 elements), both by the
+    batch-invariant quantizer class (``mxfp8_quantize(..., batch_invariant=True)``: the experts per expert at preparation,
+    the activations per token by :meth:`prepare_activations` or any producer of the canonical MXFP8 pack); the two GEMMs
+    are grouped placements of the dense batch-invariant MXFP8 GEMM class of the part (the block scales are operands of
+    the block-scaled step; the SM107 instruction folds 64 elements per step, the SM100 / SM103 one 32: the architecture
+    is a dimension of the class, as for ``mm_mxfp8``), the activation chain is the bf16 classes' on the dequantised fp32
+    accumulators, the intermediate is quantized by the same quantizer class on the materialised bf16 row, the combine is
+    the slot-order fp32 fold. Every output bit is a function of the token's own quantized row, its ``top_k`` experts and
+    routing weights and the quantized expert weights alone. ``MoEFinalizeConfig.do_finalize`` must stay ``True`` and
+    ``use_fused_finalize`` is ignored; all three routing input modes are taken; unsupported inputs raise
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls back and is not a default
+    candidate.
+
+    Weights: ``prepare_weights`` takes the canonical bf16 ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or ``w1 [E, I, H]``
+    for the ungated activations, and ``w2 [E, H, I]``, on a CUDA device; ``hidden_size`` and ``intermediate_size`` are
+    multiples of 32. Activations: the canonical MXFP8 pack, e4m3 ``[num_tokens, H]`` with token-major UE8M0 scales
+    ``[num_tokens, H / 32]`` (the pack ``TrtllmFp8BlockConfig`` and ``CutlassMxfp8Config`` prepare).
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        *,
+        quant: Optional["QuantConfig"] = None,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view: the experts quantized per expert by the batch-invariant MXFP8 quantizer (the gate /
+        up rows interleaved first for a gated activation), the swizzled scale buffers, and the activation's chain
+        (``activation`` defaults to ``SwiGLU()``)."""
+        from .batch_invariant.api_mxfp8 import MoEWeightsMXFP8
+        from .batch_invariant.spec import activation_of
+
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        w1 = w1.to(device=device) if device is not None else w1
+        w2 = w2.to(device=device) if device is not None else w2
+        return MoEWeightsMXFP8.prepare(
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states: torch.Tensor, *, quant: Optional["QuantConfig"] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The canonical MXFP8 activation pack by the batch-invariant quantizer: e4m3 ``[T, H]`` and the token-major UE8M0
+        scales ``[T, H / 32]`` (uint8)."""
+        from .batch_invariant.api_mxfp8 import quantize_activations_mxfp8
+
+        return quantize_activations_mxfp8(hidden_states.to(torch.bfloat16).contiguous())
+
+    def __repr__(self) -> str:
+        return "BatchInvariantMoeMxfp8Config()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
     BatchInvariantMoeConfig,
@@ -3391,6 +3463,7 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantMoeMxfp8Config,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3437,6 +3510,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantMoeMxfp8Config,
 )
 
 
