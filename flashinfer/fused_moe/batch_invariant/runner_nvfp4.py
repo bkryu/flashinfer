@@ -134,14 +134,6 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
                 "fused shared experts",
                 "num_fused_shared_experts = 0 (a shared expert is one more routed slot)",
             )
-        if routing.n_group not in (None, 0, 1) or routing.topk_group not in (
-            None,
-            0,
-            1,
-        ):
-            raise unsupported(
-                CLASS, "group-limited routing (n_group > 1)", "n_group in (None, 0, 1)"
-            )
         # the shape rule on the dimensions the config fixes (H enters at the first call, with the full rule)
         check_shape_nvfp4(
             None, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
@@ -280,6 +272,22 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
+            # group-limited selection is a routing term the class does not have; with pre-routed ids the group
+            # structure never enters the computation, so only the logits mode refuses it
+            if cfg.routing.n_group not in (
+                None,
+                0,
+                1,
+            ) or cfg.routing.topk_group not in (
+                None,
+                0,
+                1,
+            ):
+                raise unsupported(
+                    CLASS,
+                    "group-limited routing (n_group > 1) from logits",
+                    "n_group in (None, 0, 1) from logits, or pre-routed ids for grouped routing",
+                )
             if self._method is None:
                 raise unsupported(
                     CLASS,

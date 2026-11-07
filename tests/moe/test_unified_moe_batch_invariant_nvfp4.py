@@ -1298,8 +1298,9 @@ def test_plausibility_against_the_fp64_pipeline_and_flashinfers_reference():
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     """The error contract: a configuration outside the class raises the mode's error at build or at the first call (top_k /
     num_experts outside the bounds, an intermediate size that is not a multiple of 32, fused shared experts, an expert-parallel
-    shard, group-limited routing, no finalize, the wrong quantization pair, weights of the other chain, scales with bf16 rows,
-    packed rows without scales, an unimplemented routing method from logits); a zero-token call returns an empty output."""
+    shard, no finalize, the wrong quantization pair, weights of the other chain, scales with bf16 rows, packed rows without
+    scales, group-limited routing from logits, an unimplemented routing method from logits); a zero-token call returns an
+    empty output."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
     k, H, I, E = 6, 512, 256, 64
@@ -1338,12 +1339,6 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                 )
             ),
             "parallel",
-        ),
-        (
-            dict(
-                routing=RoutingConfig(num_experts=E, top_k=k, n_group=2, topk_group=1)
-            ),
-            "n_group",
         ),
         (dict(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize"),
         (dict(quant=QuantConfig()), "BF16"),
@@ -1390,6 +1385,31 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             intermediate_size=I,
             quant=QuantConfig(),
         )
+    # group-limited routing is refused from logits only: with pre-routed ids the group structure never enters the
+    # computation, and the output equals the ungrouped configuration's on the same ids and weights
+    grouped = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E,
+                top_k=k,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=2,
+                topk_group=1,
+            ),
+            quant=_NVFP4,
+            experts=ExpertConfig(intermediate_size=I),
+            backend=BackendOptions((BatchInvariantMoeNvfp4Config(),)),
+        ),
+        device=torch.device("cuda"),
+    )
+    with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+        grouped(_logits_pack(x, logits), W)
+    assert "n_group" in str(excinfo.value)
+    g_ids, g_wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    assert torch.equal(
+        bits(grouped(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
+        bits(layer(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
+    )
     llama = MoELayer(
         MoEConfig(
             routing=RoutingConfig(
