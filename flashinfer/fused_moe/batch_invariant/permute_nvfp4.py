@@ -39,13 +39,15 @@ def _sf_group_offset(row: Int32, g: Int32, pcols: Int32) -> Int64:
 
 class ScatterFp4Kernel:
     """The packed fp4 row of token ``t = i // k`` to row ``dest[i]`` (``B`` bytes), its swizzled scale-factor groups and its
-    per-token scale to row ``dest_sf[i]`` (the padded position; the same tensor as ``dest`` for the padded packing). One
-    warp per expanded row, the warps of a capped grid striding over the rows (``SCATTER_GRID_CAP``: a block per row would
-    be bound by the block launch rate at the large batches); lanes stride over the 16-byte row chunks, then over the
-    4-byte scale groups; lane 0 moves the per-token scale."""
+    per-token scale to row ``dest_sf[i]`` (the padded position; the same tensor as ``dest`` for the padded packing). ``wpr``
+    warps per expanded row (a placement, as the row gather: ``warps_per_row``), the row groups of a capped grid striding over
+    the rows (``SCATTER_GRID_CAP``: a block per row would be bound by the block launch rate at the large batches); a warp's
+    lanes stride over its 32-chunk slabs of the 16-byte row chunks, then over its slabs of the 4-byte scale groups; lane 0 of
+    the row's first warp moves the per-token scale."""
 
-    def __init__(self, k: int):
-        self.k = k
+    def __init__(self, k: int, wpr: int = 1):
+        assert wpr >= 1 and wpr & (wpr - 1) == 0, wpr
+        self.k, self.wpr = k, wpr
 
     @cute.jit
     def __call__(
@@ -66,7 +68,7 @@ class ScatterFp4Kernel:
         self.kernel(
             mX, mSf, mPts, mDest, mDestSf, mXp, mSfp, mPtsp, Tk, B, pcols
         ).launch(
-            grid=[scatter_grid(Tk), 1, 1],
+            grid=[scatter_grid(Tk * Int32(self.wpr)), 1, 1],
             block=[WARPS * LANES, 1, 1],
             stream=stream,
             use_pdl=True,
@@ -87,20 +89,24 @@ class ScatterFp4Kernel:
         B: Int32,
         pcols: Int32,
     ):
+        wpr = Int32(self.wpr)
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
-        w = bidx * WARPS + tidx // LANES
-        stride = gdim * WARPS
-        # this warp's rows: w, w + stride, ...
+        g = bidx * WARPS + tidx // LANES
+        w = g // wpr  # this warp's row group
+        part = g % wpr  # its slab phase within the row
+        stride = (gdim * WARPS) // wpr  # row groups per sweep
+        # this group's rows: w, w + stride, ...
         n_rows = cutlass.max((Tk - w + stride - Int32(1)) // stride, Int32(0))
         atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), Uint8, num_bits_per_copy=128
         )
         n_vec = B // Int32(16)
-        n_mine = (n_vec - lane + Int32(LANES - 1)) // Int32(LANES)
+        step = wpr * Int32(LANES)  # chunk j = (jj * wpr + part) * LANES + lane
+        n_mine = (n_vec - lane - part * Int32(LANES) + step - Int32(1)) // step
         frag = cute.make_rmem_tensor((16,), Uint8)
         src32 = cute.make_tensor(
             cute.recast_ptr(mSf.iterator, dtype=Uint32),
@@ -111,25 +117,26 @@ class ScatterFp4Kernel:
             cute.make_layout((cute.size(mSfp) // 4,)),
         )
         n_groups = pcols // Int32(SF_COL_TILE)
-        n_sf = (n_groups - lane + Int32(LANES - 1)) // Int32(LANES)
-        for r in cutlass.range(0, n_rows, 1):
-            i = w + r * stride
-            t = i // Int32(self.k)
-            p = mDest[i]
-            ps = mDestSf[i]
-            if lane == 0:
-                mPtsp[ps] = mPts[t]
-            row_x = mX[(t, None)]
-            row_p = mXp[(p, None)]
-            for jj in cutlass.range(0, n_mine, 1):
-                j = jj * LANES + lane
-                cute.copy(atom, cute.local_tile(row_x, (16,), (j,)), frag)
-                cute.copy(atom, frag, cute.local_tile(row_p, (16,), (j,)))
-            for jj in cutlass.range(0, n_sf, 1):
-                g = jj * LANES + lane
-                dst32[_sf_group_offset(ps, g, pcols) // 4] = src32[
-                    _sf_group_offset(t, g, pcols) // 4
-                ]
+        n_sf = (n_groups - lane - part * Int32(LANES) + step - Int32(1)) // step
+        if w < stride:
+            for r in cutlass.range(0, n_rows, 1):
+                i = w + r * stride
+                t = i // Int32(self.k)
+                p = mDest[i]
+                ps = mDestSf[i]
+                if (lane == 0) & (part == 0):
+                    mPtsp[ps] = mPts[t]
+                row_x = mX[(t, None)]
+                row_p = mXp[(p, None)]
+                for jj in cutlass.range(0, n_mine, 1):
+                    j = (jj * wpr + part) * Int32(LANES) + lane
+                    cute.copy(atom, cute.local_tile(row_x, (16,), (j,)), frag)
+                    cute.copy(atom, frag, cute.local_tile(row_p, (16,), (j,)))
+                for jj in cutlass.range(0, n_sf, 1):
+                    gg = (jj * wpr + part) * Int32(LANES) + lane
+                    dst32[_sf_group_offset(ps, gg, pcols) // 4] = src32[
+                        _sf_group_offset(t, gg, pcols) // 4
+                    ]
         cute.arch.griddepcontrol_launch_dependents()
 
 
@@ -211,9 +218,9 @@ def scatter_grid(Tk: Int32) -> Int32:
 
 
 @functools.cache
-def get_compiled_scatter_fp4(k: int) -> Any:
+def get_compiled_scatter_fp4(k: int, wpr: int = 1) -> Any:
     """``kernel(x4 [T, B] u8, sf [n_src] u8, pts [T] f32, dest [T k] i32, dest_sf [T k] i32, x_perm [rows, B] u8, sf_perm
-    [n_dst] u8, pts_perm [rows_sf] f32, Tk, B, pcols)``, ``B % 16 == 0``."""
+    [n_dst] u8, pts_perm [rows_sf] f32, Tk, B, pcols)``, ``B % 16 == 0``; ``wpr`` warps per row (``warps_per_row``)."""
 
     def compile_fn():
         sym_t, sym_n, sym_p, sym_b = (
@@ -253,7 +260,7 @@ def get_compiled_scatter_fp4(k: int) -> Any:
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            ScatterFp4Kernel(k),
+            ScatterFp4Kernel(k, wpr),
             x_fake,
             sf_fake,
             pts_fake,
@@ -270,7 +277,11 @@ def get_compiled_scatter_fp4(k: int) -> Any:
         )
 
     return jit.build_and_load(
-        MODULE, jit.sanitize_symbol_name(f"moe_scatter_fp4_k{k}"), compile_fn
+        MODULE,
+        jit.sanitize_symbol_name(
+            f"moe_scatter_fp4_k{k}" + (f"_w{wpr}" if wpr > 1 else "")
+        ),
+        compile_fn,
     )
 
 

@@ -598,6 +598,7 @@ def fused_moe_nvfp4(
     tile), True / False: the swapped / the padded body on both GEMMs (placements: the same bits); explicit records select the
     body themselves (a swapped record needs the dense path)."""
     from .combine import get_compiled_combine, warps_per_token
+    from .permute import warps_per_row
     from .permute_nvfp4 import get_compiled_scatter_fp4, get_compiled_scatter_sf
     from .schedule_nvfp4 import default_configs_nvfp4
 
@@ -714,7 +715,7 @@ def fused_moe_nvfp4(
                 (x_perm4, x_perm_sf, x_perm_pts),
             )
         elif Tk:
-            get_compiled_scatter_fp4(k)(
+            get_compiled_scatter_fp4(k, warps_per_row(Tk, H // 32, sm_count))(
                 x4,
                 x_sf,
                 x_pts,
@@ -827,7 +828,7 @@ def fused_moe_nvfp4(
     x_perm_pts = torch.zeros(Tk_pad, dtype=torch.float32, device=dev)
     if Tk:
         flat_dest = dest.reshape(-1)
-        get_compiled_scatter_fp4(k)(
+        get_compiled_scatter_fp4(k, warps_per_row(Tk, H // 32, sm_count))(
             x4,
             x_sf,
             x_pts,

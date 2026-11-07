@@ -1332,6 +1332,35 @@ def test_fused_input_quantize_scatter_equals_the_quantizer_and_the_scatter():
         assert torch.equal(c0, c1), ("codes", T, K, k)
         assert torch.equal(s0, s1), ("scales", T, K, k)
         assert torch.equal(bits(p0), bits(p1)), ("pts", T, K, k)
+        # the scatter's multi-warp placements (warps_per_row): the same bytes
+        dp = dest_pad.reshape(-1).long()
+        for wpr in (2, 4, 8):
+            x_perm4 = torch.zeros(Tk_a, K // 2, dtype=torch.uint8, device="cuda")
+            x_perm_sf = torch.zeros(
+                sf_numel(Tk_sf, K), dtype=torch.uint8, device="cuda"
+            )
+            x_perm_pts = torch.zeros(Tk_sf, dtype=torch.float32, device="cuda")
+            get_compiled_scatter_fp4(k, wpr)(
+                x4,
+                x_sf,
+                x_pts,
+                dest.reshape(-1),
+                dest_pad.reshape(-1),
+                x_perm4,
+                x_perm_sf,
+                x_perm_pts,
+                Tk,
+                K // 2,
+                padded_sf_cols(K),
+            )
+            assert torch.equal(x_perm4[:Tk], c1), (wpr, T, K, k)
+            assert torch.equal(unswizzle_sf_128x4(x_perm_sf, Tk_sf, K)[dp], s1), (
+                wpr,
+                T,
+                K,
+                k,
+            )
+            assert torch.equal(bits(x_perm_pts[dp]), bits(p1)), (wpr, T, K, k)
     T, k, H, I, E = 133, 4, 512, 256, 16
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=80)
     W = _weights_of(_weights(w1, w2))
@@ -1346,6 +1375,76 @@ def test_fused_input_quantize_scatter_equals_the_quantizer_and_the_scatter():
     finally:
         A.INPUT_SCATTER = saved
     assert torch.equal(bits(res["fused"]), bits(res["scatter"]))
+
+
+def _poison_allocator(byte: int):
+    """Fill the caching allocator's cached blocks (the large pool and 256 small-pool segments) with one byte pattern, so the
+    ``torch.empty`` intermediates of the next op call start with it (0x7F / 0xFF: e4m3 and bf16 NaN patterns; 0x00: zeros)."""
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    free = torch.cuda.mem_get_info()[0]
+    blocks = [
+        torch.empty(
+            int(min(free // 2, 8 << 30)), dtype=torch.uint8, device="cuda"
+        ).fill_(byte)
+    ]
+    blocks += [
+        torch.empty(1 << 19, dtype=torch.uint8, device="cuda").fill_(byte)
+        for _ in range(256)
+    ]
+    torch.cuda.synchronize()
+    del blocks
+
+
+@needs_device
+@pytest.mark.parametrize("body", ["padded", "dense", "swapped"])
+@pytest.mark.parametrize("act", [_SWIGLU, ReLU2()], ids=["swiglu", "relu2"])
+def test_poisoned_intermediates_do_not_reach_the_bits(body, act):
+    """Unspecified bytes and timing never reach the output: the op's intermediates come from ``torch.empty`` (the dense
+    packing's tail rows, GEMM1's output, GEMM2's output, the output itself); with the caching allocator's blocks filled with
+    NaN patterns before every call and a bandwidth-bound kernel running on a side stream of the same device during the call
+    (the contention that exposed a producer race: a K tail zero-filled by generic stores that the cp.async arrive did not
+    order before the MMA), the padded body, the dense-packing body and the swapped decode body each give the bits of a clean
+    run, ``FLASHINFER_BI_STRESS_ITERS`` times (default 20), at a shape whose GEMM2 K is below the K = 128 class's k-tile (the
+    zero-filled tail); the clean run is the class composed from its pieces."""
+    import os
+
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import fused_moe_nvfp4
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+
+    T, k, H, I, E = 64, 8, 256, 64, 256
+    chain = activation_of(act)
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=5, gated=chain.gated)
+    W = _weights_of(_weights(w1, w2, act))
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    kw = (
+        {"path": "padded"}
+        if body == "padded"
+        else {"path": "dense", "swap": body == "swapped"}
+    )
+    ref = bits(fused_moe_nvfp4(x, ids, weights, W, **kw).cpu())
+    side = torch.cuda.Stream()
+    junk = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
+    for i in range(int(os.environ.get("FLASHINFER_BI_STRESS_ITERS", "20"))):
+        for byte in (0x7F, 0xFF, 0x00):
+            _poison_allocator(byte)
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    junk.add_(1)
+            out = fused_moe_nvfp4(x, ids, weights, W, **kw)
+            assert torch.equal(bits(out.cpu()), ref), (i, hex(byte))
+    torch.cuda.synchronize()
+    comp = _reference_ffn(
+        _quantized(x),
+        ids,
+        weights,
+        W,
+        chain,
+        expert_classes(H, I, _family(), chain.gated),
+    )
+    assert torch.equal(ref, bits(comp.cpu()))
 
 
 @needs_device
