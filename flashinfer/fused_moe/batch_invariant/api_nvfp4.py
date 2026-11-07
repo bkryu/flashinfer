@@ -44,6 +44,14 @@ PATHS = ("dense", "padded")
 #: last tiles' TMA boxes stay in bounds: a box past the end is zero-filled by the engine at a cost. The tail rows are never
 #: stored. A placement.
 DENSE_TAIL = 256
+# the intermediate's scale factors reach the padded positions by the row-mapped quantizer (one launch) or by the quantizer
+# and a re-tiling move (two launches; the same bytes): the two spellings of one placement
+INTERMEDIATE_RETILE = "mapped"
+RETILES = ("mapped", "scatter")
+# a bf16 input reaches the grouped layout by the quantizer and the fp4 scatter (two launches, the dense codes round-tripped)
+# or by the quantizer storing into the grouped layout itself (one launch; the same bytes): the two spellings of one placement
+INPUT_SCATTER = "fused"
+INPUT_SCATTERS = ("fused", "scatter")
 GROUP_ALIGN = 128  # the scale-factor atom: the group alignment of the scale factors
 _OUT = {"bf16": torch.bfloat16, "f32": torch.float32}
 
@@ -452,6 +460,89 @@ def quantize_activations(
     return x4, sf.reshape(-1), pts
 
 
+def quantize_rows_mapped(
+    x: torch.Tensor,
+    gs_inv: Union[float, torch.Tensor],
+    row_map: torch.Tensor,
+    out: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    """The class's per-token NVFP4 quantization of bf16 rows ``[M, K]`` with the scale factors and per-row scales stored at
+    row ``row_map[r]`` of the padded buffers ``out = (x4 [M, K/2], sf_pad flat 128x4, pts_pad)`` while the codes stay at row
+    ``r``: the quantizer's kernel term for term (:mod:`.blocks.quant_nvfp4`), one launch in place of the quantizer and the
+    scale re-tiling."""
+    from ...batch_invariant.quantization.mx_api import device_sm_count
+    from ...batch_invariant.quantization.nvfp4_schedule import default_config
+    from .blocks.quant_nvfp4 import get_compiled_rowmap_quant
+
+    M, K = x.shape
+    x4, sf_pad, pts_pad = out
+    assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.data_ptr() % 16 == 0
+    assert x4.shape == (M, K // 2) and x4.is_contiguous() and x4.dtype == torch.uint8
+    assert (
+        row_map.dtype == torch.int32
+        and row_map.is_contiguous()
+        and row_map.numel() >= M
+    )
+    assert sf_pad.dtype == torch.uint8 and pts_pad.dtype == torch.float32
+    if M == 0:
+        return
+    cfg = default_config(
+        K, M, x.element_size(), True, device_sm_count(x.device), "128x4"
+    )
+    kernel = get_compiled_rowmap_quant("bf16", K, cfg, True)
+    kernel(x, x4, sf_pad.view(-1), pts_pad, _gs_inv(gs_inv, x.device), row_map, M, K)
+
+
+def quantize_scatter_rows(
+    x: torch.Tensor,
+    gs_inv: Union[float, torch.Tensor],
+    dest: torch.Tensor,
+    dest_pad: torch.Tensor,
+    k: int,
+    out: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    """The class's per-token NVFP4 quantization of bf16 rows ``[T, K]`` stored into the grouped layout: token ``t``'s codes at
+    the dense rows ``dest[t k + j]`` of ``out[0]`` (``[rows, K/2]``), its scale factors and per-token scale at the padded
+    positions ``dest_pad[t k + j]`` of ``out[1]`` (flat 128x4) and ``out[2]``: the quantizer's kernel term for term
+    (:mod:`.blocks.quant_nvfp4`), one launch in place of the quantizer and the fp4 scatter."""
+    from ...batch_invariant.quantization.mx_api import device_sm_count
+    from ...batch_invariant.quantization.nvfp4_schedule import default_config
+    from .blocks.quant_nvfp4 import get_compiled_scatter_quant
+
+    T, K = x.shape
+    x_perm4, sf_pad, pts_pad = out
+    assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.data_ptr() % 16 == 0
+    assert (
+        x_perm4.dtype == torch.uint8
+        and x_perm4.is_contiguous()
+        and x_perm4.shape[1] == K // 2
+    )
+    assert (
+        dest.dtype == torch.int32
+        and dest_pad.dtype == torch.int32
+        and dest.numel() >= T * k
+    )
+    assert dest.is_contiguous() and dest_pad.is_contiguous()
+    assert sf_pad.dtype == torch.uint8 and pts_pad.dtype == torch.float32
+    if T == 0:
+        return
+    cfg = default_config(
+        K, T, x.element_size(), True, device_sm_count(x.device), "128x4"
+    )
+    kernel = get_compiled_scatter_quant("bf16", K, cfg, k, True)
+    kernel(
+        x,
+        x_perm4,
+        sf_pad.view(-1),
+        pts_pad,
+        _gs_inv(gs_inv, x.device),
+        dest,
+        dest_pad,
+        T,
+        K,
+    )
+
+
 def _part(device: torch.device) -> Tuple[int, str]:
     return part_of(device)
 
@@ -498,8 +589,13 @@ def fused_moe_nvfp4(
             )
         T = x.shape[0]
         dev = x.device
-        x4, x_sf, x_pts = quantize_activations(x, gs_inv)
+        x_rows: Optional[torch.Tensor] = x.contiguous()
+        if path == "dense" and INPUT_SCATTER == "fused":
+            x4 = x_sf = x_pts = None  # quantized straight into the grouped layout below
+        else:
+            x4, x_sf, x_pts = quantize_activations(x, gs_inv)
     else:
+        x_rows = None
         x4, x_sf, x_pts = x
         T = x4.shape[0]
         dev = x4.device
@@ -563,7 +659,16 @@ def fused_moe_nvfp4(
         x_perm4 = torch.empty(Tk_a, H // 2, dtype=torch.uint8, device=dev)
         x_perm_sf = torch.empty(sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
         x_perm_pts = torch.empty(Tk_sf, dtype=torch.float32, device=dev)
-        if Tk:
+        if Tk and x4 is None:
+            quantize_scatter_rows(
+                x_rows,
+                gsi,
+                dest.reshape(-1),
+                dest_pad.reshape(-1),
+                k,
+                (x_perm4, x_perm_sf, x_perm_pts),
+            )
+        elif Tk:
             get_compiled_scatter_fp4(k)(
                 x4,
                 x_sf,
@@ -595,11 +700,13 @@ def fused_moe_nvfp4(
         # the class's second pass over the live rows: the codes stay dense; the scale factors and the row scales are re-tiled
         # to the padded positions for GEMM2's atom-aligned scale boxes (a byte move)
         a4 = torch.empty(Tk_a, I // 2, dtype=torch.uint8, device=dev)
-        a_sf = torch.empty(sf_numel(Tk, I), dtype=torch.uint8, device=dev)
-        a_pts = torch.empty(Tk, dtype=torch.float32, device=dev)
         a_sf_pad = torch.empty(sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
         a_pts_pad = torch.empty(Tk_sf, dtype=torch.float32, device=dev)
-        if Tk:
+        a_sf = a_pts = None
+        if Tk and INTERMEDIATE_RETILE == "mapped":
+            quantize_rows_mapped(a[:Tk], gsi, pos_pad, (a4[:Tk], a_sf_pad, a_pts_pad))
+        elif Tk:
+            a_sf = torch.empty(sf_numel(Tk, I), dtype=torch.uint8, device=dev)
             _, _, a_pts = quantize_activations(a[:Tk], gsi, out=(a4[:Tk], a_sf))
             get_compiled_scatter_sf(1)(
                 a_sf, a_pts, pos_pad, a_sf_pad, a_pts_pad, Tk, pcols_i

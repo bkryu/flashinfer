@@ -65,6 +65,10 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "fused_moe/batch_invariant/blocks/compile_nvfp4.py",
         "fused_moe/batch_invariant/permute_nvfp4.py",
     ),
+    # the NVFP4 MoE classes' row-mapped per-token quantization (the quantizer class's kernel with a destination row map)
+    "batch_invariant_moe_nvfp4_quant": (
+        "fused_moe/batch_invariant/blocks/quant_nvfp4.py",
+    ),
 }
 
 #: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer

@@ -879,6 +879,184 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
 
 
 @needs_device
+def test_row_mapped_intermediate_quantization_equals_the_quantizer_and_the_retile():
+    """The dense path's intermediate quantization: the class-local row-mapped launch (the quantizer's kernel with the scale
+    factors and row scales stored at the padded positions) gives the quantizer's codes, scale bytes and row scales exactly as
+    the quantizer plus the re-tiling move does, for row counts across the kernel's buckets and padded maps with gaps; the op
+    gives the same bits either way."""
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        unswizzle_sf_128x4,
+    )
+    from flashinfer.batch_invariant.quantization.nvfp4_schedule import (
+        padded_sf_cols,
+        sf_numel,
+    )
+    from flashinfer.fused_moe.batch_invariant import api_nvfp4 as A
+    from flashinfer.fused_moe.batch_invariant.permute_nvfp4 import (
+        get_compiled_scatter_sf,
+    )
+
+    g = torch.Generator().manual_seed(77)
+    for M, K in ((1, 256), (5, 768), (130, 1024), (257, 1536), (1000, 2048)):
+        x = (
+            (
+                torch.randn(M, K, generator=g)
+                * torch.exp2(torch.randint(-8, 8, (M, 1), generator=g).float())
+            )
+            .to(torch.bfloat16)
+            .cuda()
+        )
+        # a padded map: groups of random sizes, each starting at a 128-row atom (the dense path's pos_pad)
+        sizes, pos = [], []
+        left = M
+        while left:
+            c = int(torch.randint(1, min(left, 300) + 1, (1,), generator=g))
+            sizes.append(c)
+            left -= c
+        off = 0
+        for c in sizes:
+            pos += list(range(off, off + c))
+            off += -(-c // 128) * 128
+        M_pad = off + 256
+        row_map = torch.tensor(pos, dtype=torch.int32, device="cuda")
+        x4a = torch.empty(M, K // 2, dtype=torch.uint8, device="cuda")
+        sfa = torch.empty(sf_numel(M_pad, K), dtype=torch.uint8, device="cuda")
+        ptsa = torch.empty(M_pad, dtype=torch.float32, device="cuda")
+        A.quantize_rows_mapped(x, A.TE_GS_INV, row_map, (x4a, sfa, ptsa))
+        x4b, sfb_dense, ptsb_dense = A.quantize_activations(x, A.TE_GS_INV)
+        sfb = torch.empty_like(sfa)
+        ptsb = torch.empty_like(ptsa)
+        get_compiled_scatter_sf(1)(
+            sfb_dense, ptsb_dense, row_map, sfb, ptsb, M, padded_sf_cols(K)
+        )
+        assert torch.equal(x4a, x4b), (M, K)
+        assert torch.equal(bits(ptsa[row_map.long()]), bits(ptsb[row_map.long()])), (
+            M,
+            K,
+        )
+        # the scale bytes of the mapped rows: every scale of a mapped row equals the re-tiled one
+        ua = unswizzle_sf_128x4(sfa, M_pad, K)[row_map.long()]
+        ub = unswizzle_sf_128x4(sfb, M_pad, K)[row_map.long()]
+        assert torch.equal(ua, ub), (M, K)
+    # the op: both spellings give the bits
+    T, k, H, I, E = 133, 4, 512, 256, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=78)
+    W = _weights_of(_weights(w1, w2))
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    outs = {}
+    saved = A.INTERMEDIATE_RETILE
+    try:
+        for spelling in A.RETILES:
+            A.INTERMEDIATE_RETILE = spelling
+            outs[spelling] = A.fused_moe_nvfp4(x, ids, weights, W).cpu()
+    finally:
+        A.INTERMEDIATE_RETILE = saved
+    assert torch.equal(bits(outs["mapped"]), bits(outs["scatter"]))
+
+
+@needs_device
+def test_fused_input_quantize_scatter_equals_the_quantizer_and_the_scatter():
+    """The dense path's input: the class-local launch that quantizes a bf16 token once and stores its codes at the k dense
+    rows and its scales at the k padded positions gives the quantizer's bytes exactly as the quantizer plus the fp4 scatter
+    does, over row counts across the kernel's buckets and every k of the contract; the op gives the same bits either way."""
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        unswizzle_sf_128x4,
+    )
+    from flashinfer.batch_invariant.quantization.nvfp4_schedule import (
+        padded_sf_cols,
+        sf_numel,
+    )
+    from flashinfer.fused_moe.batch_invariant import api_nvfp4 as A
+    from flashinfer.fused_moe.batch_invariant.permute_nvfp4 import (
+        get_compiled_scatter_fp4,
+    )
+
+    g = torch.Generator().manual_seed(79)
+    for T, K, k, E in (
+        (1, 256, 8, 16),
+        (7, 768, 1, 4),
+        (130, 1024, 6, 32),
+        (257, 1536, 16, 64),
+        (600, 2048, 2, 8),
+    ):
+        x = (
+            (
+                torch.randn(T, K, generator=g)
+                * torch.exp2(torch.randint(-8, 8, (T, 1), generator=g).float())
+            )
+            .to(torch.bfloat16)
+            .cuda()
+        )
+        ids = (
+            torch.stack([torch.randperm(E, generator=g)[:k] for _ in range(T)])
+            .to(torch.int32)
+            .cuda()
+        )
+        counts, dest, src, dest_pad, pos_pad = A.permute_plan_dual(ids, E)
+        Tk = T * k
+        Tk_a, Tk_sf = Tk + A.DENSE_TAIL, A.padded_rows_bound(T, k, E) + A.DENSE_TAIL
+        outs = []
+        for spelling in ("fused", "scatter"):
+            x_perm4 = torch.zeros(Tk_a, K // 2, dtype=torch.uint8, device="cuda")
+            x_perm_sf = torch.zeros(
+                sf_numel(Tk_sf, K), dtype=torch.uint8, device="cuda"
+            )
+            x_perm_pts = torch.zeros(Tk_sf, dtype=torch.float32, device="cuda")
+            if spelling == "fused":
+                A.quantize_scatter_rows(
+                    x,
+                    A.TE_GS_INV,
+                    dest.reshape(-1),
+                    dest_pad.reshape(-1),
+                    k,
+                    (x_perm4, x_perm_sf, x_perm_pts),
+                )
+            else:
+                x4, x_sf, x_pts = A.quantize_activations(x, A.TE_GS_INV)
+                get_compiled_scatter_fp4(k)(
+                    x4,
+                    x_sf,
+                    x_pts,
+                    dest.reshape(-1),
+                    dest_pad.reshape(-1),
+                    x_perm4,
+                    x_perm_sf,
+                    x_perm_pts,
+                    Tk,
+                    K // 2,
+                    padded_sf_cols(K),
+                )
+            outs.append(
+                (
+                    x_perm4[:Tk].clone(),
+                    unswizzle_sf_128x4(x_perm_sf, Tk_sf, K)[
+                        dest_pad.reshape(-1).long()
+                    ].clone(),
+                    x_perm_pts[dest_pad.reshape(-1).long()].clone(),
+                )
+            )
+        (c0, s0, p0), (c1, s1, p1) = outs
+        assert torch.equal(c0, c1), ("codes", T, K, k)
+        assert torch.equal(s0, s1), ("scales", T, K, k)
+        assert torch.equal(bits(p0), bits(p1)), ("pts", T, K, k)
+    T, k, H, I, E = 133, 4, 512, 256, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=80)
+    W = _weights_of(_weights(w1, w2))
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    res = {}
+    saved = A.INPUT_SCATTER
+    try:
+        for spelling in A.INPUT_SCATTERS:
+            A.INPUT_SCATTER = spelling
+            res[spelling] = A.fused_moe_nvfp4(x, ids, weights, W).cpu()
+    finally:
+        A.INPUT_SCATTER = saved
+    assert torch.equal(bits(res["fused"]), bits(res["scatter"]))
+
+
+@needs_device
 def test_instruction_classes_on_the_part():
     """The part's default instruction class is the dense rule's (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere)
     and the op follows it; on SM107 the K = 64 class stays reachable by name, computes a different fp32 fold of the same
