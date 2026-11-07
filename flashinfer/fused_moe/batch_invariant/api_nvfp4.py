@@ -49,33 +49,40 @@ _OUT = {"bf16": torch.bfloat16, "f32": torch.float32}
 
 
 def check_shape_nvfp4(
-    H: int, I: int, E: int, k: Optional[int] = None, gated: bool = True
+    H: Optional[int], I: int, E: int, k: Optional[int] = None, gated: bool = True
 ) -> None:
     """The complete acceptance rule of the class on ``(H, I, E, k)``: ``H`` and ``I`` positive multiples of 32 (16-byte rows
     of the packed fp4 operands and whole scale-factor column groups), ``1 <= E <= 1024`` (the routing kernel's widest bucket
     and the group tables), ``1 <= k <= min(E, 16)``, and the expert weight shapes unsplit by the dense class's chunk rule
     (``chunks_for(N1, H) == chunks_for(H, I) == 1``: the grouped classes take one fold per weight). Everything else about a
-    shape is placement. Raises :class:`BatchInvariantUnsupportedError`; the class never routes a shape elsewhere."""
+    shape is placement. ``H=None`` checks the rules the layer's configuration fixes (the hidden size enters at the first
+    call, with the full rule). Raises :class:`BatchInvariantUnsupportedError`; the class never routes a shape elsewhere."""
     from .blocks.scheduler import MAX_E
 
     def bad(what: str, limit: str):
         raise unsupported(
             CLASS,
-            f"{what} (H={H}, I={I}, E={E}"
+            f"{what} ("
+            + (f"H={H}, " if H is not None else "")
+            + f"I={I}, E={E}"
             + (f", k={k}" if k is not None else "")
             + ")",
             limit,
         )
 
-    if H <= 0 or I <= 0 or H % ALIGN_NVFP4 or I % ALIGN_NVFP4:
+    if I <= 0 or I % ALIGN_NVFP4 or (H is not None and (H <= 0 or H % ALIGN_NVFP4)):
         bad(
-            f"hidden size {H} / intermediate size {I}",
+            f"hidden size {H} / intermediate size {I}"
+            if H is not None
+            else f"intermediate size {I}",
             f"positive multiples of {ALIGN_NVFP4} (16-byte rows of the quantized activations and weights)",
         )
     if not 1 <= E <= MAX_E:
         bad(f"{E} experts", f"1 <= num_experts <= {MAX_E}")
     if k is not None and not 1 <= k <= min(E, MAX_TOP_K):
         bad(f"top_k {k}", f"1 <= top_k <= min(num_experts, {MAX_TOP_K})")
+    if H is None:
+        return
     n1 = 2 * I if gated else I
     if chunks_for(n1, H, "nvfp4") != 1 or chunks_for(H, I, "nvfp4") != 1:
         bad(

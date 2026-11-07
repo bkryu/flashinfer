@@ -142,9 +142,9 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             raise unsupported(
                 CLASS, "group-limited routing (n_group > 1)", "n_group in (None, 0, 1)"
             )
-        # the shape rule on the dimensions the config fixes (H enters at the first call)
+        # the shape rule on the dimensions the config fixes (H enters at the first call, with the full rule)
         check_shape_nvfp4(
-            32, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
+            None, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
         )
         self._method = METHOD_OF_FLASHINFER.get(routing.method)
         if not cfg.finalize.do_finalize:

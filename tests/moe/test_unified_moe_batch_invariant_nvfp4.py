@@ -313,6 +313,9 @@ def test_shape_rules_accept_the_model_grid_and_raise_elsewhere():
             continue
         check_shape_nvfp4(H, I, E, k)
         check_shape_nvfp4(H, I, E, k, gated=False)
+        check_shape_nvfp4(
+            None, I, E, k
+        )  # the configuration-time rule (no hidden size yet)
         n += 1
     assert n == len(Is) * len(Hs) * sum(1 for E in Es for k in ks if k <= E)
     for args, why in (
@@ -332,6 +335,42 @@ def test_shape_rules_accept_the_model_grid_and_raise_elsewhere():
         check_shape_nvfp4(
             4096, 128, 8, gated=False
         )  # the ungated GEMM1 weight (I, H) is the narrower one
+    check_shape_nvfp4(
+        None, 128, 8, gated=False
+    )  # the chunk rule waits for the hidden size
+    with pytest.raises(BatchInvariantUnsupportedError, match="multiples of 32"):
+        check_shape_nvfp4(None, 768 + 16, 128)
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "H, I, E, k",
+    [
+        (2048, 768, 128, 8),
+        (4096, 1536, 128, 8),
+        (4096, 14336, 8, 2),
+        (7168, 2048, 256, 8),
+        (2048, 1024, 128, 6),
+    ],
+    ids=["qwen3_30b", "qwen3_235b", "mixtral_8x7b", "deepseek_v3", "nemotron3_30b"],
+)
+def test_layer_constructs_for_the_real_model_geometries(H, I, E, k):
+    """The layer accepts the backend for the real-model geometries at construction (the configuration fixes I, E and k; the
+    hidden size enters at the first call) and the first call runs: the construction-time rule must not stand in for the
+    hidden size."""
+    act = ReLU2() if (H, I) == (2048, 1024) else _SWIGLU
+    layer = _layer(k, E, I, act=act)
+    assert isinstance(layer.runners[0], BatchInvariantMoeNvfp4Runner)
+    if 3 * E * I * H * 2 > 2**33:
+        return  # the construction is the point; the largest experts exceed a per-test allocation
+    x, logits, w1, w2 = _problem(3, k, H, I, E, seed=H + I, gated=act is _SWIGLU)
+    out = layer(_logits_pack(x, logits), _weights(w1, w2, act))
+    out = out if isinstance(out, torch.Tensor) else out[0]
+    assert (
+        out.shape == (3, H)
+        and out.dtype == torch.bfloat16
+        and torch.isfinite(out.float()).all()
+    )
 
 
 def _adversarial(n: int, seed: int) -> torch.Tensor:
