@@ -11,3 +11,5 @@ import BIKernels.QuantExport
 import BIKernels.QuantCases
 import BIKernels.MoE
 import BIKernels.MoECases
+import BIKernels.MoENvfp4
+import BIKernels.MoENvfp4Cases

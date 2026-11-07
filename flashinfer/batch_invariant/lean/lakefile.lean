@@ -22,3 +22,6 @@ lean_exe axioms where
 
 lean_exe moeconformance where
   root := `MoEMain
+
+lean_exe moenvfp4conformance where
+  root := `MoENvfp4Main
