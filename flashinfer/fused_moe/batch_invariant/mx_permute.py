@@ -1,16 +1,16 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The MXFP8 MoE classes' scatter (plumbing, no floating point): the quantized activation rows and their UE8M0 block
-scales moved into the padded group layout the grouped block-scaled GEMM reads.
+"""The MXFP8 class's scatter (plumbing, no floating point): the quantized activation rows and their UE8M0 block scales moved
+into the padded group layout the grouped block-scaled GEMM reads.
 
-``x_perm[p, :] = xq[src[p] // k, :]`` for every padded row ``p`` (``src[p] = -1`` for a padding row: the values and the
-scale bytes of the row are zero-filled -- the UE8M0 byte ``0x00`` is the finite ``2^-127``, so a padded row's products
-are exact zeros in rows no tile ever stores); the scale bytes of token ``t`` are read from the **linear** layout the
-class takes its activations in (``xsf [T, K / 32]``: the layer's MXFP8 activation pack) and written to the **128x4
+``x_perm[dest[i], :] = xq[i // k, :]`` for every expanded row ``i`` of the ``T * k`` (token, slot) pairs: one warp per live
+row, nothing written to the padding rows of the 128-row atoms (their bytes stay unspecified: the MMA is row-local and no tile
+stores a padding row, so they never reach a stored value); the scale bytes of token ``t`` are read from the **linear** layout
+the class takes its activations in (``xsf [T, K / 32]``: the MXFP8 MoE activation pack) and written to the **128x4
 swizzled** layout of the ``(Tk_pad, K)`` operand (byte ``(r // 128) * 128 * pcols + (j // 4) * 512 + (r % 32) * 16 +
-((r % 128) // 32) * 4 + j % 4``), the padding columns ``j >= K / 32`` zero. One warp per padded row: 16-byte vectors for
-the values (lanes stride over the row), one lane per scale byte. Every copy is an unpredicated ``cute.copy`` under a
-plain branch (a predicated copy is a zero-fill), launched with programmatic dependent launch.
+((r % 128) // 32) * 4 + j % 4``), the padding columns ``j >= K / 32`` of a live row zero. 16-byte vectors for the values
+(lanes stride over the row), one lane per scale byte. Every copy is an unpredicated ``cute.copy`` under a plain branch (a
+predicated copy lowers to element-wise stores), launched with programmatic dependent launch.
 """
 
 from __future__ import annotations
@@ -40,9 +40,11 @@ def _sf_byte_offset(row: Int32, col: Int32, pcols: Int32) -> Int64:
 
 
 class ScatterMxKernel:
-    """``kernel(xq [T, B] u8, xsf [T * nb] u8 (linear), src [Tk_pad] i32, x_perm [Tk_pad, B] u8, sf_perm [sf_numel(Tk_pad, K)]
-    u8, Tk_pad, B, nb, pcols)``: ``B`` bytes per row (``B % 16 == 0``), ``nb = K / 32`` scale bytes per row, ``pcols`` the
-    padded scale columns of the destination (a multiple of 4)."""
+    """``kernel(xq [T, B] u8, xsf [T * nb] u8 (linear), dest [Tk] i32, x_perm [Tk_pad, B] u8, sf_perm [sf_numel(Tk_pad, K)]
+    u8, Tk, B, nb, pcols)``: ``B`` bytes per row (``B % 16 == 0``), ``nb = K / 32`` scale bytes per row, ``pcols`` the
+    padded scale columns of the destination (a multiple of 4); ``dest[i]`` the padded row of expanded row ``i`` (token
+    ``i // k``). One warp per live row; the padding rows of the 128-row atoms are never written (unspecified bytes the
+    row-local MMA reads into rows no tile stores)."""
 
     def __init__(self, k: int):
         self.k = k
@@ -52,17 +54,17 @@ class ScatterMxKernel:
         self,
         mX: cute.Tensor,
         mSf: cute.Tensor,
-        mSrc: cute.Tensor,
+        mDest: cute.Tensor,
         mXp: cute.Tensor,
         mSfp: cute.Tensor,
-        Tk_pad: Int32,
+        Tk: Int32,
         B: Int32,
         nb: Int32,
         pcols: Int32,
         stream,
     ):
-        self.kernel(mX, mSf, mSrc, mXp, mSfp, Tk_pad, B, nb, pcols).launch(
-            grid=[cute.ceil_div(Tk_pad, WARPS), 1, 1],
+        self.kernel(mX, mSf, mDest, mXp, mSfp, Tk, B, nb, pcols).launch(
+            grid=[cute.ceil_div(Tk, WARPS), 1, 1],
             block=[WARPS * LANES, 1, 1],
             stream=stream,
             use_pdl=True,
@@ -73,10 +75,10 @@ class ScatterMxKernel:
         self,
         mX: cute.Tensor,
         mSf: cute.Tensor,
-        mSrc: cute.Tensor,
+        mDest: cute.Tensor,
         mXp: cute.Tensor,
         mSfp: cute.Tensor,
-        Tk_pad: Int32,
+        Tk: Int32,
         B: Int32,
         nb: Int32,
         pcols: Int32,
@@ -85,36 +87,31 @@ class ScatterMxKernel:
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
-        p_raw = bidx * WARPS + tidx // LANES
-        valid = p_raw < Tk_pad
-        p = cutlass.min(p_raw, Tk_pad - Int32(1))
-        s = mSrc[p]
-        real = valid & (s >= Int32(0))
-        t = cutlass.max(s, Int32(0)) // Int32(self.k)
-        # the values: 16-byte vectors, lanes stride over the row; a padding row takes the zero vector
+        i_raw = bidx * WARPS + tidx // LANES
+        valid = i_raw < Tk
+        i = cutlass.min(i_raw, Tk - Int32(1))
+        p = mDest[i]
+        t = i // Int32(self.k)
+        # the values: 16-byte vectors, lanes stride over the row
         atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), Uint8, num_bits_per_copy=8 * VEC_BYTES
         )
         n_vec = B // Int32(VEC_BYTES)
         frag = cute.make_rmem_tensor((VEC_BYTES,), Uint8)
-        zero = cute.make_rmem_tensor((VEC_BYTES,), Uint8)
-        zero.fill(0)
         row_x = mX[(t, None)]
         row_p = mXp[(p, None)]
         n_mine = (n_vec - lane + Int32(LANES - 1)) // Int32(LANES)
         for jj in cutlass.range(0, n_mine, 1):
             j = jj * LANES + lane
             cute.copy(atom, cute.local_tile(row_x, (VEC_BYTES,), (j,)), frag)
-            if real:
+            if valid:
                 cute.copy(atom, frag, cute.local_tile(row_p, (VEC_BYTES,), (j,)))
-            elif valid:
-                cute.copy(atom, zero, cute.local_tile(row_p, (VEC_BYTES,), (j,)))
         # the scale bytes: linear source (row t, column j) -> the swizzled destination (row p, column j); padding columns zero
         n_sf = (pcols - lane + Int32(LANES - 1)) // Int32(LANES)
         for jj in cutlass.range(0, n_sf, 1):
             j = jj * LANES + lane
             v = Uint8(0)
-            if real & (j < nb):
+            if j < nb:
                 v = mSf[t.to(Int64) * nb.to(Int64) + j.to(Int64)]
             if valid:
                 mSfp[_sf_byte_offset(p, j, pcols)] = v
@@ -144,7 +141,9 @@ def get_compiled_scatter_mx(k: int) -> Any:
             assumed_align=16,
         )
         sf_fake = cute.runtime.make_fake_tensor(Uint8, (sym_s,), (1,), assumed_align=16)
-        src_fake = cute.runtime.make_fake_tensor(Int32, (sym_p,), (1,), assumed_align=4)
+        dest_fake = cute.runtime.make_fake_tensor(
+            Int32, (sym_p,), (1,), assumed_align=4
+        )
         xp_fake = cute.runtime.make_fake_tensor(
             Uint8,
             (sym_n, sym_b),
@@ -159,7 +158,7 @@ def get_compiled_scatter_mx(k: int) -> Any:
             ScatterMxKernel(k),
             x_fake,
             sf_fake,
-            src_fake,
+            dest_fake,
             xp_fake,
             sfp_fake,
             Int32(128),

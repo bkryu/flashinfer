@@ -493,15 +493,15 @@ def fused_moe_mxfp8(
     nb, pcols = H // BLOCK, padded_sf_cols(H)
     x_perm = torch.empty(Tk_pad, H, dtype=torch.float8_e4m3fn, device=dev)
     x_perm_sf = torch.empty(sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
-    # one launch: the e4m3 rows and the UE8M0 scales to the padded positions (the scales re-tiled into the swizzled
-    # atoms), the padding rows zero-filled (values and scale bytes)
+    # one launch over the live rows: the e4m3 rows and the UE8M0 scales to their padded positions (the scales re-tiled into
+    # the swizzled atoms); the padding rows are never written (unspecified bytes the MMA reads into rows no tile stores)
     get_compiled_scatter_mx(k)(
         xq.view(torch.uint8),
         xsf8.reshape(-1),
-        src,
+        dest.reshape(-1),
         x_perm.view(torch.uint8),
         x_perm_sf,
-        Tk_pad,
+        T * k,
         H,
         nb,
         pcols,
