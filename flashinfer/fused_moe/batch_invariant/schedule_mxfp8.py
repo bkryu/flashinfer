@@ -10,8 +10,10 @@ side by side). The records ranked are the grouped MX space itself (the dense blo
 in-cluster split, operand swap or B-reuse tile, filtered by the grouped block-scaled body's acceptance), not the dense
 ranking's list mapped record by record: the dense MX class's own candidates at a decode-sized ``M`` are its swapped
 decode records (the weights on the MMA's M side), a body the grouped kernel does not have, and their cluster and tile
-knobs read in the grouped orientation name records the estimate itself ranks last. Numerics-neutral: every record of the
-space computes the class.
+knobs read in the grouped orientation name records the estimate itself ranks last. Two structural terms of the grouped
+launch the dense shape cannot carry: the raster (`raster_for`: along N once an expert fills a 128-row block, along M
+below) and the expected dummy half of the clusters that pair two 128-row tiles along M (`pair_term`: the experts' row
+counts phased over the pair's extent). Numerics-neutral: every record of the space computes the class.
 """
 
 from __future__ import annotations
@@ -29,6 +31,23 @@ from .blocks.epilogue import GroupedChain
 from .schedule import TOP_K, active_experts, rows_per_expert
 
 GEMM2_CHAIN = GroupedChain("plain", "silu", "bf16")
+RASTER_N_ROWS = 128  # an expert spanning a whole 128-row block or more: the grouped scheduler rasters along N
+
+
+def raster_for(rows: int) -> str:
+    """The grouped scheduler's raster as a structural rule, not an estimate term: along N once an expert's rows fill a
+    128-row block (consecutive CTAs then share the expert's A block while its weight tiles stream), along M below it
+    (the weight tile is the larger operand of a few rows)."""
+    return "n" if rows >= RASTER_N_ROWS else "m"
+
+
+def pair_term(k: Knobs, rows: int) -> float:
+    """The expected dummy half of a cluster that pairs two 128-row tiles along M (``cluster_shape_mn[0] == 2``): every
+    expert's rows are padded to the record's M extent (128 x cm), and with the experts' row counts phased uniformly over
+    that extent the expected padding is half an extent, so the pair's records carry (rows + 128) / (rows + 64) of the
+    single-tile records' rows; the dense estimate at the average rows sees only the average's own tail."""
+    cm = k.cluster_shape_mn[0]
+    return (rows + 64.0 * cm) / (rows + 64.0)
 
 
 def grouped_knobs_mx(in_fmt: str = "mxfp8", clusters=None) -> List[Knobs]:
@@ -78,7 +97,10 @@ def rank_grouped_mx(
 ) -> List[Knobs]:
     """The ranked grouped records for one GEMM: the grouped MX space the body accepts for the weight shape and the chain,
     ordered by the dense MX class's estimate at ``(M = rows, N = n_active * N, K)`` (``n_active`` the active experts, ``E``
-    by default), best first, ties in the space's enumeration order; at a decode-sized ``rows`` the dense dispatcher's
+    by default) times the pair term (the expected dummy half of the two-tile clusters along M), each tile family priced
+    once (at the enumeration's raster) and the raster the structural rule gives the grouped scheduler (`raster_for`)
+    first among its twins,
+    best first, ties in the space's enumeration order; at a decode-sized ``rows`` the dense dispatcher's
     structural guard for a space without swapped records (`heuristic.decode_sane`: 1-CTA tiles in an N-cluster) selects
     the candidates, as it does for the bf16 classes. As in the dense ``rank_topk``, each of the best ceil(k/2) records is
     followed by its raster twin (the one knob the estimate does not price), then the rank order fills the list: distinct
@@ -95,18 +117,20 @@ def rank_grouped_mx(
         if can_implement_grouped_mxfp8(c, N, K, E, chain, in_fmt)
     ]
     guarded = [c for c in space if decode_sane(c, rows, False)]
-    ranked = [
-        c
-        for _t, _i, c in sorted(
-            (
-                estimate_cycles(
-                    c, rows, dense_n, K, 1, "k", in_fmt, fam, sm_count, nominal=nominal
-                ),
-                i,
-                c,
-            )
-            for i, c in enumerate(guarded or space)
+    raster = raster_for(rows)
+
+    def key(i, c):
+        # the tile family priced once, at the enumeration's raster (the dense estimate's tile-order term is the dense
+        # scheduler's, not the grouped one's), scaled by the pair term; the rule's raster first within the family, then
+        # the enumeration order
+        canon = dataclasses.replace(c, raster_along="m")
+        est = estimate_cycles(
+            canon, rows, dense_n, K, 1, "k", in_fmt, fam, sm_count, nominal=nominal
         )
+        return (est * pair_term(c, rows), 0 if c.raster_along == raster else 1, i)
+
+    ranked = [
+        c for _k, c in sorted((key(i, c), c) for i, c in enumerate(guarded or space))
     ]
     members = set(space)
     out: List[Knobs] = []
