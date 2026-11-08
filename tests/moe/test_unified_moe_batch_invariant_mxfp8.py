@@ -888,6 +888,23 @@ def test_the_largest_expert_count_routes_and_runs():
 
 
 @needs_device
+@pytest.mark.parametrize("T", [1, 5, 16, 17])
+def test_layer_from_logits_at_small_token_counts_equals_the_prerouted_path(T):
+    """Up to 16 tokens the runner routes and plans in one launch (``route_plan`` with the padded alignment); the layer's bits
+    from logits equal the pre-routed path's on the routing's own ids and weights, below and above the threshold, and repeat."""
+    k, H, I, E = 8, 512, 256, 128
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=11 + T, adversarial=True)
+    xq, xsf = _quant(x)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2)
+    out_l = layer(_logits_pack((xq, xsf), logits), W)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    out_u = layer(_routed_pack((xq, xsf), ids.cuda(), weights.cuda()), W)
+    assert torch.equal(bits(out_l), bits(out_u))
+    assert torch.equal(bits(layer(_logits_pack((xq, xsf), logits), W)), bits(out_l))
+
+
+@needs_device
 def test_three_routing_modes_agree_and_runs_are_deterministic():
     """From logits, pre-routed unpacked (fp32 and bf16 weights) and pre-routed packed give the bits of the class on their
     inputs (the packed mode's bf16-rounded weights are its inputs); repeated runs and a CUDA-graph replay reproduce them."""

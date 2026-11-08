@@ -168,7 +168,7 @@ class BatchInvariantMoeMxfp8Runner(MoERunner):
     ) -> List[torch.Tensor]:
         self._validate_pack_contract(act)
         self._require_built()
-        from .api import route
+        from .api import route, route_plan
         from .api_mxfp8 import MoEWeightsMXFP8, check_shape_mxfp8
 
         cfg = self.config
@@ -222,6 +222,7 @@ class BatchInvariantMoeMxfp8Runner(MoERunner):
                 f"{type(cfg.activation).__name__} with {'gated' if w.gated else 'ungated'} weights of chain {w.act!r}",
                 "weights prepared with the layer's activation",
             )
+        plan: List[torch.Tensor] = []
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
@@ -255,7 +256,22 @@ class BatchInvariantMoeMxfp8Runner(MoERunner):
             scale = cfg.routing.routed_scaling_factor if self._method.scaled else None
             if self._method.scaled and scale is None:
                 scale = 1.0
-            ids, wts = route(act.routing_logits, k, self._method, bias, scale)
+            from .api_mxfp8 import GROUP_ALIGN
+            from .blocks.scheduler import MAX_E
+            from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
+
+            if (
+                0 < T <= ROUTE_PLAN_MAX_TOKENS
+                and T * k <= ROUTE_PLAN_MAX_SLOTS
+                and cfg.routing.num_experts <= MAX_E
+            ):
+                # routing and the padded permutation plan in one launch (a placement: the same bits and integers)
+                ids, wts, counts, dest, src = route_plan(
+                    act.routing_logits, k, self._method, bias, scale, align=GROUP_ALIGN
+                )
+                plan = [counts, dest, src]
+            else:
+                ids, wts = route(act.routing_logits, k, self._method, bias, scale)
         else:
             _validate_prerouted_inputs(
                 act,
@@ -272,7 +288,7 @@ class BatchInvariantMoeMxfp8Runner(MoERunner):
                 wts = wts.to(torch.bfloat16)
             wts = wts.to(torch.float32).contiguous()
         out = torch.empty(T, H, dtype=torch.bfloat16, device=x.device)
-        return [x, sf, ids, wts, w.w1, w.w1_sf, w.w2, w.w2_sf, out]
+        return [x, sf, ids, wts, w.w1, w.w1_sf, w.w2, w.w2_sf, out] + plan
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int) -> Tuple[list, list]:
@@ -332,6 +348,7 @@ class BatchInvariantMoeMxfp8Runner(MoERunner):
         from .api_mxfp8 import MoEWeightsMXFP8, fused_moe_mxfp8
 
         xq, xsf, ids, wts, w1, w1_sf, w2, w2_sf, out = inputs[:9]
+        plan = tuple(inputs[9:12]) if len(inputs) >= 12 else None
         self._hidden = int(xq.shape[1])
         if tactic == -1 or tactic is None:
             r1, r2 = self._ranked(int(xq.shape[0]))
@@ -341,6 +358,14 @@ class BatchInvariantMoeMxfp8Runner(MoERunner):
         a = self._activation()
         w = MoEWeightsMXFP8(w1, w1_sf, w2, w2_sf, a.gated, a.act, a.params)
         fused_moe_mxfp8(
-            (xq, xsf), ids, wts, w, out=out, config1=c1, config2=c2, in_fmt=self._in_fmt
+            (xq, xsf),
+            ids,
+            wts,
+            w,
+            out=out,
+            config1=c1,
+            config2=c2,
+            in_fmt=self._in_fmt,
+            plan=plan,
         )
         return out

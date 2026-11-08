@@ -438,6 +438,7 @@ def fused_moe_mxfp8(
     in_fmt: Optional[str] = None,
     return_intermediates: bool = False,
     requant: str = "fused",
+    plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Any:
     """The MXFP8 x MXFP8 MoE FFN for pre-routed tokens: ``x`` a bf16 ``[T, H]`` (quantized here per token by the
     ``mxfp8.quant`` class) or the quantized pack ``(xq [T, H] e4m3, xsf [T, H / 32] uint8 / UE8M0)`` taken as given;
