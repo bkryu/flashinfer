@@ -5,7 +5,7 @@
 For the GEMM classes (bf16 at the ``mma16`` step; e4m3 / e5m2 at the ``mma32`` step with the scaled chain; mxfp8 at the
 ``mma32mx`` step and mxfp8_k64 at the ``mma64mx8`` step, the block-scaled steps with the unscaled chain; nvfp4 / nvfp4_k128
 at ``mma64bs`` / ``mma128bs`` and mxfp4 / mxfp4_k128 at ``mma64mx`` / ``mma128mx4``, the 4-bit block-scaled steps with the
-alpha chain) the file carries
+alpha chain; the mixed pair mxfp4w8a / mxfp4w8a_k64 at ``mma32mxw48`` / ``mma64mxw48`` with the alpha chain) the file carries
 
 * the spec terms of both classes of each format at sampled (K, chunks): the *Python spec* (``gemm.spec.GemmSpec``)
   S-expression, with a Lean theorem that the Lean model (``BIK.GEMM.kfold`` / ``kchunk`` and their ``32`` / ``MX8`` /
@@ -48,10 +48,35 @@ from ..gemm.batch_invariant.generator import (
     enumerate_space,
 )
 from ..gemm.batch_invariant.schedule import chunks_for, default_config, fp4_class_for
-from ..gemm.batch_invariant.spec import MMA_K_OF, GemmSpec, reduction
+from ..gemm.batch_invariant.spec import MMA_K_OF, GemmSpec, k_granule, reduction
 
 LEAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lean")
 CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "Cases.lean")
+
+# attention toy cases: (name, D, T, C, p, window_left, row id, d) -- T = 16 (one PV step per tile) and C = 32 keep the printed
+# terms small; D = 64 / 128 / 256 are the three classes (4 / 8 / 16 MMA steps per score)
+ATTN_CASES = [
+    ("a0", 64, 16, 32, 40, -1, 0, 0),
+    ("a1", 64, 16, 32, 40, 20, 0, 1),
+    ("a2", 64, 16, 32, 7, -1, 3, 0),
+    ("a3", 64, 16, 32, 33, 5, 1, 2),
+    ("a4", 128, 16, 32, 40, -1, 0, 0),
+    ("a5", 128, 16, 32, 33, 5, 1, 2),
+    ("a6", 256, 16, 32, 40, -1, 0, 0),
+    ("a7", 256, 16, 32, 33, 5, 1, 2),
+    (
+        "a8",
+        64,
+        16,
+        32,
+        100,
+        0,
+        0,
+        0,
+    ),  # the window starts past the first chunks: chunks 0-2 absent, key 100 alone visible
+    ("a9", 64, 32, 64, 40, -1, 0, 0),  # two PV slices per tile (T = 2 x MMA_K)
+]
+ATTN_HEAD_DIMS = (64, 128, 256)
 
 GEMM_CASES = [
     (64, 1),
@@ -141,6 +166,12 @@ GEMM_FP4_CASES = [(256, 1), (512, 1), (1024, 2), (1024, 4)]
 GEMM_FP4_K128_CASES = [(512, 1), (1024, 1), (2048, 2), (2048, 4)]
 GEMM_FP4_OUT_CASES = [(256, "bf16"), (512, "f16"), (256, "f32")]
 GEMM_FP4_K128_OUT_CASES = [(512, "bf16"), (1024, "f16"), (512, "f32")]
+#: The mixed MX classes (e2m1 weights against e4m3 activations, UE8M0 scales per 32 on both; the caller's alpha): ``mxfp4w8a``
+#: at the sm_100 / sm_103 32-wide step (K in whole 128-element runs) and ``mxfp4w8a_k64`` at the sm_107 64-wide step.
+GEMM_MXW48_CASES = GEMM_MX_CASES
+GEMM_MXW48_K64_CASES = [(256, 1), (512, 1), (1024, 2), (1024, 4)]
+GEMM_MXW48_OUT_CASES = GEMM_MX_OUT_CASES
+GEMM_MXW48_K64_OUT_CASES = GEMM_FP4_OUT_CASES
 
 
 @dataclasses.dataclass(frozen=True)
@@ -187,7 +218,7 @@ class LeanFormat:
     def elem(self) -> str:
         """The Lean chain applied to a fold: ``outputElem false`` (bf16, the MXFP8 classes), ``outputElem true`` (the fp8
         classes) or ``outputElemAlpha`` (the 4-bit classes)."""
-        if self.p in ("BS", "BS128", "MX4", "MX4K128"):
+        if self.p in ("BS", "BS128", "MX4", "MX4K128", "MXW48", "MXW48K64"):
             return "outputElemAlpha"
         return f"outputElem {'true' if self.scaled else 'false'}"
 
@@ -224,8 +255,28 @@ STEP_OF_P = {
     "BS128": "mma128bs",
     "MX4": "mma64mx",
     "MX4K128": "mma128mx4",
+    "MXW48": "mma32mxw48",
+    "MXW48K64": "mma64mxw48",
 }
-CHUNK_SUFFIX = {"": "", "32": "_fp8", "MX8": "_mx", "BS": "_fp4", "BS128": "_fp4k128"}
+CHUNK_SUFFIX = {
+    "": "",
+    "32": "_fp8",
+    "MX8": "_mx",
+    "BS": "_fp4",
+    "BS128": "_fp4k128",
+    "MXW48": "_mxw48",
+}
+#: The mixed classes' lower bound's region and its edges (the rule's own table)
+MIXED_CHUNK_EXTRA = [
+    (256, 16384),
+    (512, 16384),
+    (1024, 16384),
+    (512, 32768),
+    (384, 65536),
+    (512, 16384 + 128 * 3),
+    (512, 15360),
+    (520, 16384),
+]
 
 _MX_EXTRA = (
     (
@@ -412,11 +463,66 @@ FORMATS: Tuple[LeanFormat, ...] = (
         tuple(MX_CHUNK_EXTRA),
         _MX_EXTRA,
     ),
+    LeanFormat(
+        "mxfp4w8a",
+        "MXW48",
+        "gemmmxw48",
+        "gemm_mxw48",
+        "gemmMxW48Space",
+        "gemmMxW48Dispatch",
+        "ConfigOKMxW48",
+        "gemmMainloopInnerMxW48",
+        "chunksForMxW48",
+        "chunkTableMxW48",
+        "chunksmxw48",
+        True,
+        ("k",),
+        ("sm_100", "sm_103"),
+        tuple(GEMM_MXW48_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_MXW48_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA + MIXED_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
+    LeanFormat(
+        "mxfp4w8a_k64",
+        "MXW48K64",
+        "gemmmxw48k64",
+        "gemm_mxw48k64",
+        "gemmMxW48K64Space",
+        "gemmMxW48K64Dispatch",
+        "ConfigOKMxW48K64",
+        "gemmMainloopInnerMxW48K64",
+        "chunksForMxW48",
+        None,
+        "chunksmxw48",
+        True,
+        ("k",),
+        ("sm_107",),
+        tuple(GEMM_MXW48_K64_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_MXW48_K64_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA + MIXED_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
 )
 BY_FMT: Dict[str, LeanFormat] = {F.in_fmt: F for F in FORMATS}
 #: The generated theorems closed by ``native_decide`` (the exhaustive checks over the configuration spaces); every
 #: other case is kernel ``decide``. ``lean/Axioms.lean`` pins exactly these names.
-DECIDED_THEOREMS = tuple(n for F in FORMATS for n in F.decided)
+DECIDED_THEOREMS = (
+    tuple(n for F in FORMATS for n in F.decided)
+    + tuple(f"attn_{n}_spec" for n, *_ in ATTN_CASES)
+    + tuple(
+        f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok")
+    )
+)
+#: `native_decide` theorems of the hand-written modules (not of the generated `Cases.lean`): the attention class-separation
+#: statements on toy rows; listed in `lean/Axioms.lean` with the generated ones.
+MODULE_DECIDED_THEOREMS = (
+    "Attn.output_depends_on_C",
+    "Attn.output_depends_on_D",
+    "Attn.output_depends_on_D_64",
+)
 
 
 def lean_str(s: str) -> str:
@@ -450,6 +556,37 @@ def loop_cases(in_fmt: str = "bf16") -> Tuple[int, List[Tuple[int, str]]]:
     ]
 
 
+def swap_loop_cases(in_fmt: str) -> Tuple[int, int, List[Tuple[int, str]]]:
+    """The lowering's trace at the k-block of the format's swapped decode records (`generator.SWAP_K_BLOCK`): the inner radix,
+    its ratio to the class's default radix and ``(nblk, sexpr)``; the trace at ``nblk`` blocks is the default radix's trace at
+    ``ratio * nblk`` blocks (one fold, two blockings), which the emitted theorem states without a new literal."""
+    from ..gemm.batch_invariant.generator import SWAP_K_BLOCK
+
+    low = MainloopBlock(in_fmt).lowering()
+    lowsw = MainloopBlock(in_fmt, SWAP_K_BLOCK[in_fmt]).lowering()
+    ratio = lowsw.inner // low.inner
+    assert ratio * low.inner == lowsw.inner, (in_fmt, lowsw.inner, low.inner)
+    alg = term.TermAlgebra()
+    out = []
+    for nblk in BY_FMT[in_fmt].loop_cases:
+        sx = term.sexpr(
+            lowsw.trace(
+                reduction(nblk * lowsw.inner * MMA_K_OF[in_fmt], 0, 0, in_fmt),
+                alg,
+                nblk,
+            )
+        )
+        assert sx == term.sexpr(
+            low.trace(
+                reduction(nblk * lowsw.inner * MMA_K_OF[in_fmt], 0, 0, in_fmt),
+                alg,
+                nblk * ratio,
+            )
+        ), (in_fmt, nblk)
+        out.append((nblk, sx))
+    return lowsw.inner, ratio, out
+
+
 def out_cases(in_fmt: str = "bf16") -> List[Tuple[int, str, str]]:
     return [
         (K, fmt, term.sexpr(GemmSpec(K, fmt, in_fmt=in_fmt).out(0, 0)))
@@ -463,6 +600,30 @@ def bias_cases() -> List[Tuple[int, int, str]]:
         (K, C, term.sexpr(GemmSpec(K, chunks=C, bias=True).out(0, 0)))
         for K, C in GEMM_BIAS_CASES
     ]
+
+
+def attn_cases() -> List[Tuple[str, int, int, int, int, int, int, int, str]]:
+    """The attention toy cases with the Python spec's S-expression of the output element."""
+    from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
+    from .fp_interface.term import sexpr
+
+    out = []
+    for name, D, T, C, p, win, rid, d in ATTN_CASES:
+        sx = sexpr(
+            AttentionSpec(D, T=T, C=C).output(RowSpec(p=p, window_left=win, row=rid), d)
+        )
+        out.append((name, D, T, C, p, win, rid, d, sx))
+    return out
+
+
+def attn_spaces() -> Dict[int, list]:
+    """The attention kernel's configuration space per head dim (`engine.all_valid_configs`)."""
+    from ..attention.batch_invariant.engine import all_valid_configs
+
+    spaces = {D: all_valid_configs(D) for D in ATTN_HEAD_DIMS}
+    for D, cfgs in spaces.items():
+        assert all(c.well_formed(D) for c in cfgs), D
+    return spaces
 
 
 def chunk_table(in_fmt: str = "bf16") -> List[Tuple[int, int, int]]:
@@ -525,6 +686,8 @@ def dispatch_cases(in_fmt: str = "bf16") -> Dict[Knobs, Tuple[int, int, int]]:
     pairs += [(N, K) for K in DISPATCH_BIG for N in DISPATCH_NS[::3]]
     pairs += [(N, K) for N in DISPATCH_BIG for K in DISPATCH_NS[::3]]
     for N, K in pairs:
+        if K % k_granule(in_fmt):
+            continue  # a weight shape the class does not take (the sm_100 mixed class: K in whole 128-element runs)
         C = chunks_for(N, K, in_fmt)
         for M in DISPATCH_MS:
             for b_major in F.layouts:
@@ -595,6 +758,25 @@ def _render_format(L: List[str], F: LeanFormat) -> None:
         + ", ".join(str(n) for n in F.loop_cases)
         + "]"
     )
+    from ..gemm.batch_invariant.generator import SWAP_K_BLOCK
+
+    if SWAP_K_BLOCK.get(in_fmt):
+        # the swapped decode records of this class stage a wider k-block: the loop at that radix is the class's loop at
+        # ratio x the blocks (the same fold, another blocking), stated for every block count against the loop model
+        # itself through its fold equation (no new literal); the conformance executable prints its trace
+        inner_sw, ratio, _ = swap_loop_cases(in_fmt)
+        L.append(f"def {inner_name}Swap : Nat := {inner_sw}")
+        L.append(
+            f"theorem {tag}swap_mainloop_eq_kfold : ∀ (S nblk : Nat) (a : RowData) (b : ColData), "
+            f"{loop} a b {inner_name}Swap S .zero nblk = {kfold} a b (nblk * {inner_name}Swap) := "
+            f"fun S nblk a b => {loop}_eq_{kfold} a b {inner_name}Swap S nblk"
+        )
+        L.append(
+            f"theorem {tag}swap_loop_eq_loop : ∀ (S nblk : Nat) (a : RowData) (b : ColData), "
+            f"{loop} a b {inner_name}Swap S .zero nblk = {loop} a b {inner_name} S .zero (nblk * {ratio}) := "
+            f"fun S nblk a b => by rw [{loop}_eq_{kfold}, {loop}_eq_{kfold}]; "
+            f"exact congrArg ({kfold} a b) (by simp only [{inner_name}Swap, {inner_name}]; omega)"
+        )
     L.append("")
     L.append(
         f"/-! The {in_fmt} epilogue chain (`spec.output_elem`"
@@ -785,12 +967,65 @@ def _render_bias(L: List[str]) -> None:
     L.append("")
 
 
+def _render_attention(L: List[str]) -> None:
+    """The attention class: the toy-case spec terms and the per-head-dim configuration spaces."""
+    mk = MMA_K_OF["bf16"]
+    L.append(
+        "/-! The attention class on toy sizes (T = 16: one PV step per tile; C = 32; D = 64 / 128 / 256 = 4 / 8 / 16 MMA steps per "
+        "score): the Python spec's output element (`attention/batch_invariant/spec.py`) reproduced by `Attention.lean` node for node, "
+        "and the split kernel's equality to it instantiated on every case. -/"
+    )
+    for name, D, T, C, p, win, rid, d, sx in attn_cases():
+        tb = T.bit_length() - 1
+        L.append(
+            f"def attnP_{name} : Attn.Params := ⟨{D // mk}, {tb}, {C}, {p}, {win}, {rid}, {d}⟩"
+        )
+        L.append(
+            f"theorem attn_{name}_spec : (Attn.output attnP_{name}).sexpr = {lean_str(sx)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_{name}_split : ∀ σ : Nat → Nat, Attn.splitKernel attnP_{name} σ = Attn.output attnP_{name} := "
+            f"fun σ => Attn.splitKernel_eq_fused _ σ"
+        )
+    L.append(
+        "def attnCases : List (String × Attn.Params) := ["
+        + ", ".join(f'("{n}", attnP_{n})' for n, *_ in ATTN_CASES)
+        + "]"
+    )
+    L.append("")
+    L.append(
+        "/-! The attention kernel's configuration space per head dim (`engine.all_valid_configs(D)`): every knob record checked "
+        "against the static constraints (`ConfigOKD`), counted, and `space_invariant` instantiated on it (R3). -/"
+    )
+    for D, cfgs in attn_spaces().items():
+        L.append(
+            f"def attnSpaceD{D} : List Attn.Config := ["
+            + ", ".join(c.lean() for c in cfgs)
+            + "]"
+        )
+        L.append(
+            f"theorem attn_space_d{D}_size : attnSpaceD{D}.length = {len(cfgs)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_space_d{D}_ok : attnSpaceD{D}.all (Attn.ConfigOKD {D}) = true := by native_decide"
+        )
+        L.append(
+            f"theorem attn_space_d{D}_invariant : ∀ b₁ ∈ attnSpaceD{D}, ∀ b₂ ∈ attnSpaceD{D}, "
+            "∀ (f₁ f₂ : Bool) (P : Attn.Params) (σ τ : Nat → Nat), Attn.kernel b₁ f₁ P σ = Attn.kernel b₂ f₂ P τ := "
+            f"Attn.space_invariant attnSpaceD{D}"
+        )
+    L.append("")
+
+
 def render() -> str:
     """The content of ``Cases.lean``."""
     L = [
+        "-- Copyright (c) 2026 by FlashInfer team.",
+        "-- SPDX-License-Identifier: Apache-2.0",
         "import BIKernels.GEMM",
         "import BIKernels.GEMMConfig",
         "import BIKernels.Export",
+        "import BIKernels.Attention",
         "namespace BIK",
         "-- GENERATED by flashinfer/batch_invariant/lean_cases.py from the Python spec / engine; do not edit.",
         "set_option maxRecDepth 4096",
@@ -801,6 +1036,7 @@ def render() -> str:
     _render_bias(L)
     for F in FORMATS[1:]:
         _render_format(L, F)
+    _render_attention(L)
     L.append("end BIK")
     return "\n".join(L) + "\n"
 
@@ -820,6 +1056,7 @@ def summary() -> str:
         "lean_cases coverage: "
         + "; ".join(parts)
         + f"; bias cases={len(GEMM_BIAS_CASES)}; native_decide theorems={len(DECIDED_THEOREMS)}"
+        + f"; attention cases={len(ATTN_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
     )
 
 

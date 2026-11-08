@@ -19,6 +19,7 @@ import subprocess
 import pytest
 
 from flashinfer.batch_invariant import lean_cases
+from flashinfer.gemm.batch_invariant.generator import SWAP_K_BLOCK
 from flashinfer.gemm.batch_invariant.spec import MMA_K, MMA_K_OF
 
 LAKE = shutil.which("lake") or os.path.expanduser("~/.elan/bin/lake")
@@ -39,7 +40,7 @@ def test_generated_cases_are_current():
         assert f"theorem {name} " in committed
     with open(os.path.join(lean_cases.LEAN_DIR, "Axioms.lean")) as f:
         axioms = f.read()
-    for name in lean_cases.DECIDED_THEOREMS:
+    for name in lean_cases.DECIDED_THEOREMS + lean_cases.MODULE_DECIDED_THEOREMS:
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
 
 
@@ -110,10 +111,11 @@ def test_lean_model_matches_python_engine_and_spec():
     assert r.returncode == 0, (r.stdout + r.stderr)[-4000:]
     r = _lake("exe", "conformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
-    kinds = {"gemmbias": "spec", "fp4class": "fp4class"}
+    kinds = {"gemmbias": "spec", "fp4class": "fp4class", "attn": "attn"}
     for F in lean_cases.FORMATS:
         kinds[F.tag] = "spec"
         kinds[F.tag + "loop"] = "loop"
+        kinds[F.tag + "swaploop"] = "loop"
         kinds[F.tag + "out"] = "out"
         if F.table is not None:
             kinds[F.chunk_tag] = "chunks"
@@ -136,6 +138,9 @@ def test_lean_model_matches_python_engine_and_spec():
         elif kind == "fp4class":
             _, N, K, b = line.split(" ")
             lean[("fp4class", int(N), int(K))] = bool(int(b))
+        elif kind == "attn":
+            _, name, sx = line.split(" ", 2)
+            lean[("attn", name)] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -149,6 +154,12 @@ def test_lean_model_matches_python_engine_and_spec():
         for nblk, sx in lean_cases.loop_cases(in_fmt)[1]:
             assert lean[(F.tag + "loop", nblk)] == sx, (in_fmt, nblk)
             checked += 1
+        if (
+            in_fmt in SWAP_K_BLOCK
+        ):  # the swapped records' k-block: the trace at the class's second radix
+            for nblk, sx in lean_cases.swap_loop_cases(in_fmt)[2]:
+                assert lean[(F.tag + "swaploop", nblk)] == sx, (in_fmt, nblk)
+                checked += 1
         for K, fmt, sx in lean_cases.out_cases(in_fmt):
             assert lean[(F.tag + "out", K // mk, fmt)] == sx, (in_fmt, K, fmt)
             checked += 1
@@ -164,6 +175,9 @@ def test_lean_model_matches_python_engine_and_spec():
     for K, C, sx in lean_cases.bias_cases():
         assert lean[("gemmbias", K // MMA_K, C)] == sx, (K, C)
         checked += 1
+    for name, *_, sx in lean_cases.attn_cases():
+        assert lean[("attn", name)] == sx, name
+        checked += 1
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 80
 
@@ -173,6 +187,7 @@ def test_axioms_policy():
     r = _lake("exe", "axioms", timeout=600)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
     assert "0 with sorry, 0 violations" in r.stdout, r.stdout
-    assert f"{len(lean_cases.DECIDED_THEOREMS)} named table theorems" in r.stdout, (
-        r.stdout
+    n_decided = len(lean_cases.DECIDED_THEOREMS) + len(
+        lean_cases.MODULE_DECIDED_THEOREMS
     )
+    assert f"{n_decided} named table theorems" in r.stdout, r.stdout
