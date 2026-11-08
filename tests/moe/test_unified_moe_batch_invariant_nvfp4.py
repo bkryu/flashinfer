@@ -1035,6 +1035,37 @@ def test_both_packings_and_the_prequantized_pack_forms_give_the_bits():
 
 
 @needs_device
+@pytest.mark.parametrize("body", ["padded", "swapped"])
+def test_pdl_chain_alternating_inputs_give_each_call_its_own_bits(body):
+    """The op's kernels run under programmatic dependent launch, each warp waiting for the predecessor grid before its first read
+    of the predecessor's output (the weight loads start before the wait). Two inputs alternate over many calls, so every
+    intermediate buffer the caching allocator hands back holds the OTHER call's bytes: a read that did not wait would take them.
+    Every call gives the bits of its own clean reference, for the padded body and the swapped decode body."""
+    import os
+
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import fused_moe_nvfp4
+
+    T, k, H, I, E = 16, 8, 2048, 768, 128
+    W = None
+    calls, refs = [], []
+    for seed in (5, 6):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed)
+        if W is None:
+            W = _weights_of(_weights(w1, w2))
+        ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids, weights = ids.cuda(), weights.cuda()
+        calls.append((x, ids, weights))
+        refs.append(
+            bits(fused_moe_nvfp4(x, ids, weights, W, swap=body == "swapped").cpu())
+        )
+    assert not torch.equal(refs[0], refs[1])
+    for i in range(int(os.environ.get("FLASHINFER_BI_STRESS_ITERS", "20"))):
+        for (x, ids, weights), ref in zip(calls, refs):
+            out = fused_moe_nvfp4(x, ids, weights, W, swap=body == "swapped")
+            assert torch.equal(bits(out.cpu()), ref), (i, body)
+
+
+@needs_device
 def test_three_routing_modes_agree_and_runs_are_deterministic():
     T, k, H, I, E = 257, 8, 1024, 512, 128
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=3)

@@ -284,8 +284,10 @@ class SwappedBlockScaledGemm:
             cpasync.prefetch_descriptor(tma_atom_w)
             cpasync.prefetch_descriptor(tma_atom_sfw)
             cpasync.prefetch_descriptor(tma_atom_tok)
-        # programmatic dependent launch: wait for the predecessor grid before any dependent read, let the successor start
-        cute.arch.griddepcontrol_wait()
+        # programmatic dependent launch: the successor may start its prologue now; the wait for the predecessor grid sits in
+        # each warp before its first read of the predecessor's output (the token rows, their scale factors, the per-token
+        # scales) -- the weight loads and the group tables (the plan: complete before this grid launched, every kernel of the
+        # chain triggering after its own wait) do not wait, so the weight ring fills while the predecessor drains
         cute.arch.griddepcontrol_launch_dependents()
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
@@ -471,6 +473,7 @@ class SwappedBlockScaledGemm:
             tile_sched = GroupScheduler.create(
                 s_off, s_pre, counts, E, N, tn, WEIGHT_TILE, 1, raster_m, 0, 0
             )
+            cute.arch.griddepcontrol_wait()  # the token scale factors are the predecessor's
             swap_sf_producer_loop(
                 st,
                 k_tile_cnt,
@@ -531,6 +534,7 @@ class SwappedBlockScaledGemm:
             tile_sched = GroupScheduler.create(
                 s_off, s_pre, counts, E, N, tn, WEIGHT_TILE, 1, raster_m, 0, 0
             )
+            cute.arch.griddepcontrol_wait()  # the per-token scales are the predecessor's
             swapped_w4a4_epilogue_loop(
                 st,
                 self.chain,
@@ -574,8 +578,59 @@ def swap_tma_producer_loop(
     """The TMA producer: per tile the expert's 128 weight rows ``n_tile`` and their scale-factor atom (the expert as the batch
     coordinate) and the token box re-addressed at the group's dense row ``row0`` (``token_tile`` rows: the rows past the group's
     end are computed and never stored, the rows past the buffer are zero-filled); k-tiles ascending, one ring slot holds the
-    three."""
+    three. The weights are inputs of the whole chain, the token rows the predecessor's output: the first tile's weight stages
+    (as many as the ring holds) are issued before the programmatic-dependent-launch wait and their token boxes right after it,
+    so the ring fills while the predecessor drains; the stage's transaction barrier completes when all three copies have landed,
+    whatever their order."""
+
     work_tile = tile_sched.initial_work_tile_info()
+    n_pre = cutlass.min(Int32(st.num_ab_stage), k_tile_cnt)
+    if not work_tile.is_valid_tile:
+        n_pre = Int32(0)  # a CTA without tiles issues nothing
+    tWgW_slice = tWgW[(None, work_tile.n_tile, None, work_tile.e)]
+    tWgSFW_slice = tWgSFW[(None, work_tile.n_tile, None, work_tile.e)]
+    real_tok = cute.domain_offset((work_tile.row0, 0, 0), mTok_nkl)
+    gTok = cute.local_tile(
+        real_tok, cute.slice_(st.mma_tiler, (0, None, None)), (None, None, None)
+    )
+    tCgTok = thr_mma.partition_B(gTok)
+    tTsTok, tTgTok = cpasync.tma_partition(
+        tma_atom_tok,
+        b_cta_coord,
+        b_cta_layout,
+        cute.group_modes(sTok, 0, 3),
+        cute.group_modes(tCgTok, 0, 3),
+    )
+    tTgTok_slice = tTgTok[(None, 0, None, 0)]
+    tma_producer.reset()
+    tok_producer = (
+        tma_producer.clone()
+    )  # the same stages, walked again for the token boxes
+    for _k_tile in cutlass.range(0, n_pre, 1, unroll=1):
+        handle = tma_producer.acquire_and_advance()
+        cute.copy(
+            tma_atom_w,
+            tWgW_slice[(None, handle.count)],
+            tWsW[(None, handle.index)],
+            tma_bar_ptr=handle.barrier,
+        )
+        cute.copy(
+            tma_atom_sfw,
+            tWgSFW_slice[(None, handle.count)],
+            tWsSFW[(None, handle.index)],
+            tma_bar_ptr=handle.barrier,
+        )
+    cute.arch.griddepcontrol_wait()  # the token rows are the predecessor's
+    for _k_tile in cutlass.range(0, n_pre, 1, unroll=1):
+        handle = tok_producer.current_handle()
+        cute.copy(
+            tma_atom_tok,
+            tTgTok_slice[(None, handle.count)],
+            tTsTok[(None, handle.index)],
+            tma_bar_ptr=handle.barrier,
+        )
+        tok_producer.advance()
+    k_start = n_pre
     while work_tile.is_valid_tile:
         tWgW_slice = tWgW[(None, work_tile.n_tile, None, work_tile.e)]
         tWgSFW_slice = tWgSFW[(None, work_tile.n_tile, None, work_tile.e)]
@@ -592,9 +647,10 @@ def swap_tma_producer_loop(
             cute.group_modes(tCgTok, 0, 3),
         )
         tTgTok_slice = tTgTok[(None, 0, None, 0)]
-        tma_producer.reset()
-        peek_empty = tma_producer.try_acquire()
-        for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+        peek_empty = cutlass.Boolean(1)
+        if k_start < k_tile_cnt:
+            peek_empty = tma_producer.try_acquire()
+        for _k_tile in cutlass.range(k_start, k_tile_cnt, 1, unroll=1):
             handle = tma_producer.acquire_and_advance(peek_empty)
             cute.copy(
                 tma_atom_w,
@@ -617,6 +673,8 @@ def swap_tma_producer_loop(
             peek_empty = cutlass.Boolean(1)
             if handle.count + 1 < k_tile_cnt:
                 peek_empty = tma_producer.try_acquire()
+        tma_producer.reset()  # the next tile's k-tiles count from 0
+        k_start = Int32(0)
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
     tma_producer.tail()
