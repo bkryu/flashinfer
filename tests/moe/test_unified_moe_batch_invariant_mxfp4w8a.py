@@ -772,6 +772,26 @@ def _assert_plausible(actual, expected):
     )
 
 
+def test_grouped_records_round_trip_through_the_autotuners_tactic():
+    """Every grouped record of both mixed classes survives the flat tactic encoding (the autotuner's cache stores tactics as
+    JSON): the tiler, the cluster, the 2-CTA flag and the raster are the record; the k-block, the swizzle and the dense-only
+    knobs are the grouped kernel's fixed defaults, so nothing is dropped."""
+    from flashinfer.fused_moe.batch_invariant.runner import (
+        _configs_from_tactic,
+        _tactic,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp4w8a import grouped_knobs_mx
+
+    for fmt in ("mxfp4w8a_k64", "mxfp4w8a"):
+        ks = grouped_knobs_mx(fmt)
+        assert len(ks) == 72
+        for k in ks:
+            assert k.k_block == 0 and k.swizzle_size == 1 and not k.swap_ab, (
+                k.describe()
+            )
+            assert _configs_from_tactic(_tactic(k, ks[0])) == (k, ks[0]), k.describe()
+
+
 @needs_device
 @pytest.mark.parametrize("act", ACTIVATIONS, ids=ACTIVATION_IDS)
 def test_layer_matches_the_class_composition(act):
@@ -944,6 +964,63 @@ def test_instruction_class_is_the_parts_and_the_grouped_kernel_is_the_dense_clas
         assert not torch.equal(bits(accs["mxfp4w8a_k64"]), bits(accs["mxfp4w8a"])), (
             "the two instruction classes agree on every accumulator: not two classes"
         )
+
+
+@needs_device
+def test_dense_oracle_at_decode_rows_takes_the_dispatchers_record():
+    """The oracle's per-expert dense call with an f32 output at decode row counts, with the dispatcher's pick instead of the
+    pinned record: on a tree that carries the mixed GEMM classes and the grouped kernels together, the dense class's swapped
+    decode records (on SM107 with their 256-element stage) must build and compute the class, bitwise the pinned record's
+    accumulators (the `MainloopBlock` override by name; a positional build put the k-block in PR 1's `inner_steps`)."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp4w8a import MoEWeightsMXFP4W8A
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+    from flashinfer.gemm.batch_invariant.heuristic import family_of
+    from flashinfer.gemm.batch_invariant.schedule import default_config
+    import flashinfer
+
+    dev = torch.device("cuda")
+    cc = torch.cuda.get_device_capability(dev)
+    N, K = 256, 512
+    g = torch.Generator().manual_seed(11)
+    W = MoEWeightsMXFP4W8A.prepare(
+        (torch.randn(1, N, K, generator=g) * 0.1).to(torch.bfloat16).cuda(),
+        (torch.randn(1, K, N // 2, generator=g) * 0.1).to(torch.bfloat16).cuda(),
+        interleaved=True,
+    )
+    x = (
+        (
+            torch.randn(64, K, generator=g)
+            * torch.exp2(torch.randint(-6, 6, (64, K), generator=g).float())
+        )
+        .to(torch.bfloat16)
+        .cuda()
+    )
+    xq, xsf = _quant(x)
+    fmts = ("mxfp4w8a_k64", "mxfp4w8a") if cc == (10, 7) else ("mxfp4w8a",)
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    picks = []
+    for fmt in fmts:
+        for M in (1, 5, 28, 64):
+            pick = default_config(M, N, K, 1, "k", sms, family_of(cc), fmt)
+            picks.append(pick)
+            a = xq[:M].view(torch.float8_e4m3fn)
+            sf = _swizzle(xsf[:M].contiguous(), K)
+            args = (a, W.w1[0].t(), sf, W.w1_sf[0])
+            got = (
+                flashinfer.gemm.batch_invariant.api.mm_mxfp4w8a_mxfp8a_batch_invariant(
+                    *args, out_dtype=torch.float32, in_fmt=fmt
+                )
+            )
+            ref = (
+                flashinfer.gemm.batch_invariant.api.mm_mxfp4w8a_mxfp8a_batch_invariant(
+                    *args,
+                    out_dtype=torch.float32,
+                    in_fmt=fmt,
+                    config=Knobs(*_DENSE_RECORD),
+                )
+            )
+            assert torch.equal(got, ref), (fmt, M, pick.describe())
+    assert any(p.swap_ab for p in picks), [p.describe() for p in picks]
 
 
 @needs_device
