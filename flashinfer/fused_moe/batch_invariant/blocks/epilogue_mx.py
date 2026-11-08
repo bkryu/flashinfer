@@ -221,9 +221,15 @@ def grouped_epilogue_quant_loop(
         acc_pipeline.consumer_wait(acc_state)  # the fold of this tile is complete
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-        warp_active = (
-            rows_left > warp_row0
-        )  # a warp whose 32 rows all lie past the group's end skips
+        # a warp whose 32 rows all lie past the group's real end skips its subtiles (warp-uniform); the warp's rows are
+        # counted from the cluster tile's first row, as the store predicate is (the peer CTA of a 2-CTA pair and the later
+        # CTAs of a cluster along M sit past the first 128 rows: the bf16 epilogue's rule)
+        cta_row_rel = Int32(0)
+        if cutlass.const_expr(cta_v is not None):
+            cta_row_rel = mma_m_in_cluster * Int32(st.mma_tiler[0]) + cta_v * Int32(
+                st.cta_tile_shape_mnk[0]
+            )
+        warp_active = rows_left > cta_row_rel + warp_row0
         for s in range(
             wg, subtile_cnt, epi_warpgroups
         ):  # this warpgroup's subtiles (half blocks when gated)

@@ -18,3 +18,5 @@ import BIKernels.MoEMxfp8
 import BIKernels.MoEMxfp8Cases
 import BIKernels.Sampling
 import BIKernels.SamplingCases
+import BIKernels.MoEMxfp4w8a
+import BIKernels.MoEMxfp4w8aCases

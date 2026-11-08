@@ -78,6 +78,13 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "attention/batch_invariant/swaps/compile.py",
         "attention/batch_invariant/fixup.py",
     ),
+    # the mixed MXFP4-weight x MXFP8-activation MoE kernels: the grouped block-scaled GEMM on the mixed plans (which composes
+    # the block-scaled dense blocks and the grouped epilogues / scheduler) and the MX scatter kernel; the routing,
+    # permutation and combine kernels are the bf16 module's
+    "batch_invariant_moe_mxfp4w8a": (
+        "fused_moe/batch_invariant/blocks/compile_mxfp4w8a.py",
+        "fused_moe/batch_invariant/mx_permute.py",
+    ),
 }
 
 #: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer
@@ -116,6 +123,10 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
         "gemm/batch_invariant/heuristic.py",
     ),
     "batch_invariant_gemm_blockscaled_mixed": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_moe_mxfp4w8a": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),

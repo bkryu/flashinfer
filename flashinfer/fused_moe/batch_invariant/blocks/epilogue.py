@@ -51,7 +51,7 @@ OUT_FMTS = (
     "f16",
     "f32",
     "mxfp8",
-)  # mxfp8: the MXFP8 class's fused requantization (epilogue_mx)
+)  # mxfp8: the MXFP8 requantization fused in the epilogue (epilogue_mx): GEMM1 of the MXFP8 and the mixed MXFP4 x MXFP8 classes
 STAGED_STORE = True  # the shared-memory staged, row-coalesced store of the 16-bit outputs (False: the direct path everywhere)
 BAR_EPI_STAGE = (
     4  # named barrier ids BAR_EPI_STAGE + warpgroup (the dense blocks use 1 and 2)
@@ -97,7 +97,7 @@ class GroupedChain:
         assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
         if self.kind == "glu" and self.out_fmt not in ("bf16", "mxfp8"):
             raise AssertionError(
-                "the gated chain converts to bf16 once (or the MXFP8 class requantizes that value in place)"
+                "the gated chain converts to bf16 once (or the MX classes requantize that value in place)"
             )
         if self.out_fmt == "mxfp8" and self.kind not in ("glu", "act"):
             raise AssertionError("the fused MX requantization quantizes a GEMM1 chain")

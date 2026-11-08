@@ -32,11 +32,17 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.tensor_utils import LayoutEnum
 
 from ....gemm.batch_invariant.blocks.blockscaled import (
-    PLANS,
+    PLANS as _MX_PLANS,
+)
+from ....gemm.batch_invariant.blocks.blockscaled import (
     SF_ATOM_BYTES,
     BlockScaledPlan,
     blockscaled_mma_loop,
+    fp4_view,
     sf_view,
+)
+from ....gemm.batch_invariant.blocks.blockscaled_mx_mixed import (
+    PLANS as _MIXED_PLANS,
 )
 from ....gemm.batch_invariant.blocks.operands import (
     ACC_DTYPE,
@@ -54,8 +60,11 @@ from .epilogue import (
 )
 from .scheduler import MAX_E, GroupScheduler, build_group_tables, warp_roles
 
-#: The MX classes the grouped body serves: the SM100 / SM103 instruction (K = 32) and the SM107 one (K = 64).
-MX_FMTS = ("mxfp8", "mxfp8_k64")
+#: The MX classes the grouped body serves: the MXFP8 pair and the mixed MXFP4-weight x MXFP8-activation pair, each on the
+#: SM100 / SM103 instruction (K = 32) and the SM107 one (K = 64); the plan registry of the dense block-scaled body plus the
+#: mixed plans (the e2m1 weight through the plan's container hooks: ``B_SMEM_DT`` / ``B_TMA_INTERNAL`` on the SM100 class).
+MX_FMTS = ("mxfp8", "mxfp8_k64", "mxfp4w8a", "mxfp4w8a_k64")
+PLANS = {**_MX_PLANS, **_MIXED_PLANS}
 #: The padded group alignment (rows): one 128-row scale-factor atom.
 GROUP_ALIGN = SF_ATOM_ROWS
 #: Epilogue warpgroups of the block-scaled grouped kernel (the chains are the epilogue leg once the stores are vectors).
@@ -105,15 +114,29 @@ class GroupedBlockScaledTma:
             st.cluster_shape_mn, st.tiled_mma.thr_id
         )
         a_one = cute.slice_(st.a_smem_layout_staged, (None, None, None, 0))
+        # `internal_type` on a sub-byte global operand with an 8-bit smem container: the TMA's unpacking format (the mixed
+        # SM100 class's e2m1 weight, `blocks/blockscaled_mx_mixed.py`); None for the packed operands
         self.atom_a, self.tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op, a, a_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
+            a_op,
+            a,
+            a_one,
+            st.mma_tiler,
+            st.tiled_mma,
+            st.cluster_layout_vmnk.shape,
+            internal_type=st.A_TMA_INTERNAL,
         )
         b_op = utils.sm100.cluster_shape_to_tma_atom_B(
             st.cluster_shape_mn, st.tiled_mma.thr_id
         )
         b_one = cute.slice_(st.b_smem_layout_staged, (None, None, None, 0))
         self.atom_b, self.tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op, b, b_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
+            b_op,
+            b,
+            b_one,
+            st.mma_tiler,
+            st.tiled_mma,
+            st.cluster_layout_vmnk.shape,
+            internal_type=st.B_TMA_INTERNAL,
         )
         sfa_op = utils.sm100.cluster_shape_to_tma_atom_A(
             st.cluster_shape_mn, st.tiled_mma.thr_id
@@ -160,6 +183,8 @@ class GroupedBlockScaledTma:
                 tensor_sfb.iterator, cute.make_layout(new_shape, stride=new_stride)
             )
         self.tensor_sfb = tensor_sfb
+        # the transaction bytes are the GLOBAL bytes the TMA moves: the operand's own width on the stage's element count (an
+        # unpacked sub-byte operand lands in twice the bytes, but the mbarrier counts the bytes read)
         self.tx_bytes = (
             cute.size_in_bytes(st.a_dtype, a_one)
             + cute.size_in_bytes(st.b_dtype, b_one)
@@ -169,10 +194,11 @@ class GroupedBlockScaledTma:
 
 
 def ring_bytes(st) -> int:
-    """Shared memory of the operand rings of a block-scaled plan (A, B, SFA, SFB, all stages)."""
+    """Shared memory of the operand rings of a block-scaled plan (A, B, SFA, SFB, all stages), at the operands' container
+    widths (the mixed SM100 class's e2m1 weight occupies a byte per element in shared memory)."""
     return (
-        cute.size_in_bytes(st.a_dtype, st.a_smem_layout_staged)
-        + cute.size_in_bytes(st.b_dtype, st.b_smem_layout_staged)
+        cute.size_in_bytes(st.a_smem_dtype, st.a_smem_layout_staged)
+        + cute.size_in_bytes(st.b_smem_dtype, st.b_smem_layout_staged)
         + cute.size_in_bytes(st.sf_dtype, st.sfa_smem_layout_staged)
         + cute.size_in_bytes(st.sf_dtype, st.sfb_smem_layout_staged)
     )
@@ -211,9 +237,10 @@ def plan_with_room(plan_cls, knobs: Knobs, own_bytes):
 
 class GroupedBlockScaledGemmMX:
     """``out[p, n] = chain(sum_k MMA(A[p], SFA[p], B[n, e(p)], SFB[n, e(p)]))`` for every row ``p`` of every group: the
-    dense MX class's fold per row (the block scales inside the step), the bf16 classes' chain on the accumulators. The
-    persistent grid (``max_active_clusters``, in clusters) is a dynamic launch argument: which cluster computes a tile,
-    never the bits."""
+    dense MX class's fold per row (the block scales inside the step; the MXFP8 pair or the mixed MXFP4-weight x
+    MXFP8-activation pair, whose e2m1 weight takes the plan's container hooks), the bf16 classes' chain on the
+    accumulators. The persistent grid (``max_active_clusters``, in clusters) is a dynamic launch argument: which cluster
+    computes a tile, never the bits."""
 
     def __init__(self, knobs: Knobs, chain: GroupedChain, in_fmt: str = "mxfp8"):
         assert isinstance(chain, GroupedChain), chain
@@ -258,6 +285,11 @@ class GroupedBlockScaledGemmMX:
         self, a, b, sfa, sfb, out, counts, max_active_clusters, stream, out_sf=None
     ):
         pc = self.plan_cls
+        # a byte-packed 4-bit operand (the mixed classes' e2m1 weight) as the fp4 tensor of the logical K (the dense body's view)
+        if cutlass.const_expr(pc.A_DT.width == 4):
+            a = fp4_view(a)
+        if cutlass.const_expr(pc.B_DT.width == 4):
+            b = fp4_view(b)
         assert a.element_type is pc.A_DT and b.element_type is pc.B_DT, (
             a.element_type,
             b.element_type,
@@ -438,13 +470,13 @@ class GroupedBlockScaledGemmMX:
 
         # --- operand staging: smem rings (A, B swizzled; SFA, SFB plain), multicast masks, the B / SFB partitions
         sA = smem.allocate_tensor(
-            element_type=st.a_dtype,
+            element_type=st.a_smem_dtype,
             layout=a_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
         )
         sB = smem.allocate_tensor(
-            element_type=st.b_dtype,
+            element_type=st.b_smem_dtype,
             layout=b_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=b_smem_layout_staged.inner,
