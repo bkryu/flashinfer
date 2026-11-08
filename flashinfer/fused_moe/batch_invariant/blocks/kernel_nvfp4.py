@@ -248,11 +248,13 @@ class GroupedBlockScaledGemm:
         st = grouped_plan(
             plan_cls,
             self.knobs,
-            lambda st: tables
-            + (
-                staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_NVFP4)
-                if self.staged
-                else 0
+            lambda st: (
+                tables
+                + (
+                    staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_NVFP4)
+                    if self.staged
+                    else 0
+                )
             ),
         )
         self.st = st
@@ -336,9 +338,10 @@ class GroupedBlockScaledGemm:
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_sfa)
             cpasync.prefetch_descriptor(tma_atom_sfb)
-        # programmatic dependent launch: wait for the predecessor grid before any dependent read, let the successor start
+        # programmatic dependent launch: wait for the predecessor grid before any dependent read; the successor is let go by
+        # the TMA warp once this CTA's last tile is issued, not here -- triggered at the top of a persistent grid, the successor's
+        # CTAs sit resident on the SMs while this walk still needs them (measured: the swapped body at half speed on SM100)
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
         use_2cta_instrs = atom_thr_size == 2
         bidx, _, _ = cute.arch.block_idx()
@@ -775,4 +778,5 @@ def grouped_blockscaled_producer_loop(
                 peek_empty = ab_producer.try_acquire()
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
+    cute.arch.griddepcontrol_launch_dependents()  # this CTA's loads are all issued: the successor may launch
     ab_producer.tail()
