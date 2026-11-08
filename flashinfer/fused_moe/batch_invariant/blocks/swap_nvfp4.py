@@ -286,10 +286,10 @@ class SwappedBlockScaledGemm:
             cpasync.prefetch_descriptor(tma_atom_tok)
         # programmatic dependent launch: the wait for the predecessor grid sits in each warp before its first read of the
         # predecessor's output (the token rows, their scale factors, the per-token scales) -- the weight loads and the group
-        # tables (the plan: complete before this grid launched, every kernel of the chain triggering after its own wait) do not
-        # wait, so the weight ring fills while the predecessor drains; the successor is let go by the TMA warp once this CTA's
-        # last tile is issued (the dependents' resident waiting CTAs cost this one-CTA-per-SM kernel its bandwidth on the 148-SM
-        # part when they launch at the top)
+        # tables (the plan: complete before this grid launched; no kernel of the chain triggers before its own wait) do not
+        # wait, so the weight ring fills during the launch; no explicit trigger -- the dependents launch at this grid's
+        # completion (triggered at the top, their resident waiting CTAs cost this one-CTA-per-SM kernel its bandwidth on the
+        # 148-SM part; triggered after the CTA's last tile's loads they still cost the op)
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
@@ -678,7 +678,6 @@ def swap_tma_producer_loop(
         k_start = Int32(0)
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
-    cute.arch.griddepcontrol_launch_dependents()  # this CTA's loads are all issued: the successor may launch
     tma_producer.tail()
 
 
