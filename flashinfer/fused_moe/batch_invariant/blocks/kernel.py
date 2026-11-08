@@ -121,7 +121,7 @@ class GroupedBlockGemm:
         )
         # the generator's mainloop block for the format: its lowering (blocked issue order, accumulator reset) is what
         # mma_loop executes
-        self.block = MainloopBlock("bf16", GROUPED_K_BLOCKS)
+        self.block = MainloopBlock("bf16", inner_steps=GROUPED_K_BLOCKS)
         self.lowering = self.block.lowering()
         assert st.mma_tiler[2] == self.block.k_block, (st.mma_tiler, self.block.k_block)
         tma = TmaSetup(st, a, b, None)
