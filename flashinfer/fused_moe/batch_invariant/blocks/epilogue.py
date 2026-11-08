@@ -46,7 +46,12 @@ from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS, act_elem, glu_elem
 
 GROUP = 8  # gate/up interleave granularity (columns): u x8, g x8, u x8, ...
 KINDS = ("plain", "glu", "act")
-OUT_FMTS = ("bf16", "f16", "f32")
+OUT_FMTS = (
+    "bf16",
+    "f16",
+    "f32",
+    "mxfp8",
+)  # mxfp8: the MXFP8 class's fused requantization (epilogue_mx)
 STAGED_STORE = True  # the shared-memory staged, row-coalesced store of the 16-bit outputs (False: the direct path everywhere)
 BAR_EPI_STAGE = (
     4  # named barrier ids BAR_EPI_STAGE + warpgroup (the dense blocks use 1 and 2)
@@ -90,8 +95,12 @@ class GroupedChain:
     def __post_init__(self):
         assert self.kind in KINDS and self.out_fmt in OUT_FMTS, self
         assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
-        if self.kind == "glu" and self.out_fmt != "bf16":
-            raise AssertionError("the gated chain converts to bf16 once")
+        if self.kind == "glu" and self.out_fmt not in ("bf16", "mxfp8"):
+            raise AssertionError(
+                "the gated chain converts to bf16 once (or the MXFP8 class requantizes that value in place)"
+            )
+        if self.out_fmt == "mxfp8" and self.kind not in ("glu", "act"):
+            raise AssertionError("the fused MX requantization quantizes a GEMM1 chain")
         expected = len(ACT_PARAMS.get(self.act, ())) if self.kind == "glu" else 0
         assert len(self.params) == expected, (self, expected)
 

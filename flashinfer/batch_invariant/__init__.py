@@ -206,6 +206,61 @@ def _mm_mxfp4w8a_fingerprint(
     )
 
 
+def _moe_mxfp8_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    arch=None,
+) -> str:
+    """The MXFP8 x MXFP8 MoE classes behind ``MoELayer`` with ``BatchInvariantMoeMxfp8Config``: the dimensions of the bf16
+    classes plus the architecture (the instruction class of the dense MXFP8 GEMM: the SM107 step folds 64 elements, the
+    SM100 / SM103 one 32; ``arch`` as for ``mm_mxfp8``, the current device by default)."""
+    from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp8 import spec_fingerprint_mxfp8
+    from flashinfer.tllm_enums import RoutingMethodType
+
+    from ..gemm.batch_invariant.schedule import mx_class_for
+
+    if isinstance(method, str) and method in RoutingMethodType.__members__:
+        method = RoutingMethodType[method]
+    if isinstance(method, RoutingMethodType):
+        if method not in spec.METHOD_OF_FLASHINFER:
+            raise ValueError(
+                f"the batch-invariant MoE classes do not implement routing method {method!r}"
+            )
+        rm = spec.METHOD_OF_FLASHINFER[method]
+    elif isinstance(method, str):
+        rm = spec.METHODS[method]
+    elif isinstance(method, spec.RoutingMethod):
+        rm = method
+    else:
+        raise TypeError(
+            f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
+        )
+    if not isinstance(act, str):
+        a = spec.activation_of(act)
+        name, params, gated = a.act, a.params, a.gated
+    elif act == "swiglu":
+        name, gated = "silu", True
+    elif act == "relu2":
+        name, gated = "relu2", False
+    elif act in spec.ACTS or act in spec.UNGATED_ACTS:
+        name = act
+        if gated is None:
+            gated = act in spec.ACTS
+    else:
+        raise ValueError(f"no MoE chain named {act!r}")
+    fmt = mx_class_for("mxfp8", _mx_family(arch, "fused_moe_mxfp8"))
+    return spec_fingerprint_mxfp8(
+        H, I, top_k, num_experts, rm, name, params, gated, fmt
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     # the unified MoE layer with `BatchInvariantMoeConfig`: the routing method and the activation (gated SwiGLU / ungated
@@ -236,6 +291,14 @@ CLASSES: Dict[str, ClassInfo] = {
         ("N", "K", "out_dtype"),
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
+    ),
+    # the unified MoE layer with `BatchInvariantMoeMxfp8Config`: the bf16 classes' dimensions plus the architecture (the
+    # instruction class of the dense MXFP8 GEMM, as for mm_mxfp8)
+    "fused_moe_mxfp8": ClassInfo(
+        "moe.mxfp8",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_mxfp8_fingerprint,
+        ("method", "act", "params", "gated", "arch"),
     ),
     # the mixed MX classes (e2m1 weights x e4m3 activations, UE8M0 scales per 32 on both): the mode's own entry
     # `gemm.batch_invariant.api.mm_mxfp4w8a_mxfp8a_batch_invariant` (FlashInfer has no dense operator for the pair); the
