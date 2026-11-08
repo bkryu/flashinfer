@@ -71,6 +71,9 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "attention/batch_invariant/swaps/compile.py",
         "attention/batch_invariant/fixup.py",
     ),
+    # the block-scale fp8 MoE kernels (the DeepSeek-style class): the grouped block-scale GEMM (which composes the dense
+    # block-scale body: in its closure), the standalone block quantizer and the block-scale gather; their own module
+    "batch_invariant_moe_fp8bs": ("fused_moe/batch_invariant/blocks/fp8bs_compile.py",),
 }
 
 #: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer
@@ -105,6 +108,10 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
         "gemm/batch_invariant/heuristic.py",
     ),
     "batch_invariant_gemm_fp8_blockscale": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_moe_fp8bs": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),

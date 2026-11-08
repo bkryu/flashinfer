@@ -204,6 +204,63 @@ def _moe_bf16_fingerprint(
     )
 
 
+def _moe_dims(spec, method: object, act: object, params, gated):
+    """The MoE classes' shared dimension parsing (``_moe_bf16_fingerprint``'s rules): ``(RoutingMethod, chain name, params,
+    gated)`` from a :class:`flashinfer.RoutingMethodType` (or its name / a ``RoutingMethod``) and an ``ActivationConfig``, the
+    default chain names ``"swiglu"`` / ``"relu2"`` or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS``."""
+    from flashinfer.tllm_enums import RoutingMethodType
+
+    if isinstance(method, str) and method in RoutingMethodType.__members__:
+        method = RoutingMethodType[method]
+    if isinstance(method, RoutingMethodType):
+        if method not in spec.METHOD_OF_FLASHINFER:
+            raise ValueError(
+                f"the batch-invariant MoE classes do not implement routing method {method!r}"
+            )
+        rm = spec.METHOD_OF_FLASHINFER[method]
+    elif isinstance(method, str):
+        rm = spec.METHODS[method]
+    elif isinstance(method, spec.RoutingMethod):
+        rm = method
+    else:
+        raise TypeError(
+            f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
+        )
+    if not isinstance(act, str):
+        a = spec.activation_of(act)
+        name, params, gated = a.act, a.params, a.gated
+    elif act == "swiglu":
+        name, gated = "silu", True
+    elif act == "relu2":
+        name, gated = "relu2", False
+    elif act in spec.ACTS or act in spec.UNGATED_ACTS:
+        name = act
+        if gated is None:
+            gated = act in spec.ACTS
+    else:
+        raise ValueError(f"no MoE chain named {act!r}")
+    return rm, name, params, gated
+
+
+def _moe_fp8bs_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+) -> str:
+    """The block-scale fp8 MoE classes behind ``MoELayer`` with ``BatchInvariantMoeFp8BlockConfig``: the dimensions of
+    ``fused_moe`` (``method`` / ``act`` / ``params`` / ``gated`` as there); the block scales, like the operands, are inputs."""
+    from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.fused_moe.batch_invariant.spec_fp8bs import spec_fingerprint_fp8bs
+
+    rm, name, params, gated = _moe_dims(spec, method, act, params, gated)
+    return spec_fingerprint_fp8bs(H, I, top_k, num_experts, rm, name, params, gated)
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     # the unified MoE layer with `BatchInvariantMoeConfig`: the routing method and the activation (gated SwiGLU / ungated
@@ -250,6 +307,14 @@ CLASSES: Dict[str, ClassInfo] = {
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    # the unified MoE layer with `BatchInvariantMoeFp8BlockConfig`: the same dimensions as `fused_moe` for the DeepSeek-style
+    # block-scale classes `moe.e4m3bs.<act>` (the block scales are inputs of the class: their values never enter the identifier)
+    "fused_moe_fp8bs": ClassInfo(
+        "moe.e4m3bs",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_fp8bs_fingerprint,
+        ("method", "act", "params", "gated"),
     ),
 }
 

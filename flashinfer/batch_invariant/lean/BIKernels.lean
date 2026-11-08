@@ -16,3 +16,6 @@ import BIKernels.MoE
 import BIKernels.MoECases
 import BIKernels.Sampling
 import BIKernels.SamplingCases
+import BIKernels.FP8BlockQuant
+import BIKernels.MoEFp8Bs
+import BIKernels.MoEFp8BsCases

@@ -1,0 +1,208 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""The block-scale fp8 grouped GEMMs' dispatcher: the dense block-scale class's ranking heuristic at the grouped launch's shape,
+and the placement rule of the intermediate's requantization.
+
+As for the bf16 classes (:mod:`.schedule`): a grouped GEMM is the dense class under a different scheduler, so its records are
+ranked by the dense dispatcher's model at the dense shape whose tiles, M tail and operand bytes are the grouped launch's
+(``M`` = the rows of one active expert, ``N`` = the active experts' weight rows side by side), for the block-scale format
+(``in_fmt="e4m3_bs"``: the fp8 instruction rate, the promotion hand-off chain, no 2-CTA issue gain for the lockstep pair),
+with the dense dispatcher's decode guard and its few-token N-cluster rule, mapped onto the grouped space and filtered by the
+grouped body's acceptance. The requantization's two spellings (GEMM1's epilogue on the whole-block tiles, or the standalone
+pass on the bf16 intermediate) are placements of one term: ``fused_quant_default`` picks by the rows per active expert.
+Numerics-neutral: every record of the space computes the class.
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional, Sequence, Tuple
+
+from ...gemm.batch_invariant.generator import CLUSTERS, Knobs, knob_product
+from .blocks.fp8bs_compile import (
+    GEMM2_CHAIN,
+    TILES_N_GROUPED,
+    Fp8BsChain,
+    can_implement_grouped_fp8bs,
+    gemm1_chain,
+)
+from .schedule import TOP_K, active_experts, pair_term, raster_for, rows_per_expert
+
+IN_FMT = "e4m3_bs"
+#: The fused requantization (GEMM1's output blocks quantized in its epilogue, the 256-wide gated tile) from this many rows per
+#: active expert; below it the standalone pass and GEMM1's free tile choice (empirical; a placement).
+FUSED_QUANT_MIN_ROWS = 128
+
+
+def grouped_knobs_fp8bs(clusters=None) -> List[Knobs]:
+    """The grouped block-scale space: the dense block-scale class's records (128-row CTA tiles, the six clusters, both rasters)
+    at swizzle 1 with a tile of two promotion warpgroups (N 64 / 128 / 256), or the subset with the given clusters."""
+    return [
+        k
+        for k in knob_product(
+            swizzles=(1,),
+            clusters=CLUSTERS if clusters is None else clusters,
+            in_fmt=IN_FMT,
+        )
+        if k.tile_n in TILES_N_GROUPED
+    ]
+
+
+def all_valid_configs_fp8bs(
+    N: int,
+    K: int,
+    E: int,
+    chain: Fp8BsChain = GEMM2_CHAIN,
+    clusters=None,
+    interleaved: Optional[bool] = None,
+) -> List[Knobs]:
+    """The configuration space the grouped block-scale guarantee is claimed over, for a weight shape and a chain (the fused
+    requantization's chain admits the tiles whose outputs are whole 128-column blocks)."""
+    return [
+        k
+        for k in grouped_knobs_fp8bs(clusters)
+        if can_implement_grouped_fp8bs(k, N, K, E, chain, interleaved)
+    ]
+
+
+def rank_grouped_fp8bs(
+    rows: int,
+    N: int,
+    K: int,
+    E: int,
+    chain: Fp8BsChain,
+    sm_count: Optional[int] = None,
+    family: Optional[str] = None,
+    k: int = TOP_K,
+    nominal: bool = False,
+    n_active: Optional[int] = None,
+) -> List[Knobs]:
+    """The ranked grouped records for one block-scale GEMM, as the bf16 backend's ``schedule.rank_grouped``: the grouped space
+    the body accepts for the weight shape and the chain, ordered by the dense block-scale class's estimate at ``(M = rows,
+    N = n_active * N, K)`` times the pair term, each tile family priced once at the enumeration's raster and the grouped
+    scheduler's structural raster first among its twins; at a decode-sized ``rows`` the dense dispatcher's structural guard
+    selects the candidates and its few-token rule prefers the widest N-cluster that still fits the part in one wave; each of
+    the best ceil(k/2) records is followed by its raster twin, then the rank order fills the list: distinct records, at most
+    ``k``, never empty for an implementable shape."""
+    import dataclasses
+
+    from ...gemm.batch_invariant.heuristic import (
+        PART_TABLE,
+        TOKEN_BOX_ROWS,
+        capacity_for,
+        decode_sane,
+        estimate_cycles,
+    )
+
+    fam = family or "sm_107"
+    dense_n = (n_active or E) * N
+    space = [
+        c
+        for c in grouped_knobs_fp8bs()
+        if can_implement_grouped_fp8bs(c, N, K, E, chain)
+    ]
+    if not space:
+        return []
+    guarded = [c for c in space if decode_sane(c, rows, False, True)] or space
+    if rows <= TOKEN_BOX_ROWS // 4:
+        # the dense block-scale dispatcher's few-token rule: the 128-row token box is at least three quarters zero-fill, a TMA
+        # cost per block per CTA that the N-cluster's multicast issues once per cluster; the widest N-cluster shares it most
+        # while its clusters still fit the part in one wave (every active expert's tiles count)
+        cap4 = capacity_for(fam, sm_count, nominal).get(4) or max(
+            1, (sm_count or PART_TABLE[fam].sm_count) // 4
+        )
+        wide = [
+            c
+            for c in guarded
+            if c.cluster_n == 4
+            and ((dense_n + c.tile_n - 1) // c.tile_n + 3) // 4 <= cap4
+        ]
+        guarded = wide or guarded
+
+    def key(i, c):
+        canon = dataclasses.replace(c, raster_along="m")
+        est = estimate_cycles(
+            canon, rows, dense_n, K, 1, "k", IN_FMT, fam, sm_count, nominal=nominal
+        )
+        return (
+            est * pair_term(c, rows),
+            0 if c.raster_along == raster_for(c, rows) else 1,
+            i,
+        )
+
+    ranked = [c for _k, c in sorted((key(i, c), c) for i, c in enumerate(guarded))]
+    members = set(space)
+    out: List[Knobs] = []
+    seen = set()
+    for rec in ranked[: -(-k // 2)]:
+        twin = dataclasses.replace(
+            rec, raster_along="n" if rec.raster_along == "m" else "m"
+        )
+        for cand in (rec, twin):
+            if cand not in seen and (cand is rec or cand in members):
+                out.append(cand)
+                seen.add(cand)
+    for rec in ranked:
+        if len(out) >= k:
+            break
+        if rec not in seen:
+            out.append(rec)
+            seen.add(rec)
+    return out[:k]
+
+
+def fused_quant_default(T: int, k: int, E: int) -> bool:
+    """Whether the block-scale op requantizes GEMM1's output in the epilogue (the wide-tile records) or by the standalone quantizer
+    pass at this (T, k, E) by default: a placement rule on the rows per active expert, both spellings the same bits."""
+    return rows_per_expert(T, k, E) >= FUSED_QUANT_MIN_ROWS
+
+
+def default_configs_fp8bs(
+    T: int,
+    k: int,
+    H: int,
+    I: int,
+    E: int,
+    sm_count: Optional[int] = None,
+    family: Optional[str] = None,
+    act: str = "silu",
+    gated: bool = True,
+    params: Sequence[Optional[float]] = (),
+    fused: bool = False,
+    nominal: bool = False,
+) -> Tuple[Knobs, Knobs]:
+    """``(config for GEMM1 (N = 2I, K = H; N = I ungated), config for GEMM2 (N = H, K = I))`` of the block-scale class: the first
+    record of each ranked list; ``fused`` ranks GEMM1 over the fused requantization's records."""
+    rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
+    n1 = 2 * I if gated else I
+    c1 = rank_grouped_fp8bs(
+        rows,
+        n1,
+        H,
+        E,
+        gemm1_chain(act, params, gated, fused),
+        sm_count,
+        family,
+        1,
+        nominal,
+        n_act,
+    )
+    c2 = rank_grouped_fp8bs(
+        rows, H, I, E, GEMM2_CHAIN, sm_count, family, 1, nominal, n_act
+    )
+    if not c1 or not c2:
+        raise ValueError(
+            f"no grouped block-scale record implements (H={H}, I={I}, E={E}, gated={gated}, fused={fused})"
+        )
+    return c1[0], c2[0]
+
+
+__all__ = [
+    "FUSED_QUANT_MIN_ROWS",
+    "IN_FMT",
+    "all_valid_configs_fp8bs",
+    "default_configs_fp8bs",
+    "fused_quant_default",
+    "gemm1_chain",
+    "grouped_knobs_fp8bs",
+    "rank_grouped_fp8bs",
+]
