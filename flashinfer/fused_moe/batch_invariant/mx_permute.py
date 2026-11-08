@@ -43,11 +43,13 @@ class ScatterMxKernel:
     """``kernel(xq [T, B] u8, xsf [T * nb] u8 (linear), dest [Tk] i32, x_perm [Tk_pad, B] u8, sf_perm [sf_numel(Tk_pad, K)]
     u8, Tk, B, nb, pcols)``: ``B`` bytes per row (``B % 16 == 0``), ``nb = K / 32`` scale bytes per row, ``pcols`` the
     padded scale columns of the destination (a multiple of 4); ``dest[i]`` the padded row of expanded row ``i`` (token
-    ``i // k``). One warp per live row; the padding rows of the 128-row atoms are never written (unspecified bytes the
-    row-local MMA reads into rows no tile stores)."""
+    ``i // k``). ``wpr`` warps per live row (a placement, ``permute.warps_per_row``: warp ``part`` of a row owns the
+    32-vector slabs ``part, part + wpr, ...`` of the values and of the scale bytes); the padding rows of the 128-row atoms
+    are never written (unspecified bytes the row-local MMA reads into rows no tile stores)."""
 
-    def __init__(self, k: int):
-        self.k = k
+    def __init__(self, k: int, wpr: int = 1):
+        assert wpr >= 1 and wpr & (wpr - 1) == 0, wpr
+        self.k, self.wpr = k, wpr
 
     @cute.jit
     def __call__(
@@ -64,7 +66,7 @@ class ScatterMxKernel:
         stream,
     ):
         self.kernel(mX, mSf, mDest, mXp, mSfp, Tk, B, nb, pcols).launch(
-            grid=[cute.ceil_div(Tk, WARPS), 1, 1],
+            grid=[cute.ceil_div(Tk * Int32(self.wpr), WARPS), 1, 1],
             block=[WARPS * LANES, 1, 1],
             stream=stream,
             use_pdl=True,
@@ -87,12 +89,15 @@ class ScatterMxKernel:
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
-        i_raw = bidx * WARPS + tidx // LANES
+        wpr = self.wpr
+        g = bidx * WARPS + tidx // LANES
+        i_raw = g // Int32(wpr)
+        part = g % Int32(wpr)
         valid = i_raw < Tk
         i = cutlass.min(i_raw, Tk - Int32(1))
         p = mDest[i]
         t = i // Int32(self.k)
-        # the values: 16-byte vectors, lanes stride over the row
+        # the values: 16-byte vectors, this warp's slabs of 32 (lanes stride inside a slab)
         atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), Uint8, num_bits_per_copy=8 * VEC_BYTES
         )
@@ -100,30 +105,33 @@ class ScatterMxKernel:
         frag = cute.make_rmem_tensor((VEC_BYTES,), Uint8)
         row_x = mX[(t, None)]
         row_p = mXp[(p, None)]
-        n_mine = (n_vec - lane + Int32(LANES - 1)) // Int32(LANES)
+        n_slabs = (n_vec + Int32(LANES - 1)) // Int32(LANES)
+        n_mine = (n_slabs - part + Int32(wpr - 1)) // Int32(wpr)
         for jj in cutlass.range(0, n_mine, 1):
-            j = jj * LANES + lane
-            cute.copy(atom, cute.local_tile(row_x, (VEC_BYTES,), (j,)), frag)
-            if valid:
-                cute.copy(atom, frag, cute.local_tile(row_p, (VEC_BYTES,), (j,)))
+            j = (jj * Int32(wpr) + part) * LANES + lane
+            jc = cutlass.min(j, n_vec - Int32(1))
+            cute.copy(atom, cute.local_tile(row_x, (VEC_BYTES,), (jc,)), frag)
+            if valid & (j < n_vec):
+                cute.copy(atom, frag, cute.local_tile(row_p, (VEC_BYTES,), (jc,)))
         # the scale bytes: linear source (row t, column j) -> the swizzled destination (row p, column j); padding columns zero
-        n_sf = (pcols - lane + Int32(LANES - 1)) // Int32(LANES)
-        for jj in cutlass.range(0, n_sf, 1):
-            j = jj * LANES + lane
+        n_sf_slabs = (pcols + Int32(LANES - 1)) // Int32(LANES)
+        n_sf_mine = (n_sf_slabs - part + Int32(wpr - 1)) // Int32(wpr)
+        for jj in cutlass.range(0, n_sf_mine, 1):
+            j = (jj * Int32(wpr) + part) * LANES + lane
             v = Uint8(0)
             if j < nb:
                 v = mSf[t.to(Int64) * nb.to(Int64) + j.to(Int64)]
-            if valid:
+            if valid & (j < pcols):
                 mSfp[_sf_byte_offset(p, j, pcols)] = v
         cute.arch.griddepcontrol_launch_dependents()
 
 
-def scatter_mx_kernel_name(k: int) -> str:
-    return jit.sanitize_symbol_name(f"moe_scatter_mx_k{k}")
+def scatter_mx_kernel_name(k: int, wpr: int = 1) -> str:
+    return jit.sanitize_symbol_name(f"moe_scatter_mx_k{k}_w{wpr}")
 
 
 @functools.cache
-def get_compiled_scatter_mx(k: int) -> Any:
+def get_compiled_scatter_mx(k: int, wpr: int = 1) -> Any:
     """``kernel(xq [T, B] u8, xsf [n_src] u8, src [Tk_pad] i32, x_perm [Tk_pad, B] u8, sf_perm [n_dst] u8, Tk_pad, B, nb, pcols)``."""
 
     def compile_fn():
@@ -155,7 +163,7 @@ def get_compiled_scatter_mx(k: int) -> Any:
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            ScatterMxKernel(k),
+            ScatterMxKernel(k, wpr),
             x_fake,
             sf_fake,
             dest_fake,
@@ -169,4 +177,4 @@ def get_compiled_scatter_mx(k: int) -> Any:
             options="--enable-tvm-ffi",
         )
 
-    return jit.build_and_load(MODULE, scatter_mx_kernel_name(k), compile_fn)
+    return jit.build_and_load(MODULE, scatter_mx_kernel_name(k, wpr), compile_fn)

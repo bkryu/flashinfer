@@ -448,6 +448,7 @@ def fused_moe_mxfp8(
     the records used."""
     from .combine import get_compiled_combine, warps_per_token
     from .mx_permute import get_compiled_scatter_mx
+    from .permute import warps_per_row
     from .schedule_mxfp8 import GEMM2_CHAIN, default_configs_mx
 
     H, I, E = w.hidden_size, w.intermediate_size, w.num_experts
@@ -518,14 +519,15 @@ def fused_moe_mxfp8(
         sm_count, family = _part(dev)
         c1, c2 = default_configs_mx(T, k, H, I, E, w.chain1, in_fmt, sm_count, family)
         config1, config2 = config1 or c1, config2 or c2
-    counts, dest, src = permute_plan_padded(experts, E)
+    # ``plan``: ``route_plan(..., align=GROUP_ALIGN)``'s outputs (the same integers as the padded plan, one launch with the routing)
+    counts, dest, src = plan if plan is not None else permute_plan_padded(experts, E)
     Tk_pad = src.shape[0]
     nb, pcols = H // BLOCK, padded_sf_cols(H)
     x_perm = torch.empty(Tk_pad, H, dtype=torch.float8_e4m3fn, device=dev)
     x_perm_sf = torch.empty(sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
     # one launch over the live rows: the e4m3 rows and the UE8M0 scales to their padded positions (the scales re-tiled into
     # the swizzled atoms); the padding rows are never written (unspecified bytes the MMA reads into rows no tile stores)
-    get_compiled_scatter_mx(k)(
+    get_compiled_scatter_mx(k, warps_per_row(T * k, H // 16, sm_count_of(dev)))(
         xq.view(torch.uint8),
         xsf8.reshape(-1),
         dest.reshape(-1),
