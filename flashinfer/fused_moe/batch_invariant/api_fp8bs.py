@@ -40,6 +40,7 @@ from .spec_fp8bs import BLOCK as QBLOCK
 from .spec_fp8bs import CLASS, E4M3_MAX, block_chain, quant_pre
 
 ALIGN_E4M3 = 16  # e4m3 elements per 16-byte row: the TMA alignment of every operand
+TAIL_ROWS = 256  # rows past the live rows of every packed buffer: the largest cluster tile's TMA box stays in bounds
 _OUT_DTYPE = {"bf16": torch.bfloat16, "f32": torch.float32}
 _DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "f16"}
 SCALE_LAYOUTS = ("MN", "K")
@@ -569,45 +570,57 @@ def fused_moe_fp8bs(
         plan if plan is not None else permute_plan(experts, E)
     )  # ``plan``: ``route_plan``'s outputs
     Tk = T * k
-    x_perm = torch.empty(Tk, H, dtype=torch.float8_e4m3fn, device=dev)
-    sx_perm = torch.empty(KB, Tk, dtype=torch.float32, device=dev)
+    # the packed row buffers (and their scale columns) carry TAIL_ROWS past Tk so every tile's TMA box stays in bounds (an
+    # out-of-bounds box is served far more slowly than the rows it zero-fills); the tail rows are never stored or read back
+    Tk_a = Tk + TAIL_ROWS if Tk else 0
+    x_perm = torch.empty(Tk_a, H, dtype=torch.float8_e4m3fn, device=dev)
+    sx_perm = torch.empty(KB, Tk_a, dtype=torch.float32, device=dev)
     if Tk:
         get_compiled_gather(k, "e4m3", warps_per_row(Tk, H // 16, sm_count_of(dev)))(
-            xq, src, x_perm, Tk, H
-        )
+            xq, src, x_perm[:Tk], Tk, H
+        )  # the live rows: the kernel's row count is the index tensor's
         get_compiled_gather_scales(k)(sx_kt, src.reshape(-1), sx_perm, Tk, KB)
     a = None
     if fuse_quant:
         aq, sa = grouped_gemm_fp8bs(
             x_perm, sx_perm, w.w1, w.w1_sf, counts, config1, chain1
-        )  # [Tk, I] e4m3 + [I / 128, Tk]
+        )  # [Tk_a, I] e4m3 + [I / 128, Tk_a]
     else:
         a = grouped_gemm_fp8bs(
             x_perm, sx_perm, w.w1, w.w1_sf, counts, config1, chain1
-        )  # [Tk, I] bf16
+        )  # [Tk_a, I] bf16
+        aq = torch.empty(Tk_a, I, dtype=torch.float8_e4m3fn, device=dev)
+        sa = torch.empty(I // QBLOCK, Tk_a, dtype=torch.float32, device=dev)
         if Tk:
-            aq, sa = fp8_block_quantize(a, "MN")
-        else:
-            aq = torch.empty(0, I, dtype=torch.float8_e4m3fn, device=dev)
-            sa = torch.empty(I // QBLOCK, 0, dtype=torch.float32, device=dev)
+            fp8_block_quantize(
+                a[:Tk], "MN", out=(aq[:Tk], sa[:, :Tk])
+            )  # the live rows only
     y = grouped_gemm_fp8bs(
         aq, sa, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN
-    )  # [Tk, H] bf16
+    )  # [Tk_a, H] bf16
     if T:
         get_compiled_combine(
             k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev))
-        )(y, dest, scales, out, T, H)
+        )(y[:Tk], dest, scales, out, T, H)
     if return_intermediates:
+        # the live rows under the common keys; the tail-carrying buffers the kernels consume under ``*_buf`` (a kernel timed
+        # on a live-row view reintroduces the out-of-bounds boxes)
         return out, dict(
             counts=counts,
             dest=dest,
             src=src,
-            x_perm=x_perm,
-            sx_perm=sx_perm,
-            a=a,
-            aq=aq,
-            sa=sa,
-            y=y,
+            x_perm=x_perm[:Tk],
+            sx_perm=sx_perm[:, :Tk],
+            a=None if a is None else a[:Tk],
+            aq=aq[:Tk],
+            sa=sa[:, :Tk],
+            y=y[:Tk],
+            x_perm_buf=x_perm,
+            sx_perm_buf=sx_perm,
+            a_buf=a,
+            aq_buf=aq,
+            sa_buf=sa,
+            y_buf=y,
             config1=config1,
             config2=config2,
             fused=fuse_quant,
@@ -622,6 +635,7 @@ __all__ = [
     "K_MAX",
     "ROW_WARPS_PER_SM_SMALL",
     "SCALE_LAYOUTS",
+    "TAIL_ROWS",
     "MoEWeightsE4M3BS",
     "check_shape_fp8bs",
     "fp8_block_quantize",

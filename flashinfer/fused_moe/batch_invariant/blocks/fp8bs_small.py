@@ -38,6 +38,9 @@ V = 8  # elements per lane: one 16-byte load of 16-bit values, one block per six
 LANES_PER_BLOCK = BLOCK // V
 TRIGGERS = ("none", "late", "early")
 SCATTER_THREADS = 256
+SCALE_BLOCKS_PER_THREAD = (
+    8  # block columns per thread of the scale gather, their loads issued together
+)
 
 
 class _Loader:
@@ -155,7 +158,9 @@ class BSQuantKernel:
 class GatherScalesKernel:
     """``sf_perm[kb, p] = sf[kb, src[p] // k]`` for ``p < Tk``, ``kb < KB``; ``sf`` is read through its own strides (the ``(KB, T)``
     view of either scale layout), ``sf_perm`` is the contiguous ``(KB, Tk)`` MN-major tensor. Thread = expanded row, so a
-    warp's stores of one block column are one contiguous line (the reads gather one 4-byte value per token)."""
+    warp's stores of one block column are one contiguous line (the reads gather one 4-byte value per token); a thread handles
+    ``SCALE_BLOCKS_PER_THREAD`` block columns with their loads in flight together and the grid's second dimension covers the
+    rest (the launch is latency-bound: a serial walk over the block columns cost one memory round trip each)."""
 
     def __init__(self, k: int):
         self.k = k
@@ -171,7 +176,11 @@ class GatherScalesKernel:
         stream,
     ):
         self.kernel(mS, mSrc, mSp, Tk, KB).launch(
-            grid=[cute.ceil_div(Tk, SCATTER_THREADS), 1, 1],
+            grid=[
+                cute.ceil_div(Tk, SCATTER_THREADS),
+                cute.ceil_div(KB, SCALE_BLOCKS_PER_THREAD),
+                1,
+            ],
             block=[SCATTER_THREADS, 1, 1],
             stream=stream,
             use_pdl=True,
@@ -182,14 +191,20 @@ class GatherScalesKernel:
         self, mS: cute.Tensor, mSrc: cute.Tensor, mSp: cute.Tensor, Tk: Int32, KB: Int32
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
+        bidx, bidy, _ = cute.arch.block_idx()
         cute.arch.griddepcontrol_wait()
         p_raw = bidx * SCATTER_THREADS + tidx
         valid = p_raw < Tk
         p = cutlass.min(p_raw, Tk - Int32(1))
         t = mSrc[p] // Int32(self.k)
-        for kb in cutlass.range(0, KB, 1):
-            v = mS[(kb, t)]
+        kb0 = bidy * SCALE_BLOCKS_PER_THREAD
+        vals = []
+        for j in cutlass.range_constexpr(SCALE_BLOCKS_PER_THREAD):
+            # the thread's block columns, their loads all in flight
+            vals.append(mS[(cutlass.min(kb0 + j, KB - Int32(1)), t)])
+        for j in cutlass.range_constexpr(SCALE_BLOCKS_PER_THREAD):
+            kb = kb0 + j
             if valid:
-                mSp[(kb, p)] = v
+                if kb < KB:
+                    mSp[(kb, p)] = vals[j]
         pdl.trigger_one_wave()
