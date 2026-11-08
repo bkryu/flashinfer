@@ -360,10 +360,6 @@ class GroupedBlockScaledGemmMX:
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_sfa)
             cpasync.prefetch_descriptor(tma_atom_sfb)
-        # programmatic dependent launch: wait for the predecessor grid before any dependent read (counts, the operands,
-        # the scales), and let the successor start its prologue at once (this grid is one persistent wave)
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
         use_2cta_instrs = atom_thr_size == 2
         bidx, _, _ = cute.arch.block_idx()
@@ -430,6 +426,12 @@ class GroupedBlockScaledGemmMX:
         s_off = storage.group_off.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_pre = storage.group_pre.get_tensor(cute.make_layout((MAX_E + 1,)))
         cluster_rows = st.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
+        # programmatic dependent launch: the prologue above (descriptor prefetch, barrier and pipeline setup, the TMEM
+        # allocator) reads nothing of the predecessor's, so it overlaps the predecessor's tail; every thread waits here,
+        # before the first dependent read (counts, then the operands and the scales), and lets the successor start its
+        # own prologue at once (this grid is one persistent wave)
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == EPILOGUE_WARPS[0]:
             build_group_tables(counts, E, cluster_rows, s_off, s_pre, GROUP_ALIGN)
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
