@@ -1060,7 +1060,7 @@ def test_pdl_chain_alternating_inputs_give_each_call_its_own_bits(body):
         )
     assert not torch.equal(refs[0], refs[1])
     for i in range(int(os.environ.get("FLASHINFER_BI_STRESS_ITERS", "20"))):
-        for (x, ids, weights), ref in zip(calls, refs):
+        for (x, ids, weights), ref in zip(calls, refs, strict=True):
             out = fused_moe_nvfp4(x, ids, weights, W, swap=body == "swapped")
             assert torch.equal(bits(out.cpu()), ref), (i, body)
 
