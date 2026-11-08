@@ -470,75 +470,13 @@ def route_plan_dual(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """:func:`.api.route` and :func:`permute_plan_dual` in one launch for small token counts: ``(experts [T, k] int32,
-    weights [T, k] f32, counts [E] int32, dest [T, k] int32, src [T k] int32, dest_pad [T, k] int32, pos_pad [T k] int32)``,
-    the same bits and integers as the two calls (:mod:`.route_plan_nvfp4`); ``T k <= route_plan.ROUTE_PLAN_MAX_SLOTS``,
-    ``E <= MAX_E``."""
-    from .api import _IN, _const, expert_bucket
-    from .blocks.scheduler import MAX_E
-    from .route_plan import ROUTE_PLAN_MAX_SLOTS
-    from .route_plan_nvfp4 import get_compiled_route_plan_dual
+    """:func:`.api.route` and :func:`permute_plan_dual` in one launch for small token counts: the shared fused kernel's dual form
+    (:func:`.api.route_plan` with ``dual=True``): ``(experts [T, k] int32, weights [T, k] f32, counts [E] int32, dest [T, k] int32,
+    src [T k] int32, dest_pad [T, k] int32, pos_pad [T k] int32)``, the same bits and integers as the two calls."""
+    from .api import route_plan
 
-    method = S.METHODS[method] if isinstance(method, str) else method
-    if logits.dim() != 2 or logits.stride(1) != 1 or logits.dtype not in _IN:
-        raise TypeError(
-            "route_plan_dual: logits must be a row-major f32 or bf16 [T, E]"
-        )
-    T, E = logits.shape
-    if E > MAX_E:
-        raise ValueError(
-            f"route_plan_dual: {E} experts; the fused plan holds at most {MAX_E}"
-        )
-    if not 1 <= top_k <= min(E, 16):
-        raise ValueError(f"route_plan_dual: top_k {top_k} must be in [1, min(E, 16)]")
-    if T * top_k > ROUTE_PLAN_MAX_SLOTS:
-        raise ValueError(
-            f"route_plan_dual: {T * top_k} expanded rows; the fused plan holds at most {ROUTE_PLAN_MAX_SLOTS}"
-        )
-    if (bias is not None) != method.bias:
-        raise ValueError(
-            "route_plan_dual: a bias is given iff the method selects on sigmoid(l) + bias"
-        )
-    if (scaling_factor is not None) != method.scaled:
-        raise ValueError(
-            "route_plan_dual: a scaling factor is given iff the method scales the weights"
-        )
-    dev = logits.device
-    b = (
-        bias.to(device=dev, dtype=torch.float32).contiguous()
-        if bias is not None
-        else _const(dev, E, 0.0)
-    )
-    if tuple(b.shape) != (E,):
-        raise ValueError(f"route_plan_dual: bias must be [E] = [{E}]")
-    if scaling_factor is None:
-        s = _const(dev, 1, 1.0)
-    elif isinstance(scaling_factor, torch.Tensor):
-        s = scaling_factor.to(device=dev, dtype=torch.float32).reshape(1)
-    else:
-        s = _const(dev, 1, float(scaling_factor))
-    n = T * top_k
-    experts = torch.empty(T, top_k, dtype=torch.int32, device=dev)
-    weights = torch.empty(T, top_k, dtype=torch.float32, device=dev)
-    counts = torch.empty(E, dtype=torch.int32, device=dev)
-    dest = torch.empty(n, dtype=torch.int32, device=dev)
-    src = torch.empty(n, dtype=torch.int32, device=dev)
-    dest_pad = torch.empty(n, dtype=torch.int32, device=dev)
-    pos_pad = torch.empty(n, dtype=torch.int32, device=dev)
-    if T:
-        get_compiled_route_plan_dual(
-            expert_bucket(E), top_k, method, _IN[logits.dtype], pad_align
-        )(logits, b, s, experts, weights, counts, dest, src, dest_pad, pos_pad, T, E)
-    else:
-        counts.zero_()
-    return (
-        experts,
-        weights,
-        counts,
-        dest.view(T, top_k),
-        src,
-        dest_pad.view(T, top_k),
-        pos_pad,
+    return route_plan(
+        logits, top_k, method, bias, scaling_factor, dual=True, pad_align=pad_align
     )
 
 
