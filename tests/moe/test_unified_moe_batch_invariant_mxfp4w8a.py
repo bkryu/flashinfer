@@ -286,14 +286,14 @@ def test_fingerprint_dimensions_and_classes():
     )  # noqa: E731
     assert bi.class_name("fused_moe_mxfp4w8a") == "moe.mxfp4w8a"
     s107, s100 = fp(arch="sm_107"), fp(arch="sm_100")
-    assert s107 == "moe-58adb6f85d2d0541" and s100 == "moe-461822fcaf9d0dba"
+    assert s107 == "moe-d052e19078f8166f" and s100 == "moe-c65c0fc11ce51102"
     assert (
         fp(arch="sm_103") == s100
         and fp(arch=(10, 7)) == s107
         and fp(arch=(10, 0)) == s100
     )
-    assert fp(arch="sm_107", act="relu2") == "moe-16158ab9f3b2b408"
-    assert fp(arch="sm_100", act="relu2") == "moe-656a1ed1bfceef36"
+    assert fp(arch="sm_107", act="relu2") == "moe-98239c5cb16e1740"
+    assert fp(arch="sm_100", act="relu2") == "moe-cca0c4d297a5dd48"
     assert (
         fp(arch="sm_107", act=SwiGLU()) == s107
         and fp(arch="sm_107", act="silu") == s107
