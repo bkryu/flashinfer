@@ -415,6 +415,17 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
     ),
+    # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
+    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
     # the unified MoE layer with `BatchInvariantFp8BlockConfig` under `QuantConfig(MXFP8, MXFP8)` (the fp8-block backend
     # groups the fp8 formats with block scales under one key, the pair selecting the classes): the bf16 classes' dimensions
     # plus the architecture (the instruction class of the dense MXFP8 GEMM, as for mm_mxfp8)
@@ -449,17 +460,6 @@ CLASSES: Dict[str, ClassInfo] = {
         ("N", "K", "out_dtype"),
         _mm_mxfp4w8a_fingerprint,
         ("arch",),
-    ),
-    # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
-    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
-    "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
-    ),
-    "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
-    ),
-    "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
     ),
 }
 

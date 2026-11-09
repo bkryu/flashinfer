@@ -34,8 +34,8 @@ _FI_DIR = Path(__file__).resolve().parents[1]  # the flashinfer package
 MODE_DIRS: Tuple[Path, ...] = (
     _FI_DIR / "batch_invariant",
     _FI_DIR / "gemm" / "batch_invariant",
-    _FI_DIR / "fused_moe" / "batch_invariant",
     _FI_DIR / "attention" / "batch_invariant",
+    _FI_DIR / "fused_moe" / "batch_invariant",
 )
 
 #: Root files of every cache module, relative to the flashinfer package; the module's closure is the transitive
@@ -51,6 +51,12 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     # module's objects valid and vice versa (the split's fixup stays in the dense module)
     "batch_invariant_gemm_blockscaled": (
         "gemm/batch_invariant/blocks/compile_blockscaled.py",
+    ),
+    # the attention kernels (the row body, the Swaps-AB decode body) and the split-KV fixup share one module
+    "batch_invariant_attention": (
+        "attention/batch_invariant/blocks/compile.py",
+        "attention/batch_invariant/swaps/compile.py",
+        "attention/batch_invariant/fixup.py",
     ),
     # the bf16 MoE kernels: the grouped GEMM (which composes the dense GEMM blocks: they are in its closure), the
     # routing, permutation and combine kernels; the MoE API, dispatcher and runner stay outside
@@ -71,12 +77,6 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     # plans leaves the one-format block-scaled module's objects valid (an edit to the shared body moves both)
     "batch_invariant_gemm_blockscaled_mixed": (
         "gemm/batch_invariant/blocks/compile_blockscaled_mixed.py",
-    ),
-    # the attention kernels (the row body, the Swaps-AB decode body) and the split-KV fixup share one module
-    "batch_invariant_attention": (
-        "attention/batch_invariant/blocks/compile.py",
-        "attention/batch_invariant/swaps/compile.py",
-        "attention/batch_invariant/fixup.py",
     ),
     # the mixed MXFP4-weight x MXFP8-activation MoE kernels: the grouped block-scaled GEMM on the mixed plans (which composes
     # the block-scaled dense blocks and the grouped epilogues / scheduler) and the MX scatter kernel; the routing,
