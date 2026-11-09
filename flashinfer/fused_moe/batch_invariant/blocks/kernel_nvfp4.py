@@ -49,7 +49,7 @@ from ....gemm.batch_invariant.blocks.operands import (
 )
 from ....gemm.batch_invariant.generator import Knobs
 from ....gemm.batch_invariant.spec import NVFP4_FMTS, SF_ATOM_KBLOCKS, SF_ATOM_ROWS
-from .epilogue import staged_store, staging_bytes, staging_layout
+from .epilogue import BAR_EPI_JOIN, staged_store, staging_bytes, staging_layout
 from .epilogue_nvfp4 import W4A4Chain, grouped_w4a4_epilogue_loop
 from .scheduler import MAX_E, GroupScheduler, build_group_tables, warp_roles
 
@@ -398,6 +398,9 @@ class GroupedBlockScaledGemm:
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(EPILOGUE_WARPS) + 1)
         )
+        epi_join = pipeline.NamedBarrier(
+            barrier_id=BAR_EPI_JOIN, num_threads=32 * len(EPILOGUE_WARPS)
+        )
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -666,6 +669,9 @@ class GroupedBlockScaledGemm:
                 mma_tile_coord_v,
             )
             tmem.relinquish_alloc_permit()
+            # the allocator warp alone frees the columns: every epilogue warpgroup joins here after its last TMEM load (the
+            # staged store's barriers join one group only)
+            epi_join.arrive_and_wait()
             tmem.free(tmem_ptr)
 
 
