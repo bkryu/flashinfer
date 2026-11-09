@@ -198,10 +198,10 @@ def _moe_nvfp4_fingerprint(
     gated: Optional[bool] = None,
     arch=None,
 ) -> str:
-    """The NVFP4 (W4A4) MoE classes behind ``MoELayer`` with ``BatchInvariantMoeNvfp4Config``: ``method`` and ``act`` as for
-    ``fused_moe``; ``arch`` (an architecture family, a compute capability or a device; the current CUDA device by default)
-    selects the instruction class of each expert weight shape (the sm_107 K = 128 step on SM107 for the unsplit shapes, the
-    K = 64 step elsewhere): the architecture is a dimension of the class."""
+    """The NVFP4 (W4A4) MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the NVFP4 x NVFP4 pair): ``method``
+    and ``act`` as for ``fused_moe``; ``arch`` (an architecture family, a compute capability or a device; the current CUDA
+    device by default) selects the instruction class of each expert weight shape (the sm_107 K = 128 step on SM107 for the
+    unsplit shapes, the K = 64 step elsewhere): the architecture is a dimension of the class."""
     from flashinfer.fused_moe.batch_invariant import spec
     from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import (
         expert_classes,
@@ -283,8 +283,9 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
     ),
-    # the unified MoE layer with `BatchInvariantMoeNvfp4Config` (NVFP4 experts, per-token NVFP4 activations): the dimensions
-    # of the bf16 MoE classes plus the architecture (the instruction class of each expert weight shape)
+    # the unified MoE layer with `BatchInvariantFp4Config` (the NVFP4 x NVFP4 pair: NVFP4 experts, per-token NVFP4
+    # activations): the dimensions of the bf16 MoE classes plus the architecture (the instruction class of each expert
+    # weight shape)
     "fused_moe_nvfp4": ClassInfo(
         "moe.nvfp4",
         ("H", "I", "top_k", "num_experts"),

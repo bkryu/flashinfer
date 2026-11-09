@@ -1,7 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant NVFP4 MoE backend of the unified MoE layer (``BatchInvariantMoeNvfp4Config`` ->
-``BatchInvariantMoeNvfp4Runner``).
+"""The NVFP4 x NVFP4 pair of the batch-invariant fp4 MoE backend of the unified MoE layer (``BatchInvariantFp4Config`` with
+``QuantConfig(weight=NVFP4, activation=NVFP4)`` -> ``BatchInvariantFp4Runner`` -> ``BatchInvariantMoeNvfp4Runner``, this
+module's implementation runner; :mod:`.runner_fp4` holds the backend).
 
 The runner serves the W4A4 classes ``moe.nvfp4.<act>`` (``QuantConfig(weight=NVFP4, activation=NVFP4)``: NVFP4 experts with
 one per-tensor global scale per expert and GEMM, per-token NVFP4 activations) for every typed activation of the layer, on
@@ -106,7 +107,8 @@ def _configs_from_tactic_nvfp4(t: tuple):
 class BatchInvariantMoeNvfp4Runner(MoERunner):
     """The unified layer's runner for the batch-invariant NVFP4 (W4A4) MoE classes."""
 
-    backend_key = "batch_invariant_nvfp4"
+    # the fp4 backend's key (``runner_fp4.BACKEND_KEY``): the pair implementations share the weight view and the records
+    backend_key = "batch_invariant_fp4"
     supported_routing_modes = (
         RoutingInputMode.FromLogits,
         RoutingInputMode.PackedPrecomputed,

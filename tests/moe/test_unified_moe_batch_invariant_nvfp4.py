@@ -1,6 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant NVFP4 MoE backend of the unified MoE layer (``BatchInvariantMoeNvfp4Config``): the W4A4 classes
+"""The NVFP4 x NVFP4 pair of the batch-invariant fp4 MoE backend of the unified MoE layer (``BatchInvariantFp4Config``
+with ``QuantConfig(weight=NVFP4, activation=NVFP4)``): the W4A4 classes
 ``moe.nvfp4.<act>`` (NVFP4 experts with one per-tensor global scale per expert and GEMM, per-token NVFP4 activations), one
 per typed activation of the layer.
 
@@ -25,7 +26,7 @@ import torch
 from flashinfer import batch_invariant as bi
 from flashinfer.fused_moe import (
     BackendOptions,
-    BatchInvariantMoeNvfp4Config,
+    BatchInvariantFp4Config,
     ExecutionConfig,
     ExpertConfig,
     MoEActivationPack,
@@ -41,6 +42,7 @@ from flashinfer.fused_moe import (
     SwiGLU,
 )
 from flashinfer.fused_moe.api import ALL_BACKEND_CONFIGS, _DEFAULT_BACKEND
+from flashinfer.fused_moe.batch_invariant.runner_fp4 import BatchInvariantFp4Runner
 from flashinfer.fused_moe.batch_invariant.runner_nvfp4 import (
     MOE_NVFP4_ARCHS,
     BatchInvariantMoeNvfp4Runner,
@@ -58,6 +60,7 @@ needs_device = pytest.mark.skipif(
 
 _SWIGLU = SwiGLU()
 _NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+KEY = BatchInvariantFp4Runner.backend_key
 # the activations the suites cover (every typed activation of the layer, the parameterised ones once more with scalars that
 # move every branch): the bf16 backend's list, each its own class of this backend too
 from tests.moe.test_unified_moe_batch_invariant import (  # noqa: E402
@@ -123,7 +126,7 @@ def _config(
         quant=quant,
         experts=ExpertConfig(intermediate_size=I),
         activation=act,
-        backend=BackendOptions((BatchInvariantMoeNvfp4Config(),)),
+        backend=BackendOptions((BatchInvariantFp4Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=tune_max),
         finalize=MoEFinalizeConfig(do_finalize=True),
     )
@@ -135,7 +138,7 @@ def _layer(*args, device="cuda", **kw):
 
 def _weights(w1: torch.Tensor, w2: torch.Tensor, act=_SWIGLU) -> MoEWeightPack:
     pack = MoEWeightPack({})
-    view = BatchInvariantMoeNvfp4Config.prepare_weights(
+    view = BatchInvariantFp4Config.prepare_weights(
         w1,
         w2,
         num_local_experts=w1.shape[0],
@@ -143,7 +146,7 @@ def _weights(w1: torch.Tensor, w2: torch.Tensor, act=_SWIGLU) -> MoEWeightPack:
         intermediate_size=w2.shape[2],
         activation=act,
     )
-    pack.prepare_for(BatchInvariantMoeNvfp4Runner.backend_key, view)
+    pack.prepare_for(KEY, view)
     return pack
 
 
@@ -180,31 +183,72 @@ def _routed_pack(x, ids, weights, packed: bool = False) -> MoEActivationPack:
 
 
 def test_backend_is_registered_and_never_a_default_candidate():
-    assert BatchInvariantMoeNvfp4Config in ALL_BACKEND_CONFIGS
-    assert (
-        _BACKEND_RUNNERS[BatchInvariantMoeNvfp4Config] is BatchInvariantMoeNvfp4Runner
-    )
+    """The fp4 config is a known backend of the layer, mapped to the fp4 runner, absent from the default candidates; the
+    runner serves the NVFP4 x NVFP4 pair through the NVFP4 implementation runner (the two share the backend's key), declares
+    the three routing modes and every activation class of the layer for the pair."""
+    assert BatchInvariantFp4Config in ALL_BACKEND_CONFIGS
+    assert _BACKEND_RUNNERS[BatchInvariantFp4Config] is BatchInvariantFp4Runner
     assert not any(
-        isinstance(c, BatchInvariantMoeNvfp4Config) for c in _DEFAULT_BACKEND.candidates
+        isinstance(c, BatchInvariantFp4Config) for c in _DEFAULT_BACKEND.candidates
     )
     assert [
         a
         for a in (89, 90, 100, 103, 107, 110, 120, 121)
-        if BatchInvariantMoeNvfp4Config.supported(a)
+        if BatchInvariantFp4Config.supported(a)
     ] == [100, 103, 107]
-    assert BatchInvariantMoeNvfp4Runner.supported_quant_variants == (
+    assert KEY == "batch_invariant_fp4"
+    assert BatchInvariantMoeNvfp4Runner.backend_key == KEY
+    assert BatchInvariantFp4Runner.supported_quant_variants == (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
     )
-    assert BatchInvariantMoeNvfp4Runner.supports_per_token_scale
-    assert set(BatchInvariantMoeNvfp4Runner.supported_activation_classes) == {
+    assert BatchInvariantFp4Runner.supports_quant(_NVFP4)
+    assert BatchInvariantFp4Runner.supports_per_token_scale
+    assert set(BatchInvariantFp4Runner.supported_activation_classes) == {
         type(a) for a in ACTIVATIONS
     }
-    assert set(BatchInvariantMoeNvfp4Runner.supported_routing_modes) == {
+    assert set(
+        BatchInvariantFp4Runner.supported_activation_classes_by_quant[_NVFP4.pair]
+    ) == {type(a) for a in ACTIVATIONS}
+    assert set(BatchInvariantFp4Runner.supported_routing_modes) == {
         RoutingInputMode.FromLogits,
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     }
-    assert repr(BatchInvariantMoeNvfp4Config()) == "BatchInvariantMoeNvfp4Config()"
+    assert repr(BatchInvariantFp4Config()) == "BatchInvariantFp4Config()"
+
+
+def test_unserved_quant_pair_is_refused_and_names_the_served_pairs():
+    """A quantization pair the fp4 backend does not serve: the layer's candidate filter skips the runner
+    (``supports_quant``), and ``prepare_weights`` / ``prepare_activations`` / the runner's ``check_support`` raise the
+    mode's error naming the served pairs and the pending one."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    mixed = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    assert not BatchInvariantFp4Runner.supports_quant(mixed)
+    assert not BatchInvariantFp4Runner.supports_quant(QuantConfig())
+    w1 = torch.zeros(2, 64, 64, dtype=torch.bfloat16)
+    w2 = torch.zeros(2, 64, 32, dtype=torch.bfloat16)
+    for call in (
+        lambda: BatchInvariantFp4Config.prepare_weights(w1, w2, quant=mixed),
+        lambda: BatchInvariantFp4Config.prepare_activations(w1[0], quant=mixed),
+        lambda: BatchInvariantFp4Runner(
+            MoEConfig(
+                routing=RoutingConfig(num_experts=2, top_k=1),
+                quant=mixed,
+                experts=ExpertConfig(intermediate_size=32),
+                backend=BackendOptions((BatchInvariantFp4Config(),)),
+            ),
+            torch.device("cuda", 0),
+        ).check_support(),
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+            call()
+        msg = str(excinfo.value)
+        assert "weight=MXFP4, activation=MXFP8" in msg
+        assert "NVFP4 x NVFP4" in msg and "mixed MoE PR" in msg and KEY in msg
+    # the default pair is NVFP4 x NVFP4: the bf16 rows as given, no scale
+    x, sf = BatchInvariantFp4Config.prepare_activations(w1[0].float())
+    assert x.dtype == torch.bfloat16 and sf is None
 
 
 def test_fingerprint_dimensions_and_classes():
@@ -714,9 +758,7 @@ def _quantized(x: torch.Tensor, check: bool = True):
 def _weights_of(pack: MoEWeightPack):
     from flashinfer.fused_moe.batch_invariant.api_nvfp4 import MoEWeightsNVFP4
 
-    return MoEWeightsNVFP4.from_view(
-        pack.get_view(BatchInvariantMoeNvfp4Runner.backend_key)
-    )
+    return MoEWeightsNVFP4.from_view(pack.get_view(KEY))
 
 
 @needs_device
@@ -1645,7 +1687,7 @@ def test_routing_methods_from_logits_match_the_cpu_model():
                 quant=_NVFP4,
                 experts=ExpertConfig(intermediate_size=I),
                 activation=SwiGLU(),
-                backend=BackendOptions((BatchInvariantMoeNvfp4Config(),)),
+                backend=BackendOptions((BatchInvariantFp4Config(),)),
                 execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=T),
             ),
             device=torch.device("cuda"),
@@ -1804,7 +1846,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                     routing=kw.get("routing", routing),
                     quant=kw.get("quant", _NVFP4),
                     experts=kw.get("experts", experts),
-                    backend=BackendOptions((BatchInvariantMoeNvfp4Config(),)),
+                    backend=BackendOptions((BatchInvariantFp4Config(),)),
                     finalize=kw.get("finalize", MoEFinalizeConfig(do_finalize=True)),
                 ),
                 device=torch.device("cuda"),
@@ -1832,7 +1874,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     with pytest.raises(BatchInvariantUnsupportedError):
         layer(_logits_pack(x4, logits), W)  # packed rows without their scales
     with pytest.raises(BatchInvariantUnsupportedError):
-        BatchInvariantMoeNvfp4Config.prepare_weights(
+        BatchInvariantFp4Config.prepare_weights(
             w1,
             w2,
             num_local_experts=E,
@@ -1853,7 +1895,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ),
             quant=_NVFP4,
             experts=ExpertConfig(intermediate_size=I),
-            backend=BackendOptions((BatchInvariantMoeNvfp4Config(),)),
+            backend=BackendOptions((BatchInvariantFp4Config(),)),
         ),
         device=torch.device("cuda"),
     )
@@ -1872,7 +1914,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ),
             quant=_NVFP4,
             experts=ExpertConfig(intermediate_size=I),
-            backend=BackendOptions((BatchInvariantMoeNvfp4Config(),)),
+            backend=BackendOptions((BatchInvariantFp4Config(),)),
         ),
         device=torch.device("cuda"),
     )
