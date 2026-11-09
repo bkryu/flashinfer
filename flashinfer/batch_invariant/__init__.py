@@ -160,7 +160,7 @@ def _moe_bf16_fingerprint(
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
 ) -> str:
-    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantMoeConfig``: ``method`` is a
+    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: ``method`` is a
     :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements; ``act`` an
     ``ActivationConfig`` of the layer (its scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default
     gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the
@@ -252,7 +252,8 @@ def _moe_fp8bs_fingerprint(
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
 ) -> str:
-    """The block-scale fp8 MoE classes behind ``MoELayer`` with ``BatchInvariantMoeFp8BlockConfig``: the dimensions of
+    """The block-scale fp8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8BlockConfig`` under
+    ``QuantConfig(DeepSeekFp8, DeepSeekFp8)``: the dimensions of
     ``fused_moe`` (``method`` / ``act`` / ``params`` / ``gated`` as there); the block scales, like the operands, are inputs."""
     from flashinfer.fused_moe.batch_invariant import spec
     from flashinfer.fused_moe.batch_invariant.spec_fp8bs import spec_fingerprint_fp8bs
@@ -261,9 +262,36 @@ def _moe_fp8bs_fingerprint(
     return spec_fingerprint_fp8bs(H, I, top_k, num_experts, rm, name, params, gated)
 
 
+def _moe_mxfp8_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    arch=None,
+) -> str:
+    """The MXFP8 x MXFP8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8BlockConfig`` under
+    ``QuantConfig(MXFP8, MXFP8)``: the dimensions of the bf16 classes plus the architecture (the instruction class of the
+    dense MXFP8 GEMM: the SM107 step folds 64 elements, the SM100 / SM103 one 32; ``arch`` as for ``mm_mxfp8``, the current
+    device by default)."""
+    from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp8 import spec_fingerprint_mxfp8
+
+    from ..gemm.batch_invariant.schedule import mx_class_for
+
+    rm, name, params, gated = _moe_dims(spec, method, act, params, gated)
+    fmt = mx_class_for("mxfp8", _mx_family(arch, "fused_moe_mxfp8"))
+    return spec_fingerprint_mxfp8(
+        H, I, top_k, num_experts, rm, name, params, gated, fmt
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
-    # the unified MoE layer with `BatchInvariantMoeConfig`: the routing method and the activation (gated SwiGLU / ungated
+    # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
     # ReLU^2) are dimensions of the class; the hidden and intermediate sizes fix the two GEMM classes
     "fused_moe": ClassInfo(
         "moe.bf16",
@@ -308,13 +336,23 @@ CLASSES: Dict[str, ClassInfo] = {
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint
     ),
-    # the unified MoE layer with `BatchInvariantMoeFp8BlockConfig`: the same dimensions as `fused_moe` for the DeepSeek-style
-    # block-scale classes `moe.e4m3bs.<act>` (the block scales are inputs of the class: their values never enter the identifier)
+    # the unified MoE layer with `BatchInvariantFp8BlockConfig` under `QuantConfig(DeepSeekFp8, DeepSeekFp8)`: the same
+    # dimensions as `fused_moe` for the DeepSeek-style block-scale classes `moe.e4m3bs.<act>` (the block scales are inputs of the class: their values never enter the identifier)
     "fused_moe_fp8bs": ClassInfo(
         "moe.e4m3bs",
         ("H", "I", "top_k", "num_experts"),
         _moe_fp8bs_fingerprint,
         ("method", "act", "params", "gated"),
+    ),
+    # the unified MoE layer with `BatchInvariantFp8BlockConfig` under `QuantConfig(MXFP8, MXFP8)` (the fp8-block backend
+    # groups the fp8 formats with block scales under one key, the pair selecting the classes: this entry and the
+    # block-scale one): the bf16 classes' dimensions
+    # plus the architecture (the instruction class of the dense MXFP8 GEMM, as for mm_mxfp8)
+    "fused_moe_mxfp8": ClassInfo(
+        "moe.mxfp8",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_mxfp8_fingerprint,
+        ("method", "act", "params", "gated", "arch"),
     ),
 }
 

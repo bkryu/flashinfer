@@ -1,9 +1,11 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The block-scale fp8 batch-invariant MoE backend of the unified MoE layer (``BatchInvariantMoeFp8BlockConfig`` ->
-``BatchInvariantMoeFp8BlockRunner``): the DeepSeek-style classes ``moe.e4m3bs.<act>`` on SM100 / SM103 / SM107.
+"""The DeepSeekFp8 x DeepSeekFp8 pair of the batch-invariant fp8-block MoE backend of the unified MoE layer
+(``BatchInvariantFp8BlockConfig`` under ``QuantConfig(DeepSeekFp8, DeepSeekFp8)`` -> ``BatchInvariantFp8BlockRunner`` ->
+``BatchInvariantDeepSeekFp8Runner``, the pair's runner): the DeepSeek-style block-scale classes ``moe.e4m3bs.<act>`` on
+SM100 / SM103 / SM107.
 
-The surface is TRTLLM-Gen's block-fp8 one under ``QuantConfig(DeepSeekFp8, DeepSeekFp8)``: e4m3 activations with their fp32
+The surface is TRTLLM-Gen's block-fp8 one under the DeepSeek pair: e4m3 activations with their fp32
 block scales (``hidden_states_scale [H / 128, T]``, as ``TrtllmFp8BlockConfig.prepare_activations`` hands them; the ``[T,
 H / 128]`` layout is taken too), the weights prepared from the bf16 experts per 128x128 block (or FlashInfer's DeepSeek weight
 view taken as given), every routing input mode (``FromLogits`` runs the class's own routing kernel), every typed activation of
@@ -19,14 +21,10 @@ from typing import Any, List, Tuple
 import torch
 
 from ...batch_invariant.support import check_device, unsupported
-from ..api import MoEActivationPack, MoEWeightPack, QuantFormat, RoutingInputMode
+from ..api import MoEActivationPack, MoEWeightPack, RoutingInputMode
 from ..runners import _validate_logits_inputs, _validate_prerouted_inputs
-from .runner import (
-    MOE_BF16_ARCHS,
-    BatchInvariantMoeRunner,
-    _configs_from_tactic,
-    _tactic,
-)
+from .runner import MOE_BF16_ARCHS, _configs_from_tactic, _tactic
+from .runner_fp8_block import PAIR_DEEPSEEK_FP8, BatchInvariantFp8BlockRunner
 from .spec_fp8bs import BLOCK as QBLOCK
 from .spec_fp8bs import CLASS
 
@@ -48,18 +46,17 @@ def _configs_from_tactic_bs(t: tuple):
     return c1, c2, bool(t[12])
 
 
-class BatchInvariantMoeFp8BlockRunner(BatchInvariantMoeRunner):
-    """The unified layer's runner for the batch-invariant block-scale fp8 MoE classes."""
+class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
+    """The fp8-block backend's runner for the DeepSeekFp8 x DeepSeekFp8 pair: the batch-invariant block-scale fp8 MoE
+    classes."""
 
-    backend_key = "batch_invariant_fp8_block"
-    supported_quant_variants = ((QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),)
+    supported_quant_variants = (PAIR_DEEPSEEK_FP8,)
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _check_support(self) -> None:
-        from ..runners import MoERunner
+        super()._check_support()
         from .spec import METHOD_OF_FLASHINFER
 
-        MoERunner._check_support(self)
         cfg = self.config
         check_device(self.device, CLASS, MOE_FP8BS_ARCHS)
         try:
@@ -284,9 +281,7 @@ class BatchInvariantMoeFp8BlockRunner(BatchInvariantMoeRunner):
         return out
 
     def _cache_key_extras(self) -> tuple:
-        from ..runners import MoERunner
-
-        return MoERunner._cache_key_extras(self) + ("moe.e4m3bs-v1",)
+        return super()._cache_key_extras() + ("moe.e4m3bs-v1",)
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(
@@ -323,4 +318,4 @@ class BatchInvariantMoeFp8BlockRunner(BatchInvariantMoeRunner):
         return out
 
 
-__all__ = ["MOE_FP8BS_ARCHS", "BatchInvariantMoeFp8BlockRunner"]
+__all__ = ["MOE_FP8BS_ARCHS", "BatchInvariantDeepSeekFp8Runner"]

@@ -28,3 +28,5 @@ lean_exe moeconformance where
 
 lean_exe fp8bsconformance where
   root := `Fp8BsMain
+lean_exe moemxfp8conformance where
+  root := `MoEMxfp8Main

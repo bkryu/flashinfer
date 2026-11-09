@@ -74,6 +74,12 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     # the block-scale fp8 MoE kernels (the DeepSeek-style class): the grouped block-scale GEMM (which composes the dense
     # block-scale body: in its closure), the standalone block quantizer and the block-scale gather; their own module
     "batch_invariant_moe_fp8bs": ("fused_moe/batch_invariant/blocks/fp8bs_compile.py",),
+    # the MXFP8 MoE kernels: the grouped block-scaled GEMM (which composes the block-scaled dense blocks and the grouped
+    # epilogue / scheduler) and the scatter kernel; the routing, permutation and combine kernels are the bf16 module's
+    "batch_invariant_moe_mxfp8": (
+        "fused_moe/batch_invariant/blocks/compile_mxfp8.py",
+        "fused_moe/batch_invariant/mx_permute.py",
+    ),
 }
 
 #: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer
@@ -112,6 +118,10 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
         "gemm/batch_invariant/heuristic.py",
     ),
     "batch_invariant_moe_fp8bs": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_moe_mxfp8": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),

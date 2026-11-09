@@ -3280,7 +3280,7 @@ class FrostLowLatencyConfig:
 
 
 @dataclass(frozen=True)
-class BatchInvariantMoeConfig:
+class BatchInvariantBf16Config:
     """The batch-invariant MoE backend: the bf16 classes of the mode documented in ``flashinfer/batch_invariant/README.md``
     (one class per typed activation and parameter set: ``SwiGLU`` with any ``alpha`` / ``beta`` / ``limit``,
     ``SwiGLUStep``, ``GeGLU``, ``GeGLUTanh``, ``SiTU``, ``PowLU``; ``ReLU2``, ``Identity``, ``GELU``, ``ReLU``, ``SiLU``),
@@ -3343,29 +3343,50 @@ class BatchInvariantMoeConfig:
         return hidden_states.to(torch.bfloat16).contiguous(), None
 
     def __repr__(self) -> str:
-        return "BatchInvariantMoeConfig()"
+        return "BatchInvariantBf16Config()"
 
 
 @dataclass(frozen=True)
-class BatchInvariantMoeFp8BlockConfig:
-    """The batch-invariant block-scale fp8 MoE backend: the DeepSeek-style classes ``moe.e4m3bs.<act>`` of the mode documented
-    in ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set, as the bf16 backend), on
-    SM100 / SM103 / SM107.
+class BatchInvariantFp8BlockConfig:
+    """The batch-invariant fp8-block MoE backend: the fp8 formats with block scales under one backend
+    (``backend_key = "batch_invariant_fp8_block"``), grouped as :class:`TrtllmFp8BlockConfig` groups them, on SM100 / SM103 /
+    SM107. The quantization pair of ``QuantConfig`` selects the class family, each pair keeping its own kernels, classes,
+    fingerprints and pack conventions: ``QuantConfig(weight=MXFP8, activation=MXFP8)`` runs the classes ``moe.mxfp8.<act>``,
+    ``QuantConfig(weight=DeepSeekFp8, activation=DeepSeekFp8)`` the DeepSeek-style block-scale classes ``moe.e4m3bs.<act>``
+    of the mode documented in ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set
+    each, as the bf16 backend). Another pair is not admitted by the layer (``supported_quant_variants``) and is refused by
+    :meth:`prepare_weights` / :meth:`prepare_activations` with
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` naming the pairs served. For both pairs every output
+    bit is a function of the token's own quantized row and scales, its ``top_k`` experts and routing weights and the
+    quantized expert weights and scales alone; ``MoEFinalizeConfig.do_finalize`` must stay ``True`` and
+    ``use_fused_finalize`` is ignored; all three routing input modes are taken; unsupported inputs raise
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls back and is not a default
+    candidate.
 
-    The surface is :class:`TrtllmFp8BlockConfig`'s under ``QuantConfig(weight=QuantFormat.DeepSeekFp8,
-    activation=QuantFormat.DeepSeekFp8)``: ``prepare_weights`` from the bf16 experts (e4m3 payloads with one fp32 scale per
-    128x128 block, quantized here by the class's own chain; FlashInfer's DeepSeek weight view is taken as given through
-    ``from_trtllm_view``), ``prepare_activations`` quantizing the bf16 activations per 1x128 block into the DeepSeek pair (an
-    e4m3 ``[num_tokens, H]`` and fp32 scales ``[H / 128, num_tokens]``), all three routing input modes. The class declares every
-    rounding: both quantizations are the ``fp8bs.quant`` chain (the block amax, ``s = fmax(amax / 448, 1e-12)``, the correctly
-    rounded reciprocal, one saturating RNE conversion per element), the two grouped GEMMs are placements of the dense
-    block-scale class ``gemm.e4m3.kblock128`` (the fp8 instruction's fold per 128-element K block promoted in block order with
-    the row's and the weight block's scales), GEMM1's activation runs on the promoted accumulators and rounds to bf16 once, the
-    intermediate is requantized by the same chain (in GEMM1's epilogue or by a standalone pass: one term, two placements),
-    GEMM2 converts to bf16 once, the combine is the slot-order fp32 fold. Every output bit is a function of the token's own
-    e4m3 row and block scales, its ``top_k`` experts and routing weights, the expert bytes and block scales; ``do_finalize=True``
-    only; unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; never a default
-    candidate (name it in ``BackendOptions``). ``H`` and ``I`` are multiples of 128 (whole scale blocks of every operand).
+    MXFP8 x MXFP8: the expert weights and the activations are MXFP8 (e4m3 values, one UE8M0 scale per 32 elements), both by
+    the batch-invariant quantizer class (``mxfp8_quantize(..., batch_invariant=True)``: the experts per expert at
+    preparation, the activations per token by :meth:`prepare_activations` or any producer of the canonical MXFP8 pack); the
+    two GEMMs are grouped placements of the dense batch-invariant MXFP8 GEMM class of the part (the block scales are
+    operands of the block-scaled step; the SM107 instruction folds 64 elements per step, the SM100 / SM103 one 32: the
+    architecture is a dimension of the class, as for ``mm_mxfp8``), the activation chain is the bf16 classes' on the
+    dequantised fp32 accumulators, the intermediate is quantized by the same quantizer class on the materialised bf16 row,
+    the combine is the slot-order fp32 fold. Weights: ``prepare_weights`` takes the canonical bf16 ``w1 [E, 2I, H]`` (rows
+    ``[up, gate]``) or ``w1 [E, I, H]`` for the ungated activations, and ``w2 [E, H, I]``, on a CUDA device;
+    ``hidden_size`` and ``intermediate_size`` are multiples of 32. Activations: the canonical MXFP8 pack, e4m3
+    ``[num_tokens, H]`` with token-major UE8M0 scales ``[num_tokens, H / 32]`` (the pack ``TrtllmFp8BlockConfig`` and
+    ``CutlassMxfp8Config`` prepare).
+
+    DeepSeekFp8 x DeepSeekFp8: :class:`TrtllmFp8BlockConfig`'s DeepSeek surface: ``prepare_weights`` from the bf16 experts
+    (e4m3 payloads with one fp32 scale per 128x128 block, quantized here by the class's own chain; FlashInfer's DeepSeek
+    weight view is taken as given through :meth:`from_trtllm_view`), ``prepare_activations`` quantizing the bf16
+    activations per 1x128 block into the DeepSeek pair (an e4m3 ``[num_tokens, H]`` and fp32 scales ``[H / 128,
+    num_tokens]``). The class declares every rounding: both quantizations are the ``fp8bs.quant`` chain (the block amax,
+    ``s = fmax(amax / 448, 1e-12)``, the correctly rounded reciprocal, one saturating RNE conversion per element), the two
+    grouped GEMMs are placements of the dense block-scale class ``gemm.e4m3.kblock128`` (the fp8 instruction's fold per
+    128-element K block promoted in block order with the row's and the weight block's scales), GEMM1's activation runs on
+    the promoted accumulators and rounds to bf16 once, the intermediate is requantized by the same chain (in GEMM1's
+    epilogue or by a standalone pass: one term, two placements), GEMM2 converts to bf16 once, the combine is the slot-order
+    fp32 fold. ``H`` and ``I`` are multiples of 128 (whole scale blocks of every operand).
     """
 
     @classmethod
@@ -3374,25 +3395,45 @@ class BatchInvariantMoeFp8BlockConfig:
 
     @staticmethod
     def prepare_weights(
-        w1_bf16: torch.Tensor,
-        w2_bf16: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
         *,
+        quant: "QuantConfig",
         num_local_experts: Optional[int] = None,
         hidden_size: Optional[int] = None,
         intermediate_size: Optional[int] = None,
         activation: Optional["ActivationConfig"] = None,
-        quant: Optional["QuantConfig"] = None,
         device: Optional[torch.device] = None,
     ) -> Dict[str, Any]:
-        """The backend's weight view: the experts quantized per 128x128 block by the class's chain, the gate / up rows interleaved
-        for a gated activation (the block scales stay the canonical rows'), the activation's chain (``activation`` defaults to
-        ``SwiGLU()``)."""
-        from .batch_invariant.api_fp8bs import MoEWeightsE4M3BS
+        """The weight view of the pair ``quant`` selects, from the canonical bf16 experts: the gate / up rows interleaved for
+        a gated activation and the activation's chain recorded (``activation`` defaults to ``SwiGLU()``). MXFP8 x MXFP8: the
+        experts quantized per expert by the batch-invariant MXFP8 quantizer, with the swizzled scale buffers. DeepSeekFp8 x
+        DeepSeekFp8: the experts quantized per 128x128 block by the class's chain (the block scales stay the canonical
+        rows')."""
+        from .batch_invariant.runner_fp8_block import (
+            PAIR_DEEPSEEK_FP8,
+            PAIR_MXFP8,
+            unsupported_pair,
+        )
         from .batch_invariant.spec import activation_of
 
+        if quant.pair not in (PAIR_MXFP8, PAIR_DEEPSEEK_FP8):
+            raise unsupported_pair(quant)
         chain = activation_of(activation if activation is not None else SwiGLU())
-        w1 = w1_bf16.to(device=device) if device is not None else w1_bf16
-        w2 = w2_bf16.to(device=device) if device is not None else w2_bf16
+        w1 = w1.to(device=device) if device is not None else w1
+        w2 = w2.to(device=device) if device is not None else w2
+        if quant.pair == PAIR_MXFP8:
+            from .batch_invariant.api_mxfp8 import MoEWeightsMXFP8
+
+            return MoEWeightsMXFP8.prepare(
+                w1.to(torch.bfloat16),
+                w2.to(torch.bfloat16),
+                gated=chain.gated,
+                act=chain.act,
+                params=chain.params,
+            ).view()
+        from .batch_invariant.api_fp8bs import MoEWeightsE4M3BS
+
         return MoEWeightsE4M3BS.prepare(
             w1.to(torch.bfloat16),
             w2.to(torch.bfloat16),
@@ -3403,15 +3444,29 @@ class BatchInvariantMoeFp8BlockConfig:
 
     @staticmethod
     def from_trtllm_view(
-        view: Dict[str, Any], *, activation: Optional["ActivationConfig"] = None
+        view: Dict[str, Any],
+        *,
+        quant: "QuantConfig",
+        activation: Optional["ActivationConfig"] = None,
     ) -> Dict[str, Any]:
-        """The backend's weight view from FlashInfer's DeepSeek block-fp8 weight view (``TrtllmFp8BlockConfig.prepare_weights``
-        under ``QuantConfig(DeepSeekFp8, DeepSeekFp8)``: ``gemm1_weights`` / ``gemm1_weights_scale`` / ``gemm2_weights`` /
-        ``gemm2_weights_scale`` of the canonical rows): the caller's block quantization taken as given, the gated weight's
-        quantized rows interleaved here."""
+        """The DeepSeekFp8 x DeepSeekFp8 weight view from FlashInfer's DeepSeek block-fp8 weight view
+        (``TrtllmFp8BlockConfig.prepare_weights`` under ``QuantConfig(DeepSeekFp8, DeepSeekFp8)``: ``gemm1_weights`` /
+        ``gemm1_weights_scale`` / ``gemm2_weights`` / ``gemm2_weights_scale`` of the canonical rows): the caller's block
+        quantization taken as given, the gated weight's quantized rows interleaved here. The MXFP8 pair has no such view
+        (TRTLLM-Gen's MXFP8 view is shuffled): it is prepared from the bf16 experts by :meth:`prepare_weights`."""
         from .batch_invariant.api_fp8bs import MoEWeightsE4M3BS
+        from .batch_invariant.runner_fp8_block import (
+            PAIR_DEEPSEEK_FP8,
+            unsupported_pair,
+        )
         from .batch_invariant.spec import activation_of
 
+        if quant.pair != PAIR_DEEPSEEK_FP8:
+            raise unsupported_pair(
+                quant,
+                served=(PAIR_DEEPSEEK_FP8,),
+                of="`from_trtllm_view` of the fp8-block MoE backend",
+            )
         chain = activation_of(activation if activation is not None else SwiGLU())
         return MoEWeightsE4M3BS.prepare(
             view["gemm1_weights"],
@@ -3429,23 +3484,39 @@ class BatchInvariantMoeFp8BlockConfig:
 
     @staticmethod
     def prepare_activations(
-        hidden_states_bf16: torch.Tensor, *, quant: Optional["QuantConfig"] = None
+        hidden_states: torch.Tensor, *, quant: "QuantConfig"
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """The class's activation quantization per 1x128 block (the ``fp8bs.quant`` kernel: graph-capturable, no host sync):
-        ``(hidden_states_q [num_tokens, H] e4m3, hidden_states_scale [H / 128, num_tokens] fp32)``, the DeepSeek pair."""
-        from .batch_invariant.api_fp8bs import fp8_block_quantize
-
-        return fp8_block_quantize(
-            hidden_states_bf16.to(torch.bfloat16).contiguous(), "MN"
+        """The activation pack of the pair ``quant`` selects, from bf16 ``[T, H]``. MXFP8 x MXFP8: the canonical MXFP8 pack
+        by the batch-invariant quantizer, e4m3 ``[T, H]`` and the token-major UE8M0 scales ``[T, H / 32]`` (uint8). DeepSeekFp8
+        x DeepSeekFp8: the class's quantization per 1x128 block (the ``fp8bs.quant`` kernel: graph-capturable, no host sync),
+        e4m3 ``[T, H]`` and fp32 scales ``[H / 128, T]`` (the DeepSeek pair)."""
+        from .batch_invariant.runner_fp8_block import (
+            PAIR_DEEPSEEK_FP8,
+            PAIR_MXFP8,
+            unsupported_pair,
         )
 
+        if quant.pair == PAIR_MXFP8:
+            from .batch_invariant.api_mxfp8 import quantize_activations_mxfp8
+
+            return quantize_activations_mxfp8(
+                hidden_states.to(torch.bfloat16).contiguous()
+            )
+        if quant.pair == PAIR_DEEPSEEK_FP8:
+            from .batch_invariant.api_fp8bs import fp8_block_quantize
+
+            return fp8_block_quantize(
+                hidden_states.to(torch.bfloat16).contiguous(), "MN"
+            )
+        raise unsupported_pair(quant)
+
     def __repr__(self) -> str:
-        return "BatchInvariantMoeFp8BlockConfig()"
+        return "BatchInvariantFp8BlockConfig()"
 
 
 # Union type for backend config
 BackendConfigType = Union[
-    BatchInvariantMoeConfig,
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3488,11 +3559,11 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
-    BatchInvariantMoeFp8BlockConfig,
+    BatchInvariantFp8BlockConfig,
 ]
 
 ALL_BACKEND_CONFIGS = (
-    BatchInvariantMoeConfig,
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3535,7 +3606,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
-    BatchInvariantMoeFp8BlockConfig,
+    BatchInvariantFp8BlockConfig,
 )
 
 
