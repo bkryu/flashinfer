@@ -80,6 +80,71 @@ def _bmm_fp8_fingerprint(
     return spec_fingerprint(K, _out_fmt(out_dtype), chunks_for(N, K, fmt), fmt)
 
 
+def _moe_nvfp4_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    arch=None,
+) -> str:
+    """The NVFP4 (W4A4) MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the NVFP4 x NVFP4 pair): ``method``
+    and ``act`` as for ``fused_moe``; ``arch`` (an architecture family, a compute capability or a device; the current CUDA
+    device by default) selects the instruction class of each expert weight shape (the sm_107 K = 128 step on SM107 for the
+    unsplit shapes, the K = 64 step elsewhere): the architecture is a dimension of the class."""
+    from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import (
+        expert_classes,
+        spec_fingerprint_nvfp4,
+    )
+    from flashinfer.tllm_enums import RoutingMethodType
+
+    if isinstance(method, str) and method in RoutingMethodType.__members__:
+        method = RoutingMethodType[method]
+    if isinstance(method, RoutingMethodType):
+        if method not in spec.METHOD_OF_FLASHINFER:
+            raise ValueError(
+                f"the batch-invariant MoE classes do not implement routing method {method!r}"
+            )
+        rm = spec.METHOD_OF_FLASHINFER[method]
+    elif isinstance(method, str):
+        rm = spec.METHODS[method]
+    elif isinstance(method, spec.RoutingMethod):
+        rm = method
+    else:
+        raise TypeError(
+            f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
+        )
+    if not isinstance(act, str):
+        a = spec.activation_of(act)
+        name, params, gated = a.act, a.params, a.gated
+    elif act == "swiglu":
+        name, gated = "silu", True
+    elif act == "relu2":
+        name, gated = "relu2", False
+    elif act in spec.ACTS or act in spec.UNGATED_ACTS:
+        name = act
+        if gated is None:
+            gated = act in spec.ACTS
+    else:
+        raise ValueError(f"no MoE chain named {act!r}")
+    family = _mx_family(arch, "fused_moe_nvfp4")
+    return spec_fingerprint_nvfp4(
+        H,
+        I,
+        top_k,
+        num_experts,
+        rm,
+        name,
+        params,
+        gated,
+        expert_classes(H, I, family, bool(gated)),
+    )
+
+
 def _attention_fingerprint(head_dim: int) -> str:
     from ..attention.batch_invariant.spec import spec_fingerprint
 
@@ -150,7 +215,7 @@ def _moe_bf16_fingerprint(
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
 ) -> str:
-    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantMoeConfig``: ``method`` is a
+    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: ``method`` is a
     :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements; ``act`` an
     ``ActivationConfig`` of the layer (its scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default
     gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the
@@ -321,7 +386,7 @@ def _moe_mxfp4w8a_fingerprint(
 
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
-    # the unified MoE layer with `BatchInvariantMoeConfig`: the routing method and the activation (gated SwiGLU / ungated
+    # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
     # ReLU^2) are dimensions of the class; the hidden and intermediate sizes fix the two GEMM classes
     "fused_moe": ClassInfo(
         "moe.bf16",
@@ -364,6 +429,15 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.mxfp4w8a",
         ("H", "I", "top_k", "num_experts"),
         _moe_mxfp4w8a_fingerprint,
+        ("method", "act", "params", "gated", "arch"),
+    ),
+    # the unified MoE layer with `BatchInvariantFp4Config` (the NVFP4 x NVFP4 pair: NVFP4 experts, per-token NVFP4
+    # activations): the dimensions of the bf16 MoE classes plus the architecture (the instruction class of each expert
+    # weight shape)
+    "fused_moe_nvfp4": ClassInfo(
+        "moe.nvfp4",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_nvfp4_fingerprint,
         ("method", "act", "params", "gated", "arch"),
     ),
     # the mixed MX classes (e2m1 weights x e4m3 activations, UE8M0 scales per 32 on both): the mode's own entry

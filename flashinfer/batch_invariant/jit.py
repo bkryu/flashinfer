@@ -85,6 +85,16 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "fused_moe/batch_invariant/blocks/compile_mxfp4w8a.py",
         "fused_moe/batch_invariant/mx_permute.py",
     ),
+    # the NVFP4 MoE kernels: the grouped block-scaled GEMM (composing the block-scaled dense blocks) and the fp4 scatter
+    # kernels; the routing, plan and combine kernels stay in the bf16 module
+    "batch_invariant_moe_nvfp4": (
+        "fused_moe/batch_invariant/blocks/compile_nvfp4.py",
+        "fused_moe/batch_invariant/permute_nvfp4.py",
+    ),
+    # the NVFP4 MoE classes' row-mapped per-token quantization (the quantizer class's kernel with a destination row map)
+    "batch_invariant_moe_nvfp4_quant": (
+        "fused_moe/batch_invariant/blocks/quant_nvfp4.py",
+    ),
 }
 
 #: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer
@@ -127,6 +137,10 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
         "gemm/batch_invariant/heuristic.py",
     ),
     "batch_invariant_moe_mxfp4w8a": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_moe_nvfp4": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),
