@@ -1510,7 +1510,12 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # weights on the CPU cannot be quantized by the class
     with pytest.raises(TypeError):
         BatchInvariantFp4Config.prepare_weights(
-            w1.cpu(), w2.cpu(), num_local_experts=E, hidden_size=H, intermediate_size=I
+            w1.cpu(),
+            w2.cpu(),
+            quant=_QUANT,
+            num_local_experts=E,
+            hidden_size=H,
+            intermediate_size=I,
         )
     # zero tokens
     out = layer(_logits_pack((xq[:0], xsf[:0]), logits[:0]), W)
