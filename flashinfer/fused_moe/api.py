@@ -3280,7 +3280,7 @@ class FrostLowLatencyConfig:
 
 
 @dataclass(frozen=True)
-class BatchInvariantMoeConfig:
+class BatchInvariantBf16Config:
     """The batch-invariant MoE backend: the bf16 classes of the mode documented in ``flashinfer/batch_invariant/README.md``
     (one class per typed activation and parameter set: ``SwiGLU`` with any ``alpha`` / ``beta`` / ``limit``,
     ``SwiGLUStep``, ``GeGLU``, ``GeGLUTanh``, ``SiTU``, ``PowLU``; ``ReLU2``, ``Identity``, ``GELU``, ``ReLU``, ``SiLU``),
@@ -3343,7 +3343,7 @@ class BatchInvariantMoeConfig:
         return hidden_states.to(torch.bfloat16).contiguous(), None
 
     def __repr__(self) -> str:
-        return "BatchInvariantMoeConfig()"
+        return "BatchInvariantBf16Config()"
 
 
 def _fp4_pair(quant: Optional["QuantConfig"]) -> Tuple[QuantFormat, QuantFormat]:
@@ -3370,7 +3370,7 @@ class BatchInvariantFp4Config:
     The kernel classes keep their registry names (``fingerprint("fused_moe_nvfp4", ...)``).
 
     The guarantee, the routing input modes, the finalize contract and the error contract are the bf16 backend's
-    (:class:`BatchInvariantMoeConfig`): a token's output bits depend on its own row, its ``top_k`` experts and routing weights
+    (:class:`BatchInvariantBf16Config`): a token's output bits depend on its own row, its ``top_k`` experts and routing weights
     and the expert weights only; the backend never falls back and is not a default candidate. The dataflow of the NVFP4 pair
     (the proofs are the ``MoENvfp4`` Lean module of the mode): the input row quantized per token by the mode's NVFP4
     quantizer (TransformerEngine's recipe), GEMM1 as the dense NVFP4 GEMM class per expert with the chain
@@ -3445,7 +3445,7 @@ class BatchInvariantFp4Config:
 
 # Union type for backend config
 BackendConfigType = Union[
-    BatchInvariantMoeConfig,
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3492,7 +3492,7 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
-    BatchInvariantMoeConfig,
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
