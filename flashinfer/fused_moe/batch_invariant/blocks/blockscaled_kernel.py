@@ -69,6 +69,7 @@ PLANS = {**_MX_PLANS, **_MIXED_PLANS}
 GROUP_ALIGN = SF_ATOM_ROWS
 #: Epilogue warpgroups of the block-scaled grouped kernel (the chains are the epilogue leg once the stores are vectors).
 from .epilogue_mx import (  # noqa: E402
+    BAR_EPI_JOIN,
     grouped_epilogue_quant_loop,
     xch_bytes,
     xch_layout,
@@ -447,6 +448,9 @@ class GroupedBlockScaledGemmMX:
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(EPILOGUE_WARPS) + 1)
         )
+        epi_join = pipeline.NamedBarrier(
+            barrier_id=BAR_EPI_JOIN, num_threads=32 * len(EPILOGUE_WARPS)
+        )
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -733,6 +737,9 @@ class GroupedBlockScaledGemmMX:
                     cta_v=mma_tile_coord_v,
                 )
             tmem.relinquish_alloc_permit()
+            # the allocator warp alone frees the columns: every epilogue warpgroup joins here after its last TMEM load (the
+            # staged store's barriers join one group only)
+            epi_join.arrive_and_wait()
             tmem.free(tmem_ptr)
 
 
