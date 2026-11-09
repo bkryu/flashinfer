@@ -8,7 +8,7 @@ and takes ``hidden_size`` / ``intermediate_size`` in multiples of 128). The quan
 with ``QuantConfig(MXFP4, MXFP8)``. The class has exact CPU models of everything but the block-scaled step (the routing, the
 chain on the fp32 accumulators, both quantizers, the slot-order combine), so the tests are bit comparisons: the layer's output
 against the class's own composition (the routing on the CPU, the padded permutation, the dense batch-invariant
-``mm_mxfp4w8a_mxfp8a`` per expert, the CPU chain, the MXFP8 quantizer's CPU reference on the intermediate, the dense mixed GEMM
+``mm_mxfp8_mxfp4`` per expert, the CPU chain, the MXFP8 quantizer's CPU reference on the intermediate, the dense mixed GEMM
 again, the CPU combine) for every activation, run-to-run determinism including CUDA-graph replay, batch / permutation /
 sub-batch / hot-expert invariance, agreement of every tactic the autotuner may pick, the three routing input modes giving the
 same bits, the error contract (an unsupported configuration raises before any kernel runs), zero tokens, the largest expert
@@ -611,7 +611,7 @@ def _deq_mxfp4(packed: torch.Tensor, sf_rows: torch.Tensor) -> torch.Tensor:
 def _reference_ffn(xq, xsf, ids, weights, w1, w2, act):
     """The class composed from its own pieces on the quantized activation pack: the padded permutation of the class, the
     scatter by indexing (the padding rows unspecified), GEMM1 as the dense batch-invariant mixed GEMM
-    (``mm_mxfp4w8a_mxfp8a_batch_invariant``; the fp32 output the oracle needs, the instruction class pinned: the same fold) per
+    (``mm_mxfp8_mxfp4_batch_invariant``; the fp32 output the oracle needs, the instruction class pinned: the same fold) per
     expert, the CPU chain ``act`` on those accumulators, the MXFP8 quantizer's CPU reference on the bf16 intermediate, GEMM2 as
     the dense mixed GEMM (bf16 out) per expert, the CPU slot-order combine. Bit for bit what the fused op must produce."""
     from flashinfer.fused_moe.batch_invariant import reference as R
@@ -621,7 +621,7 @@ def _reference_ffn(xq, xsf, ids, weights, w1, w2, act):
         mx_class_of,
         permute_plan_padded,
     )
-    from flashinfer.gemm.batch_invariant.api import mm_mxfp4w8a_mxfp8a_batch_invariant
+    from flashinfer.gemm.batch_invariant.api import mm_mxfp8_mxfp4_batch_invariant
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GROUP
     from flashinfer.gemm.batch_invariant.generator import Knobs
     from flashinfer.gemm.batch_invariant.schedule import chunks_for
@@ -673,7 +673,7 @@ def _reference_ffn(xq, xsf, ids, weights, w1, w2, act):
         if not c:
             continue
         lo, hi = off[e], off[e] + c
-        acc = mm_mxfp4w8a_mxfp8a_batch_invariant(
+        acc = mm_mxfp8_mxfp4_batch_invariant(
             x_perm[lo:hi].view(torch.float8_e4m3fn),
             W.w1[e].t(),
             _swizzle(sf_perm[lo:hi], H),
@@ -696,7 +696,7 @@ def _reference_ffn(xq, xsf, ids, weights, w1, w2, act):
         pk, sfr = _quant_ref(
             a[lo:hi]
         )  # the quantizer class on the materialised bf16 rows (the declared second pass)
-        y[lo:hi] = mm_mxfp4w8a_mxfp8a_batch_invariant(
+        y[lo:hi] = mm_mxfp8_mxfp4_batch_invariant(
             pk.view(torch.float8_e4m3fn).cuda(),
             W.w2[e].t(),
             _swizzle(sfr.cuda(), I),
@@ -880,7 +880,7 @@ def test_activation_pack_is_the_quantizer_class_and_other_producers_packs_are_ta
 @needs_device
 def test_instruction_class_is_the_parts_and_the_grouped_kernel_is_the_dense_class():
     """The runner's instruction class is the part's (`mx_class_for`); the grouped kernel equals the dense batch-invariant
-    ``mm_mxfp4w8a_mxfp8a`` per expert on the raw fp32 accumulators for several records (unaligned group starts, empty groups);
+    ``mm_mxfp8_mxfp4`` per expert on the raw fp32 accumulators for several records (unaligned group starts, empty groups);
     where the part has both instructions (SM107) the two classes are distinct on the accumulators and both reachable by name."""
     from flashinfer.fused_moe.batch_invariant.api_mxfp4w8a import (
         MoEWeightsMXFP4W8A,
@@ -951,7 +951,7 @@ def test_instruction_class_is_the_parts_and_the_grouped_kernel_is_the_dense_clas
             if c:
                 lo, hi = off[e], off[e] + c
                 ref[lo:hi] = (
-                    flashinfer.gemm.batch_invariant.api.mm_mxfp4w8a_mxfp8a_batch_invariant(
+                    flashinfer.gemm.batch_invariant.api.mm_mxfp8_mxfp4_batch_invariant(
                         a8[lo:hi].view(torch.float8_e4m3fn),
                         W.w1[e].t(),
                         _swizzle(sfr[lo:hi], K),
@@ -1024,18 +1024,14 @@ def test_dense_oracle_at_decode_rows_takes_the_dispatchers_record():
             a = xq[:M].view(torch.float8_e4m3fn)
             sf = _swizzle(xsf[:M].contiguous(), K)
             args = (a, W.w1[0].t(), sf, W.w1_sf[0])
-            got = (
-                flashinfer.gemm.batch_invariant.api.mm_mxfp4w8a_mxfp8a_batch_invariant(
-                    *args, out_dtype=torch.float32, in_fmt=fmt
-                )
+            got = flashinfer.gemm.batch_invariant.api.mm_mxfp8_mxfp4_batch_invariant(
+                *args, out_dtype=torch.float32, in_fmt=fmt
             )
-            ref = (
-                flashinfer.gemm.batch_invariant.api.mm_mxfp4w8a_mxfp8a_batch_invariant(
-                    *args,
-                    out_dtype=torch.float32,
-                    in_fmt=fmt,
-                    config=Knobs(*_DENSE_RECORD),
-                )
+            ref = flashinfer.gemm.batch_invariant.api.mm_mxfp8_mxfp4_batch_invariant(
+                *args,
+                out_dtype=torch.float32,
+                in_fmt=fmt,
+                config=Knobs(*_DENSE_RECORD),
             )
             assert torch.equal(got, ref), (fmt, M, pick.describe())
     assert any(p.swap_ab for p in picks), [p.describe() for p in picks]

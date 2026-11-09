@@ -3397,7 +3397,7 @@ class BatchInvariantFp4Config:
     dense batch-invariant mixed GEMM class of the part (both operands' block scales are operands of the mixed-format
     block-scaled step; the SM107 instruction folds 64 elements per step, the SM100 / SM103 one 32 and reads the e2m1
     weight through the TMA's unpacking format: the architecture is a dimension of the class, as for
-    ``mm_mxfp4w8a_mxfp8a``), the activation chain is the bf16 classes' on the dequantised fp32 accumulators, the
+    ``mm_mxfp8_mxfp4``), the activation chain is the bf16 classes' on the dequantised fp32 accumulators, the
     intermediate is quantized by the MXFP8 quantizer class inside GEMM1's epilogue, the combine is the slot-order fp32
     fold. Weights (MXFP4 x MXFP8): ``prepare_weights`` takes the same canonical bf16 ``w1`` / ``w2`` on a CUDA device;
     ``hidden_size`` and ``intermediate_size`` are multiples of 32 on SM107 and of 128 on SM100 / SM103 (the unpacking

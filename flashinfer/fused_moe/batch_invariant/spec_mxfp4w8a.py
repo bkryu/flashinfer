@@ -18,7 +18,7 @@ the other) and the experts' quantizer. The fingerprint names both.
 
 The instruction class is a dimension of the specification: the SM107 step folds 64 elements where the SM100 / SM103 step
 folds 32 (`gemm.mxfp4w8a.kfold64` vs `gemm.mxfp4w8a.kfold`), so the fingerprint carries the class of each GEMM by name, as
-``fingerprint("mm_mxfp4w8a_mxfp8a", ...)`` does for the dense class.
+``fingerprint("mm_mxfp8_mxfp4", ...)`` does for the dense class.
 """
 
 from __future__ import annotations
