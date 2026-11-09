@@ -34,8 +34,8 @@ _FI_DIR = Path(__file__).resolve().parents[1]  # the flashinfer package
 MODE_DIRS: Tuple[Path, ...] = (
     _FI_DIR / "batch_invariant",
     _FI_DIR / "gemm" / "batch_invariant",
-    _FI_DIR / "fused_moe" / "batch_invariant",
     _FI_DIR / "attention" / "batch_invariant",
+    _FI_DIR / "fused_moe" / "batch_invariant",
 )
 
 #: Root files of every cache module, relative to the flashinfer package; the module's closure is the transitive
@@ -52,6 +52,12 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm_blockscaled": (
         "gemm/batch_invariant/blocks/compile_blockscaled.py",
     ),
+    # the attention kernels (the row body, the Swaps-AB decode body) and the split-KV fixup share one module
+    "batch_invariant_attention": (
+        "attention/batch_invariant/blocks/compile.py",
+        "attention/batch_invariant/swaps/compile.py",
+        "attention/batch_invariant/fixup.py",
+    ),
     # the bf16 MoE kernels: the grouped GEMM (which composes the dense GEMM blocks: they are in its closure), the
     # routing, permutation and combine kernels; the MoE API, dispatcher and runner stay outside
     "batch_invariant_moe": (
@@ -64,12 +70,6 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     # the block-scale fp8 kernels (the DeepSeek-style class behind gemm_fp8_nt_groupwise): their own module
     "batch_invariant_gemm_fp8_blockscale": (
         "gemm/batch_invariant/blocks/compile_fp8bs.py",
-    ),
-    # the attention kernels (the row body, the Swaps-AB decode body) and the split-KV fixup share one module
-    "batch_invariant_attention": (
-        "attention/batch_invariant/blocks/compile.py",
-        "attention/batch_invariant/swaps/compile.py",
-        "attention/batch_invariant/fixup.py",
     ),
     # the block-scale fp8 MoE kernels (the DeepSeek-style class): the grouped block-scale GEMM (which composes the dense
     # block-scale body: in its closure), the standalone block quantizer and the block-scale gather; their own module
