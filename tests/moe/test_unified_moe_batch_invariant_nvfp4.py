@@ -367,7 +367,8 @@ def test_layer_constructs_for_the_real_model_geometries(H, I, E, k):
     hidden size."""
     act = ReLU2() if (H, I) == (2048, 1024) else _SWIGLU
     layer = _layer(k, E, I, act=act)
-    assert isinstance(layer.runners[0], BatchInvariantMoeNvfp4Runner)
+    assert isinstance(layer.runners[0], BatchInvariantFp4Runner)
+    assert isinstance(layer.runners[0].impl, BatchInvariantMoeNvfp4Runner)
     if 3 * E * I * H * 2 > 2**33:
         return  # the construction is the point; the largest experts exceed a per-test allocation
     x, logits, w1, w2 = _problem(3, k, H, I, E, seed=H + I, gated=act is _SWIGLU)
@@ -648,10 +649,12 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
 def test_unsupported_device_raises_before_any_kernel():
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
-    runner = BatchInvariantMoeNvfp4Runner(_config(8, 64, 256), torch.device("cpu"))
-    with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
-        runner._check_support()
-    assert "moe.nvfp4" in str(excinfo.value) and "cpu" in str(excinfo.value)
+    # the pair implementation and the fp4 backend's runner over it refuse alike (the backend forwards the pair's check)
+    for cls in (BatchInvariantMoeNvfp4Runner, BatchInvariantFp4Runner):
+        runner = cls(_config(8, 64, 256), torch.device("cpu"))
+        with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+            runner._check_support()
+        assert "moe.nvfp4" in str(excinfo.value) and "cpu" in str(excinfo.value)
 
 
 # ----------------------------------------------------------------------------- GPU
@@ -1278,7 +1281,7 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
     layer = _layer(k, E, I)
     W = _weights(w1, w2)
     runner = layer.runners[0]
-    assert isinstance(runner, BatchInvariantMoeNvfp4Runner)
+    assert isinstance(runner, BatchInvariantFp4Runner)
     pack = _logits_pack(x, logits)
     ref = bits(layer(pack, W))
     inputs = runner.pack_inputs(pack, W)
