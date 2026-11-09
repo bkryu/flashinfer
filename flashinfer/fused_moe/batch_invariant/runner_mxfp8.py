@@ -1,7 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant MXFP8 MoE backend of the unified MoE layer (``BatchInvariantMoeMxfp8Config`` ->
-``BatchInvariantMoeMxfp8Runner``).
+"""The MXFP8 x MXFP8 pair of the batch-invariant fp8-block MoE backend of the unified MoE layer
+(``BatchInvariantFp8BlockConfig`` under ``QuantConfig(MXFP8, MXFP8)`` -> ``BatchInvariantFp8BlockRunner`` ->
+``BatchInvariantMxfp8Runner``, the pair's runner).
 
 The runner serves the classes ``moe.mxfp8.<act>`` (MXFP8 experts and activations, every typed activation of the layer)
 on SM100 / SM103 / SM107, through the dense MXFP8 class of the part (the SM107 instruction folds 64 elements per step, the
@@ -20,27 +21,11 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from ...autotuner import TuningConfig
 from ...batch_invariant.support import check_device, unsupported
-from ..api import (
-    GELU,
-    GeGLU,
-    GeGLUTanh,
-    Identity,
-    MoEActivationPack,
-    MoEWeightPack,
-    PowLU,
-    QuantFormat,
-    ReLU,
-    ReLU2,
-    RoutingInputMode,
-    SiLU,
-    SiTU,
-    SwiGLU,
-    SwiGLUStep,
-)
-from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
+from ..api import MoEActivationPack, MoEWeightPack, RoutingInputMode
+from ..runners import _validate_logits_inputs, _validate_prerouted_inputs
 from .runner import _configs_from_tactic, _tactic
+from .runner_fp8_block import PAIR_MXFP8, BatchInvariantFp8BlockRunner
 from .spec_mxfp8 import BLOCK, CLASS
 
 #: The compute capabilities the classes are stated for (the dense MXFP8 GEMM class's parts).
@@ -50,50 +35,16 @@ MOE_MXFP8_ARCHS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3), (10, 7))
 _XQ, _XSF, _IDS, _W, _W1, _W1SF, _W2, _W2SF, _OUT = range(9)
 
 
-class BatchInvariantMoeMxfp8Runner(MoERunner):
-    """The unified layer's runner for the batch-invariant MXFP8 MoE classes."""
+class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
+    """The fp8-block backend's runner for the MXFP8 x MXFP8 pair: the batch-invariant MXFP8 MoE classes."""
 
-    backend_key = "batch_invariant_mxfp8"
-    supported_routing_modes = (
-        RoutingInputMode.FromLogits,
-        RoutingInputMode.PackedPrecomputed,
-        RoutingInputMode.UnpackedPrecomputed,
-    )
-    supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
-    supported_output_formats = (QuantFormat.BF16,)
-    # every typed activation of the layer: the bf16 classes' chains on the dequantised accumulators (``spec.activation_of``)
-    supported_activation_classes = (
-        SwiGLU,
-        SwiGLUStep,
-        GeGLU,
-        GeGLUTanh,
-        SiTU,
-        PowLU,
-        ReLU2,
-        Identity,
-        GELU,
-        ReLU,
-        SiLU,
-    )
-    supports_expert_parallelism = False
+    supported_quant_variants = (PAIR_MXFP8,)
 
     def __init__(self, config, device) -> None:
-        super().__init__()
-        self.config = config
-        self.device = torch.device(device)
-        if self.device.index is None and self.device.type == "cuda":
-            self.device = torch.device("cuda", torch.cuda.current_device())
-        # exact shapes: the dispatcher's pick is a function of the token count (every tactic computes the same bits)
-        self.tuning_config = TuningConfig(use_cuda_graph=True)
-        self._part: Optional[Tuple[int, str]] = None
+        super().__init__(config, device)
         self._in_fmt: Optional[str] = None
 
     # ---- support ---------------------------------------------------------------------------------------------------
-    def _activation(self):
-        from .spec import activation_of
-
-        return activation_of(self.config.activation)
-
     def _check_support(self) -> None:
         super()._check_support()
         from .spec import METHOD_OF_FLASHINFER
@@ -108,12 +59,6 @@ class BatchInvariantMoeMxfp8Runner(MoERunner):
                 f"activation {cfg.activation!r}",
                 "one of the layer's typed activations",
             ) from e
-        if cfg.quant.pair != (QuantFormat.MXFP8, QuantFormat.MXFP8):
-            raise unsupported(
-                CLASS,
-                f"quant {cfg.quant!r}",
-                "QuantConfig(weight=MXFP8, activation=MXFP8)",
-            )
         experts = cfg.experts
         if experts.num_fused_shared_experts:
             raise unsupported(
@@ -147,10 +92,9 @@ class BatchInvariantMoeMxfp8Runner(MoERunner):
             )
 
     def _build(self) -> None:
-        from ...gemm.batch_invariant.api import part_of
+        super()._build()
         from .api_mxfp8 import mx_class_of
 
-        self._part = part_of(self.device)
         self._in_fmt = mx_class_of(self.device)
 
     # ---- inputs ----------------------------------------------------------------------------------------------------

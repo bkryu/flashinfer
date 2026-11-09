@@ -3347,21 +3347,27 @@ class BatchInvariantMoeConfig:
 
 
 @dataclass(frozen=True)
-class BatchInvariantMoeMxfp8Config:
-    """The batch-invariant MXFP8 x MXFP8 MoE backend: the classes ``moe.mxfp8.<act>`` of the mode documented in
-    ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set, as the bf16 backend), on
-    SM100 / SM103 / SM107.
+class BatchInvariantFp8BlockConfig:
+    """The batch-invariant fp8-block MoE backend: the fp8 formats with block scales under one backend
+    (``backend_key = "batch_invariant_fp8_block"``), grouped as :class:`TrtllmFp8BlockConfig` groups them, on SM100 / SM103 /
+    SM107. The quantization pair of ``QuantConfig`` selects the class family, each pair keeping its own kernels, classes,
+    fingerprints and pack conventions: ``QuantConfig(weight=MXFP8, activation=MXFP8)`` runs the classes ``moe.mxfp8.<act>``
+    of the mode documented in ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set,
+    as the bf16 backend); the DeepSeekFp8 x DeepSeekFp8 pair (the block-scale classes) arrives with the block-scale MoE PR.
+    Another pair is not admitted by the layer (``supported_quant_variants``) and is refused by :meth:`prepare_weights` /
+    :meth:`prepare_activations` with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` naming the pairs
+    served.
 
-    The expert weights and the activations are MXFP8 (e4m3 values, one UE8M0 scale per 32 elements), both by the
-    batch-invariant quantizer class (``mxfp8_quantize(..., batch_invariant=True)``: the experts per expert at preparation,
-    the activations per token by :meth:`prepare_activations` or any producer of the canonical MXFP8 pack); the two GEMMs
-    are grouped placements of the dense batch-invariant MXFP8 GEMM class of the part (the block scales are operands of
-    the block-scaled step; the SM107 instruction folds 64 elements per step, the SM100 / SM103 one 32: the architecture
-    is a dimension of the class, as for ``mm_mxfp8``), the activation chain is the bf16 classes' on the dequantised fp32
-    accumulators, the intermediate is quantized by the same quantizer class on the materialised bf16 row, the combine is
-    the slot-order fp32 fold. Every output bit is a function of the token's own quantized row, its ``top_k`` experts and
-    routing weights and the quantized expert weights alone. ``MoEFinalizeConfig.do_finalize`` must stay ``True`` and
-    ``use_fused_finalize`` is ignored; all three routing input modes are taken; unsupported inputs raise
+    MXFP8 x MXFP8: the expert weights and the activations are MXFP8 (e4m3 values, one UE8M0 scale per 32 elements), both by
+    the batch-invariant quantizer class (``mxfp8_quantize(..., batch_invariant=True)``: the experts per expert at
+    preparation, the activations per token by :meth:`prepare_activations` or any producer of the canonical MXFP8 pack); the
+    two GEMMs are grouped placements of the dense batch-invariant MXFP8 GEMM class of the part (the block scales are
+    operands of the block-scaled step; the SM107 instruction folds 64 elements per step, the SM100 / SM103 one 32: the
+    architecture is a dimension of the class, as for ``mm_mxfp8``), the activation chain is the bf16 classes' on the
+    dequantised fp32 accumulators, the intermediate is quantized by the same quantizer class on the materialised bf16 row,
+    the combine is the slot-order fp32 fold. Every output bit is a function of the token's own quantized row, its
+    ``top_k`` experts and routing weights and the quantized expert weights alone. ``MoEFinalizeConfig.do_finalize`` must
+    stay ``True`` and ``use_fused_finalize`` is ignored; all three routing input modes are taken; unsupported inputs raise
     :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls back and is not a default
     candidate.
 
@@ -3380,42 +3386,52 @@ class BatchInvariantMoeMxfp8Config:
         w1: torch.Tensor,
         w2: torch.Tensor,
         *,
-        quant: Optional["QuantConfig"] = None,
+        quant: "QuantConfig",
         num_local_experts: Optional[int] = None,
         hidden_size: Optional[int] = None,
         intermediate_size: Optional[int] = None,
         activation: Optional["ActivationConfig"] = None,
         device: Optional[torch.device] = None,
     ) -> Dict[str, Any]:
-        """The backend's weight view: the experts quantized per expert by the batch-invariant MXFP8 quantizer (the gate /
-        up rows interleaved first for a gated activation), the swizzled scale buffers, and the activation's chain
-        (``activation`` defaults to ``SwiGLU()``)."""
-        from .batch_invariant.api_mxfp8 import MoEWeightsMXFP8
-        from .batch_invariant.spec import activation_of
+        """The weight view of the pair ``quant`` selects. MXFP8 x MXFP8: the experts quantized per expert by the
+        batch-invariant MXFP8 quantizer (the gate / up rows interleaved first for a gated activation), the swizzled scale
+        buffers, and the activation's chain (``activation`` defaults to ``SwiGLU()``)."""
+        from .batch_invariant.runner_fp8_block import PAIR_MXFP8, unsupported_pair
 
-        chain = activation_of(activation if activation is not None else SwiGLU())
-        w1 = w1.to(device=device) if device is not None else w1
-        w2 = w2.to(device=device) if device is not None else w2
-        return MoEWeightsMXFP8.prepare(
-            w1.to(torch.bfloat16),
-            w2.to(torch.bfloat16),
-            gated=chain.gated,
-            act=chain.act,
-            params=chain.params,
-        ).view()
+        if quant.pair == PAIR_MXFP8:
+            from .batch_invariant.api_mxfp8 import MoEWeightsMXFP8
+            from .batch_invariant.spec import activation_of
+
+            chain = activation_of(activation if activation is not None else SwiGLU())
+            w1 = w1.to(device=device) if device is not None else w1
+            w2 = w2.to(device=device) if device is not None else w2
+            return MoEWeightsMXFP8.prepare(
+                w1.to(torch.bfloat16),
+                w2.to(torch.bfloat16),
+                gated=chain.gated,
+                act=chain.act,
+                params=chain.params,
+            ).view()
+        raise unsupported_pair(quant)
 
     @staticmethod
     def prepare_activations(
-        hidden_states: torch.Tensor, *, quant: Optional["QuantConfig"] = None
+        hidden_states: torch.Tensor, *, quant: "QuantConfig"
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """The canonical MXFP8 activation pack by the batch-invariant quantizer: e4m3 ``[T, H]`` and the token-major UE8M0
-        scales ``[T, H / 32]`` (uint8)."""
-        from .batch_invariant.api_mxfp8 import quantize_activations_mxfp8
+        """The activation pack of the pair ``quant`` selects. MXFP8 x MXFP8: the canonical MXFP8 pack by the
+        batch-invariant quantizer, e4m3 ``[T, H]`` and the token-major UE8M0 scales ``[T, H / 32]`` (uint8)."""
+        from .batch_invariant.runner_fp8_block import PAIR_MXFP8, unsupported_pair
 
-        return quantize_activations_mxfp8(hidden_states.to(torch.bfloat16).contiguous())
+        if quant.pair == PAIR_MXFP8:
+            from .batch_invariant.api_mxfp8 import quantize_activations_mxfp8
+
+            return quantize_activations_mxfp8(
+                hidden_states.to(torch.bfloat16).contiguous()
+            )
+        raise unsupported_pair(quant)
 
     def __repr__(self) -> str:
-        return "BatchInvariantMoeMxfp8Config()"
+        return "BatchInvariantFp8BlockConfig()"
 
 
 # Union type for backend config
@@ -3463,7 +3479,7 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
-    BatchInvariantMoeMxfp8Config,
+    BatchInvariantFp8BlockConfig,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3510,7 +3526,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
-    BatchInvariantMoeMxfp8Config,
+    BatchInvariantFp8BlockConfig,
 )
 
 

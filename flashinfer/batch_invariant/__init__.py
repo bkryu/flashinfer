@@ -198,8 +198,8 @@ def _moe_mxfp8_fingerprint(
     gated: Optional[bool] = None,
     arch=None,
 ) -> str:
-    """The MXFP8 x MXFP8 MoE classes behind ``MoELayer`` with ``BatchInvariantMoeMxfp8Config``: the dimensions of the bf16
-    classes plus the architecture (the instruction class of the dense MXFP8 GEMM: the SM107 step folds 64 elements, the
+    """The MXFP8 x MXFP8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8BlockConfig`` under
+    ``QuantConfig(MXFP8, MXFP8)``: the dimensions of the bf16 classes plus the architecture (the instruction class of the dense MXFP8 GEMM: the SM107 step folds 64 elements, the
     SM100 / SM103 one 32; ``arch`` as for ``mm_mxfp8``, the current device by default)."""
     from flashinfer.fused_moe.batch_invariant import spec
     from flashinfer.fused_moe.batch_invariant.spec_mxfp8 import spec_fingerprint_mxfp8
@@ -273,8 +273,9 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
     ),
-    # the unified MoE layer with `BatchInvariantMoeMxfp8Config`: the bf16 classes' dimensions plus the architecture (the
-    # instruction class of the dense MXFP8 GEMM, as for mm_mxfp8)
+    # the unified MoE layer with `BatchInvariantFp8BlockConfig` under `QuantConfig(MXFP8, MXFP8)` (the fp8-block backend
+    # groups the fp8 formats with block scales under one key, the pair selecting the classes): the bf16 classes' dimensions
+    # plus the architecture (the instruction class of the dense MXFP8 GEMM, as for mm_mxfp8)
     "fused_moe_mxfp8": ClassInfo(
         "moe.mxfp8",
         ("H", "I", "top_k", "num_experts"),
