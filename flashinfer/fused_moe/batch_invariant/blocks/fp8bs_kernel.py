@@ -99,6 +99,9 @@ KINDS = ("plain", "glu", "act")
 TILES_N_GROUPED = (64, 128, 256)
 XCH_BUFFERS = 2  # the half-block amax exchange, double-buffered by tile parity (one barrier per tile)
 BAR_XCH = 8  # the exchange's named barrier (both promotion warpgroups)
+BAR_PROMO_JOIN = (
+    BAR_XCH + 1
+)  # both promotion warpgroups once, after their last TMEM loads, before the TMEM free
 VEC_BYTES = 16
 
 
@@ -369,6 +372,9 @@ class GroupedBlockScaleFp8Gemm:
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(PROMO_WARPS) + 1)
         )
+        promo_join = pipeline.NamedBarrier(
+            barrier_id=BAR_PROMO_JOIN, num_threads=32 * NUM_PROMO_WARPS
+        )
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -583,6 +589,9 @@ class GroupedBlockScaleFp8Gemm:
                 sX,
             )
             tmem.relinquish_alloc_permit()
+            # the allocator warp alone frees the columns: both promotion warpgroups join here after their last TMEM loads (the
+            # store barriers join one group only)
+            promo_join.arrive_and_wait()
             tmem.free(tmem_ptr)
         if warp_idx > TMA_WARP_BS:
             cute.arch.setmaxregister_decrease(
