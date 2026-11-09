@@ -1,7 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant mixed MXFP4-weight x MXFP8-activation MoE backend of the unified MoE layer
-(``BatchInvariantMoeMxfp4w8aConfig`` -> ``BatchInvariantMoeMxfp4w8aRunner``).
+"""The MXFP4 x MXFP8 pair of the batch-invariant fp4 MoE backend of the unified MoE layer (``BatchInvariantFp4Config`` with
+``QuantConfig(weight=MXFP4, activation=MXFP8)`` -> ``BatchInvariantFp4Runner`` -> ``BatchInvariantMoeMxfp4w8aRunner``, this
+module's implementation runner; :mod:`.runner_fp4` holds the backend).
 
 The runner serves the classes ``moe.mxfp4w8a.<act>`` (MXFP4 experts, MXFP8 activations, every typed activation of the
 layer) on SM100 / SM103 / SM107, through the dense mixed class of the part (the SM107 instruction folds 64 elements per
@@ -55,7 +56,8 @@ _XQ, _XSF, _IDS, _W, _W1, _W1SF, _W2, _W2SF, _OUT = range(9)
 class BatchInvariantMoeMxfp4w8aRunner(MoERunner):
     """The unified layer's runner for the batch-invariant mixed MXFP4 x MXFP8 MoE classes."""
 
-    backend_key = "batch_invariant_mxfp4w8a"
+    # the fp4 backend's key (``runner_fp4.BACKEND_KEY``): the pair implementations share the weight view and the records
+    backend_key = "batch_invariant_fp4"
     supported_routing_modes = (
         RoutingInputMode.FromLogits,
         RoutingInputMode.PackedPrecomputed,

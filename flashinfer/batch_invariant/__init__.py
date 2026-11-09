@@ -337,10 +337,10 @@ def _moe_mxfp4w8a_fingerprint(
     gated: Optional[bool] = None,
     arch=None,
 ) -> str:
-    """The mixed MXFP4-weight x MXFP8-activation MoE classes behind ``MoELayer`` with ``BatchInvariantMoeMxfp4w8aConfig``:
-    the dimensions of the bf16 classes plus the architecture (the instruction class of the dense mixed GEMM: the SM107
-    step folds 64 elements, the SM100 / SM103 one 32; ``arch`` as for ``mm_mxfp4w8a_mxfp8a``, the current device by
-    default)."""
+    """The mixed MXFP4-weight x MXFP8-activation MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the
+    MXFP4 x MXFP8 pair): the dimensions of the bf16 classes plus the architecture (the instruction class of the dense mixed
+    GEMM: the SM107 step folds 64 elements, the SM100 / SM103 one 32; ``arch`` as for ``mm_mxfp4w8a_mxfp8a``, the current
+    device by default)."""
     from flashinfer.fused_moe.batch_invariant import spec
     from flashinfer.fused_moe.batch_invariant.spec_mxfp4w8a import (
         spec_fingerprint_mxfp4w8a,
@@ -423,8 +423,8 @@ CLASSES: Dict[str, ClassInfo] = {
         _moe_mxfp8_fingerprint,
         ("method", "act", "params", "gated", "arch"),
     ),
-    # the unified MoE layer with `BatchInvariantMoeMxfp4w8aConfig`: the bf16 classes' dimensions plus the architecture (the
-    # instruction class of the dense mixed MXFP4 x MXFP8 GEMM, as for mm_mxfp4w8a_mxfp8a)
+    # the unified MoE layer with `BatchInvariantFp4Config` (the MXFP4 x MXFP8 pair): the bf16 classes' dimensions plus the
+    # architecture (the instruction class of the dense mixed MXFP4 x MXFP8 GEMM, as for mm_mxfp4w8a_mxfp8a)
     "fused_moe_mxfp4w8a": ClassInfo(
         "moe.mxfp4w8a",
         ("H", "I", "top_k", "num_experts"),

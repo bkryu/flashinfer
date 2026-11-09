@@ -198,9 +198,7 @@ def test_backend_is_registered_and_never_a_default_candidate():
     ] == [100, 103, 107]
     assert KEY == "batch_invariant_fp4"
     assert BatchInvariantMoeNvfp4Runner.backend_key == KEY
-    assert BatchInvariantFp4Runner.supported_quant_variants == (
-        (QuantFormat.NVFP4, QuantFormat.NVFP4),
-    )
+    assert _NVFP4.pair in BatchInvariantFp4Runner.supported_quant_variants
     assert BatchInvariantFp4Runner.supports_quant(_NVFP4)
     assert BatchInvariantFp4Runner.supports_per_token_scale
     assert set(BatchInvariantFp4Runner.supported_activation_classes) == {
@@ -220,10 +218,10 @@ def test_backend_is_registered_and_never_a_default_candidate():
 def test_unserved_quant_pair_is_refused_and_names_the_served_pairs():
     """A quantization pair the fp4 backend does not serve: the layer's candidate filter skips the runner
     (``supports_quant``), and ``prepare_weights`` / ``prepare_activations`` / the runner's ``check_support`` raise the
-    mode's error naming the served pairs and the pending one."""
+    mode's error naming the served pairs."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
-    mixed = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    mixed = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
     assert not BatchInvariantFp4Runner.supports_quant(mixed)
     assert not BatchInvariantFp4Runner.supports_quant(QuantConfig())
     w1 = torch.zeros(2, 64, 64, dtype=torch.bfloat16)
@@ -244,8 +242,8 @@ def test_unserved_quant_pair_is_refused_and_names_the_served_pairs():
         with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
             call()
         msg = str(excinfo.value)
-        assert "weight=MXFP4, activation=MXFP8" in msg
-        assert "NVFP4 x NVFP4" in msg and "mixed MoE PR" in msg and KEY in msg
+        assert "weight=MXFP4, activation=BF16" in msg
+        assert "NVFP4 x NVFP4" in msg and "MXFP4 x MXFP8" in msg and KEY in msg
     # the default pair is NVFP4 x NVFP4: the bf16 rows as given, no scale
     x, sf = BatchInvariantFp4Config.prepare_activations(w1[0].float())
     assert x.dtype == torch.bfloat16 and sf is None

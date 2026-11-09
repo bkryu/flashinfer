@@ -1,5 +1,6 @@
 """The batch-invariant mixed MXFP4-weight x MXFP8-activation MoE backend of the unified MoE layer
-(``BatchInvariantMoeMxfp4w8aConfig``): the classes ``moe.mxfp4w8a.<act>``, one per typed activation of the layer (the bf16
+(``BatchInvariantFp4Config`` with ``QuantConfig(weight=MXFP4, activation=MXFP8)``: the MXFP4 x MXFP8 pair of the fp4
+backend): the classes ``moe.mxfp4w8a.<act>``, one per typed activation of the layer (the bf16
 classes' chains on the dequantised accumulators), the expert weights quantized by the batch-invariant MXFP4 quantizer and the
 activations by the batch-invariant MXFP8 quantizer, the two GEMMs as grouped placements of the dense batch-invariant mixed
 GEMM class of the part (SM107: the K = 64 instruction class; SM100 / SM103: the K = 32 one, whose TMA unpacks the e2m1 weight
@@ -29,7 +30,7 @@ from flashinfer import batch_invariant as bi
 from flashinfer.fused_moe import (
     GELU,
     BackendOptions,
-    BatchInvariantMoeMxfp4w8aConfig,
+    BatchInvariantFp4Config,
     ExecutionConfig,
     ExpertConfig,
     GeGLU,
@@ -53,6 +54,7 @@ from flashinfer.fused_moe import (
     SwiGLUStep,
 )
 from flashinfer.fused_moe.api import ALL_BACKEND_CONFIGS, _DEFAULT_BACKEND
+from flashinfer.fused_moe.batch_invariant.runner_fp4 import BatchInvariantFp4Runner
 from flashinfer.fused_moe.batch_invariant.runner_mxfp4w8a import (
     MOE_MXFP4W8A_ARCHS,
     BatchInvariantMoeMxfp4w8aRunner,
@@ -70,7 +72,7 @@ needs_device = pytest.mark.skipif(
 
 _SWIGLU = SwiGLU()
 _QUANT = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
-KEY = BatchInvariantMoeMxfp4w8aRunner.backend_key
+KEY = BatchInvariantFp4Runner.backend_key
 BLOCK = 32
 #: The record of the dense oracle calls (the dense class is pinned to one record: the oracle is the class, not its dispatcher;
 #: the dense dispatcher's swapped decode records at a few rows take a 256-element stage, which the f32-output plan cannot ring)
@@ -149,7 +151,7 @@ def _config(k, E, I, act=_SWIGLU, method=RoutingMethodType.Renormalize, tune_max
         quant=_QUANT,
         experts=ExpertConfig(intermediate_size=I),
         activation=act,
-        backend=BackendOptions((BatchInvariantMoeMxfp4w8aConfig(),)),
+        backend=BackendOptions((BatchInvariantFp4Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=tune_max),
         finalize=MoEFinalizeConfig(do_finalize=True),
     )
@@ -161,12 +163,13 @@ def _layer(*args, device="cuda", **kw):
 
 def _weights(w1, w2, act=_SWIGLU) -> MoEWeightPack:
     pack = MoEWeightPack({})
-    view = BatchInvariantMoeMxfp4w8aConfig.prepare_weights(
+    view = BatchInvariantFp4Config.prepare_weights(
         w1,
         w2,
         num_local_experts=w1.shape[0],
         hidden_size=w1.shape[2],
         intermediate_size=w2.shape[2],
+        quant=_QUANT,
         activation=act,
     )
     pack.prepare_for(KEY, view)
@@ -175,7 +178,7 @@ def _weights(w1, w2, act=_SWIGLU) -> MoEWeightPack:
 
 def _quant(x: torch.Tensor):
     """The canonical MXFP8 activation pack by the backend's quantizer."""
-    return BatchInvariantMoeMxfp4w8aConfig.prepare_activations(x, quant=_QUANT)
+    return BatchInvariantFp4Config.prepare_activations(x, quant=_QUANT)
 
 
 def _logits_pack(x, logits, bias=None) -> MoEActivationPack:
@@ -212,30 +215,32 @@ def _routed_pack(x, ids, weights, packed=False) -> MoEActivationPack:
 
 
 def test_backend_is_registered_and_never_a_default_candidate():
-    """The config is a known backend of the layer, mapped to its runner, absent from the default candidates, declares the
-    three routing modes, the MXFP4 x MXFP8 quant variant and every activation class of the layer."""
-    assert BatchInvariantMoeMxfp4w8aConfig in ALL_BACKEND_CONFIGS
-    assert (
-        _BACKEND_RUNNERS[BatchInvariantMoeMxfp4w8aConfig]
-        is BatchInvariantMoeMxfp4w8aRunner
-    )
+    """The fp4 config is a known backend of the layer, mapped to the fp4 runner, absent from the default candidates; the
+    runner serves the MXFP4 x MXFP8 pair next to NVFP4 x NVFP4, through the mixed implementation runner (the two share the
+    backend's key), declares the three routing modes and every activation class of the layer for the pair; a pair the
+    backend does not serve is refused naming the served ones."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    assert BatchInvariantFp4Config in ALL_BACKEND_CONFIGS
+    assert _BACKEND_RUNNERS[BatchInvariantFp4Config] is BatchInvariantFp4Runner
     assert not any(
-        isinstance(c, BatchInvariantMoeMxfp4w8aConfig)
-        for c in _DEFAULT_BACKEND.candidates
+        isinstance(c, BatchInvariantFp4Config) for c in _DEFAULT_BACKEND.candidates
     )
     assert [
         a
         for a in (89, 90, 100, 103, 107, 110, 120, 121)
-        if BatchInvariantMoeMxfp4w8aConfig.supported(a)
+        if BatchInvariantFp4Config.supported(a)
     ] == [100, 103, 107]
-    assert set(BatchInvariantMoeMxfp4w8aRunner.supported_routing_modes) == {
+    assert set(BatchInvariantFp4Runner.supported_routing_modes) == {
         RoutingInputMode.FromLogits,
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     }
-    assert BatchInvariantMoeMxfp4w8aRunner.supported_quant_variants == (
+    assert BatchInvariantFp4Runner.supported_quant_variants == (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
     )
+    assert BatchInvariantFp4Runner.supports_quant(_QUANT)
     assert set(BatchInvariantMoeMxfp4w8aRunner.supported_activation_classes) == {
         SwiGLU,
         SwiGLUStep,
@@ -249,9 +254,20 @@ def test_backend_is_registered_and_never_a_default_candidate():
         ReLU,
         SiLU,
     }
-    assert KEY == "batch_invariant_mxfp4w8a"
-    assert (
-        repr(BatchInvariantMoeMxfp4w8aConfig()) == "BatchInvariantMoeMxfp4w8aConfig()"
+    assert set(
+        BatchInvariantFp4Runner.supported_activation_classes_by_quant[_QUANT.pair]
+    ) == set(BatchInvariantMoeMxfp4w8aRunner.supported_activation_classes)
+    assert KEY == "batch_invariant_fp4"
+    assert BatchInvariantMoeMxfp4w8aRunner.backend_key == KEY
+    assert repr(BatchInvariantFp4Config()) == "BatchInvariantFp4Config()"
+    w4a16 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
+    assert not BatchInvariantFp4Runner.supports_quant(w4a16)
+    with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+        BatchInvariantFp4Config.prepare_activations(
+            torch.zeros(2, 64, dtype=torch.bfloat16), quant=w4a16
+        )
+    assert "MXFP4 x MXFP8" in str(excinfo.value) and "NVFP4 x NVFP4" in str(
+        excinfo.value
     )
 
 
@@ -519,20 +535,22 @@ def test_unsupported_device_and_quant_raise_before_any_kernel():
     config with this backend is refused (the layer admits the declared quant variant only)."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
-    runner = BatchInvariantMoeMxfp4w8aRunner(_config(8, 64, 256), torch.device("cpu"))
-    with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
-        runner._check_support()
-    assert "moe.mxfp4w8a" in str(excinfo.value) and "cpu" in str(excinfo.value)
+    # the pair implementation and the fp4 backend's runner over it refuse alike (the backend forwards the pair's check)
+    for cls in (BatchInvariantMoeMxfp4w8aRunner, BatchInvariantFp4Runner):
+        runner = cls(_config(8, 64, 256), torch.device("cpu"))
+        with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+            runner._check_support()
+        assert "moe.mxfp4w8a" in str(excinfo.value) and "cpu" in str(excinfo.value)
     cfg = MoEConfig(
         routing=RoutingConfig(num_experts=64, top_k=8),
         quant=QuantConfig(),
         experts=ExpertConfig(intermediate_size=256),
-        backend=BackendOptions((BatchInvariantMoeMxfp4w8aConfig(),)),
+        backend=BackendOptions((BatchInvariantFp4Config(),)),
     )
     with pytest.raises(
         (BatchInvariantUnsupportedError, RuntimeError, ValueError, NotImplementedError)
     ):
-        BatchInvariantMoeMxfp4w8aRunner(cfg, torch.device("cpu"))._check_support()
+        BatchInvariantFp4Runner(cfg, torch.device("cpu"))._check_support()
 
 
 # ----------------------------------------------------------------------------- GPU
@@ -1168,7 +1186,8 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
     layer = _layer(k, E, I)
     W = _weights(w1, w2)
     runner = layer.runners[0]
-    assert isinstance(runner, BatchInvariantMoeMxfp4w8aRunner)
+    assert isinstance(runner, BatchInvariantFp4Runner)
+    assert isinstance(runner.impl, BatchInvariantMoeMxfp4w8aRunner)
     pack = _logits_pack(x, logits)
     ref = bits(layer(pack, W))
     inputs = runner.pack_inputs(pack, W)
@@ -1218,7 +1237,7 @@ def test_routing_methods_from_logits_match_the_cpu_model():
                 quant=_QUANT,
                 experts=ExpertConfig(intermediate_size=I),
                 activation=SwiGLU(),
-                backend=BackendOptions((BatchInvariantMoeMxfp4w8aConfig(),)),
+                backend=BackendOptions((BatchInvariantFp4Config(),)),
                 execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=T),
             ),
             device=torch.device("cuda"),
@@ -1361,7 +1380,7 @@ def test_grouped_routing_config_takes_prerouted_ids_and_refuses_logits():
             ),
             quant=_QUANT,
             experts=ExpertConfig(intermediate_size=I),
-            backend=BackendOptions((BatchInvariantMoeMxfp4w8aConfig(),)),
+            backend=BackendOptions((BatchInvariantFp4Config(),)),
             execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=4096),
         ),
         device=torch.device("cuda"),
@@ -1391,7 +1410,8 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         NotImplementedError,
     )
     oai = _layer(k, E, I, SwiGLU(alpha=1.702, beta=1.0, limit=7.0))
-    assert isinstance(oai.runners[0], BatchInvariantMoeMxfp4w8aRunner)
+    assert isinstance(oai.runners[0], BatchInvariantFp4Runner)
+    assert isinstance(oai.runners[0].impl, BatchInvariantMoeMxfp4w8aRunner)
     for cfg_kw, what in (
         (dict(k=17), "top_k"),
         (dict(E=1025), "num_experts"),
@@ -1430,7 +1450,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                     routing=kw.get("routing", routing),
                     quant=_QUANT,
                     experts=kw.get("experts", experts),
-                    backend=BackendOptions((BatchInvariantMoeMxfp4w8aConfig(),)),
+                    backend=BackendOptions((BatchInvariantFp4Config(),)),
                     finalize=kw.get("finalize", MoEFinalizeConfig(do_finalize=True)),
                 ),
                 device=torch.device("cuda"),
@@ -1481,7 +1501,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ),
             quant=_QUANT,
             experts=ExpertConfig(intermediate_size=I),
-            backend=BackendOptions((BatchInvariantMoeMxfp4w8aConfig(),)),
+            backend=BackendOptions((BatchInvariantFp4Config(),)),
         ),
         device=torch.device("cuda"),
     )
@@ -1493,7 +1513,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     ).shape == (8, H)
     # weights on the CPU cannot be quantized by the class
     with pytest.raises(TypeError):
-        BatchInvariantMoeMxfp4w8aConfig.prepare_weights(
+        BatchInvariantFp4Config.prepare_weights(
             w1.cpu(), w2.cpu(), num_local_experts=E, hidden_size=H, intermediate_size=I
         )
     # zero tokens
