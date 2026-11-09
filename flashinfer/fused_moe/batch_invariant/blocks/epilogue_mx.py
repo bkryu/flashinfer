@@ -58,6 +58,9 @@ OUT_FMT = "mxfp8"  # the GroupedChain out_fmt of this epilogue: e4m3 codes + UE8
 VEC_BYTES = 16
 XCH_BUFFERS = 2  # the half-block amax exchange of the gated chain, double-buffered by block parity (one barrier per block)
 BAR_EPI_XCH = 8  # named barrier ids BAR_EPI_XCH + warpgroup pair (the staged store uses BAR_EPI_STAGE + warpgroup)
+BAR_EPI_JOIN = (
+    3  # every epilogue warpgroup once, after its last TMEM load, before the TMEM free
+)
 
 
 def xch_layout(epi_warpgroups: int):
