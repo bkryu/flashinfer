@@ -432,9 +432,11 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     """The grouped mixed space: 72 dense block-scaled records at swizzle 1 (one list for both instruction classes, every record
     well-formed for both) and the swapped decode space (three narrow token tiles); the dispatcher's picks for both classes,
     every chain of the layer and a grid of token counts are members of the spaces the guarantee is claimed over (the
-    fused-requantization chain GEMM1 runs and the bf16 chain accept the same records on either body). The ranking over both spaces takes the swapped decode body at one row per active expert and the padded body once
-    an expert fills a 128-row block; forbidden (``swap=False``), the padded candidates at a decode-sized group are the 1-CTA
-    tiles in an N-cluster (the dense dispatcher's guard for a space without swapped records)."""
+    fused-requantization chain GEMM1 runs and the bf16 chain accept the same records on either body). The ranking over both spaces
+    takes the swapped decode body at one row per active expert on the large models (the small models' one-row cells go to the
+    padded body, whose prologue is shorter) and the padded body once an expert fills a 128-row block; forbidden (``swap=False``),
+    the padded candidates at a decode-sized group are the 1-CTA tiles in an N-cluster (the dense dispatcher's guard for a space
+    without swapped records)."""
     from flashinfer.fused_moe.batch_invariant import spec as S
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
     from flashinfer.fused_moe.batch_invariant.schedule_mxfp4w8a import (
@@ -512,10 +514,11 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     c1.describe(),
                     c2.describe(),
                 )
-                # the ranking over both spaces: the swapped decode body at one row per active expert, the padded body once
-                # an expert fills a 128-row block at the model-sized weights; in between the model decides (every record
+                # the ranking over both spaces: the swapped decode body at one row per active expert on the large models
+                # (on the small ones the padded body's shorter prologue wins there, as measured), the padded body once an
+                # expert fills a 128-row block at the model-sized weights; in between the model decides (every record
                 # computes the class)
-                if rows <= 2:
+                if rows <= 2 and H >= 4096:
                     assert c1.swap_ab and c2.swap_ab, (
                         family,
                         T,
