@@ -383,7 +383,9 @@ def grouped_gemm_fp8bs(
     chain). The persistent grid is a launch argument."""
     from .blocks.fp8bs_compile import (
         can_implement_grouped_fp8bs,
+        can_implement_swapped_fp8bs,
         get_compiled_grouped_fp8bs,
+        get_compiled_swapped_fp8bs,
     )
 
     if (
@@ -421,7 +423,12 @@ def grouped_gemm_fp8bs(
         raise ValueError(
             f"grouped_gemm_fp8bs: w_sf must be a contiguous fp32 {(E, NB, KB)}, got {tuple(w_sf.shape)}"
         )
-    if not can_implement_grouped_fp8bs(config, N, K, E, chain, interleaved):
+    accepted = (
+        can_implement_swapped_fp8bs(config, N, K, E, chain, interleaved)
+        if config.swap_ab
+        else can_implement_grouped_fp8bs(config, N, K, E, chain, interleaved)
+    )
+    if not accepted:
         raise ValueError(
             f"grouped_gemm_fp8bs: {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, interleaved={interleaved})"
         )
@@ -468,7 +475,18 @@ def grouped_gemm_fp8bs(
             out,
             w_sf[0, :1, :1].reshape(1, 1),
         )  # the scale output is unread: any fp32 (1, 1) tensor
-    if Tk:
+    if Tk and config.swap_ab:
+        # the swapped decode body: the same operands, the same bits (no fused requantization output)
+        get_compiled_swapped_fp8bs(config, chain, interleaved)(
+            a.unsqueeze(-1),
+            sfa_v,
+            w.permute(1, 2, 0),
+            w_sf,
+            out_k,
+            counts,
+            persistent_clusters(a.device, config),
+        )
+    elif Tk:
         get_compiled_grouped_fp8bs(config, chain, interleaved)(
             a.unsqueeze(-1),
             sfa_v,

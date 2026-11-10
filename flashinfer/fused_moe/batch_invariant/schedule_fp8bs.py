@@ -23,7 +23,10 @@ from .blocks.fp8bs_compile import (
     TILES_N_GROUPED,
     Fp8BsChain,
     can_implement_grouped_fp8bs,
+    can_implement_swapped_fp8bs,
     gemm1_chain,
+    swap_knobs_fp8bs,
+    swapped_knobs_fp8bs,
 )
 from .schedule import TOP_K, active_experts, pair_term, raster_for, rows_per_expert
 
@@ -62,6 +65,47 @@ def all_valid_configs_fp8bs(
         for k in grouped_knobs_fp8bs(clusters)
         if can_implement_grouped_fp8bs(k, N, K, E, chain, interleaved)
     ]
+
+
+def all_valid_configs_fp8bs_swapped(
+    N: int, K: int, E: int, chain: Fp8BsChain = GEMM2_CHAIN
+) -> List[Knobs]:
+    """The swapped decode records the swapped body accepts for a weight shape and a chain (the bf16 / f32 chains)."""
+    return [
+        k
+        for k in swapped_knobs_fp8bs()
+        if can_implement_swapped_fp8bs(k, N, K, E, chain)
+    ]
+
+
+#: The swapped decode body's structural rule (declared empirical, no measured table): the token tile is the narrowest of
+#: SWAP_TOKEN_TILES the average rows per active expert fill to at most SWAP_TILE_FILL (an expert above the average still fits one
+#: tile: its weights stream once); the weight tile is 64 rows while the active experts' 64-row tiles fit the part in SWAP_WAVES_64
+#: waves (twice the CTAs on the weight stream: the decode GEMM is bound by its per-CTA chain, not by the HBM), 128 rows beyond.
+SWAP_TOKEN_TILES = (8, 16, 32)
+SWAP_TILE_FILL = (3, 4)
+SWAP_WAVES_64 = 1
+
+
+def swap_record_fp8bs(
+    rows: int,
+    N: int,
+    n_active: int,
+    sm_count: Optional[int] = None,
+    family: Optional[str] = None,
+) -> Optional[Knobs]:
+    """The swapped decode record for ``rows`` rows per active expert and ``n_active`` experts of ``N`` weight rows each, or ``None``
+    when the rows do not fit a narrow token tile (the padded body). A placement: both bodies compute the same bits."""
+    from ...gemm.batch_invariant.heuristic import PART_TABLE
+
+    num, den = SWAP_TILE_FILL
+    tn = next((t for t in SWAP_TOKEN_TILES if rows * den <= t * num), None)
+    if tn is None:
+        return None
+    sms = sm_count or PART_TABLE[family or "sm_107"].sm_count
+    ctas64 = n_active * ((N + 63) // 64)
+    wt = 64 if ctas64 <= SWAP_WAVES_64 * sms else 128
+    return swap_knobs_fp8bs(wt, tn)
 
 
 def rank_grouped_fp8bs(
@@ -169,40 +213,49 @@ def default_configs_fp8bs(
     params: Sequence[Optional[float]] = (),
     fused: bool = False,
     nominal: bool = False,
+    swap: Optional[bool] = None,
 ) -> Tuple[Knobs, Knobs]:
-    """``(config for GEMM1 (N = 2I, K = H; N = I ungated), config for GEMM2 (N = H, K = I))`` of the block-scale class: the first
-    record of each ranked list; ``fused`` ranks GEMM1 over the fused requantization's records."""
+    """``(config for GEMM1 (N = 2I, K = H; N = I ungated), config for GEMM2 (N = H, K = I))`` of the block-scale class: the swapped
+    decode record where the rows per active expert fit a narrow token tile (`swap_record_fp8bs`; ``swap`` True / False forces /
+    forbids it; the fused requantization is not a spelling of the swapped body, so ``fused`` keeps the padded GEMM1 records), else
+    the first record of each ranked list; ``fused`` ranks GEMM1 over the fused requantization's records."""
     rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
     n1 = 2 * I if gated else I
-    c1 = rank_grouped_fp8bs(
-        rows,
-        n1,
-        H,
-        E,
-        gemm1_chain(act, params, gated, fused),
-        sm_count,
-        family,
-        1,
-        nominal,
-        n_act,
-    )
-    c2 = rank_grouped_fp8bs(
-        rows, H, I, E, GEMM2_CHAIN, sm_count, family, 1, nominal, n_act
-    )
-    if not c1 or not c2:
-        raise ValueError(
-            f"no grouped block-scale record implements (H={H}, I={I}, E={E}, gated={gated}, fused={fused})"
+    ch1 = gemm1_chain(act, params, gated, fused)
+    out = []
+    for N, K, chain in ((n1, H, ch1), (H, I, GEMM2_CHAIN)):
+        sw = None
+        if swap is not False and not (fused and chain is ch1):
+            sw = swap_record_fp8bs(rows, N, n_act, sm_count, family)
+            if sw is None and swap:
+                sw = swap_record_fp8bs(1, N, n_act, sm_count, family)
+        if sw is not None and can_implement_swapped_fp8bs(sw, N, K, E, chain):
+            out.append(sw)
+            continue
+        ranked = rank_grouped_fp8bs(
+            rows, N, K, E, chain, sm_count, family, 1, nominal, n_act
         )
-    return c1[0], c2[0]
+        if not ranked:
+            raise ValueError(
+                f"no grouped block-scale record implements (H={H}, I={I}, E={E}, gated={gated}, fused={fused})"
+            )
+        out.append(ranked[0])
+    return out[0], out[1]
 
 
 __all__ = [
     "FUSED_QUANT_MIN_ROWS",
     "IN_FMT",
+    "SWAP_TILE_FILL",
+    "SWAP_TOKEN_TILES",
+    "SWAP_WAVES_64",
     "all_valid_configs_fp8bs",
+    "all_valid_configs_fp8bs_swapped",
     "default_configs_fp8bs",
     "fused_quant_default",
     "gemm1_chain",
     "grouped_knobs_fp8bs",
     "rank_grouped_fp8bs",
+    "swap_record_fp8bs",
+    "swapped_knobs_fp8bs",
 ]

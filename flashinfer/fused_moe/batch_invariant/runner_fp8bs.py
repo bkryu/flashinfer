@@ -37,12 +37,18 @@ _X, _SX, _IDS, _W, _W1, _W1SF, _W2, _W2SF, _OUT = range(9)
 
 def _tactic_bs(c1, c2, fused: bool) -> tuple:
     """A pair of grouped records and the requantization spelling as a flat tuple of scalars (the autotuner's cache round-trips
-    every knob the records carry: the base tuple's six per record, the swizzle and the grid being the class's constants)."""
-    return _tactic(c1, c2) + (int(bool(fused)),)
+    every knob the records carry: the base tuple's six per record, the spelling, and each record's swapped flag -- the swapped
+    decode records of this class; the swizzle and the grid are the class's constants)."""
+    return _tactic(c1, c2) + (int(bool(fused)), int(bool(c1.swap_ab)), int(bool(c2.swap_ab)))
 
 
 def _configs_from_tactic_bs(t: tuple):
+    import dataclasses
+
     c1, c2 = _configs_from_tactic(tuple(t[:12]))
+    if len(t) > 13:
+        c1 = dataclasses.replace(c1, swap_ab=bool(t[13]))
+        c2 = dataclasses.replace(c2, swap_ab=bool(t[14]))
     return c1, c2, bool(t[12])
 
 
@@ -227,9 +233,9 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int, fused: bool) -> Tuple[list, list]:
-        from .blocks.fp8bs_compile import GEMM2_CHAIN
+        from .blocks.fp8bs_compile import GEMM2_CHAIN, can_implement_swapped_fp8bs
         from .schedule import TOP_K, active_experts, rows_per_expert
-        from .schedule_fp8bs import gemm1_chain, rank_grouped_fp8bs
+        from .schedule_fp8bs import gemm1_chain, rank_grouped_fp8bs, swap_record_fp8bs
 
         cfg = self.config
         E, k, I = (
@@ -242,22 +248,20 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
         n1 = 2 * I if a.gated else I
-        return (
-            rank_grouped_fp8bs(
-                rows,
-                n1,
-                H,
-                E,
-                gemm1_chain(a.act, a.params, a.gated, fused),
-                sm_count,
-                family,
-                TOP_K,
-                n_active=n_act,
-            ),
-            rank_grouped_fp8bs(
-                rows, H, I, E, GEMM2_CHAIN, sm_count, family, TOP_K, n_active=n_act
-            ),
-        )
+        ch1 = gemm1_chain(a.act, a.params, a.gated, fused)
+        out = []
+        for N, K, chain in ((n1, H, ch1), (H, I, GEMM2_CHAIN)):
+            ranked = rank_grouped_fp8bs(
+                rows, N, K, E, chain, sm_count, family, TOP_K, n_active=n_act
+            )
+            # the swapped decode record first where the rows per active expert fit a narrow token tile (the dispatcher's
+            # structural rule); the padded records follow as the autotuner's alternatives
+            if not (fused and chain is ch1):
+                sw = swap_record_fp8bs(rows, N, n_act, sm_count, family)
+                if sw is not None and can_implement_swapped_fp8bs(sw, N, K, E, chain):
+                    ranked = [sw] + [c for c in ranked if c != sw]
+            out.append(ranked)
+        return out[0], out[1]
 
     def _default(self, T: int):
         from .schedule_fp8bs import fused_quant_default

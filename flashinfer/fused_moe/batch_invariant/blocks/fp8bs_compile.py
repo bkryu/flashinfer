@@ -38,6 +38,14 @@ from .fp8bs_kernel import (
     fused_quant_ok,
 )
 from .fp8bs_small import BSQuantKernel, GatherScalesKernel
+from .fp8bs_swap_kernel import (
+    TOKEN_TILES,
+    WEIGHT_TILES,
+    SwappedBlockScaleFp8Gemm,
+    is_swapped_record_fp8bs,
+    swap_knobs_fp8bs,
+    swapped_knobs_fp8bs,
+)
 from .scheduler import MAX_E
 
 MODULE = "batch_invariant_moe_fp8bs"
@@ -71,6 +79,18 @@ def kernel_name(
     il = chain.pair if interleaved is None else interleaved
     return jit.sanitize_symbol_name(
         f"grouped_e4m3bs_{chain.describe()}_{knobs.describe()}"
+        + ("_il" if il != chain.pair else "")
+    )
+
+
+def swapped_kernel_name(
+    cfg: Knobs, chain: Fp8BsChain, interleaved: Optional[bool] = None
+) -> str:
+    """The swapped decode body's object (:mod:`.fp8bs_swap_kernel`): the record carries the weight and the token tile."""
+    knobs = dataclasses.replace(cfg, grid_clusters=0)
+    il = chain.pair if interleaved is None else interleaved
+    return jit.sanitize_symbol_name(
+        f"swapped_e4m3bs_{chain.describe()}_{knobs.describe()}"
         + ("_il" if il != chain.pair else "")
     )
 
@@ -126,6 +146,129 @@ def can_implement_grouped_fp8bs(
         n_out % OUT_ALIGN_BS[chain.out_fmt] == 0
         and 1 <= E <= MAX_E
         and (not il or N % (2 * GROUP) == 0)
+    )
+
+
+def can_implement_swapped_fp8bs(
+    knobs: Knobs,
+    N: int,
+    K: int,
+    E: int,
+    chain: Fp8BsChain,
+    interleaved: Optional[bool] = None,
+) -> bool:
+    """Acceptance of the swapped decode body (:mod:`.fp8bs_swap_kernel`): a swapped record of the class (a 64- / 128-row weight
+    tile, an 8 / 16 / 32 / 64 token tile, 1-CTA, no cluster), the bf16 / f32 chains (the fused requantization is not a spelling of
+    this body), K a whole number of scale blocks, the weight's rows whole 128-row scale blocks (the interleaved weight: whole
+    blocks of each half), at most ``MAX_E`` experts."""
+    if not isinstance(chain, Fp8BsChain) or chain.out_fmt not in ("bf16", "f32"):
+        return False
+    if not is_swapped_record_fp8bs(knobs):
+        return False
+    if K <= 0 or N <= 0 or K % BLOCK_K or N % SCALE_BLOCK_N:
+        return False
+    il = chain.pair if interleaved is None else interleaved
+    if chain.pair and not il:
+        return False
+    if il and N % (2 * SCALE_BLOCK_N):
+        return False
+    n_out = N // 2 if chain.pair else N
+    return (
+        n_out % OUT_ALIGN_BS[chain.out_fmt] == 0
+        and 1 <= E <= MAX_E
+        and (not il or N % (2 * GROUP) == 0)
+    )
+
+
+def can_implement_fp8bs(
+    knobs: Knobs,
+    N: int,
+    K: int,
+    E: int,
+    chain: Fp8BsChain,
+    interleaved: Optional[bool] = None,
+) -> bool:
+    """A record either block-scale grouped body takes: the padded body (the dense-derived records) or the swapped decode body
+    (the swapped records); the two spaces are disjoint."""
+    return can_implement_grouped_fp8bs(
+        knobs, N, K, E, chain, interleaved
+    ) or can_implement_swapped_fp8bs(knobs, N, K, E, chain, interleaved)
+
+
+def compile_swapped_fp8bs_fn(
+    cfg: Knobs, chain: Fp8BsChain, interleaved: Optional[bool] = None
+) -> Callable[[], Any]:
+    """The zero-argument compile closure of one swapped block-scale specialisation: ``kernel(a3, sfa, w3, sfw, out2, counts,
+    grid)``."""
+    in_dt, al = IN_DT[IN_FMT], ALIGN[IN_FMT]
+    out_dt, oal = OUT_DT_BS[chain.out_fmt], OUT_ALIGN_BS[chain.out_fmt]
+
+    def compile_fn():
+        sym_r, sym_m, sym_e = cute.sym_int(32), cute.sym_int(32), cute.sym_int(32)
+        sym_n = cute.sym_int(32, divisibility=SCALE_BLOCK_N)
+        sym_k = cute.sym_int(32, divisibility=BLOCK_K)
+        sym_kb, sym_nb = cute.sym_int(32), cute.sym_int(32)
+        sym_no = cute.sym_int(32, divisibility=oal)
+        a_fake = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_r, sym_k, 1),
+            (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
+            assumed_align=16,
+        )
+        sfa_fake = cute.runtime.make_fake_tensor(
+            Float32,
+            (sym_r, sym_kb),
+            (cute.sym_int64(), cute.sym_int64()),
+            assumed_align=4,
+        )
+        w_fake = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_n, sym_k, sym_e),
+            (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
+            assumed_align=16,
+        )
+        sfw_fake = cute.runtime.make_fake_tensor(
+            Float32,
+            (sym_e, sym_nb, sym_kb),
+            (cute.sym_int64(), cute.sym_int64(), 1),
+            assumed_align=4,
+        )
+        o_fake = cute.runtime.make_fake_tensor(
+            out_dt,
+            (sym_m, sym_no),
+            (cute.sym_int64(divisibility=oal), 1),
+            assumed_align=16,
+        )
+        c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        grid = GRID_PLACEHOLDER
+        return cute.compile(
+            SwappedBlockScaleFp8Gemm(cfg, chain, interleaved),
+            a_fake,
+            sfa_fake,
+            w_fake,
+            sfw_fake,
+            o_fake,
+            c_fake,
+            grid,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return compile_fn
+
+
+@functools.cache
+def get_compiled_swapped_fp8bs(
+    cfg: Knobs, chain: Fp8BsChain, interleaved: Optional[bool] = None
+):
+    """``kernel(a3, sfa, w3, sfw, out2, counts, grid)``: A ``(R, K, 1)`` the dense token rows (``R >= Tk + token tile`` keeps the
+    boxes in bounds), SFA ``(R, K / 128)`` fp32 (any strides), W ``(N, K, E)``, SFW ``(E, N / 128, K / 128)``, out ``(Tk', Nout)``,
+    counts ``(E,)``."""
+    return jit.build_and_load(
+        MODULE,
+        swapped_kernel_name(cfg, chain, interleaved),
+        compile_swapped_fp8bs_fn(cfg, chain, interleaved),
     )
 
 
@@ -301,14 +444,24 @@ __all__ = [
     "OUT_DT_BS",
     "OUT_FMT_QUANT",
     "TILES_N_GROUPED",
+    "TOKEN_TILES",
+    "WEIGHT_TILES",
     "Fp8BsChain",
+    "can_implement_fp8bs",
     "can_implement_grouped_fp8bs",
+    "can_implement_swapped_fp8bs",
     "compile_grouped_fp8bs_fn",
+    "compile_swapped_fp8bs_fn",
     "gather_scales_name",
     "gemm1_chain",
     "get_compiled_fp8bs_quant",
     "get_compiled_gather_scales",
     "get_compiled_grouped_fp8bs",
+    "get_compiled_swapped_fp8bs",
+    "is_swapped_record_fp8bs",
     "kernel_name",
     "quant_kernel_name",
+    "swap_knobs_fp8bs",
+    "swapped_kernel_name",
+    "swapped_knobs_fp8bs",
 ]

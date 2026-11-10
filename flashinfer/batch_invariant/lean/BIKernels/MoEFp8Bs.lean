@@ -63,4 +63,25 @@ theorem groupedBlockScaleFp8OK_imp_dense (cfg : GEMM.Config) (h : groupedBlockSc
   rw [Bool.and_eq_true, Bool.and_eq_true] at h
   exact h.1.1
 
+/-- The swapped decode space of the block-scale MoE class (`blocks/fp8bs_swap_kernel.py`; the MoE class's own records, which the
+dense block-scale GEMM's rule does not admit): the weights as the MMA's A operand on a 64- or 128-row tile, the group's tokens as its
+B operand in an 8 / 16 / 32 / 64 tile, 1-CTA, no cluster, swizzle 1, no split. The fp8 step is symmetric in its operands (the dense
+block-scale class's swapped records, verified bit for bit against the exact model on both parts), so each record's result is
+`promoteLoop`'s -- the per-block `mma32` partial promoted in block order; `tileResultKB` does not read the orientation, and
+`space_invariantKB` over the union of both spaces is the statement the suites check. -/
+def groupedBlockScaleFp8SwapOK (cfg : GEMM.Config) : Bool :=
+  cfg.swapAb && (cfg.tm == 64 || cfg.tm == 128) && (cfg.tn == 8 || cfg.tn == 16 || cfg.tn == 32 || cfg.tn == 64) &&
+  cfg.clusterM == 1 && cfg.clusterN == 1 && !cfg.twoCta && cfg.swizzle == 1 && cfg.clusterK == 1 && !cfg.ctaChunks
+
+/-- The two spaces are disjoint (a record is dense-derived or swapped). -/
+theorem groupedBlockScaleFp8_spaces_disjoint (cfg : GEMM.Config) :
+    ¬ (groupedBlockScaleFp8OK cfg = true ∧ groupedBlockScaleFp8SwapOK cfg = true) := by
+  intro ⟨h1, h2⟩
+  have hd := groupedBlockScaleFp8OK_imp_dense cfg h1
+  unfold GEMM.ConfigOKFp8BS at hd
+  unfold groupedBlockScaleFp8SwapOK at h2
+  simp only [Bool.and_eq_true] at hd h2
+  have hs := h2.1.1.1.1.1.1.1.1
+  simp [hs] at hd
+
 end BIK.MoE

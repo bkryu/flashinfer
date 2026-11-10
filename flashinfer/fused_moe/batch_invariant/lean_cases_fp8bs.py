@@ -114,13 +114,19 @@ def space():
     return grouped_knobs_fp8bs()
 
 
+def swap_space():
+    from .schedule_fp8bs import swapped_knobs_fp8bs
+
+    return swapped_knobs_fp8bs()
+
+
 def dispatch_cases() -> Dict:
     """Every record the block-scale dispatcher returns over ``GEOMS`` x ``TS`` x every nominal part x the chains x both
     requantization spellings, with the first (T, H, I, E) that selects it."""
     from ...gemm.batch_invariant.heuristic import PARTS
     from .blocks.fp8bs_compile import (
         GEMM2_CHAIN,
-        can_implement_grouped_fp8bs,
+        can_implement_fp8bs,
         gemm1_chain,
     )
     from .schedule_fp8bs import default_configs_fp8bs
@@ -145,14 +151,14 @@ def dispatch_cases() -> Dict:
                             fused,
                             nominal=True,
                         )
-                        assert can_implement_grouped_fp8bs(
+                        assert can_implement_fp8bs(
                             c1,
                             2 * I if gated else I,
                             H,
                             E,
                             gemm1_chain(act, (), gated, fused),
                         )
-                        assert can_implement_grouped_fp8bs(c2, H, I, E, GEMM2_CHAIN)
+                        assert can_implement_fp8bs(c2, H, I, E, GEMM2_CHAIN)
                         disp.setdefault(c1, (T, H, I, E))
                         disp.setdefault(c2, (T, H, I, E))
     return disp
@@ -270,11 +276,35 @@ def render() -> str:
         "(a : RowData) (b : ColData) (KB : Nat), tileResultKB c₁ S₁ p a b KB = tileResultKB c₂ S₂ q a b KB := "
         "space_invariantKB moeE4m3BsSpace"
     )
+    sw = swap_space()
+    L.append(
+        "/-! The swapped decode space of the class (`blocks/fp8bs_swap_kernel.py`: the weights on the MMA's M in a 64- / 128-row "
+        "tile, the tokens as the N tile): every record checked against the swapped body's static constraints, disjoint from the "
+        "dense-derived records, the tile result invariant over the union of the two spaces (the promotion loop does not read the "
+        "orientation). -/"
+    )
+    L.append(
+        "def moeE4m3BsSwapSpace : List Config := [" + ", ".join(k.lean() for k in sw) + "]"
+    )
+    L.append(
+        f"theorem moe_e4m3bs_swap_space_size : moeE4m3BsSwapSpace.length = {len(sw)} := by decide"
+    )
+    L.append(
+        "theorem moe_e4m3bs_swap_space_ok : moeE4m3BsSwapSpace.all MoE.groupedBlockScaleFp8SwapOK = true := by decide +kernel"
+    )
+    L.append(
+        "theorem moe_e4m3bs_swap_space_not_dense : moeE4m3BsSwapSpace.all (fun c => !MoE.groupedBlockScaleFp8OK c) = true := by decide +kernel"
+    )
+    L.append(
+        "theorem moe_e4m3bs_both_spaces_invariant : ∀ c₁ ∈ moeE4m3BsSpace ++ moeE4m3BsSwapSpace, ∀ c₂ ∈ moeE4m3BsSpace ++ moeE4m3BsSwapSpace, "
+        "∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (KB : Nat), tileResultKB c₁ S₁ p a b KB = tileResultKB c₂ S₂ q a b KB := "
+        "space_invariantKB (moeE4m3BsSpace ++ moeE4m3BsSwapSpace)"
+    )
     disp = dispatch_cases()
     L.append(
         "/-! Every knob record the block-scale MoE dispatcher returns over the bench geometries x token counts x every nominal "
-        "part x the chains x both requantization spellings, with the first (T, H, I, E) that selects it: a member of the space "
-        "above (R3 membership). -/"
+        "part x the chains x both requantization spellings, with the first (T, H, I, E) that selects it: a member of one of the "
+        "two spaces above (R3 membership). -/"
     )
     L.append(
         "def moeE4m3BsDispatch : List (Nat × Nat × Nat × Nat × Config) := ["
@@ -284,7 +314,7 @@ def render() -> str:
         + "]"
     )
     L.append(
-        "theorem moe_e4m3bs_dispatch_in_space : moeE4m3BsDispatch.all (fun ⟨_, _, _, _, c⟩ => moeE4m3BsSpace.any (fun s => s == c)) = true := by decide +kernel"
+        "theorem moe_e4m3bs_dispatch_in_space : moeE4m3BsDispatch.all (fun ⟨_, _, _, _, c⟩ => (moeE4m3BsSpace ++ moeE4m3BsSwapSpace).any (fun s => s == c)) = true := by decide +kernel"
     )
     L.append("end BIK")
     return "\n".join(L) + "\n"
