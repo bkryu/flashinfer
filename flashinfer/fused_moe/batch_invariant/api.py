@@ -351,6 +351,40 @@ def route(
     return experts, weights
 
 
+def group_tables_buffer(
+    E: int, device: torch.device, tables: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """The GEMM launches' group tables a plan writes: ``[TABLE_ROWS, E + 1]`` int32 (``blocks/scheduler.py``: the dense and
+    the padded group offsets and a cluster-row prefix per extent of ``TABLE_CLUSTER_ROWS``, entry ``E`` the totals);
+    ``tables`` given: checked and returned."""
+    from .blocks.scheduler import TABLE_ROWS
+
+    if tables is None:
+        return torch.empty(TABLE_ROWS, E + 1, dtype=torch.int32, device=device)
+    if (
+        tuple(tables.shape) != (TABLE_ROWS, E + 1)
+        or tables.dtype != torch.int32
+        or not tables.is_contiguous()
+    ):
+        raise ValueError(
+            f"group tables must be a contiguous int32 [{TABLE_ROWS}, {E + 1}], got {tuple(tables.shape)} {tables.dtype}"
+        )
+    return tables
+
+
+def group_tables(counts: torch.Tensor) -> torch.Tensor:
+    """The group tables of ``counts [E]``, ``[TABLE_ROWS, E + 1]``: what the plans emit, for a grouped GEMM called outside
+    them (one one-warp launch)."""
+    from .permute import get_compiled_group_tables
+
+    if counts.dtype != torch.int32 or counts.dim() != 1 or not counts.is_contiguous():
+        raise TypeError("group_tables: counts must be a contiguous int32 [E]")
+    E = int(counts.shape[0])
+    tables = group_tables_buffer(E, counts.device)
+    get_compiled_group_tables()(counts, tables, E)
+    return tables
+
+
 def route_plan(
     logits: torch.Tensor,
     top_k: int,
@@ -360,6 +394,7 @@ def route_plan(
     align: int = 1,
     dual: bool = False,
     pad_align: int = 128,
+    tables: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, ...]:
     """``route`` and ``permute_plan`` in one launch for small token counts: ``(experts [T, k] int32, weights [T, k] f32,
     counts [E] int32, dest [T, k] int32, src [T k] int32)``, the same bits and integers as the two calls (the routing is the
@@ -422,12 +457,28 @@ def route_plan(
     src = torch.empty(n_src, dtype=torch.int32, device=dev)
     dest_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
     pos_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
+    tables = group_tables_buffer(E, dev, tables)
     if T:
         get_compiled_route_plan(
             expert_bucket(E), top_k, method, _IN[logits.dtype], align, dual, pad_align
-        )(logits, b, s, experts, weights, counts, dest, src, dest_pad, pos_pad, T, E)
+        )(
+            logits,
+            b,
+            s,
+            experts,
+            weights,
+            counts,
+            dest,
+            src,
+            dest_pad,
+            pos_pad,
+            tables,
+            T,
+            E,
+        )
     else:
         counts.zero_()
+        tables.zero_()
     if dual:
         return (
             experts,
@@ -445,7 +496,7 @@ PLAN_MULTI_MIN_N = 16384  # from this many slots the plan runs as the two-launch
 
 
 def permute_plan(
-    experts: torch.Tensor, E: int
+    experts: torch.Tensor, E: int, tables: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(counts [E] int32, dest [T, k] int32, src [Tk] int32)``: the deterministic permutation of the expanded rows,
     grouped by expert in expert order and, inside a group, in token-slot order (a function of the routing alone). An id
@@ -462,17 +513,19 @@ def permute_plan(
     flat = experts.reshape(-1)
     if not flat.is_contiguous() or flat.dtype != torch.int32:
         raise TypeError("permute_plan: experts must be a contiguous int32 [T, k]")
+    tables = group_tables_buffer(E, dev, tables)
     if n == 0:
         counts.zero_()
+        tables.zero_()
         return counts, dest.view(T, k), src
     if n >= PLAN_MULTI_MIN_N:
         nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
         hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
         get_compiled_plan_multi(1, False, 128)(
-            flat, counts, dest, src, dest, dest, hist_blk, n, E, nb
+            flat, counts, dest, src, dest, dest, tables, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(1, False)(flat, counts, dest, src, dest, dest, n, E)
+        get_compiled_plan(1, False)(flat, counts, dest, src, dest, dest, tables, n, E)
     return counts, dest.view(T, k), src
 
 

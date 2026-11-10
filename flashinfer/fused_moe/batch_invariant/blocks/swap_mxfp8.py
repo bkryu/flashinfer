@@ -80,7 +80,13 @@ from .epilogue_mx import (
     swap_xch_layout,
     swapped_epilogue_quant_loop,
 )
-from .scheduler import MAX_E, GroupScheduler, build_group_tables
+from .scheduler import (
+    MAX_E,
+    GroupScheduler,
+    build_group_tables,
+    load_group_tables,
+    pre_row_of,
+)
 
 EPILOGUE_WARPS = (
     0,
@@ -202,7 +208,7 @@ class SwappedBlockScaledGemmMX:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self._launch(a, sfa, w, sfw, out, counts, max_active_clusters, stream)
+        self._launch(a, sfa, w, sfw, out, counts, None, max_active_clusters, stream)
 
     @cute.jit
     def call_quant(
@@ -217,13 +223,60 @@ class SwappedBlockScaledGemmMX:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        """The fused-requantization chain (``out_fmt == "mxfp8"``): ``out`` the e4m3 codes (uint8 ``[Tk', N_out]`` dense rows),
-        ``out_sf`` the flat uint8 UE8M0 bytes in the 128x4 layout of the padded rows."""
-        self._launch(a, sfa, w, sfw, out, counts, max_active_clusters, stream, out_sf)
+        """The fused-requantization chain (``out_fmt == "mxfp8"``): ``out`` the e4m3 codes, ``out_sf`` the flat uint8 UE8M0
+        bytes in the 128x4 layout of the padded rows."""
+        self._launch(
+            a, sfa, w, sfw, out, counts, None, max_active_clusters, stream, out_sf
+        )
+
+    # the same entries taking the plan's group tables (``tables [TABLE_ROWS, E + 1]`` int32, ``scheduler.load_group_tables``)
+    # after ``counts``: the CTAs load them in place of the two per-CTA scans of ``counts``
+    @cute.jit
+    def call_tables(
+        self,
+        a: cute.Tensor,
+        sfa: cute.Tensor,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        tables: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._launch(a, sfa, w, sfw, out, counts, tables, max_active_clusters, stream)
+
+    @cute.jit
+    def call_quant_tables(
+        self,
+        a: cute.Tensor,
+        sfa: cute.Tensor,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        out_sf: cute.Tensor,
+        counts: cute.Tensor,
+        tables: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._launch(
+            a, sfa, w, sfw, out, counts, tables, max_active_clusters, stream, out_sf
+        )
 
     # host side (trace time)
     def _launch(
-        self, a, sfa, w, sfw, out, counts, max_active_clusters, stream, out_sf=None
+        self,
+        a,
+        sfa,
+        w,
+        sfw,
+        out,
+        counts,
+        tables,
+        max_active_clusters,
+        stream,
+        out_sf=None,
     ):
         plan_cls = self.plan_cls
         assert a.element_type is plan_cls.B_DT and w.element_type is plan_cls.A_DT, (
@@ -299,6 +352,7 @@ class SwappedBlockScaledGemmMX:
             out,
             counts,
             out_sf,
+            tables,
             st.cluster_layout_vmnk,
             st.a_smem_layout_staged,
             st.b_smem_layout_staged,
@@ -327,6 +381,7 @@ class SwappedBlockScaledGemmMX:
         mOut: cute.Tensor,
         counts: cute.Tensor,
         mOutSf: Optional[cute.Tensor],
+        mTab: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -424,7 +479,12 @@ class SwappedBlockScaledGemmMX:
         s_pre = storage.group_pre.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_off_pad = storage.group_off_pad.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_pre_pad = storage.group_pre_pad.get_tensor(cute.make_layout((MAX_E + 1,)))
-        if warp_idx == EPILOGUE_WARPS[0]:
+        if cutlass.const_expr(mTab is not None):
+            # the plan's tables (the dense rows, the padded scale-factor positions, the token-tile prefix), loaded by every thread
+            load_group_tables(
+                mTab, E, tidx, THREADS, pre_row_of(tn), s_off, s_pre, s_off_pad
+            )
+        elif warp_idx == EPILOGUE_WARPS[0]:
             build_group_tables(
                 counts, E, tn, s_off, s_pre, 1
             )  # the dense rows: the token tiles of a group

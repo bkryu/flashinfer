@@ -37,7 +37,7 @@ from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.heuristic import family_of
 from ...gemm.batch_invariant.schedule import chunks_for, mx_class_for
 from . import spec as S
-from .api import interleave_fc1, route
+from .api import group_tables_buffer, interleave_fc1, route
 from .blocks.epilogue import GroupedChain
 from .spec_mxfp8 import BLOCK, CLASS, MX_CLASSES
 
@@ -452,7 +452,7 @@ def grouped_gemm_mxfp8(
 
 
 def permute_plan_padded(
-    experts: torch.Tensor, E: int
+    experts: torch.Tensor, E: int, tables: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(counts [E] int32, dest [T, k] int32, src [Tk_pad] int32)``: the bf16 classes' deterministic permutation
     (expert order, then token-slot order) with the group offsets rounded up to 128 rows; ``src`` has
@@ -471,24 +471,28 @@ def permute_plan_padded(
     dest = torch.empty(n, dtype=torch.int32, device=dev)
     src = torch.full((padded_rows_bound(T, k, E),), -1, dtype=torch.int32, device=dev)
     counts = torch.empty(E, dtype=torch.int32, device=dev)
+    tables = group_tables_buffer(
+        E, dev, tables
+    )  # the GEMM launches' group tables, emitted by the plan
     if n == 0:
         counts.zero_()
+        tables.zero_()
         return counts, dest.view(T, k), src
     if n >= PLAN_MULTI_MIN_N:
         nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
         hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
         get_compiled_plan_multi(GROUP_ALIGN, False, GROUP_ALIGN)(
-            flat, counts, dest, src, dest, dest, hist_blk, n, E, nb
+            flat, counts, dest, src, dest, dest, tables, hist_blk, n, E, nb
         )
     else:
         get_compiled_plan(GROUP_ALIGN, False, GROUP_ALIGN)(
-            flat, counts, dest, src, dest, dest, n, E
+            flat, counts, dest, src, dest, dest, tables, n, E
         )
     return counts, dest.view(T, k), src
 
 
 def permute_plan_dual_padded(
-    experts: torch.Tensor, E: int
+    experts: torch.Tensor, E: int, tables: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(counts [E], dest [T, k], src [Tk], dest_pad [T, k], pos_pad [Tk])``: the dense plan (:func:`.api.permute_plan`)
     plus the positions with the groups padded to 128 rows (``dest_pad[i]``) and the padded position of every dense row
@@ -509,17 +513,21 @@ def permute_plan_dual_padded(
     dest_pad = torch.empty(n, dtype=torch.int32, device=dev)
     pos_pad = torch.empty(n, dtype=torch.int32, device=dev)
     counts = torch.empty(E, dtype=torch.int32, device=dev)
+    tables = group_tables_buffer(
+        E, dev, tables
+    )  # the GEMM launches' group tables, emitted by the plan
     if n == 0:
         counts.zero_()
+        tables.zero_()
     elif n >= PLAN_MULTI_MIN_N:
         nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
         hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
         get_compiled_plan_multi(1, True, GROUP_ALIGN)(
-            flat, counts, dest, src, dest_pad, pos_pad, hist_blk, n, E, nb
+            flat, counts, dest, src, dest_pad, pos_pad, tables, hist_blk, n, E, nb
         )
     else:
         get_compiled_plan(1, True, GROUP_ALIGN)(
-            flat, counts, dest, src, dest_pad, pos_pad, n, E
+            flat, counts, dest, src, dest_pad, pos_pad, tables, n, E
         )
     return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
 

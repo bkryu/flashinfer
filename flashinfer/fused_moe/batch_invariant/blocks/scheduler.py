@@ -140,6 +140,96 @@ def build_group_tables(
     cute.arch.sync_warp()
 
 
+# The plan's group tables in global memory, one ``[TABLE_ROWS, E + 1]`` int32 set per plan (entry ``E`` the totals): row
+# ``TAB_OFF`` the dense group offsets, ``TAB_OFF_PAD`` the offsets with every group rounded up to the scale-factor atom, and
+# one cluster-row prefix row per extent of ``TABLE_CLUSTER_ROWS`` (the rows one cluster tile covers: the swapped bodies'
+# token tiles, the grouped bodies' CTA rows times the cluster's M extent), so any record of the launch reads its own row
+# (``TAB_PRE + pre_row_of(cluster_rows)``). The plan kernels emit the set once (``emit_group_tables``), the grouped bodies
+# load three rows coalesced (``load_group_tables``) in place of a per-CTA scan of ``counts``; the same integers either way.
+TABLE_CLUSTER_ROWS = (8, 16, 32, 64, 128, 256, 512)
+TAB_OFF, TAB_OFF_PAD, TAB_PRE = 0, 1, 2
+TABLE_ROWS = TAB_PRE + len(TABLE_CLUSTER_ROWS)
+
+
+def pre_row_of(cluster_rows: int) -> int:
+    """The table row of the cluster-row prefix of ``cluster_rows`` (a record whose extent the tables do not carry is a bug)."""
+    return TAB_PRE + TABLE_CLUSTER_ROWS.index(int(cluster_rows))
+
+
+@cute.jit
+def emit_group_tables(
+    counts: cute.Tensor, E: Int32, pad_align: cutlass.Constexpr, mTab: cute.Tensor
+):
+    """One warp: ``build_group_tables``'s integers for every entry ``e <= E`` into ``mTab [TABLE_ROWS, E + 1]`` (global) --
+    row ``TAB_OFF`` the exclusive prefix of ``counts``, ``TAB_OFF_PAD`` the prefix with the groups rounded up to
+    ``pad_align`` rows, and per extent of ``TABLE_CLUSTER_ROWS`` the exclusive prefix of ``ceil(counts[e] / extent)``;
+    entry ``E`` the totals."""
+    lane = cute.arch.lane_idx()
+    loc = [cute.make_rmem_tensor((PER_LANE,), Int32) for _ in range(TABLE_ROWS)]
+    for i in cutlass.range_constexpr(PER_LANE):
+        e = lane * PER_LANE + i
+        c = Int32(0)
+        if e < E:
+            c = counts[e]
+        loc[TAB_OFF][i] = c
+    sums = [Int32(0) for _ in range(TABLE_ROWS)]
+    for i in cutlass.range_constexpr(PER_LANE):
+        c = loc[TAB_OFF][i]
+        for r in cutlass.range_constexpr(TABLE_ROWS):
+            loc[r][i] = sums[r]
+        sums[TAB_OFF] = sums[TAB_OFF] + c
+        sums[TAB_OFF_PAD] = sums[TAB_OFF_PAD] + (
+            (c + Int32(pad_align - 1)) // Int32(pad_align)
+        ) * Int32(pad_align)
+        for r in cutlass.range_constexpr(len(TABLE_CLUSTER_ROWS)):
+            cr = TABLE_CLUSTER_ROWS[r]
+            sums[TAB_PRE + r] = sums[TAB_PRE + r] + (c + Int32(cr - 1)) // Int32(cr)
+    incs = [s for s in sums]
+    for sh in cutlass.range_constexpr(5):
+        for r in cutlass.range_constexpr(TABLE_ROWS):
+            o = cute.arch.shuffle_sync_up(incs[r], offset=1 << sh)
+            if lane >= (1 << sh):
+                incs[r] = incs[r] + o
+    for i in cutlass.range_constexpr(PER_LANE):
+        e = lane * PER_LANE + i
+        if e <= E:
+            for r in cutlass.range_constexpr(TABLE_ROWS):
+                mTab[r, e] = incs[r] - sums[r] + loc[r][i]
+    if (lane == 31) & (Int32(MAX_E) == E):
+        for r in cutlass.range_constexpr(TABLE_ROWS):
+            mTab[r, MAX_E] = incs[r]
+    cute.arch.sync_warp()
+
+
+@cute.jit
+def load_group_tables(
+    mTab: cute.Tensor,
+    E: Int32,
+    tidx: Int32,
+    threads: cutlass.Constexpr,
+    pre_row: cutlass.Constexpr,
+    s_off: cute.Tensor,
+    s_pre: cute.Tensor,
+    s_off_pad=None,
+    padded: cutlass.Constexpr = False,
+):
+    """All ``threads`` of the CTA: the plan's tables into the smem tables ``build_group_tables`` fills -- ``s_off`` the dense
+    offsets (``padded``: the pad-aligned ones), ``s_pre`` the cluster-row prefix of row ``pre_row`` (``pre_row_of``),
+    ``s_off_pad`` (when given) the pad-aligned offsets; the totals at entry ``MAX_E`` as well. The caller's CTA barrier
+    completes them."""
+    row_off = TAB_OFF_PAD if padded else TAB_OFF
+    for j in cutlass.range(tidx, E + Int32(1), threads):
+        s_off[j] = mTab[row_off, j]
+        s_pre[j] = mTab[pre_row, j]
+        if cutlass.const_expr(s_off_pad is not None):
+            s_off_pad[j] = mTab[TAB_OFF_PAD, j]
+    if tidx == 0:
+        s_off[MAX_E] = mTab[row_off, E]
+        s_pre[MAX_E] = mTab[pre_row, E]
+        if cutlass.const_expr(s_off_pad is not None):
+            s_off_pad[MAX_E] = mTab[TAB_OFF_PAD, E]
+
+
 class GroupScheduler:
     """Persistent walk over the cluster tiles of all groups. ``cluster_rows`` = CTA tile rows x cluster M (the rows one
     cluster tile covers), ``cn`` = cluster N, ``raster_m``: m-blocks fastest inside a group (consecutive clusters share

@@ -41,7 +41,7 @@ from cutlass import Boolean, Int32, Uint32
 
 from ...batch_invariant import jit
 from ...batch_invariant.fp_interface.cute import get_cutlass_dtype
-from .blocks.scheduler import MAX_E, build_group_tables
+from .blocks.scheduler import MAX_E, TABLE_ROWS, build_group_tables, emit_group_tables
 from . import pdl
 
 MODULE = "batch_invariant_moe"
@@ -90,12 +90,32 @@ class HistogramKernel:
         pdl.trigger_one_wave()
 
 
-class PositionKernel:
-    """``align``: the group offsets are the exclusive prefix of the counts rounded up to ``align`` rows."""
+PAD_ALIGN = 128  # the block-scaled classes' group padding (the scale-factor atom's rows): the plans' padded tables' alignment
 
-    def __init__(self, align: int = 1):
-        assert align >= 1
-        self.align = align
+
+@cute.jit
+def emit_tables(
+    counts: cute.Tensor,
+    E: Int32,
+    pad_align: cutlass.Constexpr,
+    mTab: cute.Tensor,
+    warp: Int32,
+):
+    """The GEMM launches' group tables (``scheduler.emit_group_tables``) from the complete histogram, by warp 1 of the
+    emitting CTA (warp 0 builds the plan's own smem tables meanwhile)."""
+    if warp == Int32(1):
+        emit_group_tables(counts, E, pad_align, mTab)
+
+
+class PositionKernel:
+    """``align``: the group offsets are the exclusive prefix of the counts rounded up to ``align`` rows. Every plan kernel
+    also emits the GEMM launches' group tables ``mTab`` (``[TABLE_ROWS, E + 1]``, ``scheduler.emit_group_tables``): the
+    group offsets (dense and padded to ``pad_align``) and the cluster-row prefixes the grouped bodies load instead of
+    scanning ``counts``."""
+
+    def __init__(self, align: int = 1, pad_align: int = PAD_ALIGN):
+        assert align >= 1 and pad_align > 1
+        self.align, self.pad_align = align, pad_align
 
     @cute.jit
     def __call__(
@@ -104,11 +124,12 @@ class PositionKernel:
         mCounts: cute.Tensor,
         mDest: cute.Tensor,
         mSrc: cute.Tensor,
+        mTab: cute.Tensor,
         n: Int32,
         E: Int32,
         stream,
     ):
-        self.kernel(mExp, mCounts, mDest, mSrc, n, E).launch(
+        self.kernel(mExp, mCounts, mDest, mSrc, mTab, n, E).launch(
             grid=[E, 1, 1], block=[THREADS, 1, 1], stream=stream, use_pdl=True
         )
 
@@ -119,6 +140,7 @@ class PositionKernel:
         mCounts: cute.Tensor,
         mDest: cute.Tensor,
         mSrc: cute.Tensor,
+        mTab: cute.Tensor,
         n: Int32,
         E: Int32,
     ):
@@ -139,6 +161,8 @@ class PositionKernel:
         )
         if warp == 0:
             build_group_tables(mCounts, E, 1, s_off, s_pre, self.align)
+        if e == Int32(0):
+            emit_tables(mCounts, E, self.pad_align, mTab, warp)
         cute.arch.barrier()
         base = s_off[e]
         running = Int32(0)
@@ -203,11 +227,12 @@ class PlanKernel:
         mSrc: cute.Tensor,
         mDestPad: cute.Tensor,
         mPosPad: cute.Tensor,
+        mTab: cute.Tensor,
         n: Int32,
         E: Int32,
         stream,
     ):
-        self.kernel(mExp, mCounts, mDest, mSrc, mDestPad, mPosPad, n, E).launch(
+        self.kernel(mExp, mCounts, mDest, mSrc, mDestPad, mPosPad, mTab, n, E).launch(
             grid=[E, 1, 1], block=[THREADS, 1, 1], stream=stream, use_pdl=True
         )
 
@@ -220,6 +245,7 @@ class PlanKernel:
         mSrc: cute.Tensor,
         mDestPad: cute.Tensor,
         mPosPad: cute.Tensor,
+        mTab: cute.Tensor,
         n: Int32,
         E: Int32,
     ):
@@ -268,6 +294,8 @@ class PlanKernel:
             build_group_tables(hist, E, 1, s_off, s_pre, self.align)
             if cutlass.const_expr(self.dual):
                 build_group_tables(hist, E, 1, s_off_pad, s_pre_pad, self.pad_align)
+        if e == Int32(0):
+            emit_tables(hist, E, self.pad_align, mTab, warp)
         # pass 1: this warp's slot range, its count of expert e (ballots over 32 slots at a time)
         n_warps = Int32(THREADS // LANES)
         per_warp = (n + n_warps - Int32(1)) // n_warps
@@ -437,6 +465,7 @@ class PlanFinishKernel:
         mSrc: cute.Tensor,
         mDestPad: cute.Tensor,
         mPosPad: cute.Tensor,
+        mTab: cute.Tensor,
         mHistBlk: cute.Tensor,
         n: Int32,
         E: Int32,
@@ -444,7 +473,7 @@ class PlanFinishKernel:
         stream,
     ):
         self.kernel(
-            mExp, mCounts, mDest, mSrc, mDestPad, mPosPad, mHistBlk, n, E, nb
+            mExp, mCounts, mDest, mSrc, mDestPad, mPosPad, mTab, mHistBlk, n, E, nb
         ).launch(
             grid=[nb, 1, 1], block=[PLAN_THREADS, 1, 1], stream=stream, use_pdl=True
         )
@@ -458,6 +487,7 @@ class PlanFinishKernel:
         mSrc: cute.Tensor,
         mDestPad: cute.Tensor,
         mPosPad: cute.Tensor,
+        mTab: cute.Tensor,
         mHistBlk: cute.Tensor,
         n: Int32,
         E: Int32,
@@ -505,6 +535,8 @@ class PlanFinishKernel:
             build_group_tables(hist, E, 1, s_off, s_pre, self.align)
             if cutlass.const_expr(self.dual):
                 build_group_tables(hist, E, 1, s_off_pad, s_pre_pad, self.pad_align)
+        if b == Int32(0):
+            emit_tables(hist, E, self.pad_align, mTab, warp)
         cute.arch.barrier()
         if b == Int32(0):
             # the rows past the total: the dropped slots' share of the buffer holds -1, which the gather skips
@@ -549,6 +581,7 @@ class PlanMultiKernel:
         mSrc: cute.Tensor,
         mDestPad: cute.Tensor,
         mPosPad: cute.Tensor,
+        mTab: cute.Tensor,
         mHistBlk: cute.Tensor,
         n: Int32,
         E: Int32,
@@ -559,10 +592,30 @@ class PlanMultiKernel:
             grid=[nb, 1, 1], block=[PLAN_THREADS, 1, 1], stream=stream, use_pdl=True
         )
         self.finish.kernel(
-            mExp, mCounts, mDest, mSrc, mDestPad, mPosPad, mHistBlk, n, E, nb
+            mExp, mCounts, mDest, mSrc, mDestPad, mPosPad, mTab, mHistBlk, n, E, nb
         ).launch(
             grid=[nb, 1, 1], block=[PLAN_THREADS, 1, 1], stream=stream, use_pdl=True
         )
+
+
+class GroupTablesKernel:
+    """One CTA of one warp: the group tables of ``counts`` (``scheduler.emit_group_tables``) for a launch outside the plans
+    (a standalone grouped GEMM call)."""
+
+    def __init__(self, pad_align: int = PAD_ALIGN):
+        self.pad_align = pad_align
+
+    @cute.jit
+    def __call__(self, mCounts: cute.Tensor, mTab: cute.Tensor, E: Int32, stream):
+        self.kernel(mCounts, mTab, E).launch(
+            grid=[1, 1, 1], block=[LANES, 1, 1], stream=stream, use_pdl=True
+        )
+
+    @cute.kernel
+    def kernel(self, mCounts: cute.Tensor, mTab: cute.Tensor, E: Int32):
+        cute.arch.griddepcontrol_wait()
+        emit_group_tables(mCounts, E, self.pad_align, mTab)
+        pdl.trigger_one_wave()
 
 
 # The row copies' placement rule: a warp keeps at least ROW_SLABS_PER_WARP 32-vector slabs of its row (the serial work that
@@ -688,11 +741,19 @@ def get_compiled_positions(align: int = 1) -> Any:
     """``kernel(experts [T k] i32, counts [E] i32, dest [T k] i32, src [rows] i32, n, E)``."""
 
     def compile_fn():
-        sym_n, sym_e, sym_p = cute.sym_int(32), cute.sym_int(32), cute.sym_int(32)
+        sym_n, sym_e, sym_p, sym_t = (
+            cute.sym_int(32),
+            cute.sym_int(32),
+            cute.sym_int(32),
+            cute.sym_int(32),
+        )
         e_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
         d_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         s_fake = cute.runtime.make_fake_tensor(Int32, (sym_p,), (1,), assumed_align=4)
+        t_fake = cute.runtime.make_fake_tensor(
+            Int32, (TABLE_ROWS, sym_t), (cute.sym_int64(), 1), assumed_align=4
+        )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
             PositionKernel(align),
@@ -700,6 +761,7 @@ def get_compiled_positions(align: int = 1) -> Any:
             c_fake,
             d_fake,
             s_fake,
+            t_fake,
             Int32(1),
             Int32(1),
             stream_fake,
@@ -713,17 +775,26 @@ def get_compiled_positions(align: int = 1) -> Any:
 
 @functools.cache
 def get_compiled_plan(align: int = 1, dual: bool = False, pad_align: int = 128) -> Any:
-    """``kernel(experts [T k] i32, counts [E] i32 (written), dest [T k], src [Tk(_pad)], dest_pad [T k], pos_pad [T k], n, E)``;
-    without ``dual`` pass any two int32 tensors for the last two."""
+    """``kernel(experts [T k] i32, counts [E] i32 (written), dest [T k], src [Tk(_pad)], dest_pad [T k], pos_pad [T k],
+    tables [TABLE_ROWS, E + 1] i32 (written), n, E)``; without ``dual`` pass any two int32 tensors for ``dest_pad`` /
+    ``pos_pad``."""
 
     def compile_fn():
-        sym_n, sym_e, sym_p = cute.sym_int(32), cute.sym_int(32), cute.sym_int(32)
+        sym_n, sym_e, sym_p, sym_t = (
+            cute.sym_int(32),
+            cute.sym_int(32),
+            cute.sym_int(32),
+            cute.sym_int(32),
+        )
         e_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
         d_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         s_fake = cute.runtime.make_fake_tensor(Int32, (sym_p,), (1,), assumed_align=4)
         dp_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         pp_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
+        t_fake = cute.runtime.make_fake_tensor(
+            Int32, (TABLE_ROWS, sym_t), (cute.sym_int64(), 1), assumed_align=4
+        )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
             PlanKernel(align, dual, pad_align),
@@ -733,6 +804,7 @@ def get_compiled_plan(align: int = 1, dual: bool = False, pad_align: int = 128) 
             s_fake,
             dp_fake,
             pp_fake,
+            t_fake,
             Int32(1),
             Int32(1),
             stream_fake,
@@ -749,11 +821,12 @@ def get_compiled_plan_multi(
     align: int = 1, dual: bool = False, pad_align: int = 128
 ) -> Any:
     """``kernel(experts [T k] i32, counts [E] i32 (written), dest [T k], src [Tk(_pad)], dest_pad [T k], pos_pad [T k],
-    hist_blk [nb E] i32 (scratch), n, E, nb)`` with ``nb = ceil(n / PLAN_BLOCK)``: the two-launch plan of large batches
-    (same outputs as ``get_compiled_plan``)."""
+    tables [TABLE_ROWS, E + 1] i32 (written), hist_blk [nb E] i32 (scratch), n, E, nb)`` with ``nb = ceil(n /
+    PLAN_BLOCK)``: the two-launch plan of large batches (same outputs as ``get_compiled_plan``)."""
 
     def compile_fn():
-        sym_n, sym_e, sym_p, sym_h = (
+        sym_n, sym_e, sym_p, sym_h, sym_t = (
+            cute.sym_int(32),
             cute.sym_int(32),
             cute.sym_int(32),
             cute.sym_int(32),
@@ -766,6 +839,9 @@ def get_compiled_plan_multi(
         dp_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         pp_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         h_fake = cute.runtime.make_fake_tensor(Int32, (sym_h,), (1,), assumed_align=4)
+        t_fake = cute.runtime.make_fake_tensor(
+            Int32, (TABLE_ROWS, sym_t), (cute.sym_int64(), 1), assumed_align=4
+        )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
             PlanMultiKernel(align, dual, pad_align),
@@ -775,6 +851,7 @@ def get_compiled_plan_multi(
             s_fake,
             dp_fake,
             pp_fake,
+            t_fake,
             h_fake,
             Int32(1),
             Int32(1),
@@ -785,6 +862,34 @@ def get_compiled_plan_multi(
 
     return jit.build_and_load(
         MODULE, plan_kernel_name("plan_multi", align, dual, pad_align), compile_fn
+    )
+
+
+@functools.cache
+def get_compiled_group_tables(pad_align: int = PAD_ALIGN) -> Any:
+    """``kernel(counts [E] i32, tables [TABLE_ROWS, E + 1] i32 (written), E)``: the group tables of a counts vector
+    outside the plans (`GroupTablesKernel`)."""
+
+    def compile_fn():
+        sym_e, sym_t = cute.sym_int(32), cute.sym_int(32)
+        c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+        t_fake = cute.runtime.make_fake_tensor(
+            Int32, (TABLE_ROWS, sym_t), (cute.sym_int64(), 1), assumed_align=4
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return cute.compile(
+            GroupTablesKernel(pad_align),
+            c_fake,
+            t_fake,
+            Int32(1),
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return jit.build_and_load(
+        MODULE,
+        "moe_group_tables" + (f"_a{pad_align}" if pad_align != PAD_ALIGN else ""),
+        compile_fn,
     )
 
 
