@@ -1232,7 +1232,6 @@ def grouped_blockscale_epilogue_loop(
         # a warp whose 32 rows all lie past the group's end skips its TMEM loads and fmas (warp-uniform; the stage releases and
         # the barriers are kept); the pair tile's rows are counted from the cluster tile's first row
         warp_active = rows_left > cta_row_rel + warp_row0
-        lane_live = row_rel < rows_left  # this lane's row is inside the group
         for i in cutlass.range_constexpr(VW):
             tTR_rSum[i] = CuteF32.const(0.0)  # acc_0 = +0
         for _kt in range(
@@ -1289,14 +1288,6 @@ def grouped_blockscale_epilogue_loop(
                         acc_state
                     )  # one arrive per warp: the stage is free once all arrived
                 acc_state.advance()
-        # a dead lane's accumulators (a row past the group's end: a zero-filled TMA row) replaced by a benign constant, so the
-        # chain and the requantization below run unconditionally with their exact divisions off the hardware's slow path; dead
-        # rows are never stored
-        for i in cutlass.range_constexpr(VW):
-            tTR_rSum[i] = Float32(
-                cutlass.select_(lane_live, tTR_rSum[i], CuteF32.const(1.0))
-            )
-
         # ===== the chain and the store of this group's half of the tile's fold =====
         if cutlass.const_expr(quant):
             # the fused requantization: the bf16-rounded chain values of the group's outputs in column order, then the block amax
