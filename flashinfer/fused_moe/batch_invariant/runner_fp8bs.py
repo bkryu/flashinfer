@@ -106,6 +106,8 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
             raise unsupported(
                 CLASS, "group-limited routing (n_group > 1)", "n_group in (None, 0, 1)"
             )
+        # the fp8-block base runner derives no routing method: the class's own (the logits mode consults it); expert-parallel
+        # shards are refused by name in super()._check_support() (the backend's `supports_expert_parallelism = False`)
         self._method = METHOD_OF_FLASHINFER.get(routing.method)
         if not cfg.finalize.do_finalize:
             raise unsupported(
