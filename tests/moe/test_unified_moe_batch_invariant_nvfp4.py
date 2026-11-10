@@ -1894,6 +1894,18 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         ),
         (
             dict(
+                experts=ExpertConfig(intermediate_size=I, local_num_experts=E // 2),
+            ),
+            "expert-parallel",
+        ),
+        (
+            dict(
+                experts=ExpertConfig(intermediate_size=I, local_expert_offset=E // 2),
+            ),
+            "expert-parallel",
+        ),
+        (
+            dict(
                 experts=ExpertConfig(
                     intermediate_size=I,
                     local_expert_offset=E // 2,

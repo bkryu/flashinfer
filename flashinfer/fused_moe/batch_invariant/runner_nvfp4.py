@@ -179,6 +179,14 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
                 "fused shared experts",
                 "num_fused_shared_experts = 0 (a shared expert is one more routed slot)",
             )
+        if experts.local_expert_offset or (
+            experts.local_num_experts not in (None, 0, routing.num_experts)
+        ):
+            raise unsupported(
+                CLASS,
+                "expert-parallel shards (local_expert_offset / local_num_experts)",
+                "the full expert set (the class's EP form is not part of this backend)",
+            )
         # the shape rule on the dimensions the config fixes (H enters at the first call, with the full rule)
         check_shape_nvfp4(
             None, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
