@@ -94,6 +94,7 @@ class CombineKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
+        cute.arch.griddepcontrol_wait()
         g_raw = (
             bidx * WARPS + tidx // LANES
         )  # the global warp index: token t_raw, part w of its row
@@ -104,14 +105,11 @@ class CombineKernel:
             t_raw, T - Int32(1)
         )  # out-of-range warps recompute a valid token and store nothing
         if cutlass.const_expr(True):
-            # the slot positions and weights are the plan's (the predecessor's predecessor, complete before this grid launched),
-            # read before the wait; the expert rows (the predecessor's) after it
             ps = [mDest[t, r] for r in range(k)]
             ws = [mW[t, r] for r in range(k)]
             # a dropped slot (dest -1: an expert id outside [0, E)) has no expert row: its loads take row 0 and its term is +0
             oks = [p >= Int32(0) for p in ps]
             ps = [cutlass.max(p, Int32(0)) for p in ps]
-            cute.arch.griddepcontrol_wait()
             atom_in = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
                 mY.element_type,
