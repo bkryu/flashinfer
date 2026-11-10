@@ -284,7 +284,9 @@ def render() -> str:
         "orientation). -/"
     )
     L.append(
-        "def moeE4m3BsSwapSpace : List Config := [" + ", ".join(k.lean() for k in sw) + "]"
+        "def moeE4m3BsSwapSpace : List Config := ["
+        + ", ".join(k.lean() for k in sw)
+        + "]"
     )
     L.append(
         f"theorem moe_e4m3bs_swap_space_size : moeE4m3BsSwapSpace.length = {len(sw)} := by decide"

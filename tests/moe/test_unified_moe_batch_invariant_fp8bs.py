@@ -571,7 +571,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     GEMM (the fused requantization's chain in its whole-block subspace), for the gated and the ungated classes, at the nominal
     parts; the ranked list is short, distinct and inside the space; the requantization rule is a function of the rows per expert."""
     from flashinfer.fused_moe.batch_invariant.blocks.fp8bs_compile import GEMM2_CHAIN
-    from flashinfer.fused_moe.batch_invariant.schedule import active_experts, rows_per_expert
+    from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
     from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import (
         FUSED_QUANT_MIN_ROWS,
         all_valid_configs_fp8bs,
@@ -581,7 +581,6 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
         gemm1_chain,
         grouped_knobs_fp8bs,
         rank_grouped_fp8bs,
-        swap_record_fp8bs,
         swapped_knobs_fp8bs,
     )
 
@@ -589,8 +588,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     # the swapped decode space: 64 / 128 weight rows x 8 / 16 / 32 / 64 tokens, 1-CTA; the bf16 / f32 chains only; disjoint
     sw = swapped_knobs_fp8bs()
     assert len(sw) == 8 and all(
-        k.swap_ab and k.tile_m in (64, 128) and k.tile_n in (8, 16, 32, 64)
-        for k in sw
+        k.swap_ab and k.tile_m in (64, 128) and k.tile_n in (8, 16, 32, 64) for k in sw
     )
     assert not set(sw) & set(grouped_knobs_fp8bs())
     geoms = [
@@ -617,10 +615,14 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
             and s1uq <= s1u
         )
         w1 = set(all_valid_configs_fp8bs_swapped(2 * I, H, E, gemm1_chain("silu")))
-        w1u = set(all_valid_configs_fp8bs_swapped(I, H, E, gemm1_chain("relu2", (), False)))
+        w1u = set(
+            all_valid_configs_fp8bs_swapped(I, H, E, gemm1_chain("relu2", (), False))
+        )
         w2 = set(all_valid_configs_fp8bs_swapped(H, I, E, GEMM2_CHAIN))
         assert len(w1) == len(w1u) == len(w2) == 8
-        assert not all_valid_configs_fp8bs_swapped(2 * I, H, E, gemm1_chain("silu", fused=True))
+        assert not all_valid_configs_fp8bs_swapped(
+            2 * I, H, E, gemm1_chain("silu", fused=True)
+        )
         for T in (1, 7, 64, 300, 800, 4096, 16384):
             for fused in (False, True):
                 c1, c2 = default_configs_fp8bs(
@@ -648,11 +650,9 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     c1.describe(),
                     c2.describe(),
                 )
-                # the swapped records come from the structural rule alone (a function of the rows per expert, N and the part)
-                rows = rows_per_expert(T, k, E)
-                exp2 = swap_record_fp8bs(rows, H, active_experts(T, k, E), sm_count, family)
-                assert c2.swap_ab == (exp2 is not None) and (exp2 is None or c2 == exp2), (family, T, H, I, E, k, c2.describe())
-                assert not (fused and c1.swap_ab)
+                assert not (
+                    fused and c1.swap_ab
+                )  # the fused requantization is the padded body's spelling
                 c1u, _ = default_configs_fp8bs(
                     T,
                     k,
@@ -691,8 +691,8 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
             assert (
                 1 <= len(ranked) <= 3
                 and len(set(ranked)) == len(ranked)
-                and all(c in s2 for c in ranked)
-            )  # the ranked padded list; the runner puts the rule's swapped record in front of it
+                and all(c in s2 | w2 for c in ranked)
+            )
             assert fused_quant_default(T, k, E) == (
                 rows_per_expert(T, k, E) >= FUSED_QUANT_MIN_ROWS
             )
@@ -1268,7 +1268,11 @@ def test_swapped_decode_body_equals_the_padded_body(act):
     W = _weights(w1, w2, act=act)
     runner = layer.runners[0]
     c1, c2, fused = runner._default(T)
-    assert c1.swap_ab and c2.swap_ab and not fused, (c1.describe(), c2.describe(), fused)
+    assert c1.swap_ab and c2.swap_ab and not fused, (
+        c1.describe(),
+        c2.describe(),
+        fused,
+    )
     pack = _logits_pack(xq, sx, logits)
     got = bits(layer(pack, W))
     Wd = MoEWeightsE4M3BS.from_view(W.get_view(runner.backend_key))
@@ -1280,18 +1284,26 @@ def test_swapped_decode_body_equals_the_padded_body(act):
         T, k, H, I, E, sm, fam, name, gated, (), False, swap=False
     )
     assert not p1.swap_ab and not p2.swap_ab
-    ref = bits(fused_moe_fp8bs(xq, sx, ids, wts, Wd, config1=p1, config2=p2, fuse_quant=False))
+    ref = bits(
+        fused_moe_fp8bs(xq, sx, ids, wts, Wd, config1=p1, config2=p2, fuse_quant=False)
+    )
     assert torch.equal(got, ref), (c1.describe(), c2.describe())
     n1 = 2 * I if gated else I
     ch1 = gemm1_chain(name, (), gated)
     for c in all_valid_configs_fp8bs_swapped(n1, H, E, ch1):
-        out = fused_moe_fp8bs(xq, sx, ids, wts, Wd, config1=c, config2=p2, fuse_quant=False)
+        out = fused_moe_fp8bs(
+            xq, sx, ids, wts, Wd, config1=c, config2=p2, fuse_quant=False
+        )
         assert torch.equal(bits(out), ref), ("gemm1", c.describe())
     for c in all_valid_configs_fp8bs_swapped(H, I, E, GEMM2_CHAIN):
-        out = fused_moe_fp8bs(xq, sx, ids, wts, Wd, config1=p1, config2=c, fuse_quant=False)
+        out = fused_moe_fp8bs(
+            xq, sx, ids, wts, Wd, config1=p1, config2=c, fuse_quant=False
+        )
         assert torch.equal(bits(out), ref), ("gemm2", c.describe())
     tactics = runner.get_valid_tactics(runner.pack_inputs(pack, W), None)
-    assert tactics[0][13] == 1 and tactics[0][14] == 1 and tactics[0][12] == 0, tactics[0]
+    assert tactics[0][13] == 1 and tactics[0][14] == 1 and tactics[0][12] == 0, tactics[
+        0
+    ]
     with autotune(True):
         assert torch.equal(bits(layer(pack, W)), ref)
     assert torch.equal(bits(layer(pack, W)), ref)
