@@ -107,34 +107,34 @@ def chain_nodes_nvfp4(chain: W4A4Chain) -> int:
     s = Q.w4a4_row_scale(alg, alg.leaf("alpha", 0), alg.leaf("pts"))
     g, u = alg.leaf("g", 0, 0), alg.leaf("u", 0, 0)
     if chain.static_quant:
-        # chain nodes are DAG nodes: the block's shared sub-terms (amax tree, scale, encode scale) are counted once and split
-        # over the block's outputs, never re-expanded per code
+        # the block's DAG (the fp32 values, the amax tree, the scale, the codes) sized once and split over its outputs
         gs = alg.leaf("gs2", 0)
         if chain.pair:
-            pre = Q.glu_scaled_pre(alg, g, u, s, chain.act, chain.params)
+            vals = [Q.glu_scaled_pre(alg, alg.leaf("g", 0, j), alg.leaf("u", 0, j), s, chain.act, chain.params) for j in range(Q.NVFP4_BLOCK)]
         else:
-            pre = Q.act_scaled_pre(alg, u, s, chain.act, chain.params)
-        leaves = [alg.leaf("v", 0, j) for j in range(Q.NVFP4_BLOCK)]
-        amax = Q.nvfp4_block_amax(alg, leaves)
-        sf_d, inv = Q.nvfp4_block_chain(alg, alg.leaf("amax"), gs)
-        code = Q.nvfp4_quant_elem(alg, alg.leaf("v", 0, 0), alg.leaf("inv"))
-        shared = (
-            term.sexpr(amax).count("(")
-            + term.sexpr(sf_d).count("(")
-            + term.sexpr(inv).count("(")
-        )
-        return (
-            term.sexpr(pre).count("(")
-            + term.sexpr(code).count("(")
-            + -(-shared // Q.NVFP4_BLOCK)
-        )
+            vals = [Q.act_scaled_pre(alg, alg.leaf("u", 0, j), s, chain.act, chain.params) for j in range(Q.NVFP4_BLOCK)]
+        sf_d, codes = Q.static_block(alg, vals, gs)
+        return -(-_dag_size([sf_d, *codes]) // Q.NVFP4_BLOCK)
     if chain.pair:
         t = Q.glu_scaled_elem(alg, g, u, s, chain.act, chain.out_fmt, chain.params)
     elif chain.kind == "act":
         t = Q.act_scaled_elem(alg, u, s, chain.act, chain.out_fmt, chain.params)
     else:
         t = Q.scaled_out_elem(alg, u, s, chain.out_fmt)
-    return term.sexpr(t).count("(")
+    return term.size(t)
+
+
+def _dag_size(roots) -> int:
+    """The distinct nodes reachable from several roots (``mterm.size`` over one): a block's terms share their sub-terms."""
+    seen: set = set()
+    stack = list(roots)
+    while stack:
+        c = stack.pop()
+        if c.uid in seen:
+            continue
+        seen.add(c.uid)
+        stack.extend(a for a in c.args if hasattr(a, "uid"))
+    return len(seen)
 
 
 def _grouped(cfg: Knobs) -> Knobs:
