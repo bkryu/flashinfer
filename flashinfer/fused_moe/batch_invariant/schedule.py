@@ -185,12 +185,13 @@ def exposed_epilogue_cycles(
     mainloop through the accumulator stages): a thread's chains times the chain's node cycles. The grouped body computes a
     row's outputs per thread, the tile's columns split between its epilogue warpgroups (``epi_warpgroups``: the bf16 classes'
     two, the block-scaled classes' four; the gated chain pairs two accumulator columns per output); the swapped body computes a
-    weight row's live token columns per thread, ``min(rows, tile)`` of them (the chain of a dead column is skipped). At a few
-    rows per expert this term separates the bodies: the grouped body's epilogue is the tile's width wide whatever the live
-    rows. The 64-row swapped tile gives a thread two weight rows at a quarter of the columns: its busiest thread holds half the
-    chains (plain), a quarter when one of its rows is the gate."""
+    weight row's token columns per thread, the whole token tile of them: the quantizing classes' chains run for every column
+    of the tile, and the tile is what the MMA issues whatever the live rows, so the dead columns of a wide tile at a few live
+    rows are priced as work (a class whose guards skip the dead columns' chains pays less here than the term says, which the
+    ranking tolerates: the narrow tile is its pick anyway). The 64-row swapped tile gives a thread two weight rows at a quarter
+    of the columns: its busiest thread holds half the chains (plain), a quarter when one of its rows is the gate."""
     if cfg.swap_ab:
-        chains = min(rows, cfg.tile_n) * cfg.tile_m / 128
+        chains = cfg.tile_n * cfg.tile_m / 128
         if pair and cfg.tile_m < 128:
             chains /= 2
     else:
@@ -299,16 +300,21 @@ def record_cost(
     in_fmt: str = "bf16",
     nominal: bool = False,
     epi_warpgroups: int = _EPI_WARPGROUPS,
+    overrides: Optional[dict] = None,
 ) -> float:
     """The shared contract's cost of one grouped record at the launch's shape ``(rows per expert, n_active x N, K)``, the key
     every class's ``rank_grouped_*`` sorts by: the dense estimate with the MoE ranking's constant overrides
-    (`estimate_overrides`; the dense dispatcher's constants untouched), times the pair term and the swapped records' tiles
-    term, plus the exposed epilogue chain and the token box's exposed fill; in SM cycles (a launch's fixed cost is the same
-    for both bodies on every measured part, so it is no term)."""
+    (`estimate_overrides`, with a class's own ``overrides`` layered on top: its promotion counts and the like; the dense
+    dispatcher's constants untouched), times the pair term and the swapped records' tiles term, plus the exposed epilogue
+    chain (over the body's ``epi_warpgroups``) and the token box's exposed fill; in SM cycles (a launch's fixed cost is the
+    same for both bodies on every measured part, so it is no term)."""
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import estimate_cycles
 
+    constants = estimate_overrides(cfg, rows, in_fmt, family)
+    if overrides:
+        constants.update(overrides)
     canon = dataclasses.replace(cfg, raster_along="m")
     est = estimate_cycles(
         canon,
@@ -321,7 +327,7 @@ def record_cost(
         family,
         sm_count,
         nominal=nominal,
-        c=estimate_overrides(cfg, rows, in_fmt, family),
+        c=constants,
     )
     return (
         est * pair_term(cfg, rows) * tiles_term(cfg, rows)
