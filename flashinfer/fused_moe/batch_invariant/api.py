@@ -193,6 +193,7 @@ def grouped_gemm(
     out: Optional[torch.Tensor] = None,
     Tk: Optional[int] = None,
     grid: Optional[int] = None,
+    tables: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` for the expert segments ``counts`` (int32 ``[E]``, group order = expert order;
     rows ``[off_e, off_e + counts[e])`` of ``a`` belong to expert ``e``). ``a [R >= Tk, K]`` bf16 row-major, ``w [E, N, K]``
@@ -256,10 +257,13 @@ def grouped_gemm(
         raise ValueError(
             "grouped_gemm: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
         )
+    tab = (
+        () if tables is None else (tables,)
+    )  # the plan's group tables (``group_tables_buffer``): the CTAs load them
     kernel = (
-        get_compiled_swapped(config, chain)
+        get_compiled_swapped(config, chain, tables=bool(tab))
         if config.swap_ab
-        else get_compiled_grouped(config, chain)
+        else get_compiled_grouped(config, chain, tables=bool(tab))
     )
     if Tk == 0:
         return out
@@ -277,6 +281,7 @@ def grouped_gemm(
         w.permute(1, 2, 0),
         out,
         counts,
+        *tab,
         grid,
     )
     return out
@@ -294,6 +299,7 @@ def grouped_gemm_gather(
     out: Optional[torch.Tensor] = None,
     Tk: Optional[int] = None,
     grid: Optional[int] = None,
+    tables: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(x[src[p] // k_div] @ w[e(p)].T)`` for the expert segments ``counts``: :func:`grouped_gemm` on a
     swapped record with the rows gathered by the kernel (the TMA's gather4 mode) from the unpermuted ``x [T, K]`` bf16 -- no
@@ -363,7 +369,10 @@ def grouped_gemm_gather(
         raise ValueError(
             "grouped_gemm_gather: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
         )
-    kernel = get_compiled_swapped(config, chain, gather=True)
+    tab = (
+        () if tables is None else (tables,)
+    )  # the plan's group tables (``group_tables_buffer``): the CTAs load them
+    kernel = get_compiled_swapped(config, chain, gather=True, tables=bool(tab))
     if Tk == 0:
         return out
     if grid is None:
@@ -377,6 +386,7 @@ def grouped_gemm_gather(
         w.permute(1, 2, 0),
         out,
         counts,
+        *tab,
         grid,
     )
     return out
@@ -662,6 +672,8 @@ def fused_moe(
     gather: Optional[bool] = None,
     grid_clip: bool = True,
     w_round: bool = False,
+    tables: Optional[torch.Tensor] = None,
+    use_tables: bool = True,
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
@@ -716,9 +728,19 @@ def fused_moe(
     if config1 is None or config2 is None:
         c1, c2 = default_configs(T, k, H, I, E, *_part(x.device), gated=w.gated)
         config1, config2 = config1 or c1, config2 or c2
-    counts, dest, src = (
-        plan if plan is not None else permute_plan(experts, E)
-    )  # ``plan``: ``route_plan``'s outputs, the same integers
+    # ``plan``: ``route_plan``'s outputs, the same integers, with the plan's group tables as a fourth element when it emitted
+    # them; ``use_tables``: the GEMMs load the plan's tables (``group_tables_buffer``; a plan given without them gets the one-warp
+    # ``group_tables`` launch) in place of the per-CTA scan of ``counts`` -- a placement with the same integers either way
+    if plan is not None:
+        counts, dest, src = plan[:3]
+        tables = plan[3] if len(plan) > 3 else tables
+    else:
+        tables = group_tables_buffer(E, x.device, tables) if use_tables else None
+        counts, dest, src = permute_plan(experts, E, tables=tables)
+    if use_tables and tables is None:
+        tables = group_tables(counts)
+    if not use_tables:
+        tables = None
     Tk = T * k
     # a swapped record reads a token box of its tile's rows at every group's row: the dense buffer it reads carries that many
     # rows past the live ones, so the last tiles' boxes stay inside it (rows past the live ones are computed and never stored)
@@ -733,7 +755,17 @@ def fused_moe(
         # the swapped GEMM1 gathers the tokens' rows itself through the plan's slots: no gather launch, no permuted tensor
         x_perm = None
         a = grouped_gemm_gather(
-            x, src, k, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
+            x,
+            src,
+            k,
+            w.w1i,
+            counts,
+            config1,
+            w.chain1,
+            out=a_buf[:Tk],
+            Tk=Tk,
+            grid=g1,
+            tables=tables,
         )  # [Tk, I] bf16
     else:
         x_buf = torch.empty(Tk + pad1, H, dtype=torch.bfloat16, device=x.device)
@@ -743,10 +775,26 @@ def fused_moe(
                 k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
             )(x, src, x_perm, Tk, H)
         a = grouped_gemm(
-            x_buf, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
+            x_buf,
+            w.w1i,
+            counts,
+            config1,
+            w.chain1,
+            out=a_buf[:Tk],
+            Tk=Tk,
+            grid=g1,
+            tables=tables,
         )  # [Tk, I] bf16
     y = grouped_gemm(
-        a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk, grid=g2
+        a_buf,
+        w.w2,
+        counts,
+        config2,
+        "plain",
+        torch.bfloat16,
+        Tk=Tk,
+        grid=g2,
+        tables=tables,
     )  # [Tk, H] bf16
     if finalize and T:
         get_compiled_combine(

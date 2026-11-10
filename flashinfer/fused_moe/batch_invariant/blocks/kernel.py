@@ -13,7 +13,7 @@ gated chain; bf16 / f16 / f32), ``counts (E,)`` int32 (tokens per expert, in gro
 
 from __future__ import annotations
 
-from typing import Union
+from typing import Optional, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -47,6 +47,8 @@ from .scheduler import (
     TABLE_SMEM_BYTES,
     GroupScheduler,
     build_group_tables,
+    load_group_tables,
+    pre_row_of,
     warp_roles,
 )
 from .. import pdl
@@ -84,8 +86,23 @@ class GroupedBlockGemm:
     ):
         self._launch(a, b, out, counts, max_active_clusters, stream)
 
+    @cute.jit
+    def call_tables(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        tables: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """``__call__`` with the plan's group tables (``tables [TABLE_ROWS, E + 1]`` int32, ``scheduler.load_group_tables``)
+        after ``counts``: the CTAs load them in place of the per-CTA scan of ``counts``."""
+        self._launch(a, b, out, counts, max_active_clusters, stream, tables=tables)
+
     # host side (trace time)
-    def _launch(self, a, b, out, counts, max_active_clusters, stream):
+    def _launch(self, a, b, out, counts, max_active_clusters, stream, tables=None):
         if cutlass.const_expr(a.element_type != b.element_type):
             raise TypeError(
                 f"A and B must have one type: {a.element_type} != {b.element_type}"
@@ -139,6 +156,7 @@ class GroupedBlockGemm:
             tma.tensor_b,
             out,
             counts,
+            tables,
             st.cluster_layout_vmnk,
             st.a_smem_layout_staged,
             st.b_smem_layout_staged,
@@ -163,6 +181,7 @@ class GroupedBlockGemm:
         mB_nkl: cute.Tensor,
         mOut: cute.Tensor,
         counts: cute.Tensor,
+        mTab: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -244,7 +263,12 @@ class GroupedBlockGemm:
         # trigger placement (pdl.py) follows it
         cute.arch.griddepcontrol_wait()
         pdl.trigger_early()
-        if warp_idx == EPILOGUE_WARPS[0]:
+        if cutlass.const_expr(mTab is not None):
+            # the plan's tables, loaded by every thread (the CTA barrier below completes them) in place of the per-CTA scan
+            load_group_tables(
+                mTab, E, tidx, THREADS, pre_row_of(cluster_rows), s_off, s_pre
+            )
+        elif warp_idx == EPILOGUE_WARPS[0]:
             build_group_tables(counts, E, cluster_rows, s_off, s_pre)
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 

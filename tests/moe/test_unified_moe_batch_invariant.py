@@ -2520,3 +2520,54 @@ def test_the_plans_emit_the_group_tables(T, k, E, multi, monkeypatch):
             )
             assert torch.equal(tab.cpu(), ref2), kw
             assert torch.equal(api.group_tables(outs[2]).cpu(), ref2), kw
+
+
+@needs_device
+def test_grouped_gemms_with_the_plan_tables_equal_the_per_cta_scan():
+    """The plan's group tables loaded by the bf16 bodies (a dense record, a swapped record, its gather form) give the bits of
+    the per-CTA scan of the counts at decode grid shapes with empty and one-token experts, through the op (pre-routed, with
+    and without the tables) and through the layer (from logits: the fused plan's set rides with its integers); the GEMM alone
+    with the plan's tables (``group_tables``) equals the GEMM without."""
+    from flashinfer.fused_moe.batch_invariant.api import (
+        MoEWeights,
+        fused_moe,
+        group_tables,
+        grouped_gemm,
+        grouped_gemm_gather,
+        permute_plan,
+        route,
+    )
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    g = torch.Generator(device="cuda").manual_seed(13)
+    dense = Knobs((128, 128), (1, 1), False, True, "m", 1)
+    swapped = Knobs((128, 8), (1, 1), False, True, "m", 1, swap_ab=True)
+    for T, k, H, I, E in [
+        (1, 8, 2048, 768, 128),
+        (4, 6, 1024, 512, 64),
+        (16, 8, 1024, 256, 256),
+    ]:
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=13 + T, adversarial=True)
+        W = MoEWeights.prepare(w1, w2)
+        ids, wts = route(logits, k)
+        ref = fused_moe(x, ids, wts, W, config1=dense, config2=dense, use_tables=False)
+        for c1, c2 in ((dense, dense), (swapped, swapped), (dense, swapped)):
+            out = fused_moe(x, ids, wts, W, config1=c1, config2=c2)
+            assert torch.equal(bits(out), bits(ref)), (T, c1.describe(), c2.describe())
+        layer = _layer(k, E, I)
+        Wl = _weights(w1, w2)
+        out_l = layer(_logits_pack(x, logits), Wl)
+        assert torch.equal(bits(out_l), bits(ref)), (T, "from logits")
+        counts, dest, src = permute_plan(ids, E)
+        tables = group_tables(counts)
+        Tk = T * k
+        a = grouped_gemm_gather(x, src, k, W.w1i, counts, swapped, W.chain1, Tk=Tk)
+        b = grouped_gemm_gather(
+            x, src, k, W.w1i, counts, swapped, W.chain1, Tk=Tk, tables=tables
+        )
+        assert torch.equal(bits(a), bits(b)), (T, "swapped gather")
+        xp = torch.zeros(Tk + 128, H, dtype=torch.bfloat16, device="cuda")
+        xp[:Tk] = x[(src[:Tk] // k).long()]
+        a = grouped_gemm(xp, W.w1i, counts, dense, W.chain1, Tk=Tk)
+        b = grouped_gemm(xp, W.w1i, counts, dense, W.chain1, Tk=Tk, tables=tables)
+        assert torch.equal(bits(a), bits(b)), (T, "dense box")

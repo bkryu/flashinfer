@@ -34,7 +34,7 @@ launch, so every warp waits for it before the group tables.
 from __future__ import annotations
 
 import dataclasses
-from typing import List, Union
+from typing import List, Optional, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -58,7 +58,14 @@ from ....gemm.batch_invariant.blocks.operands import (
 from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs, MainloopBlock
 from .epilogue import BAR_EPI_JOIN, GROUP, GroupedChain, _chain_elem, fragment_offsets
 from .kernel import GROUPED_K_BLOCKS
-from .scheduler import MAX_E, TABLE_SMEM_BYTES, GroupScheduler, build_group_tables
+from .scheduler import (
+    MAX_E,
+    TABLE_SMEM_BYTES,
+    GroupScheduler,
+    build_group_tables,
+    load_group_tables,
+    pre_row_of,
+)
 from .. import pdl
 
 EPILOGUE_WARPS = (
@@ -174,7 +181,43 @@ class SwappedGroupedGemm:
         assert self.gather
         self._launch(x, w, out, counts, max_active_clusters, stream, src, k_div)
 
-    def _launch(self, rows, w, out, counts, max_active_clusters, stream, src, k_div):
+    @cute.jit
+    def call_tables(
+        self,
+        rows: cute.Tensor,
+        w: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        tables: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The TMA-box form with the plan's group tables (``scheduler.load_group_tables``) in place of the per-CTA scan."""
+        assert not self.gather
+        self._launch(
+            rows, w, out, counts, max_active_clusters, stream, None, Int32(1), tables
+        )
+
+    @cute.jit
+    def gathered_tables(
+        self,
+        x: cute.Tensor,
+        src: cute.Tensor,
+        k_div: Int32,
+        w: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        tables: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The gather form with the plan's group tables in place of the per-CTA scan."""
+        assert self.gather
+        self._launch(x, w, out, counts, max_active_clusters, stream, src, k_div, tables)
+
+    def _launch(
+        self, rows, w, out, counts, max_active_clusters, stream, src, k_div, tables=None
+    ):
         if cutlass.const_expr(rows.element_type != w.element_type):
             raise TypeError(
                 f"rows and w must have one type: {rows.element_type} != {w.element_type}"
@@ -265,6 +308,7 @@ class SwappedGroupedGemm:
             counts,
             m_src,
             k_div,
+            tables,
             st.cluster_layout_vmnk,
             st.a_smem_layout_staged,
             st.b_smem_layout_staged,
@@ -289,6 +333,7 @@ class SwappedGroupedGemm:
         counts: cute.Tensor,
         mSrc: cute.Tensor,
         k_div: Int32,
+        mTab: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -370,7 +415,10 @@ class SwappedGroupedGemm:
             # the gather form follows the plan's launch directly (no gather kernel between): the tables read the plan's
             # counts, so every warp waits for the predecessor first (the weight prefetch then follows the wait)
             cute.arch.griddepcontrol_wait()
-        if warp_idx == EPILOGUE_WARPS[0]:
+        if cutlass.const_expr(mTab is not None):
+            # the plan's tables, loaded by every thread (the CTA barrier below completes them) in place of the per-CTA scan
+            load_group_tables(mTab, E, tidx, THREADS, pre_row_of(tn), s_off, s_pre)
+        elif warp_idx == EPILOGUE_WARPS[0]:
             build_group_tables(
                 counts, E, tn, s_off, s_pre
             )  # dense offsets; the "m-block" is the token tile

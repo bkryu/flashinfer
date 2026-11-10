@@ -282,7 +282,7 @@ class BatchInvariantMoeRunner(MoERunner):
     ) -> List[torch.Tensor]:
         self._validate_pack_contract(act)
         self._require_built()
-        from .api import MoEWeights, route, route_plan
+        from .api import MoEWeights, route, group_tables_buffer, route_plan
 
         cfg = self.config
         plan: List[torch.Tensor] = []
@@ -361,6 +361,7 @@ class BatchInvariantMoeRunner(MoERunner):
             ):
                 # routing and the permutation plan in one launch (a placement: the same bits and integers); a shard plans
                 # its local experts by their local ids
+                tables = group_tables_buffer(e_local, x.device)
                 ids, wts, counts, dest, src = route_plan(
                     act.routing_logits,
                     k,
@@ -368,8 +369,14 @@ class BatchInvariantMoeRunner(MoERunner):
                     bias,
                     scale,
                     local=None if (e_off, e_local) == (0, E) else (e_off, e_local),
+                    tables=tables,
                 )
-                plan = [counts, dest, src]
+                plan = [
+                    counts,
+                    dest,
+                    src,
+                    tables,
+                ]  # the plan's group tables ride with its integers
                 if e_off:
                     ids = ids - e_off
             else:
@@ -458,7 +465,9 @@ class BatchInvariantMoeRunner(MoERunner):
         from .api import MoEWeights, fused_moe
 
         x, ids, wts, w1i, w2, out = inputs[:6]
-        plan = tuple(inputs[6:9]) if len(inputs) >= 9 else None
+        plan = (
+            tuple(inputs[6:10]) if len(inputs) >= 9 else None
+        )  # the integers and, when the plan emitted them, the tables
         self._hidden = int(x.shape[1])
         if tactic == -1 or tactic is None:
             r1, r2 = self._ranked(int(x.shape[0]))
