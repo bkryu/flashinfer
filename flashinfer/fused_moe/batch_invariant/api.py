@@ -372,6 +372,20 @@ def group_tables_buffer(
     return tables
 
 
+_NO_TABLES: dict = {}
+
+
+def no_tables(device: torch.device) -> torch.Tensor:
+    """The stand-in for the plan kernels' tables argument when the plan does not emit them (the specialisation never reads
+    it): a [TABLE_ROWS, 1] int32 of the device, allocated once."""
+    from .blocks.scheduler import TABLE_ROWS
+
+    key = str(device)
+    if key not in _NO_TABLES:
+        _NO_TABLES[key] = torch.empty(TABLE_ROWS, 1, dtype=torch.int32, device=device)
+    return _NO_TABLES[key]
+
+
 def group_tables(counts: torch.Tensor) -> torch.Tensor:
     """The group tables of ``counts [E]``, ``[TABLE_ROWS, E + 1]``: what the plans emit, for a grouped GEMM called outside
     them (one one-warp launch)."""
@@ -457,10 +471,22 @@ def route_plan(
     src = torch.empty(n_src, dtype=torch.int32, device=dev)
     dest_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
     pos_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
-    tables = group_tables_buffer(E, dev, tables)
+    emit = (
+        tables is not None
+    )  # the plan's ``tables`` specialisation emits the GEMM launches' group tables
+    tables = (
+        group_tables_buffer(E, dev, tables) if emit else no_tables(dev)
+    )  # else any int32 tensor stands in
     if T:
         get_compiled_route_plan(
-            expert_bucket(E), top_k, method, _IN[logits.dtype], align, dual, pad_align
+            expert_bucket(E),
+            top_k,
+            method,
+            _IN[logits.dtype],
+            align,
+            dual,
+            pad_align,
+            emit,
         )(
             logits,
             b,
@@ -478,7 +504,8 @@ def route_plan(
         )
     else:
         counts.zero_()
-        tables.zero_()
+        if emit:
+            tables.zero_()
     if dual:
         return (
             experts,
@@ -513,19 +540,27 @@ def permute_plan(
     flat = experts.reshape(-1)
     if not flat.is_contiguous() or flat.dtype != torch.int32:
         raise TypeError("permute_plan: experts must be a contiguous int32 [T, k]")
-    tables = group_tables_buffer(E, dev, tables)
+    emit = (
+        tables is not None
+    )  # the plan's ``tables`` specialisation emits the GEMM launches' group tables
+    tables = (
+        group_tables_buffer(E, dev, tables) if emit else no_tables(dev)
+    )  # else any int32 tensor stands in
     if n == 0:
         counts.zero_()
-        tables.zero_()
+        if emit:
+            tables.zero_()
         return counts, dest.view(T, k), src
     if n >= PLAN_MULTI_MIN_N:
         nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
         hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
-        get_compiled_plan_multi(1, False, 128)(
+        get_compiled_plan_multi(1, False, 128, emit)(
             flat, counts, dest, src, dest, dest, tables, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(1, False)(flat, counts, dest, src, dest, dest, tables, n, E)
+        get_compiled_plan(1, False, 128, emit)(
+            flat, counts, dest, src, dest, dest, tables, n, E
+        )
     return counts, dest.view(T, k), src
 
 

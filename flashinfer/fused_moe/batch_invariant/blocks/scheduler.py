@@ -157,47 +157,48 @@ def pre_row_of(cluster_rows: int) -> int:
 
 
 @cute.jit
-def emit_group_tables(
-    counts: cute.Tensor, E: Int32, pad_align: cutlass.Constexpr, mTab: cute.Tensor
+def emit_group_table_row(
+    counts: cute.Tensor,
+    E: Int32,
+    pad_align: cutlass.Constexpr,
+    row: cutlass.Constexpr,
+    mTab: cute.Tensor,
 ):
-    """One warp: ``build_group_tables``'s integers for every entry ``e <= E`` into ``mTab [TABLE_ROWS, E + 1]`` (global) --
-    row ``TAB_OFF`` the exclusive prefix of ``counts``, ``TAB_OFF_PAD`` the prefix with the groups rounded up to
-    ``pad_align`` rows, and per extent of ``TABLE_CLUSTER_ROWS`` the exclusive prefix of ``ceil(counts[e] / extent)``;
-    entry ``E`` the totals."""
+    """One warp, one row of the set: ``build_group_tables``'s integers for every entry ``e <= E`` into ``mTab[row]`` (global) --
+    row ``TAB_OFF`` the exclusive prefix of ``counts``, ``TAB_OFF_PAD`` the prefix with the groups rounded up to ``pad_align``
+    rows, a ``TAB_PRE + i`` row the exclusive prefix of ``ceil(counts[e] / TABLE_CLUSTER_ROWS[i])``; entry ``E`` the totals.
+    One warp-scan of 32 entries per lane (the rows of a set go to different warps of the emitting CTA)."""
     lane = cute.arch.lane_idx()
-    loc = [cute.make_rmem_tensor((PER_LANE,), Int32) for _ in range(TABLE_ROWS)]
+    loc = cute.make_rmem_tensor((PER_LANE,), Int32)
     for i in cutlass.range_constexpr(PER_LANE):
         e = lane * PER_LANE + i
         c = Int32(0)
         if e < E:
             c = counts[e]
-        loc[TAB_OFF][i] = c
-    sums = [Int32(0) for _ in range(TABLE_ROWS)]
+        if cutlass.const_expr(row == TAB_OFF):
+            loc[i] = c
+        elif cutlass.const_expr(row == TAB_OFF_PAD):
+            loc[i] = ((c + Int32(pad_align - 1)) // Int32(pad_align)) * Int32(pad_align)
+        else:
+            cr = TABLE_CLUSTER_ROWS[row - TAB_PRE]
+            loc[i] = (c + Int32(cr - 1)) // Int32(cr)
+    run = Int32(0)
     for i in cutlass.range_constexpr(PER_LANE):
-        c = loc[TAB_OFF][i]
-        for r in cutlass.range_constexpr(TABLE_ROWS):
-            loc[r][i] = sums[r]
-        sums[TAB_OFF] = sums[TAB_OFF] + c
-        sums[TAB_OFF_PAD] = sums[TAB_OFF_PAD] + (
-            (c + Int32(pad_align - 1)) // Int32(pad_align)
-        ) * Int32(pad_align)
-        for r in cutlass.range_constexpr(len(TABLE_CLUSTER_ROWS)):
-            cr = TABLE_CLUSTER_ROWS[r]
-            sums[TAB_PRE + r] = sums[TAB_PRE + r] + (c + Int32(cr - 1)) // Int32(cr)
-    incs = [s for s in sums]
+        v = loc[i]
+        loc[i] = run
+        run = run + v
+    inc = run
     for sh in cutlass.range_constexpr(5):
-        for r in cutlass.range_constexpr(TABLE_ROWS):
-            o = cute.arch.shuffle_sync_up(incs[r], offset=1 << sh)
-            if lane >= (1 << sh):
-                incs[r] = incs[r] + o
+        o = cute.arch.shuffle_sync_up(inc, offset=1 << sh)
+        if lane >= (1 << sh):
+            inc = inc + o
+    base = inc - run
     for i in cutlass.range_constexpr(PER_LANE):
         e = lane * PER_LANE + i
         if e <= E:
-            for r in cutlass.range_constexpr(TABLE_ROWS):
-                mTab[r, e] = incs[r] - sums[r] + loc[r][i]
+            mTab[row, e] = base + loc[i]
     if (lane == 31) & (Int32(MAX_E) == E):
-        for r in cutlass.range_constexpr(TABLE_ROWS):
-            mTab[r, MAX_E] = incs[r]
+        mTab[row, MAX_E] = inc
     cute.arch.sync_warp()
 
 

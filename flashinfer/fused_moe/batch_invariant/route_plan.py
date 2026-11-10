@@ -56,6 +56,7 @@ class RoutePlanKernel:
         align: int = 1,
         dual: bool = False,
         pad_align: int = 128,
+        tables: bool = False,
     ):
         """``dual``: the dense positions and, next to them, the positions with the groups padded to ``pad_align`` rows
         (``dest_pad [T k]``, ``pos_pad [T k]``: the padded position of every dense row) -- the block-scaled classes' dense
@@ -70,7 +71,7 @@ class RoutePlanKernel:
             method,
             align,
         )
-        self.dual, self.pad_align = dual, pad_align
+        self.dual, self.pad_align, self.tables = dual, pad_align, tables
         red = S.softmax_reduction(Ep, lambda fp, e: None)
         self.plan = canon.plan(
             red, canon.Placement.make({"expert": [(self.P, "reg"), (LANES, "lane")]})
@@ -215,7 +216,8 @@ class RoutePlanKernel:
             build_group_tables(hist, E, 1, s_off, s_pre, self.align)
             if cutlass.const_expr(self.dual):
                 build_group_tables(hist, E, 1, s_off_pad, s_pre_pad, self.pad_align)
-        emit_tables(hist, E, self.pad_align, mTab, warp)
+        if cutlass.const_expr(self.tables):
+            emit_tables(hist, E, self.pad_align, mTab, warp, 1, WARPS_RP)
         cute.arch.barrier()
         # phase B3: the positions
         if warp < Int32(RANK_WARPS):
@@ -262,8 +264,13 @@ def route_plan_kernel_name(
     align: int = 1,
     dual: bool = False,
     pad_align: int = 128,
+    tables: bool = False,
 ) -> str:
-    mode = (f"_a{align}" if align > 1 else "") + (f"_dual{pad_align}" if dual else "")
+    mode = (
+        (f"_a{align}" if align > 1 else "")
+        + (f"_dual{pad_align}" if dual else "")
+        + ("_tab" if tables else "")
+    )
     return jit.sanitize_symbol_name(
         f"moe_route_plan_Ep{Ep}_k{k}_{method_name}_{in_fmt}{mode}"
     )
@@ -278,6 +285,7 @@ def get_compiled_route_plan(
     align: int = 1,
     dual: bool = False,
     pad_align: int = 128,
+    tables: bool = False,
 ) -> Any:
     """``kernel(logits [T, E], bias [E] f32, scale [1] f32, experts [T, k] i32, weights [T, k] f32, counts [E] i32,
     dest [T k] i32, src [T k] i32 (the padded bound's rows when ``align > 1``), dest_pad [T k] i32, pos_pad [T k] i32 (the dual
@@ -316,7 +324,7 @@ def get_compiled_route_plan(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            RoutePlanKernel(Ep, k, method, align, dual, pad_align),
+            RoutePlanKernel(Ep, k, method, align, dual, pad_align, tables),
             l_fake,
             b_fake,
             s_fake,
@@ -336,6 +344,8 @@ def get_compiled_route_plan(
 
     return jit.build_and_load(
         MODULE,
-        route_plan_kernel_name(Ep, k, method.name, in_fmt, align, dual, pad_align),
+        route_plan_kernel_name(
+            Ep, k, method.name, in_fmt, align, dual, pad_align, tables
+        ),
         compile_fn,
     )

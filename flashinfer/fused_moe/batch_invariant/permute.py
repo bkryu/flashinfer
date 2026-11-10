@@ -41,7 +41,12 @@ from cutlass import Boolean, Int32, Uint32
 
 from ...batch_invariant import jit
 from ...batch_invariant.fp_interface.cute import get_cutlass_dtype
-from .blocks.scheduler import MAX_E, TABLE_ROWS, build_group_tables, emit_group_tables
+from .blocks.scheduler import (
+    MAX_E,
+    TABLE_ROWS,
+    build_group_tables,
+    emit_group_table_row,
+)
 from . import pdl
 
 MODULE = "batch_invariant_moe"
@@ -100,22 +105,28 @@ def emit_tables(
     pad_align: cutlass.Constexpr,
     mTab: cute.Tensor,
     warp: Int32,
+    first_warp: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr,
 ):
-    """The GEMM launches' group tables (``scheduler.emit_group_tables``) from the complete histogram, by warp 1 of the
-    emitting CTA (warp 0 builds the plan's own smem tables meanwhile)."""
-    if warp == Int32(1):
-        emit_group_tables(counts, E, pad_align, mTab)
+    """The GEMM launches' group tables (``scheduler.emit_group_table_row``) from the complete histogram: the set's rows over
+    the warps ``first_warp .. n_warps - 1`` of the emitting CTA, one row per warp (round-robin when the rows outnumber them;
+    warp 0 builds the plan's own smem tables meanwhile)."""
+    for r in cutlass.range_constexpr(TABLE_ROWS):
+        if warp == Int32(first_warp + r % (n_warps - first_warp)):
+            emit_group_table_row(counts, E, pad_align, r, mTab)
 
 
 class PositionKernel:
     """``align``: the group offsets are the exclusive prefix of the counts rounded up to ``align`` rows. Every plan kernel
-    also emits the GEMM launches' group tables ``mTab`` (``[TABLE_ROWS, E + 1]``, ``scheduler.emit_group_tables``): the
+    also emits the GEMM launches' group tables ``mTab`` (``[TABLE_ROWS, E + 1]``, ``scheduler.emit_group_table_row``): the
     group offsets (dense and padded to ``pad_align``) and the cluster-row prefixes the grouped bodies load instead of
     scanning ``counts``."""
 
-    def __init__(self, align: int = 1, pad_align: int = PAD_ALIGN):
+    def __init__(
+        self, align: int = 1, pad_align: int = PAD_ALIGN, tables: bool = False
+    ):
         assert align >= 1 and pad_align > 1
-        self.align, self.pad_align = align, pad_align
+        self.align, self.pad_align, self.tables = align, pad_align, tables
 
     @cute.jit
     def __call__(
@@ -161,8 +172,9 @@ class PositionKernel:
         )
         if warp == 0:
             build_group_tables(mCounts, E, 1, s_off, s_pre, self.align)
-        if e == Int32(0):
-            emit_tables(mCounts, E, self.pad_align, mTab, warp)
+        if cutlass.const_expr(self.tables):
+            if e == Int32(0):
+                emit_tables(mCounts, E, self.pad_align, mTab, warp, 1, THREADS // LANES)
         cute.arch.barrier()
         base = s_off[e]
         running = Int32(0)
@@ -214,9 +226,20 @@ class PlanKernel:
     ``pad_align`` rows on top of the dense ``dest`` / ``src`` (the block-scaled classes' second packing; the bf16 class
     passes ``dual=False`` and any two int32 tensors for the padded outputs)."""
 
-    def __init__(self, align: int = 1, dual: bool = False, pad_align: int = 128):
+    def __init__(
+        self,
+        align: int = 1,
+        dual: bool = False,
+        pad_align: int = 128,
+        tables: bool = False,
+    ):
         assert align >= 1 and pad_align > 1 and not (dual and align > 1)
-        self.align, self.dual, self.pad_align = align, dual, pad_align
+        self.align, self.dual, self.pad_align, self.tables = (
+            align,
+            dual,
+            pad_align,
+            tables,
+        )
 
     @cute.jit
     def __call__(
@@ -294,8 +317,9 @@ class PlanKernel:
             build_group_tables(hist, E, 1, s_off, s_pre, self.align)
             if cutlass.const_expr(self.dual):
                 build_group_tables(hist, E, 1, s_off_pad, s_pre_pad, self.pad_align)
-        if e == Int32(0):
-            emit_tables(hist, E, self.pad_align, mTab, warp)
+        if cutlass.const_expr(self.tables):
+            if e == Int32(0):
+                emit_tables(hist, E, self.pad_align, mTab, warp, 1, THREADS // LANES)
         # pass 1: this warp's slot range, its count of expert e (ballots over 32 slots at a time)
         n_warps = Int32(THREADS // LANES)
         per_warp = (n + n_warps - Int32(1)) // n_warps
@@ -452,9 +476,20 @@ class PlanFinishKernel:
     block-local rank becomes its position: ``dest[i] = off_e + prefix_b[e] + rank``, ``src[dest[i]] = i`` (+ the padded
     pair when ``dual``). ``align`` / ``dual`` / ``pad_align`` as ``PlanKernel``."""
 
-    def __init__(self, align: int = 1, dual: bool = False, pad_align: int = 128):
+    def __init__(
+        self,
+        align: int = 1,
+        dual: bool = False,
+        pad_align: int = 128,
+        tables: bool = False,
+    ):
         assert align >= 1 and pad_align > 1 and not (dual and align > 1)
-        self.align, self.dual, self.pad_align = align, dual, pad_align
+        self.align, self.dual, self.pad_align, self.tables = (
+            align,
+            dual,
+            pad_align,
+            tables,
+        )
 
     @cute.jit
     def __call__(
@@ -535,8 +570,9 @@ class PlanFinishKernel:
             build_group_tables(hist, E, 1, s_off, s_pre, self.align)
             if cutlass.const_expr(self.dual):
                 build_group_tables(hist, E, 1, s_off_pad, s_pre_pad, self.pad_align)
-        if b == Int32(0):
-            emit_tables(hist, E, self.pad_align, mTab, warp)
+        if cutlass.const_expr(self.tables):
+            if b == Int32(0):
+                emit_tables(hist, E, self.pad_align, mTab, warp, 1, PLAN_WARPS)
         cute.arch.barrier()
         if b == Int32(0):
             # the rows past the total: the dropped slots' share of the buffer holds -1, which the gather skips
@@ -568,9 +604,15 @@ class PlanFinishKernel:
 class PlanMultiKernel:
     """The two launches of ``plan_multi`` from one compiled host function (``hist_blk``: int32 scratch of ``nb x E``)."""
 
-    def __init__(self, align: int = 1, dual: bool = False, pad_align: int = 128):
+    def __init__(
+        self,
+        align: int = 1,
+        dual: bool = False,
+        pad_align: int = 128,
+        tables: bool = False,
+    ):
         self.blocks = PlanBlocksKernel()
-        self.finish = PlanFinishKernel(align, dual, pad_align)
+        self.finish = PlanFinishKernel(align, dual, pad_align, tables)
 
     @cute.jit
     def __call__(
@@ -599,8 +641,8 @@ class PlanMultiKernel:
 
 
 class GroupTablesKernel:
-    """One CTA of one warp: the group tables of ``counts`` (``scheduler.emit_group_tables``) for a launch outside the plans
-    (a standalone grouped GEMM call)."""
+    """One CTA of one warp per table row: the group tables of ``counts`` (``scheduler.emit_group_table_row``) for a launch
+    outside the plans (a standalone grouped GEMM call)."""
 
     def __init__(self, pad_align: int = PAD_ALIGN):
         self.pad_align = pad_align
@@ -608,13 +650,17 @@ class GroupTablesKernel:
     @cute.jit
     def __call__(self, mCounts: cute.Tensor, mTab: cute.Tensor, E: Int32, stream):
         self.kernel(mCounts, mTab, E).launch(
-            grid=[1, 1, 1], block=[LANES, 1, 1], stream=stream, use_pdl=True
+            grid=[1, 1, 1],
+            block=[TABLE_ROWS * LANES, 1, 1],
+            stream=stream,
+            use_pdl=True,
         )
 
     @cute.kernel
     def kernel(self, mCounts: cute.Tensor, mTab: cute.Tensor, E: Int32):
+        tidx, _, _ = cute.arch.thread_idx()
         cute.arch.griddepcontrol_wait()
-        emit_group_tables(mCounts, E, self.pad_align, mTab)
+        emit_tables(mCounts, E, self.pad_align, mTab, tidx // LANES, 0, TABLE_ROWS)
         pdl.trigger_one_wave()
 
 
@@ -737,7 +783,7 @@ def get_compiled_histogram() -> Any:
 
 
 @functools.cache
-def get_compiled_positions(align: int = 1) -> Any:
+def get_compiled_positions(align: int = 1, tables: bool = False) -> Any:
     """``kernel(experts [T k] i32, counts [E] i32, dest [T k] i32, src [rows] i32, n, E)``."""
 
     def compile_fn():
@@ -756,7 +802,7 @@ def get_compiled_positions(align: int = 1) -> Any:
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            PositionKernel(align),
+            PositionKernel(align, PAD_ALIGN, tables),
             e_fake,
             c_fake,
             d_fake,
@@ -769,14 +815,20 @@ def get_compiled_positions(align: int = 1) -> Any:
         )
 
     return jit.build_and_load(
-        MODULE, "moe_positions" + (f"_a{align}" if align > 1 else ""), compile_fn
+        MODULE,
+        "moe_positions"
+        + (f"_a{align}" if align > 1 else "")
+        + ("_tab" if tables else ""),
+        compile_fn,
     )
 
 
 @functools.cache
-def get_compiled_plan(align: int = 1, dual: bool = False, pad_align: int = 128) -> Any:
+def get_compiled_plan(
+    align: int = 1, dual: bool = False, pad_align: int = 128, tables: bool = False
+) -> Any:
     """``kernel(experts [T k] i32, counts [E] i32 (written), dest [T k], src [Tk(_pad)], dest_pad [T k], pos_pad [T k],
-    tables [TABLE_ROWS, E + 1] i32 (written), n, E)``; without ``dual`` pass any two int32 tensors for ``dest_pad`` /
+    tables [TABLE_ROWS, E + 1] i32 (written by the ``tables`` specialisation), n, E)``; without ``dual`` pass any two int32 tensors for ``dest_pad`` /
     ``pos_pad``."""
 
     def compile_fn():
@@ -797,7 +849,7 @@ def get_compiled_plan(align: int = 1, dual: bool = False, pad_align: int = 128) 
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            PlanKernel(align, dual, pad_align),
+            PlanKernel(align, dual, pad_align, tables),
             e_fake,
             c_fake,
             d_fake,
@@ -812,16 +864,18 @@ def get_compiled_plan(align: int = 1, dual: bool = False, pad_align: int = 128) 
         )
 
     return jit.build_and_load(
-        MODULE, plan_kernel_name("plan", align, dual, pad_align), compile_fn
+        MODULE,
+        plan_kernel_name("plan", align, dual, pad_align) + ("_tab" if tables else ""),
+        compile_fn,
     )
 
 
 @functools.cache
 def get_compiled_plan_multi(
-    align: int = 1, dual: bool = False, pad_align: int = 128
+    align: int = 1, dual: bool = False, pad_align: int = 128, tables: bool = False
 ) -> Any:
     """``kernel(experts [T k] i32, counts [E] i32 (written), dest [T k], src [Tk(_pad)], dest_pad [T k], pos_pad [T k],
-    tables [TABLE_ROWS, E + 1] i32 (written), hist_blk [nb E] i32 (scratch), n, E, nb)`` with ``nb = ceil(n /
+    tables [TABLE_ROWS, E + 1] i32 (written by the ``tables`` specialisation), hist_blk [nb E] i32 (scratch), n, E, nb)`` with ``nb = ceil(n /
     PLAN_BLOCK)``: the two-launch plan of large batches (same outputs as ``get_compiled_plan``)."""
 
     def compile_fn():
@@ -844,7 +898,7 @@ def get_compiled_plan_multi(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            PlanMultiKernel(align, dual, pad_align),
+            PlanMultiKernel(align, dual, pad_align, tables),
             e_fake,
             c_fake,
             d_fake,
@@ -861,7 +915,10 @@ def get_compiled_plan_multi(
         )
 
     return jit.build_and_load(
-        MODULE, plan_kernel_name("plan_multi", align, dual, pad_align), compile_fn
+        MODULE,
+        plan_kernel_name("plan_multi", align, dual, pad_align)
+        + ("_tab" if tables else ""),
+        compile_fn,
     )
 
 

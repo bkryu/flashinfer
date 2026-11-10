@@ -37,7 +37,7 @@ from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.heuristic import family_of
 from ...gemm.batch_invariant.schedule import chunks_for, mx_class_for
 from . import spec as S
-from .api import group_tables_buffer, interleave_fc1, route
+from .api import group_tables_buffer, interleave_fc1, no_tables, route
 from .blocks.epilogue import GroupedChain
 from .spec_mxfp8 import BLOCK, CLASS, MX_CLASSES
 
@@ -471,21 +471,25 @@ def permute_plan_padded(
     dest = torch.empty(n, dtype=torch.int32, device=dev)
     src = torch.full((padded_rows_bound(T, k, E),), -1, dtype=torch.int32, device=dev)
     counts = torch.empty(E, dtype=torch.int32, device=dev)
-    tables = group_tables_buffer(
-        E, dev, tables
-    )  # the GEMM launches' group tables, emitted by the plan
+    emit = (
+        tables is not None
+    )  # the plan's ``tables`` specialisation emits the GEMM launches' group tables
+    tables = (
+        group_tables_buffer(E, dev, tables) if emit else no_tables(dev)
+    )  # else any int32 tensor stands in
     if n == 0:
         counts.zero_()
-        tables.zero_()
+        if emit:
+            tables.zero_()
         return counts, dest.view(T, k), src
     if n >= PLAN_MULTI_MIN_N:
         nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
         hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
-        get_compiled_plan_multi(GROUP_ALIGN, False, GROUP_ALIGN)(
+        get_compiled_plan_multi(GROUP_ALIGN, False, GROUP_ALIGN, emit)(
             flat, counts, dest, src, dest, dest, tables, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(GROUP_ALIGN, False, GROUP_ALIGN)(
+        get_compiled_plan(GROUP_ALIGN, False, GROUP_ALIGN, emit)(
             flat, counts, dest, src, dest, dest, tables, n, E
         )
     return counts, dest.view(T, k), src
@@ -513,20 +517,24 @@ def permute_plan_dual_padded(
     dest_pad = torch.empty(n, dtype=torch.int32, device=dev)
     pos_pad = torch.empty(n, dtype=torch.int32, device=dev)
     counts = torch.empty(E, dtype=torch.int32, device=dev)
-    tables = group_tables_buffer(
-        E, dev, tables
-    )  # the GEMM launches' group tables, emitted by the plan
+    emit = (
+        tables is not None
+    )  # the plan's ``tables`` specialisation emits the GEMM launches' group tables
+    tables = (
+        group_tables_buffer(E, dev, tables) if emit else no_tables(dev)
+    )  # else any int32 tensor stands in
     if n == 0:
         counts.zero_()
-        tables.zero_()
+        if emit:
+            tables.zero_()
     elif n >= PLAN_MULTI_MIN_N:
         nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
         hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
-        get_compiled_plan_multi(1, True, GROUP_ALIGN)(
+        get_compiled_plan_multi(1, True, GROUP_ALIGN, emit)(
             flat, counts, dest, src, dest_pad, pos_pad, tables, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(1, True, GROUP_ALIGN)(
+        get_compiled_plan(1, True, GROUP_ALIGN, emit)(
             flat, counts, dest, src, dest_pad, pos_pad, tables, n, E
         )
     return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
