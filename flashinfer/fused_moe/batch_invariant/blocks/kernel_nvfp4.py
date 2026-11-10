@@ -155,11 +155,16 @@ class GroupedBlockScaledTma:
         ) * st.atom_thr_size
 
 
-def grouped_plan(plan_cls, knobs: Knobs, own_bytes):
+def grouped_plan(
+    plan_cls, knobs: Knobs, own_bytes, umma_addr_max: Optional[int] = None
+):
     """The block-scaled plan with the grouped kernel's own stage rule: the operand ring (A, B, SFA, SFB per stage) fills the
     CTA's shared memory after the barrier reserve and the kernel's own buffers (``own_bytes(st)``: the group tables, the
     epilogue staging buffers), under the dense plan's A-ring cap. The dense plan's output stages are not reserved (the
-    grouped epilogue stores from its own staging buffers). A placement: the ring depth moves no bits."""
+    grouped epilogue stores from its own staging buffers). ``umma_addr_max``: the operand rings a UMMA reads (A and B,
+    behind the barriers and the kernel's own buffers) end below this many bytes of the CTA's shared memory (the plan's
+    ``UMMA_SMEM_ADDR_MAX`` on the sm_100 instruction plans: their descriptors' address window). A placement: the ring depth
+    moves no bits."""
 
     class _Plan(plan_cls):
         def _stages(self):
@@ -176,9 +181,10 @@ def grouped_plan(plan_cls, knobs: Knobs, own_bytes):
                 self.tiled_mma, self.mma_tiler, self.sf_vec, 1
             )
             a_bytes = cute.size_in_bytes(self.a_dtype, a_one)
+            b_bytes = cute.size_in_bytes(self.b_dtype, b_one)
             ab_bytes = (
                 a_bytes
-                + cute.size_in_bytes(self.b_dtype, b_one)
+                + b_bytes
                 + cute.size_in_bytes(self.sf_dtype, sfa_one)
                 + cute.size_in_bytes(self.sf_dtype, sfb_one)
             )
@@ -186,6 +192,12 @@ def grouped_plan(plan_cls, knobs: Knobs, own_bytes):
                 self.smem_capacity - MBAR_RESERVE_BYTES - own_bytes(self)
             ) // ab_bytes
             num_ab = min(num_ab, (A_RING_MAX_BYTES - 1) // a_bytes)
+            if umma_addr_max is not None:
+                num_ab = min(
+                    num_ab,
+                    (umma_addr_max - MBAR_RESERVE_BYTES - own_bytes(self))
+                    // (a_bytes + b_bytes),
+                )
             assert num_ab >= 2, (
                 "the grouped kernel's operand ring does not fit the shared memory",
                 self.knobs,
@@ -211,7 +223,11 @@ class GroupedBlockScaledGemm:
         """``dense_a``: the A rows densely packed (group offsets at align 1), the scale factors and the row scales at the
         padded positions (``pts`` has the padded row count, the scale-factor buffer the padded rows), the output ``Tk`` dense
         rows. Default: the padded packing (the rows of every group start at a multiple of ``GROUP_ALIGN``)."""
-        assert isinstance(chain, W4A4Chain) and chain.out_fmt in ("bf16", "f32", "nvfp4"), chain
+        assert isinstance(chain, W4A4Chain) and chain.out_fmt in (
+            "bf16",
+            "f32",
+            "nvfp4",
+        ), chain
         assert in_fmt in NVFP4_FMTS, in_fmt
         self.knobs, self.chain, self.in_fmt, self.dense_a = (
             knobs,
@@ -236,7 +252,9 @@ class GroupedBlockScaledGemm:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self._launch(a, b, sfa, sfb, out, counts, alpha, pts, max_active_clusters, stream)
+        self._launch(
+            a, b, sfa, sfb, out, counts, alpha, pts, max_active_clusters, stream
+        )
 
     @cute.jit
     def call_static(
@@ -258,7 +276,18 @@ class GroupedBlockScaledGemm:
         flat 128x4 scale bytes at the (padded) row positions, ``aux[e] = gs2[e]``) and GEMM2 (``scale == "w4a4s"``: ``aux[e] =
         inv2[e]``, ``out_sf`` unused)."""
         self._launch(
-            a, b, sfa, sfb, out, counts, alpha, pts, max_active_clusters, stream, out_sf, aux
+            a,
+            b,
+            sfa,
+            sfb,
+            out,
+            counts,
+            alpha,
+            pts,
+            max_active_clusters,
+            stream,
+            out_sf,
+            aux,
         )
 
     def _launch(

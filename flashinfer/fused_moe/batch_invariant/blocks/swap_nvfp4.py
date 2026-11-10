@@ -76,7 +76,12 @@ from ..spec_nvfp4 import NVFP4_BLOCK, NVFP4_C_SIXTH, w4a4_row_scale
 from .epilogue import BAR_EPI_JOIN, GROUP, MoeF32, fragment_offsets
 from .epilogue_nvfp4 import W4A4Chain, _scaled_elem, sf_byte_offset
 from .kernel_nvfp4 import GROUP_ALIGN, grouped_plan, sf_view_experts
-from .scheduler import MAX_E, GroupScheduler, build_group_tables, build_group_tables_dual
+from .scheduler import (
+    MAX_E,
+    GroupScheduler,
+    build_group_tables,
+    build_group_tables_dual,
+)
 
 EPILOGUE_WARPS = (
     0,
@@ -175,7 +180,11 @@ class SwappedBlockScaledGemm:
     def __init__(
         self, knobs: Knobs, chain: W4A4Chain, in_fmt: str = "nvfp4", variant: str = ""
     ):
-        assert isinstance(chain, W4A4Chain) and chain.out_fmt in ("bf16", "f32", "nvfp4"), chain
+        assert isinstance(chain, W4A4Chain) and chain.out_fmt in (
+            "bf16",
+            "f32",
+            "nvfp4",
+        ), chain
         assert in_fmt in NVFP4_FMTS and in_fmt in PLANS, in_fmt
         assert is_swapped_record(knobs), (
             "the swapped block-scaled body takes the narrow swapped records (128 weight rows x 8 / 16 / 32 tokens, 1-CTA)",
@@ -201,7 +210,9 @@ class SwappedBlockScaledGemm:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self._launch(a, sfa, w, sfw, out, counts, alpha, pts, max_active_clusters, stream)
+        self._launch(
+            a, sfa, w, sfw, out, counts, alpha, pts, max_active_clusters, stream
+        )
 
     @cute.jit
     def call_static(
@@ -222,7 +233,18 @@ class SwappedBlockScaledGemm:
         """The static class's chains (as ``GroupedBlockScaledGemm.call_static``): ``out`` the packed codes, ``out_sf`` the flat 128x4
         scale bytes at the padded positions, ``aux[e]`` the expert's ``gs2`` (GEMM1) or ``inv2`` (GEMM2, ``out_sf`` unused)."""
         self._launch(
-            a, sfa, w, sfw, out, counts, alpha, pts, max_active_clusters, stream, out_sf, aux
+            a,
+            sfa,
+            w,
+            sfw,
+            out,
+            counts,
+            alpha,
+            pts,
+            max_active_clusters,
+            stream,
+            out_sf,
+            aux,
         )
 
     def _launch(
@@ -247,7 +269,9 @@ class SwappedBlockScaledGemm:
             sfw, w4.shape[0], w4.shape[1], w4.shape[2], plan_cls.SF_VEC, plan_cls.SF_DT
         )
         tables = 4 * (MAX_E + 1) * 4  # the dense and the padded group tables
-        st = grouped_plan(plan_cls, self.knobs, lambda st: tables)
+        st = grouped_plan(
+            plan_cls, self.knobs, lambda st: tables, plan_cls.UMMA_SMEM_ADDR_MAX
+        )
         self.st = st
         self.block = st.block
         assert self.block.in_fmt == self.in_fmt, (self.block.in_fmt, self.in_fmt)
@@ -1111,7 +1135,9 @@ def swapped_w4a4_epilogue_loop(
         alpha_e = None
         gs6 = inv_gs = None
         if cutlass.const_expr(chain.scale == "w4a4s"):
-            alpha_e = w4a4_row_scale(MoeF32, mAlpha[e], mAux[e])  # mul(alpha2[e], inv2[e]), once per tile
+            alpha_e = w4a4_row_scale(
+                MoeF32, mAlpha[e], mAux[e]
+            )  # mul(alpha2[e], inv2[e]), once per tile
         elif cutlass.const_expr(scaled):
             alpha_e = mAlpha[e]
             if cutlass.const_expr(static_q):
@@ -1150,11 +1176,15 @@ def swapped_w4a4_epilogue_loop(
             if cutlass.const_expr(static_q):
                 # the static class's GEMM1: per live token column, the block of this warp's output lanes
                 if cutlass.const_expr(pair):
-                    bcol = n_tile * Int32(WEIGHT_TILE // (2 * NVFP4_BLOCK)) + wrow // Int32(2 * NVFP4_BLOCK)  # 16 outputs = 32 weight rows
+                    bcol = n_tile * Int32(
+                        WEIGHT_TILE // (2 * NVFP4_BLOCK)
+                    ) + wrow // Int32(2 * NVFP4_BLOCK)  # 16 outputs = 32 weight rows
                     even = (wrow % Int32(GROUP)) % Int32(2) == Int32(0)
                     sf_lane = (wrow % Int32(32)) == Int32(0)
                 else:
-                    bcol = n_tile * Int32(WEIGHT_TILE // NVFP4_BLOCK) + wrow // Int32(NVFP4_BLOCK)
+                    bcol = n_tile * Int32(WEIGHT_TILE // NVFP4_BLOCK) + wrow // Int32(
+                        NVFP4_BLOCK
+                    )
                     even = (wrow % Int32(2)) == Int32(0)
                     sf_lane = (wrow % Int32(NVFP4_BLOCK)) == Int32(0)
                 byte_col = out_col // Int32(2)
@@ -1169,21 +1199,31 @@ def swapped_w4a4_epilogue_loop(
                             sv,
                         )
                         amax = MoeF32.fabs(val)
-                        for off in (1, 2, 4, 16) if cutlass.const_expr(pair) else (1, 2, 4, 8):
-                            amax = MoeF32.fmaxc(amax, cute.arch.shuffle_sync_bfly(amax, offset=off))
+                        for off in (
+                            (1, 2, 4, 16) if cutlass.const_expr(pair) else (1, 2, 4, 8)
+                        ):
+                            amax = MoeF32.fmaxc(
+                                amax, cute.arch.shuffle_sync_bfly(amax, offset=off)
+                            )
                         sf_byte, sf_d = cvt_f32_to_e4m3(MoeF32.mul(amax, gs6))
                         inv_b = MoeF32.fmin(
                             MoeF32.div(MoeF32.const(1.0), MoeF32.mul(sf_d, inv_gs)),
                             MoeF32.const(3.4028234663852886e38),
                         )
                         y = MoeF32.mul(val, inv_b)
-                        y_odd = cute.arch.shuffle_sync_down(y, offset=1)  # the neighbouring output column's value
-                        word = cvt_f32x8_to_e2m1x8(y, y_odd, y, y, y, y, y, y)  # byte 0 = (this column, the next)
+                        y_odd = cute.arch.shuffle_sync_down(
+                            y, offset=1
+                        )  # the neighbouring output column's value
+                        word = cvt_f32x8_to_e2m1x8(
+                            y, y_odd, y, y, y, y, y, y
+                        )  # byte 0 = (this column, the next)
                         prow = row0 + j
                         if store_ok & even & (bcol < n_blocks):
                             mOut[(prow, byte_col)] = (word & Uint32(0xFF)).to(Uint8)
                         if sf_lane & (bcol < n_blocks):
-                            mOutSf[sf_byte_offset(prow + shift, bcol, pcols)] = sf_byte.to(Uint8)
+                            mOutSf[sf_byte_offset(prow + shift, bcol, pcols)] = (
+                                sf_byte.to(Uint8)
+                            )
             else:
                 for v in cutlass.range_constexpr(nv):
                     j = col0 + Int32(cols[v])

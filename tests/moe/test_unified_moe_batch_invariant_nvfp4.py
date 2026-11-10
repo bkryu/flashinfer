@@ -1320,7 +1320,7 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
     inputs = runner.pack_inputs(pack, W)
     tactics = runner.get_valid_tactics(inputs, None)
     assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
-    r1, r2 = runner._ranked(T, H)
+    r1, r2 = runner.impl._ranked(T, H)
     assert tactics == [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
     c1, c2 = _configs_from_tactic_nvfp4(tactics[0])
     assert _tactic_nvfp4(c1, c2) == tactics[0] and (c1, c2) == (r1[0], r2[0])
@@ -1961,3 +1961,414 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     )
     out = layer(_logits_pack(x[:0], logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
+
+
+# ----------------------------------------------------------------------------- the pre-quantized pack of the TRTLLM backends
+
+
+@needs_device
+def test_linear_scale_unit_pack_equals_swizzled_pack_with_ones():
+    """The per-tensor activation pack of the TRTLLM backends (fp4 codes, the e4m3 block scales row-major ``[T, H/16]``, no
+    per-token scale) through the op == the same bytes given as the class's 128x4 buffer with unit per-token scales: the fp4
+    scatter's two placements (the scale atom assembled from the linear row vs copied from the swizzled buffer; the unit
+    per-token scale written vs read) move the same bytes to the same positions."""
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        unswizzle_sf_128x4,
+    )
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import fused_moe_nvfp4
+
+    T, k, H, I, E = 100, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=24)
+    W = _weights_of(_weights(w1, w2))
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    x4, sf, _ = _quantized(x)
+    sf_lin = unswizzle_sf_128x4(sf, T, H).cuda().contiguous()
+    assert sf_lin.shape == (T, H // 16)
+    ref = fused_moe_nvfp4((x4, sf, torch.ones(T, device="cuda")), ids, wts, W)
+    out, im = fused_moe_nvfp4(
+        (x4, sf_lin, None), ids, wts, W, return_intermediates=True
+    )
+    assert torch.equal(bits(out), bits(ref))
+    pos = im["dest_pad"].reshape(-1).long()
+    assert torch.equal(im["x_perm_pts"][pos].cpu(), torch.ones(T * k))
+    assert torch.equal(
+        unswizzle_sf_128x4(im["x_perm_sf"], im["Tk_pad"], H).cpu()[pos.cpu()],
+        sf_lin.cpu()[torch.arange(T * k) // k],
+    )
+
+
+@needs_device
+def test_swapped_body_placement_variants_give_the_bits(monkeypatch):
+    """The swapped decode body's placement variants (the shipped one-pass group tables on the scale-factor warp with the TMEM
+    allocation issued first, the legacy two-scan allocator-warp prologue, the L2 cache hints) compute the same bits at every
+    token tile."""
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import fused_moe_nvfp4
+    from flashinfer.fused_moe.batch_invariant.blocks import compile_nvfp4 as CN
+    from flashinfer.fused_moe.batch_invariant.blocks.swap_nvfp4 import VARIANTS
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        swapped_knobs_blockscaled,
+    )
+
+    T, k, H, I, E = 37, 4, 512, 256, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=25)
+    W = _weights_of(_weights(w1, w2))
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    ref = bits(fused_moe_nvfp4(x, ids, wts, W, swap=False))
+    for c in swapped_knobs_blockscaled():
+        for variant in ("",) + VARIANTS + ("+".join(VARIANTS),):
+            monkeypatch.setattr(CN, "SWAP_VARIANT", variant)
+            out = fused_moe_nvfp4(x, ids, wts, W, config1=c, config2=c)
+            assert torch.equal(bits(out), ref), (c.tile_n, variant)
+
+
+@needs_device
+def test_every_record_computes_the_class_at_long_k_on_every_instruction_class_of_the_part():
+    """At a K long enough for every CTA to cycle its whole operand ring (16 k-tiles per output tile), every swapped record and
+    the deepest-ring padded records compute the class on every instruction class the part runs (on SM107 the K = 64 class
+    by name as well): the op equals the per-expert dense oracle. A ring placed past the sm_100 instructions' shared-memory
+    address window (the plan's ``UMMA_SMEM_ADDR_MAX``) would read other bytes here."""
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import fused_moe_nvfp4
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        grouped_knobs_blockscaled,
+        swapped_knobs_blockscaled,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+
+    T, k, H, I, E = 16, 2, 4096, 2048, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=77)
+    W = _weights_of(_weights(w1, w2))
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    chain = activation_of(_SWIGLU)
+    classes = {expert_classes(H, I, _family())[0]}
+    if _family() == "sm_107":
+        classes.add("nvfp4")
+    deep = [
+        c
+        for c in grouped_knobs_blockscaled()
+        if c.raster_along == "m"
+        and c.cluster_shape_mn == (1, 1)
+        and c.tile_n in (64, 256)
+    ]
+    for fmt in sorted(classes):
+        fmts = (fmt, fmt)
+        ref = bits(
+            _reference_ffn(_quantized(x, check=False), ids, wts, W, chain, fmts).cpu()
+        )
+        for c in swapped_knobs_blockscaled() + deep:
+            out = fused_moe_nvfp4(x, ids, wts, W, in_fmts=fmts, config1=c, config2=c)
+            assert torch.equal(bits(out.cpu()), ref), (fmt, c.describe())
+
+
+# ----------------------------------------------------------------------------- the static-intermediate class
+
+
+def test_static_class_fingerprints_pin():
+    """The static class's fingerprint (``moe.nvfp4.<act>.static``): its own components, pinned, different from the per-token
+    class's at every activation; the config field is validated."""
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import (
+        INTERMEDIATES,
+        MoENvfp4Spec,
+        spec_fingerprint_nvfp4,
+    )
+
+    assert INTERMEDIATES == ("per_token", "static")
+    assert (
+        spec_fingerprint_nvfp4(2048, 768, 8, 128, intermediate="static")
+        == "moe-a07bb9a65670a187"
+    )
+    assert (
+        spec_fingerprint_nvfp4(
+            2048, 1024, 6, 128, act="relu2", gated=False, intermediate="static"
+        )
+        == "moe-96f1a997c9250826"
+    )
+    for act, gated in (("silu", True), ("gelu_tanh", True), ("relu2", False)):
+        a, b = (
+            spec_fingerprint_nvfp4(
+                2048, 768, 8, 128, act=act, gated=gated, intermediate=i
+            )
+            for i in INTERMEDIATES
+        )
+        assert a != b
+    spec = MoENvfp4Spec(512, 256, 4, 16, act="silu", intermediate="static")
+    assert spec.name.endswith(".static") and spec.gs2(0) is not None
+    assert BatchInvariantFp4Config(intermediate="static").intermediate == "static"
+    with pytest.raises(ValueError):
+        BatchInvariantFp4Config(intermediate="rowwise")
+
+
+def _static_ladder(T, k, H, I, E, act, seed, gs_pow2=True):
+    """The static class's ladder at one problem: GEMM1's codes and scale bytes == the exact CPU model of the static chain on the
+    f32 oracle accumulators (``w4a4_static_gemm1_cpu``), the other body (swapped / padded) gives the same codes and scale bytes,
+    GEMM2's chain == the CPU model with ``inv2[e]``, the combine == CPU, the padded packing == the dense packing, two runs equal,
+    and the class differs from the per-token class (another quantization of the intermediate)."""
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        unswizzle_sf_128x4,
+    )
+    from flashinfer.batch_invariant.quantization.nvfp4_schedule import sf_numel
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import reference_nvfp4 as RN
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        DENSE_TAIL,
+        F32_CHAIN,
+        MoEWeightsNVFP4,
+        fused_moe_nvfp4,
+        grouped_gemm_nvfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_nvfp4 import W4A4Chain
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        rank_grouped_nvfp4,
+        rows_per_expert,
+        swapped_knobs_blockscaled,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec import ACTS
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+
+    gated = act in ACTS
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed, gated=gated)
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    gs2 = (
+        torch.exp2(torch.randint(-2, 3, (E,), device="cuda", generator=g).float())
+        if gs_pow2
+        else torch.rand(E, device="cuda", generator=g) * 3 + 0.5
+    )
+    W = MoEWeightsNVFP4.prepare(
+        w1, w2, gated=gated, act=act, intermediate="static", intermediate_scales=gs2
+    )
+    assert W.intermediate == "static" and torch.equal(W.gs2, gs2)
+    in1, in2 = expert_classes(H, I, _family(), gated)
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    out, im = fused_moe_nvfp4(x, ids, wts, W, return_intermediates=True)
+    assert torch.equal(bits(out), bits(fused_moe_nvfp4(x, ids, wts, W)))
+    assert im["a"] is None and im["path"] == "dense"
+    Tk, Tk_pad = T * k, im["Tk_pad"]
+    counts = im["counts"].cpu().tolist()
+    off = [0]
+    for c in counts:
+        off.append(off[-1] + c)
+    pos_pad = im["pos_pad"].cpu().long()
+    # the f32 oracle accumulators of GEMM1 (a padded-body record on the dense packing)
+    oracle1 = (
+        im["config1"]
+        if not im["config1"].swap_ab
+        else rank_grouped_nvfp4(
+            rows_per_expert(T, k, E), w1.shape[1], H, E, F32_CHAIN, in1, swap=False
+        )[0]
+    )
+    acc1 = grouped_gemm_nvfp4(
+        im["x_perm4"],
+        im["x_perm_sf"],
+        im["x_perm_pts"],
+        W.w1,
+        W.w1_sf,
+        W.w1_alpha,
+        im["counts"],
+        oracle1,
+        F32_CHAIN,
+        in1,
+        dense_a=True,
+    ).cpu()
+    alpha1, gsr, alpha2, inv2r = (torch.zeros(Tk) for _ in range(4))
+    for e in range(E):
+        alpha1[off[e] : off[e + 1]] = W.w1_alpha.cpu()[e]
+        gsr[off[e] : off[e + 1]] = W.gs2.cpu()[e]
+        alpha2[off[e] : off[e + 1]] = W.w2_alpha.cpu()[e]
+        inv2r[off[e] : off[e + 1]] = W.inv2.cpu()[e]
+    pts_dense = im["x_perm_pts"].cpu()[pos_pad]
+    ref_codes, ref_sf = RN.w4a4_static_gemm1_cpu(
+        acc1, alpha1, pts_dense, gsr, act, (), gated
+    )
+    assert torch.equal(im["a4"].cpu(), ref_codes), "GEMM1 codes"
+    assert torch.equal(
+        unswizzle_sf_128x4(im["a_sf_pad"].cpu(), Tk_pad, I)[pos_pad], ref_sf
+    ), "GEMM1 scale bytes"
+    # the other body gives the same codes and scale bytes (the swapped body's warp-level block vs the padded body's in-register
+    # block): a swapped record needs the token tile's rows past the live rows of its A operand
+    chain1 = W4A4Chain("glu" if gated else "act", act, "nvfp4", (), "w4a4")
+    if im["config1"].swap_ab:
+        other = rank_grouped_nvfp4(
+            rows_per_expert(T, k, E), w1.shape[1], H, E, chain1, in1, swap=False
+        )[0]
+        a_in = im["x_perm4"]
+    else:
+        # the swapped body reads a token box past the live rows and writes the same row count: the op's tail on both buffers
+        other = swapped_knobs_blockscaled()[0]
+        a_in = torch.cat(
+            [
+                im["x_perm4"],
+                torch.zeros(DENSE_TAIL, H // 2, dtype=torch.uint8, device="cuda"),
+            ]
+        )
+    codes_b = torch.full(
+        (a_in.shape[0], I // 2), 0xAA, dtype=torch.uint8, device="cuda"
+    )
+    sf_b = torch.full((sf_numel(Tk_pad, I),), 0xAA, dtype=torch.uint8, device="cuda")
+    grouped_gemm_nvfp4(
+        a_in,
+        im["x_perm_sf"],
+        im["x_perm_pts"],
+        W.w1,
+        W.w1_sf,
+        W.w1_alpha,
+        im["counts"],
+        other,
+        chain1,
+        in1,
+        out=codes_b,
+        dense_a=True,
+        out_sf=sf_b,
+        aux=W.gs2,
+    )
+    assert torch.equal(codes_b[:Tk].cpu(), ref_codes) and torch.equal(
+        unswizzle_sf_128x4(sf_b.cpu(), Tk_pad, I)[pos_pad], ref_sf
+    ), ("the other body", other.describe())
+    # GEMM2 == CPU on the codes and scale bytes the epilogue wrote; the combine == CPU
+    oracle2 = (
+        im["config2"]
+        if not im["config2"].swap_ab
+        else rank_grouped_nvfp4(
+            rows_per_expert(T, k, E), H, I, E, F32_CHAIN, in2, swap=False
+        )[0]
+    )
+    acc2 = grouped_gemm_nvfp4(
+        im["a4"],
+        im["a_sf_pad"],
+        im["a_pts_pad"],
+        W.w2,
+        W.w2_sf,
+        W.w2_alpha,
+        im["counts"],
+        oracle2,
+        F32_CHAIN,
+        in2,
+        dense_a=True,
+    ).cpu()
+    assert torch.equal(
+        bits(im["y"].cpu()), bits(RN.w4a4_static_gemm2_cpu(acc2, alpha2, inv2r))
+    ), "GEMM2 chain"
+    assert torch.equal(bits(out.cpu()), bits(R.combine_cpu(im["y"], im["dest"], wts)))
+    assert torch.equal(
+        bits(fused_moe_nvfp4(x, ids, wts, W, path="padded")), bits(out)
+    ), "the padded packing"
+    Wp = MoEWeightsNVFP4.prepare(w1, w2, gated=gated, act=act)
+    assert not torch.equal(bits(fused_moe_nvfp4(x, ids, wts, Wp)), bits(out))
+    return out
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "T,k,H,I,E,act,seed",
+    [
+        (3, 4, 512, 256, 16, "silu", 31),
+        (37, 2, 256, 128, 8, "silu", 32),
+        (300, 6, 512, 256, 64, "gelu_tanh", 33),
+        (64, 8, 256, 64, 256, "silu", 34),
+        (200, 6, 2048, 1024, 128, "relu2", 35),
+        (1000, 8, 2048, 768, 128, "silu", 36),
+    ],
+)
+def test_static_class_ladder(T, k, H, I, E, act, seed):
+    _static_ladder(T, k, H, I, E, act, seed)
+
+
+@needs_device
+def test_static_class_takes_any_positive_scale_and_unit_default():
+    """The static scales are per-expert inputs (any positive value); the default is one, the open backends' unified-layer
+    value."""
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        MoEWeightsNVFP4,
+        fused_moe_nvfp4,
+    )
+
+    _static_ladder(37, 4, 512, 256, 16, "silu", 41, gs_pow2=False)
+    T, k, H, I, E = 40, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=42)
+    W = MoEWeightsNVFP4.prepare(w1, w2, intermediate="static")
+    W1 = MoEWeightsNVFP4.prepare(
+        w1, w2, intermediate="static", intermediate_scales=torch.ones(E, device="cuda")
+    )
+    assert torch.equal(W.gs2, torch.ones(E, device="cuda")) and torch.equal(
+        W.inv2, torch.ones(E, device="cuda")
+    )
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    assert torch.equal(
+        bits(fused_moe_nvfp4(x, ids, wts, W)), bits(fused_moe_nvfp4(x, ids, wts, W1))
+    )
+
+
+@needs_device
+def test_static_class_through_the_layer_batch_invariance_graph_replay_and_pack_check():
+    """The static class selected through the layer (``BatchInvariantFp4Config(intermediate="static")`` with weights prepared
+    for it): the rows of a sub-batch equal the rows of the full batch, a permutation permutes, graph replay reproduces eager,
+    the autotuner's tactics keep the bits, the view carries the class and its scales, and a pack prepared for the other class
+    is refused."""
+    from flashinfer.autotuner import autotune
+
+    T, k, H, I, E = 64, 4, 512, 256, 32
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=43)
+    gs2 = torch.exp2(
+        torch.randint(-2, 3, (E,), generator=torch.Generator().manual_seed(43)).float()
+    ).cuda()
+    cfg = MoEConfig(
+        routing=RoutingConfig(
+            num_experts=E, top_k=k, method=RoutingMethodType.Renormalize
+        ),
+        quant=_NVFP4,
+        experts=ExpertConfig(intermediate_size=I),
+        activation=_SWIGLU,
+        backend=BackendOptions((BatchInvariantFp4Config(intermediate="static"),)),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=4096),
+        finalize=MoEFinalizeConfig(do_finalize=True),
+    )
+    layer = MoELayer(cfg, device=torch.device("cuda"))
+    view = BatchInvariantFp4Config.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=E,
+        hidden_size=H,
+        intermediate_size=I,
+        activation=_SWIGLU,
+        intermediate="static",
+        intermediate_scales=gs2,
+    )
+    assert view["intermediate"] == "static" and torch.equal(
+        view["intermediate_scale"], gs2
+    )
+    pack = MoEWeightPack({})
+    pack.prepare_for(KEY, view)
+    full = layer(_logits_pack(x, logits), pack)
+    assert torch.equal(bits(full), bits(layer(_logits_pack(x, logits), pack)))
+    sub = layer(_logits_pack(x[:5].contiguous(), logits[:5].contiguous()), pack)
+    assert torch.equal(bits(sub), bits(full[:5]))
+    perm = torch.randperm(T, generator=torch.Generator().manual_seed(44)).cuda()
+    out_p = layer(_logits_pack(x[perm].contiguous(), logits[perm].contiguous()), pack)
+    assert torch.equal(bits(out_p), bits(full[perm]))
+    with autotune(True):
+        assert torch.equal(bits(layer(_logits_pack(x, logits), pack)), bits(full))
+    assert torch.equal(bits(layer(_logits_pack(x, logits), pack)), bits(full))
+    s = torch.cuda.Stream()
+    act = _logits_pack(x, logits)
+    with torch.cuda.stream(s):
+        layer(act, pack)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        out = layer(act, pack)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), bits(full))
+    # the per-token class's output differs (another quantization of the intermediate), and its pack is refused by this layer
+    per_token = _weights(w1, w2)
+    assert not torch.equal(
+        bits(_layer(k, E, I)(_logits_pack(x, logits), per_token)), bits(full)
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+        layer(_logits_pack(x, logits), per_token)
+    assert "intermediate" in str(excinfo.value)

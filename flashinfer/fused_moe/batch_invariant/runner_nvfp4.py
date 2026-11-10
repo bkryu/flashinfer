@@ -277,7 +277,9 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             )
         pts = act.per_token_scale
         if pts is None:
-            pts = _no_scales(act.hidden_states_q.device)[1]  # the empty marker: unit scales
+            pts = _no_scales(act.hidden_states_q.device)[
+                1
+            ]  # the empty marker: unit scales
         else:
             if tuple(pts.shape) != (T,):
                 raise unsupported(
@@ -423,6 +425,9 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             w.w2_sf,
             w.w2_alpha,
             out,
+            # the static class's per-expert scales (gs2 for GEMM1, inv2 for GEMM2); the empty placeholder for the per-token class
+            w.gs2 if w.gs2 is not None else _no_scales(x.device)[1],
+            w.inv2 if w.inv2 is not None else _no_scales(x.device)[1],
         ] + plan
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
@@ -489,8 +494,8 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         self._require_built()
         from .api_nvfp4 import MoEWeightsNVFP4, fused_moe_nvfp4
 
-        x, sf, pts, ids, wts, w1, w1sf, w1a, w2, w2sf, w2a, out = inputs[:12]
-        plan = tuple(inputs[12:17]) if len(inputs) >= 17 else None
+        x, sf, pts, ids, wts, w1, w1sf, w1a, w2, w2sf, w2a, out, gs2, inv2 = inputs[:14]
+        plan = tuple(inputs[14:19]) if len(inputs) >= 19 else None
         H = self._hidden_of(x)
         if tactic == -1 or tactic is None:
             r1, r2 = self._ranked(int(x.shape[0]), H)
@@ -498,6 +503,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         else:
             c1, c2 = _configs_from_tactic_nvfp4(tuple(tactic))
         a = self._activation()
+        static = self._intermediate == "static"
         w = MoEWeightsNVFP4(
             w1,
             w1sf,
@@ -510,6 +516,9 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             a.gated,
             a.act,
             a.params,
+            self._intermediate,
+            gs2 if static else None,
+            inv2 if static else None,
         )
         # a pre-quantized pack: the empty per-token placeholder means unit scales (the per-tensor pack), the 2-D scale tensor the
         # linear layout; both are the op's own placements (no fill, no re-tiling launch)
