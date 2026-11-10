@@ -33,13 +33,9 @@ from .schedule import (
     TOP_K,
     active_experts,
     chain_nodes,
-    exposed_epilogue_cycles,
-    fixed_cycles,
-    pair_term,
     raster_for,
+    record_cost,
     rows_per_expert,
-    tiles_term,
-    zero_fill_cycles,
 )
 
 IN_FMT = "e4m3_bs"
@@ -119,10 +115,10 @@ def rank_grouped_fp8bs(
     grouped records the padded body accepts (at a decode-sized ``rows`` the dense dispatcher's structural guard and its few-token
     N-cluster rule select the candidates) and the swapped decode records the swapped body accepts (``swap``: None ranks them with
     the rest, True keeps only them, False excludes them), ordered by the dense block-scale class's estimate at ``(M = rows, N =
-    n_active * N, K)`` (a swapped record priced in the swapped orientation) times the pair term and the swapped records' spill
-    factor (`tiles_term`), plus the last tile's exposed epilogue chain (`exposed_epilogue_cycles` on the chain's term), the token
-    box's zero-fill (`zero_fill_cycles` at the e4m3 element width; a swapped record's box at the shared contract's exposed share) and
-    the per-body fixed cost per wave (`fixed_cycles`, the shared body table), to three significant digits; each tile family priced once at the
+    n_active * N, K)`` under the shared ranking contract (`schedule.record_cost`: the dense estimate with the MoE ranking's
+    constant overrides, a swapped record priced in the swapped orientation, times the pair term and the swapped records' spill
+    factor, plus the exposed epilogue chain on this chain's term, the token box's exposed zero-fill at the e4m3 element width and
+    the body's per-launch fixed cost), to three significant digits; each tile family priced once at the
     enumeration's raster and the grouped scheduler's structural raster first among its twins; each of the best ceil(k/2) records
     followed by its raster twin, then the rank order fills the list: distinct records, at most ``k``, never empty for an
     implementable shape. Numerics-neutral: every record of either space computes the class. ``block``: the class -- the
@@ -136,12 +132,10 @@ def rank_grouped_fp8bs(
         TOKEN_BOX_ROWS,
         capacity_for,
         decode_sane,
-        estimate_cycles,
     )
 
     check_block(block)
     fam = family or "sm_107"
-    sms = sm_count or PART_TABLE.get(fam, PART_TABLE["sm_107"]).sm_count
     dense_n = (n_active or E) * N
     dense = (
         []
@@ -165,10 +159,9 @@ def rank_grouped_fp8bs(
     # body's one promotion warpgroup (half the padded body's two)
     spb = STAGE_K // block
 
-    def constants(c: Knobs):
+    def promotion_overrides(c: Knobs) -> dict:
         groups = 1.0 if c.swap_ab else 2.0
         return dict(
-            CONSTANTS,
             promote_handoff_clk=CONSTANTS["promote_handoff_clk"] * spb,
             promote_pair_clk=CONSTANTS["promote_pair_clk"] * spb,
             promote_bytes_per_clk=CONSTANTS["promote_bytes_per_clk"]
@@ -198,25 +191,20 @@ def rank_grouped_fp8bs(
     nodes = chain_nodes_fp8bs(chain)
 
     def key(i, c):
-        canon = dataclasses.replace(c, raster_along="m")
-        est = estimate_cycles(
-            canon,
+        # the shared contract's cost with the class's promotion terms layered on the ranking's overrides
+        est = record_cost(
+            c,
             rows,
-            dense_n,
+            n_active or E,
+            N,
             K,
-            1,
-            "k",
-            IN_FMT,
+            nodes,
+            False,
             fam,
             sm_count,
-            c=constants(c),
-            nominal=nominal,
-        )
-        est = (
-            est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles(c, rows, nodes)
-            + zero_fill_cycles(c, rows, K, fam, IN_FMT)
-            + fixed_cycles(c, rows, n_active or E, N, fam, sms)
+            IN_FMT,
+            nominal,
+            overrides=promotion_overrides(c),
         )
         return (
             float(f"{est:.3g}"),
