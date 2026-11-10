@@ -97,46 +97,49 @@ def build_group_tables(
     """Warp-level scan (all 32 lanes of one warp): ``s_off[e]`` = exclusive prefix of ``counts`` rounded up to ``align``
     rows (the group's first row; ``align = 1``: the dense packing), ``s_pre[e]`` = exclusive prefix of
     ``ceil(counts[e] / cluster_rows)`` (the group's first cluster-row block); entries ``e > E`` hold the totals. Integer
-    sums: exact in every order."""
+    sums: exact in every order.
+    Lane-interleaved: entry ``e`` lives on lane ``e % 32`` of chunk ``e // 32``, so a chunk's 32 loads are one line and
+    its 32 stores one conflict-free wavefront (lane-major, each lane's entries sat a line apart: 32 lines per load and a
+    32-way bank conflict per store); a warp scan per chunk, the totals carried across the chunks, and the chunks past
+    ``E`` write the totals without a scan."""
     lane = cute.arch.lane_idx()
-    loc_c = cute.make_rmem_tensor((PER_LANE,), Int32)
-    loc_b = cute.make_rmem_tensor((PER_LANE,), Int32)
-    # the lane's counts first, all loads in flight together (one memory latency per CTA instead of one per entry), then the sums
+    loc = cute.make_rmem_tensor((PER_LANE,), Int32)  # one entry per chunk for this lane
+    # the lane's entries of every chunk first, all loads in flight together (one memory latency per CTA)
     for i in cutlass.range_constexpr(PER_LANE):
-        e = lane * PER_LANE + i
+        e = Int32(i * 32) + lane
         c = Int32(0)
         if e < E:
             c = counts[e]
-        loc_c[i] = c
-    sum_c = Int32(0)
-    sum_b = Int32(0)
+        loc[i] = c
+    carry_c = Int32(0)
+    carry_b = Int32(0)
     for i in cutlass.range_constexpr(PER_LANE):
-        c = loc_c[i]
-        loc_c[i] = sum_c
-        loc_b[i] = sum_b
-        if cutlass.const_expr(align > 1):
-            sum_c = sum_c + ((c + Int32(align - 1)) // Int32(align)) * Int32(align)
+        e = Int32(i * 32) + lane
+        if Int32(i * 32) < E:  # a chunk with entries: the warp scans it (warp-uniform)
+            c = loc[i]
+            if cutlass.const_expr(align > 1):
+                vc = ((c + Int32(align - 1)) // Int32(align)) * Int32(align)
+            else:
+                vc = c
+            vb = (c + Int32(cluster_rows - 1)) // Int32(cluster_rows)
+            inc_c = vc
+            inc_b = vb
+            for sh in cutlass.range_constexpr(5):
+                oc = cute.arch.shuffle_sync_up(inc_c, offset=1 << sh)
+                ob = cute.arch.shuffle_sync_up(inc_b, offset=1 << sh)
+                if lane >= (1 << sh):
+                    inc_c = inc_c + oc
+                    inc_b = inc_b + ob
+            s_off[e] = carry_c + inc_c - vc
+            s_pre[e] = carry_b + inc_b - vb
+            carry_c = carry_c + cute.arch.shuffle_sync(inc_c, offset=31)
+            carry_b = carry_b + cute.arch.shuffle_sync(inc_b, offset=31)
         else:
-            sum_c = sum_c + c
-        sum_b = sum_b + (c + Int32(cluster_rows - 1)) // Int32(cluster_rows)
-    # exclusive warp scan of the per-lane totals
-    inc_c = sum_c
-    inc_b = sum_b
-    for sh in cutlass.range_constexpr(5):
-        oc = cute.arch.shuffle_sync_up(inc_c, offset=1 << sh)
-        ob = cute.arch.shuffle_sync_up(inc_b, offset=1 << sh)
-        if lane >= (1 << sh):
-            inc_c = inc_c + oc
-            inc_b = inc_b + ob
-    base_c = inc_c - sum_c
-    base_b = inc_b - sum_b
-    for i in cutlass.range_constexpr(PER_LANE):
-        e = lane * PER_LANE + i
-        s_off[e] = base_c + loc_c[i]
-        s_pre[e] = base_b + loc_b[i]
-    if lane == 31:
-        s_off[MAX_E] = inc_c
-        s_pre[MAX_E] = inc_b
+            s_off[e] = carry_c
+            s_pre[e] = carry_b
+    if lane == 0:
+        s_off[MAX_E] = carry_c
+        s_pre[MAX_E] = carry_b
     cute.arch.sync_warp()
 
 
