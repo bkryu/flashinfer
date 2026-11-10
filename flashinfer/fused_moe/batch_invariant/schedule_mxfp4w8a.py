@@ -27,7 +27,11 @@ from ...gemm.batch_invariant.generator import (
     Knobs,
     knob_product,
 )
-from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
+from ...gemm.batch_invariant.heuristic import (
+    PART_TABLE,
+    decode_sane,
+    estimate_cycles,
+)
 from .blocks.epilogue import GroupedChain
 from .schedule import (
     TOP_K,
@@ -35,6 +39,7 @@ from .schedule import (
     active_experts,
     chain_nodes,
     exposed_epilogue_cycles,
+    fixed_cycles,
     pair_term,
     raster_for,
     rows_per_expert,
@@ -137,8 +142,9 @@ def rank_grouped_mx(
     K)`` (``n_active`` the active experts, ``E`` by default; a swapped record priced as the dense model prices a swapped
     decode record) times the pair term (the expected dummy half of the two-tile clusters along M) and the swapped records'
     spill factor (`tiles_term`), plus the last tile's exposed epilogue chain (`exposed_epilogue_cycles_mx`: the chain's
-    nodes, the fused requantization's on either body) and the token box's zero-fill (`zero_fill_cycles` at the e4m3
-    row width), at three significant digits; each tile family priced once (at the enumeration's raster: the dense estimate's
+    nodes, the fused requantization's on either body), the token box's zero-fill (`zero_fill_cycles` at the e4m3 row
+    width; a swapped record's box at its exposed share) and the body's per-wave fixed cost (`fixed_cycles`: the shared
+    body table, off until the part is measured), at three significant digits; each tile family priced once (at the enumeration's raster: the dense estimate's
     tile-order term is the dense scheduler's, not the grouped one's) and the raster the structural rule gives the grouped
     scheduler (`raster_for`) first among its twins, best first, ties in the spaces' enumeration order (the grouped records
     before the swapped ones, the narrower token tile before the wider). As in the dense ``rank_topk``, each of the best
@@ -153,6 +159,7 @@ def rank_grouped_mx(
     )
 
     fam = family or "sm_107"
+    sms = sm_count or PART_TABLE.get(fam, PART_TABLE["sm_107"]).sm_count
     dense_n = (n_active or E) * N
     dense = (
         []
@@ -185,6 +192,7 @@ def rank_grouped_mx(
             est * pair_term(c, rows) * tiles_term(c, rows)
             + exposed_epilogue_cycles_mx(c, rows, nodes)
             + zero_fill_cycles(c, rows, K, fam, ACT_FMT)
+            + fixed_cycles(c, rows, n_active or E, N, fam, sms)
         )
         return (
             float(f"{est:.3g}"),
