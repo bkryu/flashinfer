@@ -27,7 +27,7 @@ from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC
 from ..mx_permute import get_compiled_scatter_mx  # noqa: F401  (the scatter kernel shares the module)
 from .blockscaled_kernel import GROUP_ALIGN, MX_FMTS, GroupedBlockScaledGemmMX
 from .epilogue import GROUP, GroupedChain
-from .scheduler import MAX_E
+from .scheduler import MAX_E, TABLE_ROWS
 from .swap_mxfp8 import (  # noqa: F401  (re-exported)
     SwappedBlockScaledGemmMX,
     is_swapped_record,
@@ -49,26 +49,38 @@ BLOCK = SF_VEC["mxfp8"]  # elements per UE8M0 block scale
 
 
 def kernel_name(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, dense_a: bool = False
+    cfg: Knobs,
+    chain: GroupedChain,
+    in_fmt: str,
+    dense_a: bool = False,
+    tables: bool = False,
 ) -> str:
     """The object's name: the instruction class, the chain (activation, output format, parameters) and the record
     without its ``grid_clusters`` (the grid is a launch argument); ``dense_a`` the dense packing's body."""
     knobs = dataclasses.replace(cfg, grid_clusters=0)
-    mode = "_densea" if dense_a else ""
+    mode = ("_densea" if dense_a else "") + ("_tab" if tables else "")
     return jit.sanitize_symbol_name(
         f"grouped_{in_fmt}_{chain.describe()}_{knobs.describe()}{mode}"
     )
 
 
 def swapped_kernel_name(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, k_block: int = 0
+    cfg: Knobs,
+    chain: GroupedChain,
+    in_fmt: str,
+    k_block: int = 0,
+    dense_a: bool = True,
+    tables: bool = False,
 ) -> str:
-    """The swapped decode body's object: the instruction class, the chain, the swapped record (its token tile) and the
-    k-block when it is not the format's default (``_kb256``: the two-atom stage, `swap_k_block`)."""
+    """The swapped decode body's object: the instruction class, the chain, the swapped record (its token tile), the
+    k-block when it is not the format's default (``_kb256``: the two-atom stage, `swap_k_block`), the packing (``_pad``:
+    the rows at the atom-aligned positions) and the entries taking the plan's group tables (``_tab``)."""
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     return jit.sanitize_symbol_name(
         f"swapped_{in_fmt}_{chain.describe()}_{knobs.describe()}"
         + (f"_kb{k_block}" if k_block else "")
+        + ("" if dense_a else "_pad")
+        + ("_tab" if tables else "")
     )
 
 
@@ -126,7 +138,11 @@ def can_implement_grouped_mxfp8(
 
 
 def compile_grouped_mxfp8_fn(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, dense_a: bool = False
+    cfg: Knobs,
+    chain: GroupedChain,
+    in_fmt: str,
+    dense_a: bool = False,
+    tables: bool = False,
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one grouped MXFP8 specialisation (``dense_a``: the dense packing, any A row
     count)."""
@@ -178,6 +194,19 @@ def compile_grouped_mxfp8_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
         obj = GroupedBlockScaledGemmMX(cfg, chain, in_fmt, dense_a)
+        # ``tables``: the entries taking the plan's group tables after ``counts`` (``scheduler.load_group_tables``)
+        tab = (
+            [
+                cute.runtime.make_fake_tensor(
+                    Int32,
+                    (TABLE_ROWS, cute.sym_int(32)),
+                    (cute.sym_int64(), 1),
+                    assumed_align=4,
+                )
+            ]
+            if tables
+            else []
+        )
         if chain.out_fmt == "mxfp8":
             osf_fake = cute.runtime.make_fake_tensor(
                 cutlass.Uint8,
@@ -186,7 +215,7 @@ def compile_grouped_mxfp8_fn(
                 assumed_align=16,
             )
             return cute.compile(
-                obj.call_quant,
+                obj.call_quant_tables if tables else obj.call_quant,
                 a_fake,
                 b_fake,
                 sfa_fake,
@@ -194,18 +223,20 @@ def compile_grouped_mxfp8_fn(
                 o_fake,
                 osf_fake,
                 c_fake,
+                *tab,
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
             )
         return cute.compile(
-            obj,
+            obj.call_tables if tables else obj,
             a_fake,
             b_fake,
             sfa_fake,
             sfb_fake,
             o_fake,
             c_fake,
+            *tab,
             grid,
             stream_fake,
             options="--enable-tvm-ffi",
@@ -258,7 +289,12 @@ def can_implement_mxfp8(
 
 
 def compile_swapped_mxfp8_fn(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, k_block: int = 0
+    cfg: Knobs,
+    chain: GroupedChain,
+    in_fmt: str,
+    k_block: int = 0,
+    dense_a: bool = True,
+    tables: bool = False,
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one swapped MXFP8 specialisation (the dense packing; ``k_block`` as
     `swapped_kernel_name` spells it)."""
@@ -310,7 +346,19 @@ def compile_swapped_mxfp8_fn(
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
-        obj = SwappedBlockScaledGemmMX(cfg, chain, in_fmt, k_block)
+        obj = SwappedBlockScaledGemmMX(cfg, chain, in_fmt, k_block, dense_a)
+        tab = (
+            [
+                cute.runtime.make_fake_tensor(
+                    Int32,
+                    (TABLE_ROWS, cute.sym_int(32)),
+                    (cute.sym_int64(), 1),
+                    assumed_align=4,
+                )
+            ]
+            if tables
+            else []
+        )
         if chain.out_fmt == "mxfp8":
             osf_fake = cute.runtime.make_fake_tensor(
                 cutlass.Uint8,
@@ -319,7 +367,7 @@ def compile_swapped_mxfp8_fn(
                 assumed_align=16,
             )
             return cute.compile(
-                obj.call_quant,
+                obj.call_quant_tables if tables else obj.call_quant,
                 a_fake,
                 sfa_fake,
                 w_fake,
@@ -327,18 +375,20 @@ def compile_swapped_mxfp8_fn(
                 o_fake,
                 osf_fake,
                 c_fake,
+                *tab,
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
             )
         return cute.compile(
-            obj,
+            obj.call_tables if tables else obj,
             a_fake,
             sfa_fake,
             w_fake,
             sfw_fake,
             o_fake,
             c_fake,
+            *tab,
             grid,
             stream_fake,
             options="--enable-tvm-ffi",
@@ -349,7 +399,12 @@ def compile_swapped_mxfp8_fn(
 
 @functools.cache
 def get_compiled_swapped_mxfp8(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, k_block: int = 0
+    cfg: Knobs,
+    chain: GroupedChain,
+    in_fmt: str,
+    k_block: int = 0,
+    dense_a: bool = True,
+    tables: bool = False,
 ) -> Any:
     """``kernel(a3, sfa, w3, sfw, out2[, out_sf], counts, grid)``: A ``(R, K, 1)`` the dense quantized rows (``R >= Tk +
     token tile``), ``sfa`` their flat 128x4 scale factors at the padded positions, W ``(N, K, E)``, ``sfw`` (``E``
@@ -357,14 +412,18 @@ def get_compiled_swapped_mxfp8(
     assert in_fmt in MX_FMTS and is_swapped_record(cfg), (in_fmt, cfg.describe())
     return jit.build_and_load(
         MODULE,
-        swapped_kernel_name(cfg, chain, in_fmt, k_block),
-        compile_swapped_mxfp8_fn(cfg, chain, in_fmt, k_block),
+        swapped_kernel_name(cfg, chain, in_fmt, k_block, dense_a, tables),
+        compile_swapped_mxfp8_fn(cfg, chain, in_fmt, k_block, dense_a, tables),
     )
 
 
 @functools.cache
 def get_compiled_grouped_mxfp8(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, dense_a: bool = False
+    cfg: Knobs,
+    chain: GroupedChain,
+    in_fmt: str,
+    dense_a: bool = False,
+    tables: bool = False,
 ) -> Any:
     """``kernel(a3, b3, sfa, sfb, out2, counts, grid)``: A ``(Tk_pad, K, 1)`` e4m3 K-major (the padded permuted
     activations: group offsets at 128-row atoms), B ``(N, K, E)`` e4m3 K-major (the stacked expert weights), SFA / SFB
@@ -374,6 +433,6 @@ def get_compiled_grouped_mxfp8(
     assert in_fmt in MX_FMTS and isinstance(chain, GroupedChain), (in_fmt, chain)
     return jit.build_and_load(
         MODULE,
-        kernel_name(cfg, chain, in_fmt, dense_a),
-        compile_grouped_mxfp8_fn(cfg, chain, in_fmt, dense_a),
+        kernel_name(cfg, chain, in_fmt, dense_a, tables),
+        compile_grouped_mxfp8_fn(cfg, chain, in_fmt, dense_a, tables),
     )

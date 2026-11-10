@@ -1950,3 +1950,81 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # zero tokens
     out = layer(_logits_pack((xq[:0], xsf[:0]), logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
+
+
+@needs_device
+@pytest.mark.parametrize("packing", ["padded", "dense"])
+def test_swapped_record_loads_the_plan_tables_in_the_packings_form(packing):
+    """The swapped body's table path on BOTH packings: with the plan tables the body loads the rows' offsets in the packing's
+    form (the padded packing: the atom-aligned offsets; the dense one: the rows back to back) and the padded scale-factor
+    positions, and its bits equal the per-CTA scan path's and the dense class's per expert -- on a group pattern with an
+    empty group and a group past the token tile (counts 5, 0, 70, 1), the 8-token record at two K atoms per stage."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import (
+        DENSE_TAIL,
+        _quantize_experts,
+        grouped_gemm_mxfp8,
+        mx_class_of,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
+    from flashinfer.gemm.batch_invariant.api import mm_mxfp8_batch_invariant
+
+    fmt = mx_class_of(torch.device("cuda"))
+
+    counts = [5, 0, 70, 1]
+    E, K, N = len(counts), 256, 256
+    Tk = sum(counts)
+    g = torch.Generator().manual_seed(7)
+    x = (torch.randn(Tk, K, generator=g) * 0.5).to(torch.bfloat16).cuda()
+    xq, xsf = _quant(x)
+    w1q, w1_sf = _quantize_experts(
+        (torch.randn(E, N, K, generator=g) * 0.05).to(torch.bfloat16).cuda()
+    )
+    cnt = torch.tensor(counts, dtype=torch.int32, device="cuda")
+    offp = [0]
+    for c in counts:
+        offp.append(offp[-1] + -(-c // 128) * 128)
+    Tk_pad = offp[-1]
+    pos_pad = torch.tensor(
+        [q for e, c in enumerate(counts) for q in range(offp[e], offp[e] + c)],
+        device="cuda",
+    )
+    nb = K // 32
+    if packing == "padded":
+        a = torch.zeros(Tk_pad, K, dtype=torch.float8_e4m3fn, device="cuda")
+        sf_rows = torch.zeros(Tk_pad, nb, dtype=torch.uint8, device="cuda")
+        a[pos_pad] = xq
+        sf_rows[pos_pad] = xsf
+        kw = dict(dense_a=False)
+        live = pos_pad
+    else:
+        a = torch.zeros(Tk + DENSE_TAIL, K, dtype=torch.float8_e4m3fn, device="cuda")
+        a[:Tk] = xq
+        sf_rows = torch.zeros(Tk_pad + DENSE_TAIL, nb, dtype=torch.uint8, device="cuda")
+        sf_rows[pos_pad] = xsf
+        kw = dict(dense_a=True, sf_rows=Tk_pad + DENSE_TAIL)
+        live = torch.arange(Tk, device="cuda")
+    sf = _swizzle(sf_rows, K)
+    rec = next(c for c in swapped_knobs_mx() if c.mma_tiler_mn[1] == 8)
+    chain = GroupedChain("plain", "silu", "f32")
+    ref = torch.zeros(Tk, N, dtype=torch.float32, device="cuda")
+    pos = 0
+    for e, c in enumerate(counts):
+        if c:
+            ref[pos : pos + c] = mm_mxfp8_batch_invariant(
+                xq[pos : pos + c].contiguous(),
+                w1q[e].t(),
+                _swizzle(xsf[pos : pos + c], K),
+                w1_sf[e],
+                out_dtype=torch.float32,
+                in_fmt=fmt,
+            )
+            pos += c
+    scan = grouped_gemm_mxfp8(a, sf, w1q, w1_sf, cnt, rec, chain, **kw)
+    tab = grouped_gemm_mxfp8(
+        a, sf, w1q, w1_sf, cnt, rec, chain, tables=api.group_tables(cnt), **kw
+    )
+    assert torch.equal(bits(scan[live]), bits(ref)), "the scan path vs the dense class"
+    assert torch.equal(bits(tab[live]), bits(ref)), "the table path vs the dense class"
+    assert not tab[live].isnan().any()

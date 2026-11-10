@@ -303,6 +303,7 @@ def grouped_gemm_mxfp8(
     sf_rows: Optional[int] = None,
     k_block: Optional[int] = None,
     grid: Optional[int] = None,
+    tables: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` with the UE8M0 block scales applied inside the block-scaled step, on the padded
     expert segments ``counts`` (int32 ``[E]``; the rows of group ``e`` start at the exclusive prefix of the counts rounded
@@ -377,18 +378,30 @@ def grouped_gemm_mxfp8(
             launch_tile_bound(config, a.shape[0], E, N),
         )
 
-    if config.swap_ab:
-        if not dense_a:
+    # ``tables``: the plan's group tables (``[TABLE_ROWS, E + 1]`` int32, ``blocks/scheduler.py``) -> the bodies' entries that load
+    # them in place of the per-CTA scan of ``counts``
+    if tables is not None:
+        from .blocks.scheduler import TABLE_ROWS
+
+        if (
+            tuple(tables.shape) != (TABLE_ROWS, E + 1)
+            or tables.dtype != torch.int32
+            or not tables.is_contiguous()
+        ):
             raise ValueError(
-                "grouped_gemm_mxfp8: the swapped decode body reads the dense packing (the scale factors at the padded positions)"
+                f"grouped_gemm_mxfp8: tables must be a contiguous int32 [{TABLE_ROWS}, {E + 1}]"
             )
+    tab = (tables,) if tables is not None else ()
+    if config.swap_ab:
         # the stage's K extent: two atoms when they divide K (`swap_k_block`; ``k_block`` overrides), a placement
         kb = swap_k_block_arg(in_fmt, K, k_block)
         if not can_implement_swapped_mxfp8(config, N, K, E, chain, in_fmt, kb):
             raise ValueError(
                 f"grouped_gemm_mxfp8: swapped record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt}, k_block={kb or 'default'})"
             )
-        kernel = get_compiled_swapped_mxfp8(config, chain, in_fmt, kb)
+        kernel = get_compiled_swapped_mxfp8(
+            config, chain, in_fmt, kb, dense_a, tables is not None
+        )
 
         def args(*outs):
             return (
@@ -398,6 +411,7 @@ def grouped_gemm_mxfp8(
                 w_sf,
                 *outs,
                 counts,
+                *tab,
                 grid_of(),
             )
 
@@ -406,7 +420,9 @@ def grouped_gemm_mxfp8(
             raise ValueError(
                 f"grouped_gemm_mxfp8: record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
             )
-        kernel = get_compiled_grouped_mxfp8(config, chain, in_fmt, dense_a)
+        kernel = get_compiled_grouped_mxfp8(
+            config, chain, in_fmt, dense_a, tables is not None
+        )
 
         def args(*outs):
             return (
@@ -416,6 +432,7 @@ def grouped_gemm_mxfp8(
                 w_sf,
                 *outs,
                 counts,
+                *tab,
                 grid_of(),
             )
 

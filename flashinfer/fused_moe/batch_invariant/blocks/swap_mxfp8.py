@@ -181,7 +181,12 @@ class SwappedBlockScaledGemmMX:
     requantization on the accumulators (the UE8M0 block scales are operands of the instruction: no row or expert scale)."""
 
     def __init__(
-        self, knobs: Knobs, chain: GroupedChain, in_fmt: str = "mxfp8", k_block: int = 0
+        self,
+        knobs: Knobs,
+        chain: GroupedChain,
+        in_fmt: str = "mxfp8",
+        k_block: int = 0,
+        dense_a: bool = True,
     ):
         """``k_block``: K elements per smem stage (0: the format's one 128-byte atom; 256: two atoms, `swap_k_block`), a
         placement of the same fold."""
@@ -195,6 +200,9 @@ class SwappedBlockScaledGemmMX:
         self.plan_cls = PLANS[in_fmt]
         self.token_tile = knobs.tile_n
         self.k_block = k_block
+        self.dense_a = (
+            dense_a  # the rows back to back, else at the atom-aligned positions
+        )
 
     @cute.jit
     def __call__(
@@ -480,14 +488,28 @@ class SwappedBlockScaledGemmMX:
         s_off_pad = storage.group_off_pad.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_pre_pad = storage.group_pre_pad.get_tensor(cute.make_layout((MAX_E + 1,)))
         if cutlass.const_expr(mTab is not None):
-            # the plan's tables (the dense rows, the padded scale-factor positions, the token-tile prefix), loaded by every thread
+            # the plan's tables (the rows' offsets in the packing's form, the padded scale-factor positions, the token-tile
+            # prefix), loaded by every thread
             load_group_tables(
-                mTab, E, tidx, THREADS, pre_row_of(tn), s_off, s_pre, s_off_pad
+                mTab,
+                E,
+                tidx,
+                THREADS,
+                pre_row_of(tn),
+                s_off,
+                s_pre,
+                s_off_pad,
+                not self.dense_a,
             )
         elif warp_idx == EPILOGUE_WARPS[0]:
-            build_group_tables(
-                counts, E, tn, s_off, s_pre, 1
-            )  # the dense rows: the token tiles of a group
+            if cutlass.const_expr(self.dense_a):
+                build_group_tables(
+                    counts, E, tn, s_off, s_pre, 1
+                )  # the dense rows: the token tiles of a group
+            else:
+                build_group_tables(
+                    counts, E, tn, s_off, s_pre, GROUP_ALIGN
+                )  # the padded packing: the rows at the atom-aligned positions
             build_group_tables(
                 counts, E, tn, s_off_pad, s_pre_pad, GROUP_ALIGN
             )  # the padded positions of the scale factors
