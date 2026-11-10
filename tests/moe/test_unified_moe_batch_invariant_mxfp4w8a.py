@@ -477,6 +477,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
         )
         for a in ACTIVATIONS
     ]
+    swapped_at_decode = False  # the swapped GEMM1 record is the pick at some one-row cell of the large shapes
     for H, I, E, k in (
         (512, 256, 64, 6),
         (2048, 768, 128, 8),
@@ -514,20 +515,13 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     c1.describe(),
                     c2.describe(),
                 )
-                # the ranking over both spaces: the swapped decode body at one row per active expert on the large models
-                # (on the small ones the padded body's shorter prologue wins there, as measured), the padded body once an
-                # expert fills a 128-row block at the model-sized weights; in between the model decides (every record
-                # computes the class)
-                if rows <= 2 and H >= 4096:
-                    assert c1.swap_ab and c2.swap_ab, (
-                        family,
-                        T,
-                        H,
-                        I,
-                        E,
-                        c1.describe(),
-                        c2.describe(),
-                    )
+                # the ranking over both spaces: the swapped decode body for GEMM1 at one row per active expert on the large
+                # models (on the small ones, and for GEMM2 at the one-row cells generally, the padded body's shorter prologue
+                # wins, as measured; the SM100 / SM103 class's swapped records have no two-atom stage, so its one-row cells
+                # split by model), the padded body once an expert fills a 128-row block at the model-sized weights; in
+                # between the model decides (every record computes the class)
+                if rows <= 2 and H >= 4096 and c1.swap_ab:
+                    swapped_at_decode = True
                 if rows >= 128 and H >= 2048:
                     assert not c1.swap_ab and not c2.swap_ab, (
                         family,
@@ -583,6 +577,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     and len(set(ranked)) == len(ranked)
                     and set(ranked) <= space1 | swap1
                 )
+    assert swapped_at_decode, family
 
 
 def test_unsupported_device_and_quant_raise_before_any_kernel():
