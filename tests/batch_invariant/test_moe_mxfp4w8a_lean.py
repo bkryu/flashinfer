@@ -81,7 +81,7 @@ def test_lean_model_matches_python_spec():
     r = _lake("exe", "moemxfp4w8aconformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
     lean = {}
-    size = None
+    size = swap_size = None
     for line in r.stdout.splitlines():
         tag = line.split(" ", 1)[0]
         if tag == "moemxfp4w8a":
@@ -90,6 +90,8 @@ def test_lean_model_matches_python_spec():
             lean[name] = sx
         elif tag == "moemxfp4w8aspace":
             size = int(line.split(" ", 1)[1])
+        elif tag == "moemxfp4w8aswapspace":
+            swap_size = int(line.split(" ", 1)[1])
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     for name, sx, _ in lean_cases.cases():
@@ -99,6 +101,7 @@ def test_lean_model_matches_python_spec():
     assert (
         len(lean) == len(lean_cases.cases()) and size == len(lean_cases.space()) == 72
     )
+    assert swap_size == len(lean_cases.swap_space()) == 3
 
 
 @needs_lake
