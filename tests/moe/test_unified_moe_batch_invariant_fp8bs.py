@@ -331,8 +331,13 @@ def test_fingerprint_dimensions_and_classes():
     assert bi.fingerprint("fused_moe_fp8bs", act="relu2", **dims) == bi.fingerprint(
         "fused_moe_fp8bs", act=ReLU2(), **dims
     )
+    # the routing terms the bf16 model serves are classes of this backend too (Llama4 = TopK with sigmoid weights); an unknown
+    # method is refused
+    assert (
+        bi.fingerprint("fused_moe_fp8bs", method=RoutingMethodType.Llama4, **dims) != fp
+    )
     with pytest.raises(ValueError):
-        bi.fingerprint("fused_moe_fp8bs", method=RoutingMethodType.Llama4, **dims)
+        bi.fingerprint("fused_moe_fp8bs", method="NoSuchRouting", **dims)
     with pytest.raises(TypeError):
         bi.fingerprint("fused_moe_fp8bs", block=128, **dims)
     for cfg in ACTIVATIONS:
@@ -1472,8 +1477,11 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         ),
         device=torch.device("cuda"),
     )
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
-        llama(_logits_pack(xq, sx, logits), W)
+    # Llama4 routing (TopK with sigmoid weights) is a routing term the bf16 model serves: the layer runs from logits, deterministically
+    out_l = llama(_logits_pack(xq, sx, logits), W)
+    assert out_l.shape == (8, H) and torch.equal(
+        bits(out_l), bits(llama(_logits_pack(xq, sx, logits), W))
+    )
     ids = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
     assert llama(
         _routed_pack(xq, sx, ids, torch.ones(8, 1, device="cuda")), W
