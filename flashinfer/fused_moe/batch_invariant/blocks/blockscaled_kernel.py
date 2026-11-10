@@ -182,9 +182,9 @@ def ring_bytes(st) -> int:
 
 def umma_ring_bytes(st) -> int:
     """Shared memory of the operand rings a UMMA reads (A and B, all stages)."""
-    return cute.size_in_bytes(
-        st.a_dtype, st.a_smem_layout_staged
-    ) + cute.size_in_bytes(st.b_dtype, st.b_smem_layout_staged)
+    return cute.size_in_bytes(st.a_dtype, st.a_smem_layout_staged) + cute.size_in_bytes(
+        st.b_dtype, st.b_smem_layout_staged
+    )
 
 
 def plan_with_room(
@@ -194,8 +194,9 @@ def plan_with_room(
     the epilogue staging buffers): built once; if the ring plus ``own_bytes(st)`` plus the barrier reserve overflows the
     CTA's shared memory, rebuilt with the budget shortened by the overflow (one stage fewer). ``umma_addr_max``: the
     operand rings a UMMA reads (A and B, behind the barriers and the kernel's own buffers) end below this many bytes of
-    the CTA's shared memory -- the swapped decode body's rule on the sm_100 instruction plans (``UMMA_SMEM_ADDR_MAX``),
-    whose narrow token tile read other bytes once its ring sat beyond it. A placement: the ring depth moves no bits."""
+    the CTA's shared memory -- the plan's ``UMMA_SMEM_ADDR_MAX``, the bound below which every operand layout observed
+    computes the class on the sm_100 instruction plans of this part (the long-K test over every record is the guard). A
+    placement: the ring depth moves no bits."""
     st = plan_cls(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR)
     over = ring_bytes(st) + own_bytes(st) + MBAR_RESERVE_BYTES - st.smem_capacity
     if umma_addr_max is not None:
@@ -219,7 +220,9 @@ def plan_with_room(
                     self.smem_capacity += cut
 
         st2 = _Plan(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR)
-        fits = ring_bytes(st2) + own_bytes(st2) + MBAR_RESERVE_BYTES <= st2.smem_capacity
+        fits = (
+            ring_bytes(st2) + own_bytes(st2) + MBAR_RESERVE_BYTES <= st2.smem_capacity
+        )
         if umma_addr_max is not None:
             fits = fits and (
                 umma_ring_bytes(st2) + own_bytes(st2) + MBAR_RESERVE_BYTES
@@ -252,7 +255,12 @@ class GroupedBlockScaledGemmMX:
         group's rows) are never stored. Default: the padded packing."""
         assert isinstance(chain, GroupedChain), chain
         assert in_fmt in MX_FMTS, in_fmt
-        self.knobs, self.chain, self.in_fmt, self.dense_a = knobs, chain, in_fmt, dense_a
+        self.knobs, self.chain, self.in_fmt, self.dense_a = (
+            knobs,
+            chain,
+            in_fmt,
+            dense_a,
+        )
         self.plan_cls = PLANS[in_fmt]
         self.cluster_shape_mn = knobs.cluster_shape_mn
 

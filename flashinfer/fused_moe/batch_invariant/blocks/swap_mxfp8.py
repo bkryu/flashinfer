@@ -25,8 +25,8 @@ warp (rows ``16q + r`` (up) and ``16q + 8 + r`` (gate) of the interleaved weight
 ``shfl.sync.down 8`` of the gate accumulators). Per-expert agreement with the dense ``mm_mxfp8`` on the group's rows is the
 test, at every token tile, with groups spanning several tiles.
 
-The operand rings a UMMA reads stay inside the instruction's shared-memory address window on the sm_100 instruction plans
-(``UMMA_SMEM_ADDR_MAX``): a narrow token tile's ring placed beyond it read other bytes.
+The operand rings a UMMA reads stay below the plan's ``UMMA_SMEM_ADDR_MAX`` on the sm_100 instruction plans (rings placed
+above it read wrong data for some operand layouts on this part; the long-K test over every record is the guard).
 
 Operands: ``a (R, K, 1)`` e4m3 (the dense rows; ``R >= Tk + token_tile``: the last tiles' boxes stay in bounds), ``sfa`` the
 flat 128x4 swizzled scale factors at the padded positions, ``w (N, K, E)`` e4m3, ``sfw`` (``E`` consecutive 128x4 buffers),
@@ -82,14 +82,21 @@ from .epilogue_mx import (
 )
 from .scheduler import MAX_E, GroupScheduler, build_group_tables
 
-EPILOGUE_WARPS = (0, 1, 2, 3)  # one warpgroup: the 128 weight rows of the tile, one per thread
+EPILOGUE_WARPS = (
+    0,
+    1,
+    2,
+    3,
+)  # one warpgroup: the 128 weight rows of the tile, one per thread
 SF_WARP = 4  # the LDGSTS warp: the token tile's scale-factor rows (one lane per token)
 MMA_WARP = 5
 TMA_WARP = 6
 THREADS = 32 * (TMA_WARP + 1)
 WEIGHT_TILE = 128  # weight rows per tile (the MMA's M: the instruction's 1-CTA M and one scale-factor atom)
 TOKEN_TILES = TILES_N_NARROW  # the swapped records' token tiles (8, 16, 32): one scale-factor atom read from its first rows
-SF_GROUP = 4  # scale-factor bytes per 4-byte cp.async (one 4-block column group of the atom)
+SF_GROUP = (
+    4  # scale-factor bytes per 4-byte cp.async (one 4-block column group of the atom)
+)
 TABLE_BYTES = 4 * (MAX_E + 1) * 4  # the dense and the padded group tables
 
 
@@ -1038,7 +1045,9 @@ def swapped_epilogue_loop(
                 j = col0 + Int32(cols[v])
                 if j < rows_left:
                     val = _chain_elem(
-                        chain, tTR_rAcc[v], gate[v] if cutlass.const_expr(pair) else None
+                        chain,
+                        tTR_rAcc[v],
+                        gate[v] if cutlass.const_expr(pair) else None,
                     )
                     if store_ok:
                         mOut[(row0 + j, out_col)] = val

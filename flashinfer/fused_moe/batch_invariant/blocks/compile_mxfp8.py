@@ -113,9 +113,7 @@ def compile_grouped_mxfp8_fn(
 
     def compile_fn():
         sym_m = (
-            cute.sym_int(32)
-            if dense_a
-            else cute.sym_int(32, divisibility=GROUP_ALIGN)
+            cute.sym_int(32) if dense_a else cute.sym_int(32, divisibility=GROUP_ALIGN)
         )  # the padded rows: whole 128-row atoms; the dense packing: any row count
         sym_n, sym_k, sym_e = (
             cute.sym_int(32, divisibility=8),
@@ -243,7 +241,10 @@ def compile_swapped_mxfp8_fn(
             cute.sym_int(32, divisibility=al),
             cute.sym_int(32),
         )
-        sym_n, sym_no = cute.sym_int(32, divisibility=8), cute.sym_int(32, divisibility=oal)
+        sym_n, sym_no = (
+            cute.sym_int(32, divisibility=8),
+            cute.sym_int(32, divisibility=oal),
+        )
         a_fake = cute.runtime.make_fake_tensor(
             in_dt,
             (sym_r, sym_k, 1),
@@ -324,7 +325,6 @@ def get_compiled_swapped_mxfp8(cfg: Knobs, chain: GroupedChain, in_fmt: str) -> 
         MODULE,
         swapped_kernel_name(cfg, chain, in_fmt),
         compile_swapped_mxfp8_fn(cfg, chain, in_fmt),
-        __file__,
     )
 
 
@@ -340,6 +340,6 @@ def get_compiled_grouped_mxfp8(
     assert in_fmt in MX_FMTS and isinstance(chain, GroupedChain), (in_fmt, chain)
     return jit.build_and_load(
         MODULE,
-        kernel_name(cfg, chain, in_fmt),
-        compile_grouped_mxfp8_fn(cfg, chain, in_fmt),
+        kernel_name(cfg, chain, in_fmt, dense_a),
+        compile_grouped_mxfp8_fn(cfg, chain, in_fmt, dense_a),
     )

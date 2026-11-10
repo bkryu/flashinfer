@@ -250,9 +250,15 @@ def grouped_epilogue_quant_loop(
         acc_pipeline.consumer_wait(acc_state)  # the fold of this tile is complete
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-        warp_active = (
-            rows_left > warp_row0
-        )  # a warp whose 32 rows all lie past the group's end skips
+        # a warp whose 32 rows all lie past the group's real end skips its subtiles (warp-uniform); the warp's rows are
+        # counted from the cluster tile's first row, as the store predicate is (the peer CTA of a 2-CTA pair and the later
+        # CTAs of a cluster along M sit past the first 128 rows: the bf16 epilogue's rule)
+        cta_row_rel = Int32(0)
+        if cutlass.const_expr(cta_v is not None):
+            cta_row_rel = mma_m_in_cluster * Int32(st.mma_tiler[0]) + cta_v * Int32(
+                st.cta_tile_shape_mnk[0]
+            )
+        warp_active = rows_left > cta_row_rel + warp_row0
         for s in range(
             wg, subtile_cnt, epi_warpgroups
         ):  # this warpgroup's subtiles (half blocks when gated)
@@ -393,7 +399,10 @@ def swapped_epilogue_quant_loop(
     frag = tTR_cF[(None, None, None, 0, 0, 0, 0, 0)]
     offs = fragment_offsets(frag.layout)
     nv = len(offs)
-    assert len({m for m, _ in offs}) == 1 and st.cta_tile_shape_mnk[0] == weight_tile == 128, (
+    assert (
+        len({m for m, _ in offs}) == 1
+        and st.cta_tile_shape_mnk[0] == weight_tile == 128
+    ), (
         "the 128-row TMEM layout: one weight row per thread",
         offs,
     )
@@ -510,10 +519,16 @@ def swapped_epilogue_quant_loop(
                     scale_norm(fp, am[v1], fmt, rule), rule.round
                 )
                 y0 = saturate(
-                    fp, quant_pre(fp, ys[v0], inv_scale(fp, sfd0, rule), rule), fmt, rule
+                    fp,
+                    quant_pre(fp, ys[v0], inv_scale(fp, sfd0, rule), rule),
+                    fmt,
+                    rule,
                 )
                 y1 = saturate(
-                    fp, quant_pre(fp, ys[v1], inv_scale(fp, sfd1, rule), rule), fmt, rule
+                    fp,
+                    quant_pre(fp, ys[v1], inv_scale(fp, sfd1, rule), rule),
+                    fmt,
+                    rule,
                 )
                 pr = cvt_f32x2_to_fp8x2(y0, y1, fmt.elem_fmt)
                 ok0 = store_ok & (j0 < rows_left)
@@ -524,12 +539,18 @@ def swapped_epilogue_quant_loop(
                     mOut[(row0 + j1, out_col)] = (pr >> 8).to(Uint8)
                 if leader & (j0 < rows_left):
                     mSf[
-                        sf_offset_128x4_dev((row0 + j0 + sf_shift).to(Int64), blk, pcols)
+                        sf_offset_128x4_dev(
+                            (row0 + j0 + sf_shift).to(Int64), blk, pcols
+                        )
                     ] = sf0.to(Uint8)
                 if leader & (j1 < rows_left):
                     mSf[
-                        sf_offset_128x4_dev((row0 + j1 + sf_shift).to(Int64), blk, pcols)
+                        sf_offset_128x4_dev(
+                            (row0 + j1 + sf_shift).to(Int64), blk, pcols
+                        )
                     ] = sf1.to(Uint8)
         with cute.arch.elect_one():
-            acc_pipeline.consumer_release(acc_state)  # TMEM buffer free for the next fold
+            acc_pipeline.consumer_release(
+                acc_state
+            )  # TMEM buffer free for the next fold
         acc_state.advance()
