@@ -431,9 +431,9 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     well-formed for both) and the swapped decode space (three narrow token tiles); the dispatcher's picks for both classes,
     every chain of the layer and a grid of token counts are members of the spaces the guarantee is claimed over (the
     fused-requantization chain GEMM1 runs and the bf16 chain accept the same padded records; the swapped records take the bf16
-    chain). At a decode-sized group the structural rule picks the swapped decode body (the narrowest token tile the rows per
-    active expert fill to at most three quarters); forbidden (``swap=False``), the padded candidates are the 1-CTA tiles in an
-    N-cluster (the dense dispatcher's guard for a space without swapped records)."""
+    chain). The ranking over both spaces takes the swapped decode body at one row per active expert and the padded body once
+    an expert fills a 128-row block; forbidden (``swap=False``), the padded candidates at a decode-sized group are the 1-CTA
+    tiles in an N-cluster (the dense dispatcher's guard for a space without swapped records)."""
     from flashinfer.fused_moe.batch_invariant import spec as S
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
     from flashinfer.fused_moe.batch_invariant.schedule_mxfp4w8a import (
@@ -445,7 +445,6 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
         rank_grouped_mx,
     )
     from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
-    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import token_tile_default
     from flashinfer.gemm.batch_invariant.heuristic import DECODE_M
     from flashinfer.gemm.batch_invariant.schedule import mx_class_for
 
@@ -497,7 +496,6 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
             assert all_valid_configs_mx_swapped(n1, H, E, quant_chain, fmt) == []
             for T in (1, 2, 7, 64, 300, 1024, 4096, 16384):
                 rows = rows_per_expert(T, k, E)
-                tn = token_tile_default(rows)
                 c1, c2 = default_configs_mx(
                     T, k, H, I, E, chain, fmt, sm_count, family, nominal=True
                 )
@@ -511,16 +509,29 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     c1.describe(),
                     c2.describe(),
                 )
-                # the structural rule: the swapped decode body at a decode-sized group (both GEMMs, the rule's tile), the
-                # padded body above it; forced or forbidden by `swap`
-                assert (c1.swap_ab, c2.swap_ab) == (tn is not None,) * 2, (
-                    family,
-                    T,
-                    c1.describe(),
-                    c2.describe(),
-                )
-                if tn is not None:
-                    assert c1.tile_n == c2.tile_n == tn
+                # the ranking over both spaces: the swapped decode body at one row per active expert, the padded body once
+                # an expert fills a 128-row block at the model-sized weights; in between the model decides (every record
+                # computes the class)
+                if rows <= 2:
+                    assert c1.swap_ab and c2.swap_ab, (
+                        family,
+                        T,
+                        H,
+                        I,
+                        E,
+                        c1.describe(),
+                        c2.describe(),
+                    )
+                if rows >= 128 and H >= 2048:
+                    assert not c1.swap_ab and not c2.swap_ab, (
+                        family,
+                        T,
+                        H,
+                        I,
+                        E,
+                        c1.describe(),
+                        c2.describe(),
+                    )
                 p1, p2 = default_configs_mx(
                     T,
                     k,
@@ -565,9 +576,6 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     1 <= len(ranked) <= 3
                     and len(set(ranked)) == len(ranked)
                     and set(ranked) <= space1 | swap1
-                )
-                assert (ranked[0].swap_ab) == (
-                    token_tile_default(max(1, T * k // E)) is not None
                 )
 
 
@@ -1234,11 +1242,7 @@ def test_swapped_op_equals_the_padded_op(act):
     out0, im0 = F.fused_moe_mxfp4w8a(
         (xq, xsf), ids, weights, W, return_intermediates=True
     )
-    assert (
-        im0["swap"] == (True, True)
-        and im0["config1"].tile_n == 8
-        and torch.equal(bits(out0), bits(ref))
-    )
+    assert im0["swap"] == (True, True) and torch.equal(bits(out0), bits(ref))
     layer = _layer(k, E, I, act=act)
     assert torch.equal(
         bits(layer(_logits_pack((xq, xsf), logits), _weights(w1, w2, act))), bits(ref)
@@ -1452,9 +1456,8 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
     inputs = runner.pack_inputs(pack, W)
     tactics = runner.get_valid_tactics(inputs, None)
     assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
-    assert any(t[6] for t in tactics) == (
-        T <= 16
-    )  # the swapped decode record is a tactic at the decode token count
+    if T <= 16:  # the swapped decode record is a tactic at the decode token count
+        assert any(t[6] for t in tactics), tactics
     for t in tactics:
         out = runner.forward(runner.pack_inputs(pack, W), tactic=t)
         assert torch.equal(bits(out), ref), t

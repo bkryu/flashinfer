@@ -98,9 +98,9 @@ SF_GROUP = (
 SWAP_PLANS = {**PLANS, **_MIXED_SWAPPED_PLANS}
 #: The MX classes the swapped body serves through :class:`SwappedBlockScaledGemmMX` (the unscaled chains, the padded packing).
 MX_SWAP_FMTS = ("mxfp8", "mxfp8_k64", "mxfp4w8a", "mxfp4w8a_k64")
-#: The barriers, the group tables and the whole operand ring stay inside the first 256 KB of the CTA's shared memory: every
-#: operand the MMA descriptors and the scale-factor copies address lies below that bound (an operand ring placed past it
-#: reads as zeros on the SM100 instruction variant of a part with more shared memory).
+#: With the TMA's unpacking container (the mixed SM100 plan's e2m1 weight), the barriers, the group tables and the whole
+#: operand ring stay inside the first 256 KB of the CTA's shared memory: an operand ring placed past that bound reads as zeros
+#: on that instruction variant on a part with more shared memory (the packed plans place their rings past it without harm).
 RING_CAP_BYTES = 1 << 18
 
 
@@ -229,9 +229,8 @@ class SwappedBlockScaledGemm:
             sfw, w4.shape[0], w4.shape[1], w4.shape[2], plan_cls.SF_VEC, plan_cls.SF_DT
         )
         tables = 4 * (MAX_E + 1) * 4  # the dense and the padded group tables
-        st = grouped_plan(
-            plan_cls, self.knobs, lambda st: tables, ring_cap_bytes=RING_CAP_BYTES
-        )
+        cap = RING_CAP_BYTES if plan_cls.A_SMEM_DT is not None else None
+        st = grouped_plan(plan_cls, self.knobs, lambda st: tables, ring_cap_bytes=cap)
         self.st = st
         self.block = st.block
         assert self.block.in_fmt == self.in_fmt, (self.block.in_fmt, self.in_fmt)

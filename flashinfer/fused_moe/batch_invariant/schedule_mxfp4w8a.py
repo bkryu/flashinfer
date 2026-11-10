@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The mixed MXFP4 x MXFP8 grouped GEMMs' dispatcher: the dense mixed class's estimate over the grouped space at the grouped
+"""The mixed MXFP4 x MXFP8 grouped GEMMs' dispatcher: the dense mixed class's estimate over both record spaces at the grouped
 launch's shape.
 
 As for the bf16 classes (:mod:`.schedule`), a grouped GEMM is the dense class under a different scheduler, so its records
@@ -8,13 +8,13 @@ are ranked by the dense dispatcher's model (`flashinfer.gemm.batch_invariant.heu
 class of the part: the part's roofline with nominal constants and the mixed classes' per-operand traffic terms -- the
 e2m1 weight fetched at four bits, staged at the container's width -- no measured tables) at the dense shape whose tiles,
 M tail and operand bytes are the grouped launch's (``M`` = the rows of one active expert, ``N`` = the active experts'
-weight rows side by side). The records ranked are the grouped mixed space itself (the dense block-scaled records at
-swizzle 1 without in-cluster split, operand swap, B-reuse tile or in-CTA chunk fold, filtered by the grouped body's
-acceptance), not the dense ranking's list mapped record by record: the dense mixed class's own candidates at a
-decode-sized ``M`` are its swapped decode records (the weights on the MMA's M side), a body the grouped kernel does not
-have. Two structural terms of the grouped launch the dense shape cannot carry: the raster (`raster_for`: along N once an
-expert fills a 128-row block, along M below) and the expected dummy half of the clusters that pair two 128-row tiles
-along M (`pair_term`). Numerics-neutral: every record of the space computes the class.
+weight rows side by side). Two record spaces are ranked together: the grouped mixed space (the dense block-scaled records
+at swizzle 1 without in-cluster split, operand swap, B-reuse tile or in-CTA chunk fold, filtered by the grouped body's
+acceptance) and the swapped decode space (the dense mixed class's swapped decode records at the narrow token tiles, the
+weights on the MMA's M side: :mod:`.blocks.swap_nvfp4` on the mixed plans), each priced as the dense model prices it, with
+the grouped launch's own terms of the bf16 classes' ranking (:mod:`.schedule`): the pair term, the swapped records' spill
+over their token tile under the load, the last tile's exposed epilogue chain (the fused requantization's element work on the
+padded records) and the token box's zero-fill. Numerics-neutral: every record of either space computes the class.
 """
 
 from __future__ import annotations
@@ -27,30 +27,43 @@ from ...gemm.batch_invariant.generator import (
     Knobs,
     knob_product,
 )
-from ...gemm.batch_invariant.generator import TILES_N_NARROW
 from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
 from .blocks.epilogue import GroupedChain
-from .schedule import TOP_K, active_experts, rows_per_expert
-from .schedule_nvfp4 import token_tile_default
+from .schedule import (
+    TOP_K,
+    _EPI_WARPGROUPS,
+    active_experts,
+    chain_nodes,
+    exposed_epilogue_cycles,
+    pair_term,
+    raster_for,
+    rows_per_expert,
+    tiles_term,
+    zero_fill_cycles,
+)
 
 GEMM2_CHAIN = GroupedChain("plain", "silu", "bf16")
-RASTER_N_ROWS = 128  # an expert spanning a whole 128-row block or more: the grouped scheduler rasters along N
+#: The activation operand's format for the zero-fill term: e4m3 rows (the token box's bytes).
+ACT_FMT = "mxfp8"
+#: Nodes of the fused requantization's per-element term on top of the bf16 chain (the ``mxfp8.quant`` class's element chain:
+#: the scaled value and its e4m3 conversion), counted from its S-expression as `chain_nodes` counts the chain's.
+REQUANT_NODES = 3
 
 
-def raster_for(rows: int) -> str:
-    """The grouped scheduler's raster as a structural rule, not an estimate term: along N once an expert's rows fill a
-    128-row block (consecutive CTAs then share the expert's A block while its weight tiles stream), along M below it
-    (the weight tile is the larger operand of a few rows)."""
-    return "n" if rows >= RASTER_N_ROWS else "m"
+def epilogue_nodes(chain: GroupedChain) -> int:
+    """The per-element epilogue work of a GEMM1 chain: the bf16 chain's nodes, plus the requantization's for the fused
+    spelling (``out_fmt == "mxfp8"``); GEMM2's plain conversion is one node."""
+    return chain_nodes(chain) + (REQUANT_NODES if chain.out_fmt == "mxfp8" else 0)
 
 
-def pair_term(k: Knobs, rows: int) -> float:
-    """The expected dummy half of a cluster that pairs two 128-row tiles along M (``cluster_shape_mn[0] == 2``): every
-    expert's rows are padded to the record's M extent (128 x cm), and with the experts' row counts phased uniformly over
-    that extent the expected padding is half an extent, so the pair's records carry (rows + 128) / (rows + 64) of the
-    single-tile records' rows; the dense estimate at the average rows sees only the average's own tail."""
-    cm = k.cluster_shape_mn[0]
-    return (rows + 64.0 * cm) / (rows + 64.0)
+def exposed_epilogue_cycles_mx(cfg: Knobs, rows: int, nodes: int) -> float:
+    """The bf16 ranking's exposed-epilogue term for this class's bodies: the swapped body as the bf16 one, the padded body's
+    subtiles split between its four epilogue warpgroups (`blocks.blockscaled_kernel.EPI_WARPGROUPS_MX`) where the bf16
+    body's are split between two."""
+    from .blocks.blockscaled_kernel import EPI_WARPGROUPS_MX
+
+    cycles = exposed_epilogue_cycles(cfg, rows, nodes)
+    return cycles if cfg.swap_ab else cycles * _EPI_WARPGROUPS / EPI_WARPGROUPS_MX
 
 
 def grouped_knobs_mx(in_fmt: str = "mxfp4w8a", clusters=None) -> List[Knobs]:
@@ -102,47 +115,6 @@ def all_valid_configs_mx_swapped(
     ]
 
 
-def swapped_pick(
-    rows: int,
-    N: int,
-    K: int,
-    E: int,
-    chain: GroupedChain,
-    in_fmt: str,
-    swap: Optional[bool] = None,
-) -> Optional[Knobs]:
-    """The swapped decode body's record by the structural rule (:func:`schedule_nvfp4.token_tile_default`: the narrowest
-    swapped token tile the rows per active expert fill to at most three quarters), at the dense class's stage width for the
-    instruction class; ``swap`` True / False forces / forbids it. None when the rule (or the body's acceptance) says the
-    padded body. The chain ranked is the bf16 chain (the swapped GEMM1 writes the intermediate the standalone pass quantizes)."""
-    from .blocks.compile_mxfp4w8a import (
-        can_implement_swapped_mxfp4w8a,
-        swapped_knobs_mx,
-    )
-
-    if swap is False:
-        return None
-    tn = (
-        token_tile_default(rows)
-        if swap is None
-        else (token_tile_default(rows) or TILES_N_NARROW[-1])
-    )
-    if tn is None:
-        return None
-    bf16 = GroupedChain(
-        chain.kind,
-        chain.act,
-        "bf16" if chain.out_fmt == "mxfp8" else chain.out_fmt,
-        chain.params,
-    )
-    for sw in swapped_knobs_mx(in_fmt):
-        if sw.tile_n == tn and can_implement_swapped_mxfp4w8a(
-            sw, N, K, E, bf16, in_fmt
-        ):
-            return sw
-    return None
-
-
 def rank_grouped_mx(
     rows: int,
     N: int,
@@ -157,53 +129,83 @@ def rank_grouped_mx(
     n_active: Optional[int] = None,
     swap: Optional[bool] = None,
 ) -> List[Knobs]:
-    """The ranked grouped records for one GEMM: the swapped decode body's record first when the rows per active expert fit a
-    narrow token tile with room to spare (:func:`swapped_pick`; ``swap`` True / False forces / forbids it), then the grouped
-    mixed space the body accepts for the weight shape and the chain, ordered by the dense mixed class's estimate at
-    ``(M = rows, N = n_active * N, K)`` (``n_active`` the active experts, ``E`` by default) times the pair term (the expected
-    dummy half of the two-tile clusters along M), each tile family priced once (at the enumeration's raster) and the raster
-    the structural rule gives the grouped scheduler (`raster_for`) first among its twins, best first, ties in the space's
-    enumeration order; at a decode-sized ``rows`` the dense dispatcher's structural guard for a space without swapped
-    records (`heuristic.decode_sane`: 1-CTA tiles in an N-cluster) selects the padded candidates, as it does for the bf16
-    classes. As in the dense ``rank_topk``, each of the best ceil(k/2) records is followed by its raster twin (the one knob
-    the estimate does not price), then the rank order fills the list: distinct records, at most ``k``, never empty for an
-    implementable shape."""
+    """The ranked records for one GEMM over both record spaces: the grouped mixed records the padded body accepts for the
+    weight shape and the chain (at a decode-sized ``rows`` the dense dispatcher's structural guard, `heuristic.decode_sane`:
+    1-CTA tiles in an N-cluster, selects the candidates) and the swapped records the swapped body accepts for the bf16 chain
+    (the swapped GEMM1 writes the intermediate the standalone pass quantizes; ``swap``: None ranks them with the rest, True
+    keeps only them, False excludes them), ordered by the dense mixed class's estimate at ``(M = rows, N = n_active * N,
+    K)`` (``n_active`` the active experts, ``E`` by default; a swapped record priced as the dense model prices a swapped
+    decode record) times the pair term (the expected dummy half of the two-tile clusters along M) and the swapped records'
+    spill factor (`tiles_term`), plus the last tile's exposed epilogue chain (`exposed_epilogue_cycles_mx`: the chain's
+    nodes, the fused requantization's on the padded records) and the token box's zero-fill (`zero_fill_cycles` at the e4m3
+    row width), at three significant digits; each tile family priced once (at the enumeration's raster: the dense estimate's
+    tile-order term is the dense scheduler's, not the grouped one's) and the raster the structural rule gives the grouped
+    scheduler (`raster_for`) first among its twins, best first, ties in the spaces' enumeration order (the grouped records
+    before the swapped ones, the narrower token tile before the wider). As in the dense ``rank_topk``, each of the best
+    ceil(k/2) records is followed by its raster twin (the one knob the estimate does not price), then the rank order fills
+    the list: distinct records, at most ``k``, never empty for an implementable shape."""
     import dataclasses
 
-    from .blocks.compile_mxfp4w8a import can_implement_grouped_mxfp4w8a
+    from .blocks.compile_mxfp4w8a import (
+        can_implement_grouped_mxfp4w8a,
+        can_implement_swapped_mxfp4w8a,
+        swapped_knobs_mx,
+    )
 
     fam = family or "sm_107"
-    sw = swapped_pick(rows, N, K, E, chain, in_fmt, swap)
-    if sw is not None and k <= 1:
-        return [sw]
     dense_n = (n_active or E) * N
-    space = [
-        c
-        for c in grouped_knobs_mx(in_fmt)
-        if can_implement_grouped_mxfp4w8a(c, N, K, E, chain, in_fmt)
-    ]
-    guarded = [c for c in space if decode_sane(c, rows, False)]
-    raster = raster_for(rows)
+    bf16 = GroupedChain(
+        chain.kind,
+        chain.act,
+        "bf16" if chain.out_fmt == "mxfp8" else chain.out_fmt,
+        chain.params,
+    )
+    dense = (
+        []
+        if swap is True
+        else [
+            c
+            for c in grouped_knobs_mx(in_fmt)
+            if can_implement_grouped_mxfp4w8a(c, N, K, E, chain, in_fmt)
+        ]
+    )
+    swapped = (
+        []
+        if swap is False
+        else [
+            c
+            for c in swapped_knobs_mx(in_fmt)
+            if can_implement_swapped_mxfp4w8a(c, N, K, E, bf16, in_fmt)
+        ]
+    )
+    space = dense + swapped
+    guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
+    nodes_padded, nodes_swapped = epilogue_nodes(chain), chain_nodes(bf16)
 
     def key(i, c):
-        # the tile family priced once, at the enumeration's raster (the dense estimate's tile-order term is the dense
-        # scheduler's, not the grouped one's), scaled by the pair term; the rule's raster first within the family, then
-        # the enumeration order
         canon = dataclasses.replace(c, raster_along="m")
         est = estimate_cycles(
             canon, rows, dense_n, K, 1, "k", in_fmt, fam, sm_count, nominal=nominal
         )
-        return (est * pair_term(c, rows), 0 if c.raster_along == raster else 1, i)
+        est = (
+            est * pair_term(c, rows) * tiles_term(c, rows)
+            + exposed_epilogue_cycles_mx(
+                c, rows, nodes_swapped if c.swap_ab else nodes_padded
+            )
+            + zero_fill_cycles(c, rows, K, fam, ACT_FMT)
+        )
+        return (
+            float(f"{est:.3g}"),
+            0 if (c.swap_ab or c.raster_along == raster_for(c, rows)) else 1,
+            i,
+        )
 
     ranked = [
-        c for _k, c in sorted((key(i, c), c) for i, c in enumerate(guarded or space))
+        c for _k, c in sorted((key(i, c), c) for i, c in enumerate(guarded + swapped))
     ]
     members = set(space)
     out: List[Knobs] = []
     seen = set()
-    if sw is not None:
-        out.append(sw)
-        seen.add(sw)
     for rec in ranked[: -(-k // 2)]:
         twin = dataclasses.replace(
             rec, raster_along="n" if rec.raster_along == "m" else "m"
@@ -235,7 +237,7 @@ def default_configs_mx(
     swap: Optional[bool] = None,
 ) -> Tuple[Knobs, Knobs]:
     """``(config for GEMM1 (N = 2I or I, K = H), config for GEMM2 (N = H, K = I))``: the first record of each ranked list
-    (``swap``: the swapped decode body by the structural rule (None), forced (True) or forbidden (False))."""
+    (``swap``: both record spaces ranked together (None), the swapped records only (True) or the grouped ones only (False))."""
     rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
     n1 = 2 * I if chain1.pair else I
     c1 = rank_grouped_mx(
