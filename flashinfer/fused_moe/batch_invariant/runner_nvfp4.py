@@ -138,6 +138,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         super().__init__()
         self.config = config
         self.device = torch.device(device)
+        self._round_scales = False
         if self.device.index is None and self.device.type == "cuda":
             self.device = torch.device("cuda", torch.cuda.current_device())
         # exact shapes: the dispatcher's pick is a function of the token count (every tactic computes the same bits)
@@ -301,6 +302,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
 
         cfg = self.config
         plan: List[torch.Tensor] = []
+        self._round_scales = False
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype not in (torch.bfloat16, torch.uint8):
             raise unsupported(
@@ -406,10 +408,12 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             )
             ids = act.topk_ids.contiguous()
             wts = act.topk_weights
-            if mode is RoutingInputMode.PackedPrecomputed:
-                wts = wts.to(
-                    torch.bfloat16
-                )  # the packed word carries the weight as bf16: the rounded weights are the inputs
+            # the packed word carries the weight as bf16: the rounded weights are the inputs -- f32 weights are rounded by
+            # the combine itself (no host passes over the slots), bf16 weights widen exactly
+            self._round_scales = (
+                mode is RoutingInputMode.PackedPrecomputed
+                and wts.dtype != torch.bfloat16
+            )
             wts = wts.to(torch.float32).contiguous()
         out = torch.empty(T, H, dtype=torch.bfloat16, device=x.device)
         return [
@@ -527,5 +531,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             if x.dtype == torch.bfloat16
             else (x, sf, pts if pts.numel() == x.shape[0] else None)
         )
-        fused_moe_nvfp4(xin, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan)
+        fused_moe_nvfp4(
+            xin, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan, round_scales=self._round_scales
+        )
         return out

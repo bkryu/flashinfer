@@ -754,10 +754,12 @@ def fused_moe_nvfp4(
     plan: Optional[
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ] = None,
+    round_scales: bool = False,
 ):
     """The W4A4 MoE FFN for pre-routed tokens: ``x`` bf16 ``[T, H]`` (quantized here per token with the class and
     ``gs_inv``) or the quantized triple ``(x4 [T, H/2] uint8, x_sf (128x4 swizzled, uint8), x_pts [T] f32)``;
-    ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` f32; the output bf16 ``[T, H]`` in token order.
+    ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` f32 (``round_scales``: the combine takes their
+    bf16 rounding, the pre-routed packed-word convention); the output bf16 ``[T, H]`` in token order.
     ``in_fmts`` names the instruction class per GEMM (default: the dense rule on each expert weight shape and the device's
     family); ``config1`` / ``config2`` the grouped records (any record of the space gives the same bits; the dispatcher's pick
     by default); ``path`` the packing of the expanded rows (``"dense"`` / ``"padded"``: placements); ``swap`` the dense path's
@@ -993,7 +995,7 @@ def fused_moe_nvfp4(
             aux=w.inv2 if static else None,
         )
         if T:
-            get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count))(
+            get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count), round_scales)(
                 y, dest, scales, out, T, H
             )
         if return_intermediates:
@@ -1125,7 +1127,7 @@ def fused_moe_nvfp4(
             in2,
         )
     if T:
-        get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count))(
+        get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count), round_scales)(
             y, dest, scales, out, T, H
         )
     if return_intermediates:
