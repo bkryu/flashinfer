@@ -1807,10 +1807,14 @@ def test_decode_tactics_include_the_swapped_records_and_agree():
 
 @needs_device
 def test_grouped_routing_config_takes_prerouted_ids_and_refuses_logits():
-    """A group-limited routing configuration (``n_group`` / ``topk_group`` > 1) constructs; from logits it is refused (the
-    class has no grouped routing term); with pre-routed ids the group structure is irrelevant and the output is the
-    ungrouped configuration's bit for bit on the same ids and weights."""
+    """A group-limited routing configuration (``n_group`` / ``topk_group`` > 1) constructs; with a method other than
+    DeepSeekV3 it is refused from logits (the groups are a term of the DeepSeekV3 method alone); with pre-routed ids the group
+    structure is irrelevant and the output is the ungrouped configuration's bit for bit on the same ids and weights; the
+    grouped DeepSeekV3 layer runs from logits deterministically, and its output is the pre-routed path's on the ids and
+    weights of the bf16 model's grouped routing term (the routing kernel is the shared one; the GEMMs never see the groups)."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.api import route
+    from flashinfer.fused_moe.batch_invariant.spec import METHOD_OF_FLASHINFER
 
     T, k, H, I, E = 64, 8, 512, 256, 64
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=5)
@@ -1839,6 +1843,32 @@ def test_grouped_routing_config_takes_prerouted_ids_and_refuses_logits():
     out = grouped(_routed_pack((xq, xsf), ids.cuda(), weights.cuda()), W)
     ref = _layer(k, E, I)(_routed_pack((xq, xsf), ids.cuda(), weights.cuda()), W)
     assert torch.equal(bits(out), bits(ref))
+    dsv3 = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E,
+                top_k=k,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=8,
+                topk_group=4,
+            ),
+            quant=_QUANT,
+            experts=ExpertConfig(intermediate_size=I),
+            backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+            execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=4096),
+        ),
+        device=torch.device("cuda"),
+    )
+    bias = torch.randn(E, device="cuda")
+    out_g = dsv3(_logits_pack((xq, xsf), logits, bias), W)
+    assert out_g.shape == (T, H) and torch.equal(
+        bits(out_g), bits(dsv3(_logits_pack((xq, xsf), logits, bias), W))
+    )
+    term = METHOD_OF_FLASHINFER[RoutingMethodType.DeepSeekV3].with_groups(8, 4)
+    ids_g, weights_g = route(logits, k, term, bias, 1.0)
+    assert torch.equal(
+        bits(out_g), bits(dsv3(_routed_pack((xq, xsf), ids_g, weights_g), W))
+    )
 
 
 @needs_device

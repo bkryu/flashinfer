@@ -26,10 +26,9 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from ...batch_invariant.support import check_device, unsupported
-from ...tllm_enums import RoutingMethodType
 from ..api import MoEActivationPack, MoEWeightPack, RoutingInputMode
 from ..runners import _validate_logits_inputs, _validate_prerouted_inputs
-from .runner import _configs_from_tactic, _tactic
+from .runner import _configs_from_tactic, _tactic, routing_term
 from .runner_fp8_block import PAIR_MXFP8, BatchInvariantFp8BlockRunner
 from .spec_mxfp8 import BLOCK, CLASS
 
@@ -52,8 +51,6 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
     # ---- support ---------------------------------------------------------------------------------------------------
     def _check_support(self) -> None:
         super()._check_support()
-        from .spec import METHOD_OF_FLASHINFER
-
         cfg = self.config
         check_device(self.device, CLASS, MOE_MXFP8_ARCHS)
         try:
@@ -86,14 +83,15 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
             raise unsupported(
                 CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
             )
-        # group-limited routing (n_group / topk_group > 1) is refused only from logits (the class has no grouped routing
-        # term); with pre-routed ids the group structure is irrelevant, the output is the ungrouped configuration's
-        self._method = METHOD_OF_FLASHINFER.get(routing.method)
-        if routing.method is RoutingMethodType.Llama4 and routing.top_k != 1:
+        # the routing term (the method, its expert groups, the Llama4 top-1 rule): the bf16 runner's derivation
+        self._method, self._grouped_other = routing_term(routing, CLASS)
+        if experts.local_expert_offset or (
+            experts.local_num_experts not in (None, 0, routing.num_experts)
+        ):
             raise unsupported(
                 CLASS,
-                f"Llama4 routing with top_k {routing.top_k}",
-                "top_k = 1 (the method is the top-1 of the logits with its sigmoid as the weight; TopKSigmoid for other k)",
+                "expert-parallel shards (local_expert_offset / local_num_experts)",
+                "the full expert set (the class's EP form is not part of this backend)",
             )
         if not cfg.finalize.do_finalize:
             raise unsupported(
@@ -181,25 +179,19 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
-            if cfg.routing.n_group not in (
-                None,
-                0,
-                1,
-            ) or cfg.routing.topk_group not in (
-                None,
-                0,
-                1,
-            ):
+            # the group-limited selection is a term of the DeepSeekV3 method; with another method the groups have no
+            # meaning in this module (with pre-routed ids the group structure never enters the computation)
+            if self._grouped_other:
                 raise unsupported(
                     CLASS,
-                    "group-limited routing (n_group > 1) from logits",
-                    "n_group in (None, 0, 1) from logits, or pre-routed ids for grouped routing",
+                    f"expert groups (n_group / topk_group) with {cfg.routing.method!r} from logits",
+                    "the groups with DeepSeekV3, or pre-routed ids",
                 )
             if self._method is None:
                 raise unsupported(
                     CLASS,
                     f"routing method {cfg.routing.method!r} from logits",
-                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm or DeepSeekV3 with n_group <= 1",
+                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm, TopK, Llama4, TopKSigmoid or DeepSeekV3",
                 )
             bias = act.routing_bias
             if (bias is not None) != self._method.bias:
