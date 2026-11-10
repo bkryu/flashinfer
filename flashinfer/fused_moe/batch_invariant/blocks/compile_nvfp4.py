@@ -68,21 +68,16 @@ def _static_fakes(sym_e):
 
 
 def kernel_name(
-    cfg: Knobs, chain: W4A4Chain, in_fmt: str, dense_a: bool = False, variant: str = ""
+    cfg: Knobs, chain: W4A4Chain, in_fmt: str, dense_a: bool = False
 ) -> str:
-    """The object's name: the instruction class, the packing, the chain (activation, scale, parameters), the record
-    without its ``grid_clusters`` and the placement variant."""
+    """The object's name: the instruction class, the packing, the chain (activation, scale, parameters) and the record
+    without its ``grid_clusters``."""
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     tag = "nvfp4k128" if in_fmt == "nvfp4_k128" else "nvfp4"
     mode = "_densea" if dense_a else ""
     return jit.sanitize_symbol_name(
         f"grouped_{tag}{mode}_{chain.describe()}_{knobs.describe()}"
-        + (f"_v_{variant}" if variant else "")
     )
-
-
-#: The grouped body's placement variant of this process (``GROUPED_VARIANTS``; the A/B benches set it).
-GROUPED_VARIANT = os.environ.get("FLASHINFER_BI_MOE_GROUPED_VARIANT", "")
 
 
 def can_implement_grouped_nvfp4(
@@ -110,12 +105,8 @@ def can_implement_grouped_nvfp4(
     if chain.static_quant and not static_body_ok(knobs):
         return False
     n_out = N // 2 if chain.pair else N
-    oal = (
-        32 if chain.out_fmt == "nvfp4" else ALIGN[chain.out_fmt]
-    )  # the fp4 codes: 16-byte rows, whole scale blocks
-    return (
-        K % ALIGN[in_fmt] == 0 and N % 8 == 0 and n_out % oal == 0 and 1 <= E <= MAX_E
-    )
+    oal = 32 if chain.out_fmt == "nvfp4" else ALIGN[chain.out_fmt]  # the fp4 codes: 16-byte rows, whole scale blocks
+    return K % ALIGN[in_fmt] == 0 and N % 8 == 0 and n_out % oal == 0 and 1 <= E <= MAX_E
 
 
 def swapped_kernel_name(
@@ -152,9 +143,7 @@ def can_implement_swapped_nvfp4(
         return False
     n_out = N // 2 if chain.pair else N
     oal = 32 if chain.out_fmt == "nvfp4" else ALIGN[chain.out_fmt]
-    return (
-        K % ALIGN[in_fmt] == 0 and N % 8 == 0 and n_out % oal == 0 and 1 <= E <= MAX_E
-    )
+    return K % ALIGN[in_fmt] == 0 and N % 8 == 0 and n_out % oal == 0 and 1 <= E <= MAX_E
 
 
 def can_implement_nvfp4(
@@ -282,7 +271,7 @@ def get_compiled_swapped_nvfp4(
 
 
 def compile_grouped_nvfp4_fn(
-    cfg: Knobs, chain: W4A4Chain, in_fmt: str, dense_a: bool, variant: str = ""
+    cfg: Knobs, chain: W4A4Chain, in_fmt: str, dense_a: bool
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one grouped block-scaled specialisation."""
     out_dt, oal = _out_dtype(chain)
@@ -340,7 +329,7 @@ def compile_grouped_nvfp4_fn(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
-        obj = GroupedBlockScaledGemm(cfg, chain, in_fmt, dense_a, variant)
+        obj = GroupedBlockScaledGemm(cfg, chain, in_fmt, dense_a)
         if static:
             osf_fake, aux_fake = _static_fakes(sym_e)
             return cute.compile(
@@ -379,11 +368,7 @@ def compile_grouped_nvfp4_fn(
 
 @functools.cache
 def get_compiled_grouped_nvfp4(
-    cfg: Knobs,
-    chain: W4A4Chain,
-    in_fmt: str = "nvfp4",
-    dense_a: bool = False,
-    variant: str = "",
+    cfg: Knobs, chain: W4A4Chain, in_fmt: str = "nvfp4", dense_a: bool = False
 ) -> Any:
     """``kernel(a3, b3, sfa, sfb, out2, counts, alpha, pts, grid)``: A ``(rows, K/2, 1)`` packed fp4 as uint8 (the padded
     packing: ``rows`` a multiple of 128; ``dense_a``: any row count, the scale factors and ``pts`` at the padded positions),
@@ -397,6 +382,6 @@ def get_compiled_grouped_nvfp4(
     ), (in_fmt, chain)
     return jit.build_and_load(
         MODULE,
-        kernel_name(cfg, chain, in_fmt, dense_a, variant),
-        compile_grouped_nvfp4_fn(cfg, chain, in_fmt, dense_a, variant),
+        kernel_name(cfg, chain, in_fmt, dense_a),
+        compile_grouped_nvfp4_fn(cfg, chain, in_fmt, dense_a),
     )

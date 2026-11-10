@@ -208,17 +208,6 @@ def grouped_plan(
     return _Plan(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR)
 
 
-#: Placement variants of the grouped body (A/B records; the kernel name carries them): ``live_all`` = the epilogue chain computed
-#: on every lane of an active warp (the default computes the live rows' lanes only).
-GROUPED_VARIANTS = ("live_all",)
-
-
-def grouped_variant_tokens(variant: str) -> tuple:
-    toks = tuple(t for t in variant.split("+") if t)
-    assert all(t in GROUPED_VARIANTS for t in toks), (variant, GROUPED_VARIANTS)
-    return toks
-
-
 class GroupedBlockScaledGemm:
     """``out[p, n] = chain(sum_k MMA(A[p], SFA[p], B[n, e(p)], SFB[n, e(p)]))`` for every row ``p`` of every group, with the
     W4A4 chains (``W4A4Chain.scale == "w4a4"``: ``s = mul(alpha[e], pts[p])``) or the unscaled oracle chains. The persistent
@@ -230,12 +219,10 @@ class GroupedBlockScaledGemm:
         chain: W4A4Chain,
         in_fmt: str = "nvfp4",
         dense_a: bool = False,
-        variant: str = "",
     ):
         """``dense_a``: the A rows densely packed (group offsets at align 1), the scale factors and the row scales at the
         padded positions (``pts`` has the padded row count, the scale-factor buffer the padded rows), the output ``Tk`` dense
-        rows. Default: the padded packing (the rows of every group start at a multiple of ``GROUP_ALIGN``). ``variant``: the
-        placement variants (``GROUPED_VARIANTS``)."""
+        rows. Default: the padded packing (the rows of every group start at a multiple of ``GROUP_ALIGN``)."""
         assert isinstance(chain, W4A4Chain) and chain.out_fmt in (
             "bf16",
             "f32",
@@ -250,7 +237,6 @@ class GroupedBlockScaledGemm:
         )
         self.plan_cls = PLANS[in_fmt]
         self.cluster_shape_mn = knobs.cluster_shape_mn
-        self.live_only = "live_all" not in grouped_variant_tokens(variant)
 
     @cute.jit
     def __call__(
@@ -758,7 +744,6 @@ class GroupedBlockScaledGemm:
                 mma_tile_coord_v,
                 mOutSf,
                 mAux,
-                self.live_only,
             )
             tmem.relinquish_alloc_permit()
             # the allocator warp alone frees the columns: every epilogue warpgroup joins here after its last TMEM load (the
