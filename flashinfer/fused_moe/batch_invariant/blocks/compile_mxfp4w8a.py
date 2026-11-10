@@ -27,7 +27,12 @@ from ....batch_invariant import jit
 from ....gemm.batch_invariant.blocks.operands import ALIGN as _ALIGN
 from ....gemm.batch_invariant.blocks.operands import IN_DT
 from ....gemm.batch_invariant.blocks.operands import OUT_DT as _OUT_DT
-from ....gemm.batch_invariant.generator import TILES_N_BLOCKSCALED, Knobs
+from ....gemm.batch_invariant.generator import (
+    SWAP_K_BLOCK,
+    TILES_N_BLOCKSCALED,
+    TILES_N_NARROW,
+    Knobs,
+)
 from ....gemm.batch_invariant.spec import (
     SF_ATOM_KBLOCKS,
     SF_ATOM_ROWS,
@@ -37,6 +42,7 @@ from ....gemm.batch_invariant.spec import (
 from .blockscaled_kernel import GROUP_ALIGN, GroupedBlockScaledGemmMX
 from .epilogue import GROUP, GroupedChain
 from .scheduler import MAX_E
+from .swap_nvfp4 import SwappedBlockScaledGemmMX, is_swapped_record
 
 MODULE = "batch_invariant_moe_mxfp4w8a"
 #: The mixed classes the grouped body serves: the SM100 / SM103 instruction (K = 32) and the SM107 one (K = 64).
@@ -60,6 +66,33 @@ def kernel_name(cfg: Knobs, chain: GroupedChain, in_fmt: str) -> str:
     return jit.sanitize_symbol_name(
         f"grouped_{in_fmt}_{chain.describe()}_{knobs.describe()}"
     )
+
+
+def swapped_kernel_name(cfg: Knobs, chain: GroupedChain, in_fmt: str) -> str:
+    """The swapped decode body's object: the instruction class, the chain and the record (its token tile and stage width)."""
+    knobs = dataclasses.replace(cfg, grid_clusters=0)
+    return jit.sanitize_symbol_name(
+        f"swapped_{in_fmt}_{chain.describe()}_{knobs.describe()}"
+    )
+
+
+def swapped_knobs_mx(in_fmt: str) -> list:
+    """The swapped decode space of the mixed class: the dense mixed class's swapped 1-CTA records at the narrow token tiles
+    (128 weight rows x 8 / 16 / 32 tokens) at the dense class's stage width for the instruction class (``SWAP_K_BLOCK``)."""
+    assert in_fmt in MIXED_FMTS, in_fmt
+    return [
+        Knobs(
+            (128, tn),
+            (1, 1),
+            False,
+            True,
+            "m",
+            1,
+            swap_ab=True,
+            k_block=SWAP_K_BLOCK.get(in_fmt, 0),
+        )
+        for tn in TILES_N_NARROW
+    ]
 
 
 def a_granule(in_fmt: str) -> int:
@@ -100,6 +133,125 @@ def can_implement_grouped_mxfp4w8a(
         and N % 8 == 0
         and n_out % ALIGN[chain.out_fmt] == 0
         and 1 <= E <= MAX_E
+    )
+
+
+def can_implement_swapped_mxfp4w8a(
+    knobs: Knobs, N: int, K: int, E: int, chain: GroupedChain, in_fmt: str
+) -> bool:
+    """Acceptance of the swapped decode body on the mixed plans (:mod:`.swap_nvfp4`): a swapped record of the dense mixed
+    class's space at a narrow token tile (128 weight rows x 8 / 16 / 32 tokens, 1-CTA, no cluster, swizzle 1, either stage
+    width of the class), a chain with a bf16 / f32 output (the fused requantization's codes are the padded body's: the
+    swapped GEMM1 writes the bf16 intermediate and the standalone pass quantizes it), the grouped operand rules (K in whole
+    granules, N % 8, the gate / up pairing, 16-byte output rows, E <= MAX_E). The body reads the padded packing."""
+    if in_fmt not in MIXED_FMTS or not isinstance(chain, GroupedChain):
+        return False
+    if not is_swapped_record(knobs) or not knobs.well_formed(in_fmt):
+        return False
+    if chain.out_fmt not in ("bf16", "f32"):
+        return False
+    if chain.pair and N % (2 * GROUP):
+        return False
+    n_out = N // 2 if chain.pair else N
+    return (
+        K % a_granule(in_fmt) == 0
+        and N % 8 == 0
+        and n_out % ALIGN[chain.out_fmt] == 0
+        and 1 <= E <= MAX_E
+    )
+
+
+def can_implement_mxfp4w8a(
+    knobs: Knobs, N: int, K: int, E: int, chain: GroupedChain, in_fmt: str
+) -> bool:
+    """A record either grouped body of the class takes: the padded body (the dense records) or the swapped decode body (the
+    narrow swapped records); the two spaces are disjoint."""
+    return can_implement_grouped_mxfp4w8a(
+        knobs, N, K, E, chain, in_fmt
+    ) or can_implement_swapped_mxfp4w8a(knobs, N, K, E, chain, in_fmt)
+
+
+def compile_swapped_mxfp4w8a_fn(
+    cfg: Knobs, chain: GroupedChain, in_fmt: str
+) -> Callable[[], Any]:
+    """The zero-argument compile closure of one swapped mixed specialisation: ``kernel(a3, sfa, w3, sfw, out2, counts, grid)``
+    -- A ``(Tk_pad, K, 1)`` e4m3 at the padded positions, ``sfa`` their flat 128x4 scale factors, W ``(N, K / 2, E)`` packed
+    e2m1, ``sfw`` (``E`` buffers), out ``(Tk_pad, Nout)`` bf16 / f32."""
+    assert in_fmt in MIXED_FMTS and is_swapped_record(cfg), (in_fmt, cfg.describe())
+    in_dt = IN_DT[in_fmt]
+    gran = a_granule(in_fmt)
+    out_dt, oal = OUT_DT[chain.out_fmt], ALIGN[chain.out_fmt]
+
+    def compile_fn():
+        sym_m = cute.sym_int(32, divisibility=GROUP_ALIGN)
+        sym_n, sym_k, sym_e = (
+            cute.sym_int(32, divisibility=8),
+            cute.sym_int(32, divisibility=gran),
+            cute.sym_int(32),
+        )
+        sym_kb = cute.sym_int(32, divisibility=gran // 2)
+        sym_no = cute.sym_int(32, divisibility=oal)
+        a_fake = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_m, sym_k, 1),
+            (cute.sym_int64(divisibility=gran), 1, cute.sym_int64(divisibility=gran)),
+            assumed_align=16,
+        )
+        sfa_fake = cute.runtime.make_fake_tensor(
+            cutlass.Uint8,
+            (cute.sym_int(32, divisibility=SF_BUFFER_DIVISIBILITY),),
+            (1,),
+            assumed_align=16,
+        )
+        w_fake = cute.runtime.make_fake_tensor(
+            cutlass.Uint8,
+            (sym_n, sym_kb, sym_e),
+            (
+                cute.sym_int64(divisibility=gran // 2),
+                1,
+                cute.sym_int64(divisibility=gran // 2),
+            ),
+            assumed_align=16,
+        )
+        sfw_fake = cute.runtime.make_fake_tensor(
+            cutlass.Uint8,
+            (cute.sym_int(32, divisibility=SF_BUFFER_DIVISIBILITY),),
+            (1,),
+            assumed_align=16,
+        )
+        o_fake = cute.runtime.make_fake_tensor(
+            out_dt,
+            (sym_m, sym_no),
+            (cute.sym_int64(divisibility=oal), 1),
+            assumed_align=16,
+        )
+        c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        grid = GRID_PLACEHOLDER
+        return cute.compile(
+            SwappedBlockScaledGemmMX(cfg, chain, in_fmt),
+            a_fake,
+            sfa_fake,
+            w_fake,
+            sfw_fake,
+            o_fake,
+            c_fake,
+            grid,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return compile_fn
+
+
+@functools.cache
+def get_compiled_swapped_mxfp4w8a(cfg: Knobs, chain: GroupedChain, in_fmt: str) -> Any:
+    """The swapped decode kernel of (swapped record, chain, class); see :func:`compile_swapped_mxfp4w8a_fn` for the call shape."""
+    assert in_fmt in MIXED_FMTS and isinstance(chain, GroupedChain), (in_fmt, chain)
+    return jit.build_and_load(
+        MODULE,
+        swapped_kernel_name(cfg, chain, in_fmt),
+        compile_swapped_mxfp4w8a_fn(cfg, chain, in_fmt),
     )
 
 

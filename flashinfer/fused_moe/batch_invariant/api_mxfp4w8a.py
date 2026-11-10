@@ -349,10 +349,14 @@ def grouped_gemm_mxfp4w8a(
     ``w [E, N, K / 2]`` packed e2m1 (uint8), ``w_sf [E, sf_numel(N, K)]``. ``chain``: a bf16 class chain (no scale) or its
     fused-requantization spelling (``out_fmt == "mxfp8"``: returns ``(codes [Tk_pad, Nout] e4m3, sf)``); ``in_fmt`` the
     instruction class (the device's by default); ``out [Tk_pad, Nout]`` of the chain's dtype (rows past a group's real end
-    are never stored)."""
+    are never stored). The record selects the body: a dense record runs the padded body, a swapped record (``config.swap_ab``:
+    128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side) the swapped decode body on the same padded packing
+    (:mod:`.blocks.swap_nvfp4`; the bf16 / f32 chains only -- the fused requantization is the padded body's)."""
     from .blocks.compile_mxfp4w8a import (
         can_implement_grouped_mxfp4w8a,
+        can_implement_swapped_mxfp4w8a,
         get_compiled_grouped_mxfp4w8a,
+        get_compiled_swapped_mxfp4w8a,
     )
 
     w8 = _w_bytes(w, "w")
@@ -382,12 +386,21 @@ def grouped_gemm_mxfp4w8a(
     in_fmt = in_fmt or mx_class_of(a.device)
     if in_fmt not in MX_CLASSES:
         raise ValueError(f"grouped_gemm_mxfp4w8a: unknown instruction class {in_fmt!r}")
-    if not can_implement_grouped_mxfp4w8a(config, N, K, E, chain, in_fmt):
+    ok = (
+        can_implement_swapped_mxfp4w8a
+        if config.swap_ab
+        else can_implement_grouped_mxfp4w8a
+    )
+    if not ok(config, N, K, E, chain, in_fmt):
         raise ValueError(
             f"grouped_gemm_mxfp4w8a: record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
         )
     n_out = N // 2 if chain.pair else N
-    kernel = get_compiled_grouped_mxfp4w8a(config, chain, in_fmt)
+    kernel = (
+        get_compiled_swapped_mxfp4w8a(config, chain, in_fmt)
+        if config.swap_ab
+        else get_compiled_grouped_mxfp4w8a(config, chain, in_fmt)
+    )
     if chain.out_fmt == "mxfp8":
         # the fused requantization: the codes and the 128x4 scale bytes of the bf16-rounded chain, written by the epilogue
         if out is not None:
@@ -420,7 +433,17 @@ def grouped_gemm_mxfp4w8a(
         raise ValueError(
             "grouped_gemm_mxfp4w8a: out must be a 16-byte-aligned row-major [Tk_pad, n_out] of the chain's dtype"
         )
-    if Tk:
+    if Tk and config.swap_ab:
+        kernel(
+            a.unsqueeze(-1),
+            a_sf,
+            w8.permute(1, 2, 0),
+            w_sf,
+            out,
+            counts,
+            persistent_clusters(a.device, config),
+        )
+    elif Tk:
         kernel(
             a.unsqueeze(-1),
             w8.permute(1, 2, 0),
@@ -487,6 +510,7 @@ def fused_moe_mxfp4w8a(
     return_intermediates: bool = False,
     requant: str = "fused",
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    swap: Optional[bool] = None,
 ) -> Any:
     """The mixed MXFP4-weight x MXFP8-activation MoE FFN for pre-routed tokens: ``x`` a bf16 ``[T, H]`` (quantized here per
     token by the ``mxfp8.quant`` class) or the quantized pack ``(xq [T, H] e4m3, xsf [T, H / 32] uint8 / UE8M0)`` taken as
@@ -494,8 +518,12 @@ def fused_moe_mxfp4w8a(
     ``in_fmt`` names the instruction class (the device's by default); ``config1`` / ``config2`` the grouped records (any
     record of the space gives the same bits; the dispatcher's pick by default). ``requant``: ``"fused"`` (the intermediate
     quantized inside GEMM1's epilogue, no bf16 intermediate) or ``"standalone"`` (the bf16 intermediate, then the quantizer
-    kernel on it): the same bytes on the live rows. ``return_intermediates``: the live buffers (``counts``, ``dest``,
-    ``src``, ``xq``, ``xsf``, ``x_perm`` / ``x_perm_sf``, ``a``, ``aq`` / ``a_sf``, ``y``) and the records used."""
+    kernel on it): the same bytes on the live rows; a swapped GEMM1 record (the decode body) writes the bf16 intermediate,
+    so the second pass is the standalone spelling there whatever ``requant`` says. ``swap``: the swapped decode body --
+    None: the dispatcher's structural rule (the swapped records when the rows per active expert fit a narrow token tile),
+    True / False: the swapped / the padded body on both GEMMs (placements: the same bits); explicit records select the body
+    themselves. ``return_intermediates``: the live buffers (``counts``, ``dest``, ``src``, ``xq``, ``xsf``, ``x_perm`` /
+    ``x_perm_sf``, ``a``, ``aq`` / ``a_sf``, ``y``), the records used and the requantization spelling run."""
     from .combine import get_compiled_combine, warps_per_token
     from .mx_permute import get_compiled_scatter_mx
     from .permute import warps_per_row
@@ -567,8 +595,14 @@ def fused_moe_mxfp4w8a(
         return out
     if config1 is None or config2 is None:
         sm_count, family = _part(dev)
-        c1, c2 = default_configs_mx(T, k, H, I, E, w.chain1, in_fmt, sm_count, family)
+        c1, c2 = default_configs_mx(
+            T, k, H, I, E, w.chain1, in_fmt, sm_count, family, swap=swap
+        )
         config1, config2 = config1 or c1, config2 or c2
+    if requant not in ("fused", "standalone"):
+        raise ValueError(f"requant must be 'fused' or 'standalone', got {requant!r}")
+    if config1.swap_ab:
+        requant = "standalone"  # the swapped body writes the bf16 intermediate; the class's pass quantizes it
     # ``plan``: ``route_plan(..., align=GROUP_ALIGN)``'s outputs (the same integers as the padded plan, one launch with the routing)
     counts, dest, src = plan if plan is not None else permute_plan_padded(experts, E)
     Tk_pad = src.shape[0]
@@ -589,8 +623,6 @@ def fused_moe_mxfp4w8a(
         nb,
         pcols,
     )
-    if requant not in ("fused", "standalone"):
-        raise ValueError(f"requant must be 'fused' or 'standalone', got {requant!r}")
     if requant == "fused":
         # the class's second quantization inside GEMM1's epilogue: no bf16 intermediate
         a = None
@@ -627,6 +659,8 @@ def fused_moe_mxfp4w8a(
             config2=config2,
             in_fmt=in_fmt,
             Tk_pad=Tk_pad,
+            requant=requant,
+            swap=(config1.swap_ab, config2.swap_ab),
         )
     return out
 
@@ -649,7 +683,10 @@ def moe_ffn_mxfp4w8a(
     config1: Optional[Knobs] = None,
     config2: Optional[Knobs] = None,
     in_fmt: Optional[str] = None,
+    swap: Optional[bool] = None,
 ) -> torch.Tensor:
     """Routing (the bf16 classes' kernel) + the mixed FFN."""
     experts, weights = route(router_logits, top_k, method, bias, scaling_factor)
-    return fused_moe_mxfp4w8a(x, experts, weights, w, out, config1, config2, in_fmt)
+    return fused_moe_mxfp4w8a(
+        x, experts, weights, w, out, config1, config2, in_fmt, swap=swap
+    )

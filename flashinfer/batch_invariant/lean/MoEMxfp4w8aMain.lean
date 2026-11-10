@@ -10,3 +10,4 @@ def main : IO Unit := do
   for (name, t) in moeMxfp4w8aCases do
     IO.println s!"moemxfp4w8a {name} {t.sexpr}"
   IO.println s!"moemxfp4w8aspace {moeMxfp4w8aSpace.length}"
+  IO.println s!"moemxfp4w8aswapspace {moeMxfp4w8aSwapSpace.length}"

@@ -428,19 +428,24 @@ def test_shape_rules_and_padded_bound():
 )
 def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     """The grouped mixed space: 72 dense block-scaled records at swizzle 1 (one list for both instruction classes, every record
-    well-formed for both); the dispatcher's picks for both classes, every chain of the layer and a grid of token counts are
-    members of the space the guarantee is claimed over (the fused-requantization chain GEMM1 runs and the bf16 chain accept
-    the same records)."""
+    well-formed for both) and the swapped decode space (three narrow token tiles); the dispatcher's picks for both classes,
+    every chain of the layer and a grid of token counts are members of the spaces the guarantee is claimed over (the
+    fused-requantization chain GEMM1 runs and the bf16 chain accept the same padded records; the swapped records take the bf16
+    chain). At a decode-sized group the structural rule picks the swapped decode body (the narrowest token tile the rows per
+    active expert fill to at most three quarters); forbidden (``swap=False``), the padded candidates are the 1-CTA tiles in an
+    N-cluster (the dense dispatcher's guard for a space without swapped records)."""
     from flashinfer.fused_moe.batch_invariant import spec as S
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
     from flashinfer.fused_moe.batch_invariant.schedule_mxfp4w8a import (
         GEMM2_CHAIN,
         all_valid_configs_mx,
+        all_valid_configs_mx_swapped,
         default_configs_mx,
         grouped_knobs_mx,
         rank_grouped_mx,
     )
     from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import token_tile_default
     from flashinfer.gemm.batch_invariant.heuristic import DECODE_M
     from flashinfer.gemm.batch_invariant.schedule import mx_class_for
 
@@ -486,11 +491,17 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
             quant_chain = GroupedChain(chain.kind, chain.act, "mxfp8", chain.params)
             assert len(space1) == 72 and len(space2) == 72
             assert set(all_valid_configs_mx(n1, H, E, quant_chain, fmt)) == space1
+            swap1 = set(all_valid_configs_mx_swapped(n1, H, E, chain, fmt))
+            swap2 = set(all_valid_configs_mx_swapped(H, I, E, GEMM2_CHAIN, fmt))
+            assert len(swap1) == 3 and len(swap2) == 3 and not (swap1 & space1)
+            assert all_valid_configs_mx_swapped(n1, H, E, quant_chain, fmt) == []
             for T in (1, 2, 7, 64, 300, 1024, 4096, 16384):
+                rows = rows_per_expert(T, k, E)
+                tn = token_tile_default(rows)
                 c1, c2 = default_configs_mx(
                     T, k, H, I, E, chain, fmt, sm_count, family, nominal=True
                 )
-                assert c1 in space1 and c2 in space2, (
+                assert c1 in space1 | swap1 and c2 in space2 | swap2, (
                     family,
                     T,
                     H,
@@ -500,11 +511,38 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     c1.describe(),
                     c2.describe(),
                 )
-                if rows_per_expert(T, k, E) <= DECODE_M:
-                    # the grouped space has no swapped decode body: at a decode-sized group the candidates are the
-                    # 1-CTA tiles in an N-cluster (the dense dispatcher's guard for such a space), never the dense
-                    # class's swapped decode records read in the grouped orientation
-                    for c in (c1, c2):
+                # the structural rule: the swapped decode body at a decode-sized group (both GEMMs, the rule's tile), the
+                # padded body above it; forced or forbidden by `swap`
+                assert (c1.swap_ab, c2.swap_ab) == (tn is not None,) * 2, (
+                    family,
+                    T,
+                    c1.describe(),
+                    c2.describe(),
+                )
+                if tn is not None:
+                    assert c1.tile_n == c2.tile_n == tn
+                p1, p2 = default_configs_mx(
+                    T,
+                    k,
+                    H,
+                    I,
+                    E,
+                    chain,
+                    fmt,
+                    sm_count,
+                    family,
+                    nominal=True,
+                    swap=False,
+                )
+                assert p1 in space1 and p2 in space2
+                s1, s2 = default_configs_mx(
+                    T, k, H, I, E, chain, fmt, sm_count, family, nominal=True, swap=True
+                )
+                assert s1 in swap1 and s2 in swap2
+                if rows <= DECODE_M:
+                    # without the swapped body the candidates are the 1-CTA tiles in an N-cluster (the dense dispatcher's
+                    # guard for such a space), never the dense class's swapped records read in the grouped orientation
+                    for c in (p1, p2):
                         assert (
                             not c.use_2cta_instrs
                             and c.cluster_shape_mn[0] == 1
@@ -526,7 +564,10 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                 assert (
                     1 <= len(ranked) <= 3
                     and len(set(ranked)) == len(ranked)
-                    and set(ranked) <= space1
+                    and set(ranked) <= space1 | swap1
+                )
+                assert (ranked[0].swap_ab) == (
+                    token_tile_default(max(1, T * k // E)) is not None
                 )
 
 
@@ -791,23 +832,39 @@ def _assert_plausible(actual, expected):
 
 
 def test_grouped_records_round_trip_through_the_autotuners_tactic():
-    """Every grouped record of both mixed classes survives the flat tactic encoding (the autotuner's cache stores tactics as
-    JSON): the tiler, the cluster, the 2-CTA flag and the raster are the record; the k-block, the swizzle and the dense-only
-    knobs are the grouped kernel's fixed defaults, so nothing is dropped."""
-    from flashinfer.fused_moe.batch_invariant.runner import (
-        _configs_from_tactic,
-        _tactic,
+    """Every record of both spaces of both mixed classes survives the runner's flat tactic encoding (the autotuner's cache
+    stores tactics as JSON): the tiler, the cluster, the 2-CTA flag, the raster, the swapped flag and the stage width are the
+    record; the swizzle and the dense-only knobs are the grouped kernels' fixed defaults, so nothing is dropped. The swapped
+    decode space: the three narrow token tiles at the dense class's stage width for the instruction class (256 elements on
+    the SM107 class, the default on the SM100 / SM103 one), disjoint from the grouped space."""
+    from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp4w8a import (
+        swapped_knobs_mx,
+    )
+    from flashinfer.fused_moe.batch_invariant.runner_mxfp4w8a import (
+        _configs_from_tactic_mx,
+        _tactic_mx,
     )
     from flashinfer.fused_moe.batch_invariant.schedule_mxfp4w8a import grouped_knobs_mx
 
     for fmt in ("mxfp4w8a_k64", "mxfp4w8a"):
         ks = grouped_knobs_mx(fmt)
-        assert len(ks) == 72
+        sw = swapped_knobs_mx(fmt)
+        assert len(ks) == 72 and len(sw) == 3 and not set(sw) & set(ks)
         for k in ks:
             assert k.k_block == 0 and k.swizzle_size == 1 and not k.swap_ab, (
                 k.describe()
             )
-            assert _configs_from_tactic(_tactic(k, ks[0])) == (k, ks[0]), k.describe()
+        for k in sw:
+            assert k.swap_ab and k.tile_m == 128 and k.tile_n in (8, 16, 32)
+            assert k.k_block == (256 if fmt == "mxfp4w8a_k64" else 0), k.describe()
+            assert k.well_formed(fmt)
+        for k in ks + sw:
+            assert _configs_from_tactic_mx(_tactic_mx(k, sw[0])) == (k, sw[0]), (
+                k.describe()
+            )
+            assert _configs_from_tactic_mx(_tactic_mx(ks[0], k)) == (ks[0], k), (
+                k.describe()
+            )
 
 
 @needs_device
@@ -982,6 +1039,210 @@ def test_instruction_class_is_the_parts_and_the_grouped_kernel_is_the_dense_clas
         assert not torch.equal(bits(accs["mxfp4w8a_k64"]), bits(accs["mxfp4w8a"])), (
             "the two instruction classes agree on every accumulator: not two classes"
         )
+
+
+@needs_device
+def test_swapped_body_equals_the_dense_class_per_expert():
+    """The swapped decode body on the mixed plans (the e2m1 weight as the MMA's A -- through the TMA's unpacking container on
+    the SM100 class, packed on the SM107 one -- the group's tokens as a narrow N tile from the padded packing, their scale
+    factors gathered from the padded positions): at every token tile of its space its fp32 accumulators equal the dense
+    batch-invariant ``mm_mxfp8_mxfp4`` per expert on the group's rows, the GEMM1 chain and GEMM2's conversion equal the padded
+    body's, rows past a group's end are never stored; both instruction classes where the part has both (the SM107 class at
+    its 256-element stage, the SM100 class at the default); the fused requantization's chain is refused."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp4w8a import (
+        MoEWeightsMXFP4W8A,
+        grouped_gemm_mxfp4w8a,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp4w8a import (
+        can_implement_grouped_mxfp4w8a,
+        can_implement_swapped_mxfp4w8a,
+        swapped_knobs_mx,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+    import flashinfer
+
+    dev = torch.device("cuda")
+    cc = torch.cuda.get_device_capability(dev)
+    fmts = ("mxfp4w8a_k64", "mxfp4w8a") if cc == (10, 7) else ("mxfp4w8a",)
+    f32 = GroupedChain("plain", "silu", "f32")
+    swiglu = GroupedChain("glu", "silu", "bf16")
+    padded = Knobs(*_DENSE_RECORD)
+    for counts, N, K in (
+        ([5, 0, 70, 1, 33, 64, 0, 3], 256, 512),
+        ([1] * 16, 256, 1024),
+        ([1], 256, 2048),
+        ([3, 7, 11, 13] * 8, 512, 128),
+    ):
+        E, Tk = len(counts), sum(counts)
+        g = torch.Generator().manual_seed(E + 7)
+        x = (
+            (
+                torch.randn(Tk, K, generator=g)
+                * torch.exp2(torch.randint(-6, 6, (Tk, K), generator=g).float())
+            )
+            .to(torch.bfloat16)
+            .cuda()
+        )
+        xq, xsf = _quant(x)
+        off = [0]
+        for c in counts:
+            off.append(off[-1] + -(-c // 128) * 128)
+        Tk_pad = off[-1]
+        a8 = torch.zeros(Tk_pad, K, dtype=torch.uint8, device="cuda")
+        sfr = torch.zeros(Tk_pad, K // BLOCK, dtype=torch.uint8, device="cuda")
+        live = torch.zeros(Tk_pad, dtype=torch.bool)
+        pos = 0
+        for e, c in enumerate(counts):
+            a8[off[e] : off[e] + c] = xq.view(torch.uint8)[pos : pos + c]
+            sfr[off[e] : off[e] + c] = xsf[pos : pos + c]
+            live[off[e] : off[e] + c] = True
+            pos += c
+        a_sf = _swizzle(sfr, K)
+        W = MoEWeightsMXFP4W8A.prepare(
+            (torch.randn(E, N, K, generator=g) * 0.1).to(torch.bfloat16).cuda(),
+            (torch.randn(E, K, N // 2, generator=g) * 0.1).to(torch.bfloat16).cuda(),
+            interleaved=True,
+        )
+        cnt = torch.tensor(counts, dtype=torch.int32, device="cuda")
+        for fmt in fmts:
+            ref = torch.zeros(Tk_pad, N, dtype=torch.float32, device="cuda")
+            for e, c in enumerate(counts):
+                if c:
+                    lo, hi = off[e], off[e] + c
+                    ref[lo:hi] = (
+                        flashinfer.gemm.batch_invariant.api.mm_mxfp8_mxfp4_batch_invariant(
+                            a8[lo:hi].view(torch.float8_e4m3fn),
+                            W.w1[e].t(),
+                            _swizzle(sfr[lo:hi], K),
+                            W.w1_sf[e],
+                            out_dtype=torch.float32,
+                            in_fmt=fmt,
+                            config=padded,
+                        )
+                    )
+            ref = ref.cpu()
+            a_pad = grouped_gemm_mxfp4w8a(
+                a8.view(torch.float8_e4m3fn),
+                a_sf,
+                W.w1,
+                W.w1_sf,
+                cnt,
+                padded,
+                swiglu,
+                fmt,
+            ).cpu()
+            for cfg in swapped_knobs_mx(fmt):
+                assert can_implement_swapped_mxfp4w8a(cfg, N, K, E, f32, fmt)
+                assert not can_implement_grouped_mxfp4w8a(cfg, N, K, E, f32, fmt)
+                out = torch.full(
+                    (Tk_pad, N), float("nan"), dtype=torch.float32, device="cuda"
+                )
+                grouped_gemm_mxfp4w8a(
+                    a8.view(torch.float8_e4m3fn),
+                    a_sf,
+                    W.w1,
+                    W.w1_sf,
+                    cnt,
+                    cfg,
+                    f32,
+                    fmt,
+                    out=out,
+                )
+                got = out.cpu()
+                assert torch.equal(bits(got[live]), bits(ref[live])), (
+                    fmt,
+                    counts[:4],
+                    cfg.describe(),
+                )
+                assert torch.isnan(got[~live]).all(), (
+                    "rows past a group's end are never stored"
+                )
+                got1 = grouped_gemm_mxfp4w8a(
+                    a8.view(torch.float8_e4m3fn),
+                    a_sf,
+                    W.w1,
+                    W.w1_sf,
+                    cnt,
+                    cfg,
+                    swiglu,
+                    fmt,
+                ).cpu()
+                assert torch.equal(bits(got1[live]), bits(a_pad[live])), (
+                    fmt,
+                    cfg.describe(),
+                    "swiglu",
+                )
+            with pytest.raises(ValueError, match="does not implement"):
+                grouped_gemm_mxfp4w8a(
+                    a8.view(torch.float8_e4m3fn),
+                    a_sf,
+                    W.w1,
+                    W.w1_sf,
+                    cnt,
+                    swapped_knobs_mx(fmt)[0],
+                    GroupedChain("glu", "silu", "mxfp8"),
+                    fmt,
+                )
+
+
+@needs_device
+@pytest.mark.parametrize("act", [SwiGLU(), ReLU2()], ids=["swiglu", "relu2"])
+def test_swapped_op_equals_the_padded_op(act):
+    """At a decode-sized group the op with the swapped decode body on both GEMMs (the standalone requantization pass behind
+    the swapped GEMM1) equals the op with the padded body (the fused spelling) bit for bit, the default dispatch takes the
+    swapped records, and the layer from logits at a small token count gives the same bits as the pre-routed path."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp4w8a as F
+    from flashinfer.fused_moe.batch_invariant.api import route
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    T, k, H, I, E = 5, 2, 512, 256, 64
+    chain = activation_of(act)
+    x, logits, w1, w2 = _problem(
+        T, k, H, I, E, seed=9, gated=chain.gated, adversarial=True
+    )
+    xq, xsf = _quant(x)
+    W = F.MoEWeightsMXFP4W8A.prepare(
+        w1, w2, gated=chain.gated, act=chain.act, params=chain.params
+    )
+    ids, weights = route(logits, k)
+    ref, im_p = F.fused_moe_mxfp4w8a(
+        (xq, xsf), ids, weights, W, return_intermediates=True, swap=False
+    )
+    got, im_s = F.fused_moe_mxfp4w8a(
+        (xq, xsf), ids, weights, W, return_intermediates=True, swap=True
+    )
+    assert (
+        im_p["swap"] == (False, False)
+        and im_p["requant"] == "fused"
+        and im_p["a"] is None
+    )
+    assert (
+        im_s["swap"] == (True, True)
+        and im_s["requant"] == "standalone"
+        and im_s["a"] is not None
+    )
+    assert torch.equal(bits(got), bits(ref))
+    assert torch.equal(
+        bits(
+            F.fused_moe_mxfp4w8a(
+                (xq, xsf), ids, weights, W, swap=False, requant="standalone"
+            )
+        ),
+        bits(ref),
+    )
+    out0, im0 = F.fused_moe_mxfp4w8a(
+        (xq, xsf), ids, weights, W, return_intermediates=True
+    )
+    assert (
+        im0["swap"] == (True, True)
+        and im0["config1"].tile_n == 8
+        and torch.equal(bits(out0), bits(ref))
+    )
+    layer = _layer(k, E, I, act=act)
+    assert torch.equal(
+        bits(layer(_logits_pack((xq, xsf), logits), _weights(w1, w2, act))), bits(ref)
+    )
 
 
 @needs_device
@@ -1172,12 +1433,14 @@ def test_batch_permutation_subbatch_and_hot_expert_invariance():
 
 
 @needs_device
-def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
-    """Every tactic the autotuner may pick (the dispatcher's ranked record pairs) gives the same bits; tuning the layer
-    profiles them and the output before, during and after tuning is one output."""
+@pytest.mark.parametrize("T", [300, 8], ids=["mid", "decode"])
+def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
+    """Every tactic the autotuner may pick (the dispatcher's ranked record pairs: at the decode token count the swapped
+    decode body's record among them) gives the same bits; tuning the layer profiles them and the output before, during and
+    after tuning is one output."""
     from flashinfer.autotuner import AutoTuner, autotune
 
-    T, k, H, I, E = 300, 6, 1024, 512, 64
+    k, H, I, E = 6, 1024, 512, 64
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=6, adversarial=True)
     layer = _layer(k, E, I)
     W = _weights(w1, w2)
@@ -1189,6 +1452,9 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
     inputs = runner.pack_inputs(pack, W)
     tactics = runner.get_valid_tactics(inputs, None)
     assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
+    assert any(t[6] for t in tactics) == (
+        T <= 16
+    )  # the swapped decode record is a tactic at the decode token count
     for t in tactics:
         out = runner.forward(runner.pack_inputs(pack, W), tactic=t)
         assert torch.equal(bits(out), ref), t

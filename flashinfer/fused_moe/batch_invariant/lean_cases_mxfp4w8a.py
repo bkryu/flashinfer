@@ -37,6 +37,16 @@ def space():
     return ks
 
 
+def swap_space():
+    """The swapped decode space's records in their Lean form (the stage width is a lowering choice, not a field of the
+    record, so the two instruction classes' lists print as one), in enumeration order."""
+    from .blocks.compile_mxfp4w8a import swapped_knobs_mx
+
+    ks = [k.lean() for k in swapped_knobs_mx("mxfp4w8a")]
+    assert ks == [k.lean() for k in swapped_knobs_mx("mxfp4w8a_k64")]
+    return ks
+
+
 def cases() -> List[Tuple[str, str, str]]:
     """``(name, python_sexpr, lean_term)``: the class's chain terms and the Lean expressions that must print identically."""
     alg = term.TermAlgebra()
@@ -90,7 +100,8 @@ def render() -> str:
         "`MoEMxfp4w8a.lean`): the GEMM1 chains (the bf16 classes' terms) and the GEMM2 conversion print identically "
         "(`mterm.sexpr` vs `MTerm.sexpr`); the grouped record space (one list for both instruction classes) satisfies the "
         "grouped predicate, is a member of both verified dense mixed spaces, and the tile result is invariant over it on both "
-        "classes. Kernel `decide` throughout. -/",
+        "classes; the swapped decode space satisfies the swapped predicate, is a member of both dense mixed decode spaces, and "
+        "the tile result is invariant over the union of the two spaces on both classes. Kernel `decide` throughout. -/",
     ]
     for name, sx, lt in cases():
         L.append(
@@ -128,14 +139,38 @@ def render() -> str:
         "(a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), GEMM.tileResultMXW48 c₁ S₁ p a b kb nblk = GEMM.tileResultMXW48 c₂ S₂ q a b kb nblk := "
         "GEMM.space_invariantMXW48 moeMxfp4w8aSpace"
     )
+    sw = swap_space()
+    L.append("def moeMxfp4w8aSwapSpace : List GEMM.Config := [" + ", ".join(sw) + "]")
+    L.append(
+        f"theorem moe_mxfp4w8a_swap_space_size : moeMxfp4w8aSwapSpace.length = {len(sw)} := by decide"
+    )
+    L.append(
+        "theorem moe_mxfp4w8a_swap_space_ok : moeMxfp4w8aSwapSpace.all MoEMxfp4w8a.groupedSwapOK = true := by decide +kernel"
+    )
+    L.append(
+        "theorem moe_mxfp4w8a_swap_space_in_mxw48_decode : moeMxfp4w8aSwapSpace.all (fun c => gemmMxW48SpaceDecode.any (fun s => s == c)) = true := by decide +kernel"
+    )
+    L.append(
+        "theorem moe_mxfp4w8a_swap_space_in_mxw48k64_decode : moeMxfp4w8aSwapSpace.all (fun c => gemmMxW48K64SpaceDecode.any (fun s => s == c)) = true := by decide +kernel"
+    )
+    L.append(
+        "theorem moe_mxfp4w8a_both_spaces_invariant_k64 : ∀ c₁ ∈ moeMxfp4w8aSpace ++ moeMxfp4w8aSwapSpace, ∀ c₂ ∈ moeMxfp4w8aSpace ++ moeMxfp4w8aSwapSpace, "
+        "∀ (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), "
+        "GEMM.tileResultMXW48K64 c₁ S₁ p a b kb nblk = GEMM.tileResultMXW48K64 c₂ S₂ q a b kb nblk := "
+        "GEMM.space_invariantMXW48K64 (moeMxfp4w8aSpace ++ moeMxfp4w8aSwapSpace)"
+    )
+    L.append(
+        "theorem moe_mxfp4w8a_both_spaces_invariant_k32 : ∀ c₁ ∈ moeMxfp4w8aSpace ++ moeMxfp4w8aSwapSpace, ∀ c₂ ∈ moeMxfp4w8aSpace ++ moeMxfp4w8aSwapSpace, "
+        "∀ (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), "
+        "GEMM.tileResultMXW48 c₁ S₁ p a b kb nblk = GEMM.tileResultMXW48 c₂ S₂ q a b kb nblk := "
+        "GEMM.space_invariantMXW48 (moeMxfp4w8aSpace ++ moeMxfp4w8aSwapSpace)"
+    )
     L.append("end BIK")
     return "\n".join(L) + "\n"
 
 
 def summary() -> str:
-    return (
-        f"moe mxfp4w8a lean_cases coverage: chains={len(cases())} space={len(space())}"
-    )
+    return f"moe mxfp4w8a lean_cases coverage: chains={len(cases())} space={len(space())} swap={len(swap_space())}"
 
 
 def main(out_path: str = CASES_PATH) -> str:

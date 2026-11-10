@@ -43,8 +43,45 @@ from ..api import (
     SwiGLUStep,
 )
 from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
-from .runner import _configs_from_tactic, _tactic
 from .spec_mxfp4w8a import BLOCK, CLASS
+
+
+def _tactic_mx(c1, c2) -> tuple:
+    """A pair of records as a flat tuple of scalars (JSON round-trip safe for the autotuner's cache): the bf16 runner's six
+    per record plus the swapped-record flag and the stage width (the dispatcher's two record spaces)."""
+    return tuple(
+        int(v) if isinstance(v, bool) else v
+        for cfg in (c1, c2)
+        for v in (
+            cfg.mma_tiler_mn[0],
+            cfg.mma_tiler_mn[1],
+            cfg.cluster_shape_mn[0],
+            cfg.cluster_shape_mn[1],
+            cfg.use_2cta_instrs,
+            cfg.raster_along,
+            cfg.swap_ab,
+            cfg.k_block,
+        )
+    )
+
+
+def _configs_from_tactic_mx(t: tuple):
+    from ...gemm.batch_invariant.generator import Knobs
+
+    def one(v):
+        return Knobs(
+            (int(v[0]), int(v[1])),
+            (int(v[2]), int(v[3])),
+            bool(v[4]),
+            True,
+            str(v[5]),
+            1,
+            swap_ab=bool(v[6]),
+            k_block=int(v[7]),
+        )
+
+    return one(t[:8]), one(t[8:16])
+
 
 #: The compute capabilities the classes are stated for (the dense mixed GEMM class's parts).
 MOE_MXFP4W8A_ARCHS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3), (10, 7))
@@ -315,7 +352,8 @@ class BatchInvariantMoeMxfp4w8aRunner(MoERunner):
         H = self._hidden
         rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
         a = self._activation()
-        # the records are ranked for the fused-requantization spelling GEMM1 runs (the same acceptance as the bf16 chain's)
+        # the padded records are ranked for the fused-requantization spelling GEMM1 runs (the same acceptance as the bf16
+        # chain's); the swapped decode record runs the bf16 chain (the standalone pass quantizes its intermediate)
         chain1 = GroupedChain(a.chain, a.act, "mxfp8", a.params)
         n1 = 2 * I if a.gated else I
         sm_count, family = self._part if self._part is not None else (None, None)
@@ -342,10 +380,10 @@ class BatchInvariantMoeMxfp4w8aRunner(MoERunner):
         self._require_built()
         self._hidden = int(inputs[_XQ].shape[1])
         r1, r2 = self._ranked(int(inputs[_XQ].shape[0]))
-        return [_tactic(c1, c2) for c1 in r1 for c2 in r2]
+        return [_tactic_mx(c1, c2) for c1 in r1 for c2 in r2]
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + ("moe.mxfp4w8a-v1", self._in_fmt or "")
+        return super()._cache_key_extras() + ("moe.mxfp4w8a-v2", self._in_fmt or "")
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(
@@ -365,7 +403,7 @@ class BatchInvariantMoeMxfp4w8aRunner(MoERunner):
             r1, r2 = self._ranked(int(xq.shape[0]))
             c1, c2 = r1[0], r2[0]
         else:
-            c1, c2 = _configs_from_tactic(tuple(tactic))
+            c1, c2 = _configs_from_tactic_mx(tuple(tactic))
         a = self._activation()
         w = MoEWeightsMXFP4W8A(w1, w1_sf, w2, w2_sf, a.gated, a.act, a.params)
         fused_moe_mxfp4w8a(

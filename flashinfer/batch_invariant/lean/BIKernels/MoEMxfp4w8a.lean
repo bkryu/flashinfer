@@ -99,4 +99,20 @@ def groupedOK (cfg : GEMM.Config) : Bool :=
   GEMM.ConfigOKMxW48 cfg && GEMM.ConfigOKMxW48K64 cfg && cfg.swizzle == 1 && cfg.clusterK == 1 && !cfg.swapAb &&
   !cfg.ctaChunks && cfg.tm != 512
 
+/-- The swapped decode space of the mixed classes (`blocks/swap_nvfp4.py` on the mixed plans): the dense mixed classes'
+swapped 1-CTA records at a narrow token tile (128 weight rows x 8 / 16 / 32 tokens), no cluster, swizzle 1, no in-cluster
+split, no in-CTA chunk fold, on both instruction classes. The mixed step is symmetric in its operands as every block-scaled
+step (the dense classes' swapped decode records are in their verified spaces), so each is a placement of the class; the stage
+width is a lowering choice, not a field of the record. Disjoint from `groupedOK` (`swapAb`). -/
+def groupedSwapOK (cfg : GEMM.Config) : Bool :=
+  GEMM.ConfigOKMxW48 cfg && GEMM.ConfigOKMxW48K64 cfg && cfg.swizzle == 1 && cfg.clusterK == 1 && cfg.swapAb &&
+  !cfg.ctaChunks && cfg.tm == 128 && cfg.tn ≤ 32 && cfg.clusterM == 1 && cfg.clusterN == 1 && !cfg.twoCta
+
+/-- The two record spaces of the class are disjoint. -/
+theorem grouped_spaces_disjoint (cfg : GEMM.Config) (h : groupedOK cfg = true) : groupedSwapOK cfg = false := by
+  unfold groupedOK at h
+  unfold groupedSwapOK
+  simp only [Bool.and_eq_true] at h
+  simp [h.1.2.2.2.1]
+
 end BIK.MoEMxfp4w8a

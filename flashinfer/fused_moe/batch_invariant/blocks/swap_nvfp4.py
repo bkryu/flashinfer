@@ -36,6 +36,7 @@ positions, ``Tk_pad`` entries at least).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 import cuda.bindings.driver as cuda
@@ -65,11 +66,14 @@ from ....gemm.batch_invariant.blocks.blockscaled import (
     fp4_view,
     s2t_copy_and_partition,
 )
+from ....gemm.batch_invariant.blocks.blockscaled_mx_mixed import (
+    SWAPPED_PLANS as _MIXED_SWAPPED_PLANS,
+)
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE, BAR_TMEM_ALLOC
 from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs
-from ....gemm.batch_invariant.spec import NVFP4_FMTS, SF_ATOM_KBLOCKS
+from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS
 from ..spec_nvfp4 import w4a4_row_scale
-from .epilogue import BAR_EPI_JOIN, GROUP, MoeF32, fragment_offsets
+from .epilogue import BAR_EPI_JOIN, GROUP, GroupedChain, MoeF32, fragment_offsets
 from .epilogue_nvfp4 import W4A4Chain, _scaled_elem
 from .kernel_nvfp4 import GROUP_ALIGN, grouped_plan, sf_view_experts
 from .scheduler import MAX_E, GroupScheduler, build_group_tables
@@ -89,6 +93,15 @@ TOKEN_TILES = TILES_N_NARROW  # the swapped records' token tiles (8, 16, 32): on
 SF_GROUP = (
     4  # scale-factor bytes per 4-byte cp.async (one 4-block column group of the atom)
 )
+# the plan whose A operand is the weight's format: the one-format plans as they are, the mixed classes' swapped twins (the
+# e2m1 weight as the kernel's A: through the TMA's unpacking container on the SM100 instruction, packed on the SM107 one)
+SWAP_PLANS = {**PLANS, **_MIXED_SWAPPED_PLANS}
+#: The MX classes the swapped body serves through :class:`SwappedBlockScaledGemmMX` (the unscaled chains, the padded packing).
+MX_SWAP_FMTS = ("mxfp8", "mxfp8_k64", "mxfp4w8a", "mxfp4w8a_k64")
+#: The barriers, the group tables and the whole operand ring stay inside the first 256 KB of the CTA's shared memory: every
+#: operand the MMA descriptors and the scale-factor copies address lies below that bound (an operand ring placed past it
+#: reads as zeros on the SM100 instruction variant of a part with more shared memory).
+RING_CAP_BYTES = 1 << 18
 
 
 def is_swapped_record(knobs: Knobs) -> bool:
@@ -151,15 +164,29 @@ class PipelineCpAsyncUmma(PipelineAsync):
 class SwappedBlockScaledGemm:
     """``out[p, n] = chain(sum_k MMA(W[n, e(p)], SFW[n, e(p)], A[p], SFA[pad(p)]))`` for every dense row ``p`` of every group."""
 
-    def __init__(self, knobs: Knobs, chain: W4A4Chain, in_fmt: str = "nvfp4"):
+    def __init__(
+        self,
+        knobs: Knobs,
+        chain: W4A4Chain,
+        in_fmt: str = "nvfp4",
+        dense_a: bool = True,
+    ):
+        """``dense_a``: the token rows densely packed (the W4A4 classes: the scale factors and row scales at the padded
+        positions); False: the padded packing (the MX classes: the token rows, their scale factors and the output rows at the
+        padded positions)."""
         assert isinstance(chain, W4A4Chain) and chain.out_fmt in ("bf16", "f32"), chain
-        assert in_fmt in NVFP4_FMTS and in_fmt in PLANS, in_fmt
+        assert in_fmt in SWAP_PLANS, in_fmt
         assert is_swapped_record(knobs), (
             "the swapped block-scaled body takes the narrow swapped records (128 weight rows x 8 / 16 / 32 tokens, 1-CTA)",
             knobs,
         )
-        self.knobs, self.chain, self.in_fmt = knobs, chain, in_fmt
-        self.plan_cls = PLANS[in_fmt]
+        self.knobs, self.chain, self.in_fmt, self.dense_a = (
+            knobs,
+            chain,
+            in_fmt,
+            dense_a,
+        )
+        self.plan_cls = SWAP_PLANS[in_fmt]
         self.token_tile = knobs.tile_n
 
     @cute.jit
@@ -176,14 +203,35 @@ class SwappedBlockScaledGemm:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        self._launch(
+            a, sfa, w, sfw, out, counts, alpha, pts, max_active_clusters, stream
+        )
+
+    def _launch(
+        self, a, sfa, w, sfw, out, counts, alpha, pts, max_active_clusters, stream
+    ):
+        """Host side (trace time): the operand views in the plan's formats (the weight as the MMA's A), the plan with room
+        for the group tables, the TMA setup and the launch. ``alpha`` / ``pts`` are None for the unscaled chains (the MX
+        classes)."""
         plan_cls = self.plan_cls
-        a4 = fp4_view(a)  # (R, K, 1): the dense token rows, the MMA's B operand
-        w4 = fp4_view(w)  # (N, K, E): the MMA's A operand (M = N, K, L = E)
+        # a byte-packed 4-bit operand as the fp4 tensor of the logical K (the dense body's view); the e4m3 token rows as given
+        a4 = a  # (R, K, 1): the token rows, the MMA's B operand
+        if cutlass.const_expr(plan_cls.B_DT.width == 4):
+            a4 = fp4_view(a)
+        w4 = w  # (N, K, E): the MMA's A operand (M = N, K, L = E)
+        if cutlass.const_expr(plan_cls.A_DT.width == 4):
+            w4 = fp4_view(w)
+        assert a4.element_type is plan_cls.B_DT and w4.element_type is plan_cls.A_DT, (
+            a4.element_type,
+            w4.element_type,
+        )
         sfw_t = sf_view_experts(
             sfw, w4.shape[0], w4.shape[1], w4.shape[2], plan_cls.SF_VEC, plan_cls.SF_DT
         )
         tables = 4 * (MAX_E + 1) * 4  # the dense and the padded group tables
-        st = grouped_plan(plan_cls, self.knobs, lambda st: tables)
+        st = grouped_plan(
+            plan_cls, self.knobs, lambda st: tables, ring_cap_bytes=RING_CAP_BYTES
+        )
         self.st = st
         self.block = st.block
         assert self.block.in_fmt == self.in_fmt, (self.block.in_fmt, self.in_fmt)
@@ -198,8 +246,16 @@ class SwappedBlockScaledGemm:
             st.cluster_shape_mn, st.tiled_mma.thr_id
         )
         a_one = cute.slice_(st.a_smem_layout_staged, (None, None, None, 0))
+        # `internal_type`: the TMA's unpacking format of a sub-byte weight into the 8-bit smem container (the mixed SM100
+        # class); None for the packed operands
         atom_w, tensor_w = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op, w4, a_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
+            a_op,
+            w4,
+            a_one,
+            st.mma_tiler,
+            st.tiled_mma,
+            st.cluster_layout_vmnk.shape,
+            internal_type=plan_cls.A_TMA_INTERNAL,
         )
         sfa_one = cute.slice_(st.sfa_smem_layout_staged, (None, None, None, 0))
         atom_sfw, tensor_sfw = cute.nvgpu.make_tiled_tma_atom_A(
@@ -268,8 +324,8 @@ class SwappedBlockScaledGemm:
         mSFA_flat: cute.Tensor,
         mOut: cute.Tensor,
         counts: cute.Tensor,
-        mAlpha: cute.Tensor,
-        mPts: cute.Tensor,
+        mAlpha: Optional[cute.Tensor],
+        mPts: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -279,6 +335,9 @@ class SwappedBlockScaledGemm:
     ):
         st = self.st
         tn = self.token_tile
+        row_align = (
+            1 if self.dense_a else GROUP_ALIGN
+        )  # the token rows' group alignment: dense, or the padded atoms
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_w)
@@ -371,15 +430,15 @@ class SwappedBlockScaledGemm:
         s_pre_pad = storage.group_pre_pad.get_tensor(cute.make_layout((MAX_E + 1,)))
         if warp_idx == EPILOGUE_WARPS[0]:
             build_group_tables(
-                counts, E, tn, s_off, s_pre, 1
-            )  # the dense rows: the token tiles of a group
+                counts, E, tn, s_off, s_pre, row_align
+            )  # the token rows: the token tiles of a group
             build_group_tables(
                 counts, E, tn, s_off_pad, s_pre_pad, GROUP_ALIGN
             )  # the padded positions of the scale factors and row scales
         pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
 
         sW = smem.allocate_tensor(
-            element_type=st.a_dtype,
+            element_type=st.a_smem_dtype,
             layout=a_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
@@ -560,6 +619,45 @@ class SwappedBlockScaledGemm:
             # the allocator warp alone frees the columns: the epilogue warpgroup's warps join here after their last TMEM loads
             epi_join.arrive_and_wait()
             tmem.free(tmem_ptr)
+
+
+class SwappedBlockScaledGemmMX(SwappedBlockScaledGemm):
+    """The swapped decode body for the MX classes (``in_fmt`` in ``MX_SWAP_FMTS``: the MXFP8 class and the mixed
+    MXFP4-weight x MXFP8-activation class through its swapped twin plan) on the padded packing: the unscaled chains (the
+    UE8M0 block scales are operands of the instruction), hence no ``alpha`` / ``pts`` operands; the token rows, their scale
+    factors and the output rows at the padded positions (``out (Tk_pad, Nout)``). The chain is the grouped bf16 chain
+    (:class:`GroupedChain`), run by the transposed epilogue as the unscaled W4A4 chain."""
+
+    def __init__(
+        self,
+        knobs: Knobs,
+        chain: GroupedChain,
+        in_fmt: str = "mxfp4w8a_k64",
+        dense_a: bool = False,
+    ):
+        assert in_fmt in MX_SWAP_FMTS and isinstance(chain, GroupedChain), (
+            in_fmt,
+            chain,
+        )
+        assert chain.out_fmt in ("bf16", "f32"), chain
+        unscaled = W4A4Chain(chain.kind, chain.act, chain.out_fmt, chain.params, "none")
+        super().__init__(knobs, unscaled, in_fmt, dense_a)
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        sfa: cute.Tensor,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._launch(
+            a, sfa, w, sfw, out, counts, None, None, max_active_clusters, stream
+        )
 
 
 @cute.jit

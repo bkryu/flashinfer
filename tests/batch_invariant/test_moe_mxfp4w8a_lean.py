@@ -41,11 +41,16 @@ def test_generated_cases_are_current():
     } <= set(names)
     for name in names:
         assert f"theorem moe_mxfp4w8a_{name} :" in committed
-    assert len(lean_cases.space()) == 72
+    assert len(lean_cases.space()) == 72 and len(lean_cases.swap_space()) == 3
     assert (
         "theorem moe_mxfp4w8a_space_size : moeMxfp4w8aSpace.length = 72 := by decide"
         in committed
     )
+    assert (
+        "theorem moe_mxfp4w8a_swap_space_size : moeMxfp4w8aSwapSpace.length = 3 := by decide"
+        in committed
+    )
+    assert "moe_mxfp4w8a_both_spaces_invariant_k64" in committed
     assert "sorry" not in committed and "native_decide" not in committed
 
 
