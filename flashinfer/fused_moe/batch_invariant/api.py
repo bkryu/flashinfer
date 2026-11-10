@@ -512,6 +512,7 @@ def fused_moe(
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     finalize: bool = True,
     grid_clip: bool = True,
+    w_round: bool = False,
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
@@ -522,7 +523,9 @@ def fused_moe(
     rows ``y`` and the positions ``dest`` of ``return_intermediates`` are then the unfinalized form of the op (a placement:
     the rows are the class's own intermediates, a function of the token, its expert and the routing alone). ``grid_clip``:
     the GEMMs' persistent grids clipped to the launch's tile bound (the default), or the device's capacity (a placement
-    either way)."""
+    either way). ``w_round``: the f32 ``weights`` enter the fold as their bf16 rounding, done by the combine kernel (the
+    pre-routed packed-word convention: the bits of rounding them on the host first, without the host's passes over the
+    slots)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
@@ -587,7 +590,7 @@ def fused_moe(
     )  # [Tk, H] bf16
     if finalize and T:
         get_compiled_combine(
-            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(x.device))
+            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(x.device)), w_round
         )(y, dest, scales, out, T, H)
     if return_intermediates:
         return out, dict(
