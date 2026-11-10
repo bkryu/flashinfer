@@ -300,17 +300,22 @@ def record_cost(
     nominal: bool = False,
     fill_fmt: Optional[str] = None,
     epi_warpgroups: int = _EPI_WARPGROUPS,
+    overrides: Optional[dict] = None,
 ) -> float:
     """The shared contract's cost of one grouped record at the launch's shape ``(rows per expert, n_active x N, K)``, the key
     every class's ``rank_grouped_*`` sorts by: the dense estimate with the MoE ranking's constant overrides
-    (`estimate_overrides`), times the pair term and the swapped records' tiles term, plus the exposed epilogue chain, the
-    token box's exposed fill and the body's per-launch fixed cost; in SM cycles. ``fill_fmt``: the token rows' element
-    format for the fill term where it differs from the class's (the mixed class's e4m3 tokens); ``epi_warpgroups``: the
-    grouped body's epilogue warpgroups (the block-scaled bodies' four)."""
+    (`estimate_overrides`, with a class's own ``overrides`` layered on top: its promotion counts and the like; the dense
+    dispatcher's constants untouched), times the pair term and the swapped records' tiles term, plus the exposed epilogue
+    chain, the token box's exposed fill and the body's per-launch fixed cost; in SM cycles. ``fill_fmt``: the token rows'
+    element format for the fill term where it differs from the class's (the mixed class's e4m3 tokens); ``epi_warpgroups``:
+    the grouped body's epilogue warpgroups (the block-scaled bodies' four)."""
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import estimate_cycles
 
+    constants = estimate_overrides(cfg, rows, in_fmt, family)
+    if overrides:
+        constants.update(overrides)
     canon = dataclasses.replace(cfg, raster_along="m")
     est = estimate_cycles(
         canon,
@@ -323,7 +328,7 @@ def record_cost(
         family,
         sm_count,
         nominal=nominal,
-        c=estimate_overrides(cfg, rows, in_fmt, family),
+        c=constants,
     )
     return (
         est * pair_term(cfg, rows) * tiles_term(cfg, rows)
