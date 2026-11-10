@@ -83,16 +83,9 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
             raise unsupported(
                 CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
             )
-        # the routing term (the method, its expert groups, the Llama4 top-1 rule): the bf16 runner's derivation
+        # the routing term (the method, its expert groups, the Llama4 top-1 rule): the bf16 runner's derivation; expert-parallel
+        # shards are refused by name in super()._check_support() (the family's `supports_expert_parallelism = False`)
         self._method, self._grouped_other = routing_term(routing, CLASS)
-        if experts.local_expert_offset or (
-            experts.local_num_experts not in (None, 0, routing.num_experts)
-        ):
-            raise unsupported(
-                CLASS,
-                "expert-parallel shards (local_expert_offset / local_num_experts)",
-                "the full expert set (the class's EP form is not part of this backend)",
-            )
         if not cfg.finalize.do_finalize:
             raise unsupported(
                 CLASS,

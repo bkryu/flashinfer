@@ -1932,6 +1932,25 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                 device=torch.device("cuda"),
             )
         assert what in str(excinfo.value) or "moe.mxfp8" in str(excinfo.value), what
+    # an expert-parallel shard (the layer's local expert range): the fp8-block family declares no expert parallelism, so the
+    # layer's candidate filter and the runner's support check refuse the shard by name (the bf16 backend's base runner, which
+    # computes shards, is not this runner's base)
+    assert BatchInvariantMxfp8Runner.supports_expert_parallelism is False
+    for shard in (
+        dict(local_expert_offset=E // 2, local_num_experts=E // 2),
+        dict(local_expert_offset=0, local_num_experts=E // 2),
+    ):
+        sharded = MoEConfig(
+            routing=routing,
+            quant=_QUANT,
+            experts=ExpertConfig(intermediate_size=I, **shard),
+            backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+        )
+        with pytest.raises(RuntimeError) as excinfo:
+            MoELayer(sharded, device=torch.device("cuda"))
+        assert "expert parallelism" in str(excinfo.value), shard
+        with pytest.raises(NotImplementedError, match="expert parallelism"):
+            BatchInvariantMxfp8Runner(sharded, torch.device("cuda"))._check_support()
     layer = _layer(k, E, I)
     x, logits, w1, w2 = _problem(8, k, H, I, E, seed=9)
     W = _weights(w1, w2)
