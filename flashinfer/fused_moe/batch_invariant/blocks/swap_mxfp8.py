@@ -93,7 +93,7 @@ from .epilogue_mx import (
     swap_xch_layout,
     swapped_epilogue_quant_loop,
 )
-from .scheduler import MAX_E, GroupScheduler, build_group_tables
+from .scheduler import MAX_E, GroupScheduler, build_group_tables_dual
 
 EPILOGUE_WARPS = (
     0,
@@ -110,7 +110,9 @@ TOKEN_TILES = TILES_N_NARROW  # the swapped records' token tiles (8, 16, 32): on
 SF_GROUP = (
     4  # scale-factor bytes per 4-byte cp.async (one 4-block column group of the atom)
 )
-TABLE_BYTES = 4 * (MAX_E + 1) * 4  # the dense and the padded group tables
+TABLE_BYTES = (
+    3 * (MAX_E + 1) * 4
+)  # the dense offsets, the padded offsets, the tile prefix
 # the plan whose A operand is the weight's format: the one-format plans as they are, the mixed class's swapped twins (the
 # e2m1 weight as the kernel's A: through the TMA's unpacking container on the SM100 instruction, packed on the SM107 one)
 SWAP_PLANS = {**PLANS, **_MIXED_SWAPPED_PLANS}
@@ -419,7 +421,6 @@ class SwappedBlockScaledGemmMX:
             group_off: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
             group_pre: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
             group_off_pad: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
-            group_pre_pad: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
 
         smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -469,14 +470,12 @@ class SwappedBlockScaledGemmMX:
         s_off = storage.group_off.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_pre = storage.group_pre.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_off_pad = storage.group_off_pad.get_tensor(cute.make_layout((MAX_E + 1,)))
-        s_pre_pad = storage.group_pre_pad.get_tensor(cute.make_layout((MAX_E + 1,)))
         if warp_idx == EPILOGUE_WARPS[0]:
-            build_group_tables(
-                counts, E, tn, s_off, s_pre, row_align
-            )  # the token rows: the token tiles of a group
-            build_group_tables(
-                counts, E, tn, s_off_pad, s_pre_pad, GROUP_ALIGN
-            )  # the padded positions of the scale factors
+            # one pass for both tables: the token rows at the packing's alignment (dense, or the padded atoms), the padded
+            # positions of the scale factors, the token-tile prefix
+            build_group_tables_dual(
+                counts, E, tn, s_off, s_pre, s_off_pad, GROUP_ALIGN, row_align
+            )
         pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
 
         sW = smem.allocate_tensor(
