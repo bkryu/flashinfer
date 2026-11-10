@@ -195,8 +195,8 @@ class SwappedBlockScaledGemmMX:
         knobs: Knobs,
         chain: GroupedChain,
         in_fmt: str = "mxfp8",
-        dense_a: bool = True,
         k_block: int = 0,
+        dense_a: bool = True,
     ):
         """``in_fmt``: the MXFP8 class or the mixed MXFP4-weight x MXFP8-activation class (its swapped twin plan: the e2m1
         weight as the kernel's A). ``dense_a``: the token rows densely packed (the MXFP8 class: the scale factors at the
