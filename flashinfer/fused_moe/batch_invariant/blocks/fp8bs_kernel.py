@@ -1289,6 +1289,14 @@ def grouped_blockscale_epilogue_loop(
                         acc_state
                     )  # one arrive per warp: the stage is free once all arrived
                 acc_state.advance()
+        # a dead lane's accumulators (a row past the group's end: a zero-filled TMA row) replaced by a benign constant, so the
+        # chain and the requantization below run unconditionally with their exact divisions off the hardware's slow path; dead
+        # rows are never stored
+        for i in cutlass.range_constexpr(VW):
+            tTR_rSum[i] = Float32(
+                cutlass.select_(lane_live, tTR_rSum[i], CuteF32.const(1.0))
+            )
+
         # ===== the chain and the store of this group's half of the tile's fold =====
         if cutlass.const_expr(quant):
             # the fused requantization: the bf16-rounded chain values of the group's outputs in column order, then the block amax
@@ -1354,14 +1362,6 @@ def grouped_blockscale_epilogue_loop(
                 if stored & (half == Int32(0)):
                     mSfo[(blk, row_g)] = s_blk
         else:
-            # a dead lane's accumulators (a row past the group's end: a zero-filled TMA row) replaced by a benign constant, so
-            # the chain below runs unconditionally with its exact divisions off the hardware's slow path; dead rows are never
-            # stored. The fused requantization's path (whole tiles by its row rule) keeps its accumulators as they are: the
-            # select there cost its prefill
-            for i in cutlass.range_constexpr(VW):
-                tTR_rSum[i] = Float32(
-                    cutlass.select_(lane_live, tTR_rSum[i], CuteF32.const(1.0))
-                )
             for k in cutlass.range_constexpr(per_group):
                 s = gsel * per_group + k  # the group's subtile index within the tile
                 if warp_active:
