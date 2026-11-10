@@ -55,15 +55,15 @@ SWAPPED_QUANT_COLUMN_CYCLES = 150.0
 
 
 #: Cycles per launch of the swapped body's own prologue on the MX classes beyond the grouped body's: its second group table and
-#: the token scale-factor gather, paid once per CTA whatever the live rows. One declared empirical constant of this class, the
-#: smallest that puts the padded body first at the one-live-row cells of the small models and leaves the picks from sixteen rows
-#: per expert swapped; the padded body and the bf16 chains carry no such term.
+#: the token scale-factor gather, paid once per CTA whatever the live rows and whatever the chain (GEMM2's conversion as much as
+#: GEMM1's quantizing chain). One declared empirical constant of this class, the smallest that puts the padded body first at the
+#: one-live-row cells of the small models; the padded body carries no such term.
 SWAPPED_FIXED_CYCLES = 12000.0
 
 
 def swapped_fixed_cycles(cfg: Knobs, chain: GroupedChain) -> float:
-    """``SWAPPED_FIXED_CYCLES`` for a swapped record running the fused requantization chain; zero otherwise."""
-    return SWAPPED_FIXED_CYCLES if (cfg.swap_ab and chain.out_fmt == ACT_FMT) else 0.0
+    """``SWAPPED_FIXED_CYCLES`` for a swapped record (the body's prologue, every chain); zero for the padded body."""
+    return SWAPPED_FIXED_CYCLES if cfg.swap_ab else 0.0
 
 
 def swapped_quant_column_cycles(
