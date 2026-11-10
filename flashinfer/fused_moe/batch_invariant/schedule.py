@@ -298,11 +298,15 @@ def record_cost(
     sm_count: Optional[int] = None,
     in_fmt: str = "bf16",
     nominal: bool = False,
+    fill_fmt: Optional[str] = None,
+    epi_warpgroups: int = _EPI_WARPGROUPS,
 ) -> float:
     """The shared contract's cost of one grouped record at the launch's shape ``(rows per expert, n_active x N, K)``, the key
     every class's ``rank_grouped_*`` sorts by: the dense estimate with the MoE ranking's constant overrides
     (`estimate_overrides`), times the pair term and the swapped records' tiles term, plus the exposed epilogue chain, the
-    token box's exposed fill and the body's per-launch fixed cost; in SM cycles."""
+    token box's exposed fill and the body's per-launch fixed cost; in SM cycles. ``fill_fmt``: the token rows' element
+    format for the fill term where it differs from the class's (the mixed class's e4m3 tokens); ``epi_warpgroups``: the
+    grouped body's epilogue warpgroups (the block-scaled bodies' four)."""
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import estimate_cycles
@@ -323,8 +327,8 @@ def record_cost(
     )
     return (
         est * pair_term(cfg, rows) * tiles_term(cfg, rows)
-        + exposed_epilogue_cycles(cfg, rows, nodes, pair)
-        + zero_fill_cycles(cfg, rows, K, family, in_fmt)
+        + exposed_epilogue_cycles(cfg, rows, nodes, pair, epi_warpgroups)
+        + zero_fill_cycles(cfg, rows, K, family, fill_fmt or in_fmt)
         + fixed_cycles(cfg, family)
     )
 

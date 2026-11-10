@@ -1052,6 +1052,69 @@ def test_instruction_class_is_the_parts_and_the_grouped_kernel_is_the_dense_clas
         )
 
 
+def test_launch_tile_bound_dominates_the_scheduler_total_over_the_mixed_spaces():
+    """The persistent grid's clip on the mixed class's launches: the static bound on a launch's cluster tiles is at least
+    the grouped scheduler's total -- the sum over experts of ceil(count / cluster rows), times the N tiles -- for every
+    record of both record spaces (the 72 grouped records, the swapped decode records at both stage widths) over random
+    count vectors (empty experts, one-row experts, one expert holding everything), and tight at one row per active
+    expert."""
+    import random
+
+    from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp4w8a import (
+        swapped_knobs_mx,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule import launch_tile_bound
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp4w8a import grouped_knobs_mx
+
+    rng = random.Random(5)
+    records = (
+        grouped_knobs_mx()
+        + swapped_knobs_mx("mxfp4w8a_k64")
+        + swapped_knobs_mx("mxfp4w8a")
+    )
+    for E, Tk, N in [
+        (8, 2, 4096),
+        (128, 8, 1536),
+        (128, 128, 1536),
+        (256, 2048, 7168),
+        (64, 64, 512),
+        (1024, 4096, 768),
+    ]:
+        vectors = [[Tk] + [0] * (E - 1), [1] * min(E, Tk) + [0] * max(0, E - Tk)]
+        if Tk >= E:
+            vectors[1] = [Tk // E + (1 if i < Tk % E else 0) for i in range(E)]
+        for _ in range(6):
+            cuts = sorted(rng.randrange(Tk + 1) for _ in range(E - 1))
+            vectors.append(
+                [b - a for a, b in zip([0] + cuts, cuts + [Tk], strict=True)]
+            )
+        for cfg in records:
+            if cfg.swap_ab:
+                cluster_rows, tn, cn = cfg.tile_n, cfg.mma_tiler_mn[0], 1
+            else:
+                cta_m = cfg.mma_tiler_mn[0] // (2 if cfg.use_2cta_instrs else 1)
+                cluster_rows, tn, cn = (
+                    cta_m * cfg.cluster_shape_mn[0],
+                    cfg.mma_tiler_mn[1],
+                    cfg.cluster_shape_mn[1],
+                )
+            n_tiles = -(-N // (tn * cn))
+            bound = launch_tile_bound(cfg, Tk, E, N)
+            for counts in vectors:
+                total = sum(-(-c // cluster_rows) for c in counts) * n_tiles
+                assert total <= bound, (
+                    cfg.describe(),
+                    E,
+                    Tk,
+                    N,
+                    counts[:8],
+                    total,
+                    bound,
+                )
+            if Tk <= E:
+                assert bound == Tk * n_tiles, (cfg.describe(), E, Tk, N, bound)
+
+
 @needs_device
 def test_swapped_body_equals_the_dense_class_per_expert():
     """The swapped decode body on the mixed plans (the e2m1 weight as the MMA's A -- through the TMA's unpacking container on
@@ -1453,6 +1516,16 @@ def test_swapped_op_equals_the_padded_op(act):
         (xq, xsf), ids, weights, W, return_intermediates=True
     )
     assert im0["swap"] == (True, True) and torch.equal(bits(out0), bits(ref))
+    # the persistent grids at the device's capacity instead of the launch's tile bound: a placement
+    for sw in (False, True):
+        assert torch.equal(
+            bits(
+                F.fused_moe_mxfp4w8a(
+                    (xq, xsf), ids, weights, W, swap=sw, grid_clip=False
+                )
+            ),
+            bits(ref),
+        ), sw
     layer = _layer(k, E, I, act=act)
     assert torch.equal(
         bits(layer(_logits_pack((xq, xsf), logits), _weights(w1, w2, act))), bits(ref)

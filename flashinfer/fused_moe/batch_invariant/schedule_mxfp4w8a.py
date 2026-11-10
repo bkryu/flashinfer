@@ -4,7 +4,7 @@
 launch's shape.
 
 As for the bf16 classes (:mod:`.schedule`), a grouped GEMM is the dense class under a different scheduler, so its records
-are ranked by the dense dispatcher's model (`flashinfer.gemm.batch_invariant.heuristic.estimate_cycles` for the mixed
+are ranked by the shared contract (`schedule.record_cost`: `flashinfer.gemm.batch_invariant.heuristic.estimate_cycles` for the mixed
 class of the part: the part's roofline with nominal constants and the mixed classes' per-operand traffic terms -- the
 e2m1 weight fetched at four bits, staged at the container's width -- no measured tables) at the dense shape whose tiles,
 M tail and operand bytes are the grouped launch's (``M`` = the rows of one active expert, ``N`` = the active experts'
@@ -27,24 +27,15 @@ from ...gemm.batch_invariant.generator import (
     Knobs,
     knob_product,
 )
-from ...gemm.batch_invariant.heuristic import (
-    PART_TABLE,
-    decode_sane,
-    estimate_cycles,
-)
+from ...gemm.batch_invariant.heuristic import decode_sane
 from .blocks.epilogue import GroupedChain
 from .schedule import (
     TOP_K,
-    _EPI_WARPGROUPS,
     active_experts,
     chain_nodes,
-    exposed_epilogue_cycles,
-    fixed_cycles,
-    pair_term,
     raster_for,
+    record_cost,
     rows_per_expert,
-    tiles_term,
-    zero_fill_cycles,
 )
 
 GEMM2_CHAIN = GroupedChain("plain", "silu", "bf16")
@@ -59,16 +50,6 @@ def epilogue_nodes(chain: GroupedChain) -> int:
     """The per-element epilogue work of a GEMM1 chain: the bf16 chain's nodes, plus the requantization's for the fused
     spelling (``out_fmt == "mxfp8"``); GEMM2's plain conversion is one node."""
     return chain_nodes(chain) + (REQUANT_NODES if chain.out_fmt == "mxfp8" else 0)
-
-
-def exposed_epilogue_cycles_mx(cfg: Knobs, rows: int, nodes: int) -> float:
-    """The bf16 ranking's exposed-epilogue term for this class's bodies: the swapped body as the bf16 one, the padded body's
-    subtiles split between its four epilogue warpgroups (`blocks.blockscaled_kernel.EPI_WARPGROUPS_MX`) where the bf16
-    body's are split between two."""
-    from .blocks.blockscaled_kernel import EPI_WARPGROUPS_MX
-
-    cycles = exposed_epilogue_cycles(cfg, rows, nodes)
-    return cycles if cfg.swap_ab else cycles * _EPI_WARPGROUPS / EPI_WARPGROUPS_MX
 
 
 def grouped_knobs_mx(in_fmt: str = "mxfp4w8a", clusters=None) -> List[Knobs]:
@@ -138,13 +119,12 @@ def rank_grouped_mx(
     weight shape and the chain (at a decode-sized ``rows`` the dense dispatcher's structural guard, `heuristic.decode_sane`:
     1-CTA tiles in an N-cluster, selects the candidates) and the swapped records the swapped body accepts for the chain
     (either spelling: the transposed quantizing epilogue; ``swap``: None ranks them with the rest, True keeps only them,
-    False excludes them), ordered by the dense mixed class's estimate at ``(M = rows, N = n_active * N,
-    K)`` (``n_active`` the active experts, ``E`` by default; a swapped record priced as the dense model prices a swapped
-    decode record) times the pair term (the expected dummy half of the two-tile clusters along M) and the swapped records'
-    spill factor (`tiles_term`), plus the last tile's exposed epilogue chain (`exposed_epilogue_cycles_mx`: the chain's
-    nodes, the fused requantization's on either body), the token box's zero-fill (`zero_fill_cycles` at the e4m3 row
-    width; a swapped record's box at its exposed share) and the body's per-wave fixed cost (`fixed_cycles`: the shared
-    body table, off until the part is measured), at three significant digits; each tile family priced once (at the enumeration's raster: the dense estimate's
+    False excludes them), ordered by the shared contract's cost (`schedule.record_cost`: the dense mixed class's estimate at ``(M = rows, N = n_active * N,
+    K)`` (``n_active`` the active experts, ``E`` by default; a swapped record priced as the dense model prices a swapped decode
+    record) under the MoE ranking's overrides, times the pair term and the swapped records' spill factor, plus the last tile's
+    exposed epilogue chain (the chain's nodes, the fused requantization's on either body; the padded body's four epilogue
+    warpgroups), the token box's exposed zero-fill at the e4m3 row width and the body's per-launch fixed cost (the shared body
+    table, off until the part is measured)), at three significant digits; each tile family priced once (at the enumeration's raster: the dense estimate's
     tile-order term is the dense scheduler's, not the grouped one's) and the raster the structural rule gives the grouped
     scheduler (`raster_for`) first among its twins, best first, ties in the spaces' enumeration order (the grouped records
     before the swapped ones, the narrower token tile before the wider). As in the dense ``rank_topk``, each of the best
@@ -158,9 +138,9 @@ def rank_grouped_mx(
         swapped_knobs_mx,
     )
 
+    from .blocks.blockscaled_kernel import EPI_WARPGROUPS_MX
+
     fam = family or "sm_107"
-    sms = sm_count or PART_TABLE.get(fam, PART_TABLE["sm_107"]).sm_count
-    dense_n = (n_active or E) * N
     dense = (
         []
         if swap is True
@@ -184,15 +164,23 @@ def rank_grouped_mx(
     nodes = epilogue_nodes(chain)
 
     def key(i, c):
-        canon = dataclasses.replace(c, raster_along="m")
-        est = estimate_cycles(
-            canon, rows, dense_n, K, 1, "k", in_fmt, fam, sm_count, nominal=nominal
-        )
-        est = (
-            est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles_mx(c, rows, nodes)
-            + zero_fill_cycles(c, rows, K, fam, ACT_FMT)
-            + fixed_cycles(c, rows, n_active or E, N, fam, sms)
+        # the shared contract's cost (`schedule.record_cost`): the dense mixed estimate at the grouped shape under the MoE
+        # ranking's overrides and the launch's own terms, the fill term at the e4m3 token width and the padded body's four
+        # epilogue warpgroups
+        est = record_cost(
+            c,
+            rows,
+            n_active or E,
+            N,
+            K,
+            nodes,
+            chain.pair,
+            fam,
+            sm_count,
+            in_fmt,
+            nominal,
+            fill_fmt=ACT_FMT,
+            epi_warpgroups=EPI_WARPGROUPS_MX,
         )
         return (
             float(f"{est:.3g}"),

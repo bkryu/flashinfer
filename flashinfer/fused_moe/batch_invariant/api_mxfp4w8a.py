@@ -342,6 +342,7 @@ def grouped_gemm_mxfp4w8a(
     chain: GroupedChain,
     in_fmt: Optional[str] = None,
     out: Optional[torch.Tensor] = None,
+    grid: Optional[int] = None,
 ) -> Any:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` with both operands' UE8M0 block scales applied inside the mixed block-scaled step,
     on the padded expert segments ``counts`` (int32 ``[E]``; the rows of group ``e`` start at the exclusive prefix of the
@@ -351,13 +352,16 @@ def grouped_gemm_mxfp4w8a(
     instruction class (the device's by default); ``out [Tk_pad, Nout]`` of the chain's dtype (rows past a group's real end
     are never stored). The record selects the body: a dense record runs the padded body, a swapped record (``config.swap_ab``:
     128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side) the swapped decode body on the same padded packing
-    (:mod:`.blocks.swap_mxfp8`), each with either spelling of the chain."""
+    (:mod:`.blocks.swap_mxfp8`), each with either spelling of the chain. The persistent grid is a launch argument: the device's
+    co-resident cluster capacity for the record's cluster size, clipped to the launch's static tile bound
+    (`schedule.launch_tile_bound`), or ``grid`` as given."""
     from .blocks.compile_mxfp4w8a import (
         can_implement_grouped_mxfp4w8a,
         can_implement_swapped_mxfp4w8a,
         get_compiled_grouped_mxfp4w8a,
         get_compiled_swapped_mxfp4w8a,
     )
+    from .schedule import launch_tile_bound
 
     w8 = _w_bytes(w, "w")
     if a.dtype != torch.float8_e4m3fn or a.dim() != 2 or w8.dim() != 3:
@@ -401,6 +405,11 @@ def grouped_gemm_mxfp4w8a(
         if config.swap_ab
         else get_compiled_grouped_mxfp4w8a(config, chain, in_fmt)
     )
+    if grid is None:
+        # the persistent grid clipped to the launch's tile bound (a placement: which CTA computes a tile)
+        grid = min(
+            persistent_clusters(a.device, config), launch_tile_bound(config, Tk, E, N)
+        )
     if chain.out_fmt == "mxfp8":
         # the fused requantization: the codes and the 128x4 scale bytes of the bf16-rounded chain, written by the epilogue
         if out is not None:
@@ -418,7 +427,7 @@ def grouped_gemm_mxfp4w8a(
                 codes,
                 sf,
                 counts,
-                persistent_clusters(a.device, config),
+                grid,
             )
         elif Tk:
             kernel(
@@ -429,7 +438,7 @@ def grouped_gemm_mxfp4w8a(
                 codes,
                 sf,
                 counts,
-                persistent_clusters(a.device, config),
+                grid,
             )
         return codes.view(torch.float8_e4m3fn), sf
     out_dtype = _OUT[chain.out_fmt]
@@ -452,7 +461,7 @@ def grouped_gemm_mxfp4w8a(
             w_sf,
             out,
             counts,
-            persistent_clusters(a.device, config),
+            grid,
         )
     elif Tk:
         kernel(
@@ -462,7 +471,7 @@ def grouped_gemm_mxfp4w8a(
             w_sf,
             out,
             counts,
-            persistent_clusters(a.device, config),
+            grid,
         )
     return out
 
@@ -522,6 +531,7 @@ def fused_moe_mxfp4w8a(
     requant: str = "fused",
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     swap: Optional[bool] = None,
+    grid_clip: bool = True,
 ) -> Any:
     """The mixed MXFP4-weight x MXFP8-activation MoE FFN for pre-routed tokens: ``x`` a bf16 ``[T, H]`` (quantized here per
     token by the ``mxfp8.quant`` class) or the quantized pack ``(xq [T, H] e4m3, xsf [T, H / 32] uint8 / UE8M0)`` taken as
@@ -532,7 +542,8 @@ def fused_moe_mxfp4w8a(
     kernel on it): the same bytes on the live rows on either body. ``swap``: the swapped decode body --
     None: the dispatcher's structural rule (the swapped records when the rows per active expert fit a narrow token tile),
     True / False: the swapped / the padded body on both GEMMs (placements: the same bits); explicit records select the body
-    themselves. ``return_intermediates``: the live buffers (``counts``, ``dest``, ``src``, ``xq``, ``xsf``, ``x_perm`` /
+    themselves. ``grid_clip``: the GEMMs' persistent grids clipped to the launch's tile bound (the default), or the device's
+    capacity (a placement either way). ``return_intermediates``: the live buffers (``counts``, ``dest``, ``src``, ``xq``, ``xsf``, ``x_perm`` /
     ``x_perm_sf``, ``a``, ``aq`` / ``a_sf``, ``y``), the records used and the requantization spelling run."""
     from .combine import get_compiled_combine, warps_per_token
     from .mx_permute import get_compiled_scatter_mx
@@ -632,21 +643,40 @@ def fused_moe_mxfp4w8a(
         nb,
         pcols,
     )
+    # the GEMMs' persistent grids: clipped to each launch's tile bound, or the device's capacity (a placement)
+    g1 = None if grid_clip else persistent_clusters(dev, config1)
+    g2 = None if grid_clip else persistent_clusters(dev, config2)
     if requant == "fused":
         # the class's second quantization inside GEMM1's epilogue: no bf16 intermediate
         a = None
         aq, a_sf = grouped_gemm_mxfp4w8a(
-            x_perm, x_perm_sf, w.w1, w.w1_sf, counts, config1, w.chain1_quant, in_fmt
+            x_perm,
+            x_perm_sf,
+            w.w1,
+            w.w1_sf,
+            counts,
+            config1,
+            w.chain1_quant,
+            in_fmt,
+            grid=g1,
         )
     else:
         a = grouped_gemm_mxfp4w8a(
-            x_perm, x_perm_sf, w.w1, w.w1_sf, counts, config1, w.chain1, in_fmt
+            x_perm,
+            x_perm_sf,
+            w.w1,
+            w.w1_sf,
+            counts,
+            config1,
+            w.chain1,
+            in_fmt,
+            grid=g1,
         )  # [Tk_pad, I] bf16 (the padding rows unspecified)
         aq, a_sf = quantize_mxfp8_rows(
             a, swizzled=True, enable_pdl=True
         )  # the quantizer class, second pass (the padding rows' codes are read by no stored value)
     y = grouped_gemm_mxfp4w8a(
-        aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt
+        aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt, grid=g2
     )  # [Tk_pad, H] bf16
     get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev)))(
         y, dest, scales, out, T, H
