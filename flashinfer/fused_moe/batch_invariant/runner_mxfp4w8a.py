@@ -352,8 +352,8 @@ class BatchInvariantMoeMxfp4w8aRunner(MoERunner):
         H = self._hidden
         rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
         a = self._activation()
-        # the padded records are ranked for the fused-requantization spelling GEMM1 runs (the same acceptance as the bf16
-        # chain's); the swapped decode record runs the bf16 chain (the standalone pass quantizes its intermediate)
+        # both record spaces are ranked for the fused-requantization spelling GEMM1 runs (the same acceptance as the bf16
+        # chain's on either body)
         chain1 = GroupedChain(a.chain, a.act, "mxfp8", a.params)
         n1 = 2 * I if a.gated else I
         sm_count, family = self._part if self._part is not None else (None, None)

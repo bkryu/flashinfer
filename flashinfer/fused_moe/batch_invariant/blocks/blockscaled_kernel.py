@@ -207,10 +207,10 @@ def ring_bytes(st) -> int:
 
 
 def umma_ring_bytes(st) -> int:
-    """Shared memory of the operand rings a UMMA reads (A and B, all stages)."""
-    return cute.size_in_bytes(st.a_dtype, st.a_smem_layout_staged) + cute.size_in_bytes(
-        st.b_dtype, st.b_smem_layout_staged
-    )
+    """Shared memory of the operand rings a UMMA reads (A and B, all stages), at the operands' container widths."""
+    return cute.size_in_bytes(
+        st.a_smem_dtype, st.a_smem_layout_staged
+    ) + cute.size_in_bytes(st.b_smem_dtype, st.b_smem_layout_staged)
 
 
 def plan_with_room(
@@ -353,13 +353,15 @@ class GroupedBlockScaledGemmMX:
         st = plan_with_room(
             self.plan_cls,
             self.knobs,
-            lambda st: tables
-            + (
-                staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_MX)
-                if self.staged
-                else 0
-            )
-            + xch_bytes(self.chain, EPI_WARPGROUPS_MX),
+            lambda st: (
+                tables
+                + (
+                    staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_MX)
+                    if self.staged
+                    else 0
+                )
+                + xch_bytes(self.chain, EPI_WARPGROUPS_MX)
+            ),
         )
         self.st = st
         self.c_smem_layout_staged = (

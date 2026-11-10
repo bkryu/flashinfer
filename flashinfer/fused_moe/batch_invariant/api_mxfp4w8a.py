@@ -351,7 +351,7 @@ def grouped_gemm_mxfp4w8a(
     instruction class (the device's by default); ``out [Tk_pad, Nout]`` of the chain's dtype (rows past a group's real end
     are never stored). The record selects the body: a dense record runs the padded body, a swapped record (``config.swap_ab``:
     128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side) the swapped decode body on the same padded packing
-    (:mod:`.blocks.swap_nvfp4`; the bf16 / f32 chains only -- the fused requantization is the padded body's)."""
+    (:mod:`.blocks.swap_mxfp8`), each with either spelling of the chain."""
     from .blocks.compile_mxfp4w8a import (
         can_implement_grouped_mxfp4w8a,
         can_implement_swapped_mxfp4w8a,
@@ -409,7 +409,18 @@ def grouped_gemm_mxfp4w8a(
             )
         codes = torch.empty(Tk, n_out, dtype=torch.uint8, device=a.device)
         sf = torch.empty(sf_numel(Tk, n_out), dtype=torch.uint8, device=a.device)
-        if Tk:
+        if Tk and config.swap_ab:
+            kernel(
+                a.unsqueeze(-1),
+                a_sf,
+                w8.permute(1, 2, 0),
+                w_sf,
+                codes,
+                sf,
+                counts,
+                persistent_clusters(a.device, config),
+            )
+        elif Tk:
             kernel(
                 a.unsqueeze(-1),
                 w8.permute(1, 2, 0),
@@ -518,8 +529,7 @@ def fused_moe_mxfp4w8a(
     ``in_fmt`` names the instruction class (the device's by default); ``config1`` / ``config2`` the grouped records (any
     record of the space gives the same bits; the dispatcher's pick by default). ``requant``: ``"fused"`` (the intermediate
     quantized inside GEMM1's epilogue, no bf16 intermediate) or ``"standalone"`` (the bf16 intermediate, then the quantizer
-    kernel on it): the same bytes on the live rows; a swapped GEMM1 record (the decode body) writes the bf16 intermediate,
-    so the second pass is the standalone spelling there whatever ``requant`` says. ``swap``: the swapped decode body --
+    kernel on it): the same bytes on the live rows on either body. ``swap``: the swapped decode body --
     None: the dispatcher's structural rule (the swapped records when the rows per active expert fit a narrow token tile),
     True / False: the swapped / the padded body on both GEMMs (placements: the same bits); explicit records select the body
     themselves. ``return_intermediates``: the live buffers (``counts``, ``dest``, ``src``, ``xq``, ``xsf``, ``x_perm`` /
@@ -601,8 +611,6 @@ def fused_moe_mxfp4w8a(
         config1, config2 = config1 or c1, config2 or c2
     if requant not in ("fused", "standalone"):
         raise ValueError(f"requant must be 'fused' or 'standalone', got {requant!r}")
-    if config1.swap_ab:
-        requant = "standalone"  # the swapped body writes the bf16 intermediate; the class's pass quantizes it
     # ``plan``: ``route_plan(..., align=GROUP_ALIGN)``'s outputs (the same integers as the padded plan, one launch with the routing)
     counts, dest, src = plan if plan is not None else permute_plan_padded(experts, E)
     Tk_pad = src.shape[0]
@@ -616,6 +624,7 @@ def fused_moe_mxfp4w8a(
         xq.view(torch.uint8),
         xsf8.reshape(-1),
         dest.reshape(-1),
+        dest.reshape(-1),  # the padded packing: the scale bytes at the rows' positions
         x_perm.view(torch.uint8),
         x_perm_sf,
         T * k,

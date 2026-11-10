@@ -22,8 +22,6 @@ the same per-row fold.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -155,24 +153,19 @@ class GroupedBlockScaledTma:
         ) * st.atom_thr_size
 
 
-def grouped_plan(
-    plan_cls, knobs: Knobs, own_bytes, ring_cap_bytes: Optional[int] = None
-):
+def grouped_plan(plan_cls, knobs: Knobs, own_bytes):
     """The block-scaled plan with the grouped kernel's own stage rule: the operand ring (A, B, SFA, SFB per stage) fills the
     CTA's shared memory after the barrier reserve and the kernel's own buffers (``own_bytes(st)``: the group tables, the
     epilogue staging buffers), under the dense plan's A-ring cap. The dense plan's output stages are not reserved (the
-    grouped epilogue stores from its own staging buffers). The stage is sized at the operands' container widths (the mixed
-    SM100 class's e2m1 weight occupies a byte per element in shared memory). ``ring_cap_bytes``: a bound on the shared memory
-    the barriers, the kernel's own buffers and the whole operand ring occupy together. A placement: the ring depth moves no
-    bits."""
+    grouped epilogue stores from its own staging buffers). A placement: the ring depth moves no bits."""
 
     class _Plan(plan_cls):
         def _stages(self):
             a_one = utils.sm100.make_smem_layout_a(
-                self.tiled_mma, self.mma_tiler, self.a_smem_dtype, 1
+                self.tiled_mma, self.mma_tiler, self.a_dtype, 1
             )
             b_one = utils.sm100.make_smem_layout_b(
-                self.tiled_mma, self.mma_tiler, self.b_smem_dtype, 1
+                self.tiled_mma, self.mma_tiler, self.b_dtype, 1
             )
             sfa_one = bs_layout.make_smem_layout_sfa(
                 self.tiled_mma, self.mma_tiler, self.sf_vec, 1
@@ -180,19 +173,16 @@ def grouped_plan(
             sfb_one = bs_layout.make_smem_layout_sfb(
                 self.tiled_mma, self.mma_tiler, self.sf_vec, 1
             )
-            a_bytes = cute.size_in_bytes(self.a_smem_dtype, a_one)
+            a_bytes = cute.size_in_bytes(self.a_dtype, a_one)
             ab_bytes = (
                 a_bytes
-                + cute.size_in_bytes(self.b_smem_dtype, b_one)
+                + cute.size_in_bytes(self.b_dtype, b_one)
                 + cute.size_in_bytes(self.sf_dtype, sfa_one)
                 + cute.size_in_bytes(self.sf_dtype, sfb_one)
             )
-            budget = (
-                self.smem_capacity
-                if ring_cap_bytes is None
-                else min(self.smem_capacity, ring_cap_bytes)
-            )
-            num_ab = (budget - MBAR_RESERVE_BYTES - own_bytes(self)) // ab_bytes
+            num_ab = (
+                self.smem_capacity - MBAR_RESERVE_BYTES - own_bytes(self)
+            ) // ab_bytes
             num_ab = min(num_ab, (A_RING_MAX_BYTES - 1) // a_bytes)
             assert num_ab >= 2, (
                 "the grouped kernel's operand ring does not fit the shared memory",

@@ -42,7 +42,7 @@ from ....gemm.batch_invariant.spec import (
 from .blockscaled_kernel import GROUP_ALIGN, GroupedBlockScaledGemmMX
 from .epilogue import GROUP, GroupedChain
 from .scheduler import MAX_E
-from .swap_nvfp4 import SwappedBlockScaledGemmMX, is_swapped_record
+from .swap_mxfp8 import SwappedBlockScaledGemmMX, is_swapped_record
 
 MODULE = "batch_invariant_moe_mxfp4w8a"
 #: The mixed classes the grouped body serves: the SM100 / SM103 instruction (K = 32) and the SM107 one (K = 64).
@@ -139,16 +139,16 @@ def can_implement_grouped_mxfp4w8a(
 def can_implement_swapped_mxfp4w8a(
     knobs: Knobs, N: int, K: int, E: int, chain: GroupedChain, in_fmt: str
 ) -> bool:
-    """Acceptance of the swapped decode body on the mixed plans (:mod:`.swap_nvfp4`): a swapped record of the dense mixed
+    """Acceptance of the swapped decode body on the mixed plans (:mod:`.swap_mxfp8`): a swapped record of the dense mixed
     class's space at a narrow token tile (128 weight rows x 8 / 16 / 32 tokens, 1-CTA, no cluster, swizzle 1, either stage
-    width of the class), a chain with a bf16 / f32 output (the fused requantization's codes are the padded body's: the
-    swapped GEMM1 writes the bf16 intermediate and the standalone pass quantizes it), the grouped operand rules (K in whole
-    granules, N % 8, the gate / up pairing, 16-byte output rows, E <= MAX_E). The body reads the padded packing."""
+    width of the class), a chain with a bf16 / f32 output or the fused requantization's codes (the transposed quantizing
+    epilogue), the grouped operand rules (K in whole granules, N % 8, the gate / up pairing, 16-byte output rows,
+    E <= MAX_E). The body reads the padded packing."""
     if in_fmt not in MIXED_FMTS or not isinstance(chain, GroupedChain):
         return False
     if not is_swapped_record(knobs) or not knobs.well_formed(in_fmt):
         return False
-    if chain.out_fmt not in ("bf16", "f32"):
+    if chain.out_fmt not in OUT_DT:
         return False
     if chain.pair and N % (2 * GROUP):
         return False
@@ -174,9 +174,10 @@ def can_implement_mxfp4w8a(
 def compile_swapped_mxfp4w8a_fn(
     cfg: Knobs, chain: GroupedChain, in_fmt: str
 ) -> Callable[[], Any]:
-    """The zero-argument compile closure of one swapped mixed specialisation: ``kernel(a3, sfa, w3, sfw, out2, counts, grid)``
-    -- A ``(Tk_pad, K, 1)`` e4m3 at the padded positions, ``sfa`` their flat 128x4 scale factors, W ``(N, K / 2, E)`` packed
-    e2m1, ``sfw`` (``E`` buffers), out ``(Tk_pad, Nout)`` bf16 / f32."""
+    """The zero-argument compile closure of one swapped mixed specialisation: ``kernel(a3, sfa, w3, sfw, out2[, out_sf],
+    counts, grid)`` -- A ``(Tk_pad, K, 1)`` e4m3 at the padded positions, ``sfa`` their flat 128x4 scale factors, W
+    ``(N, K / 2, E)`` packed e2m1, ``sfw`` (``E`` buffers), out ``(Tk_pad, Nout)`` bf16 / f32, or the fused requantization's
+    e4m3 codes with ``out_sf`` the flat UE8M0 bytes of the padded rows."""
     assert in_fmt in MIXED_FMTS and is_swapped_record(cfg), (in_fmt, cfg.describe())
     in_dt = IN_DT[in_fmt]
     gran = a_granule(in_fmt)
@@ -228,8 +229,29 @@ def compile_swapped_mxfp4w8a_fn(
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
+        obj = SwappedBlockScaledGemmMX(cfg, chain, in_fmt, dense_a=False)
+        if chain.out_fmt == "mxfp8":
+            osf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8,
+                (cute.sym_int(32, divisibility=SF_BUFFER_DIVISIBILITY),),
+                (1,),
+                assumed_align=16,
+            )
+            return cute.compile(
+                obj.call_quant,
+                a_fake,
+                sfa_fake,
+                w_fake,
+                sfw_fake,
+                o_fake,
+                osf_fake,
+                c_fake,
+                grid,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
         return cute.compile(
-            SwappedBlockScaledGemmMX(cfg, chain, in_fmt),
+            obj,
             a_fake,
             sfa_fake,
             w_fake,

@@ -131,13 +131,13 @@ def rank_grouped_mx(
 ) -> List[Knobs]:
     """The ranked records for one GEMM over both record spaces: the grouped mixed records the padded body accepts for the
     weight shape and the chain (at a decode-sized ``rows`` the dense dispatcher's structural guard, `heuristic.decode_sane`:
-    1-CTA tiles in an N-cluster, selects the candidates) and the swapped records the swapped body accepts for the bf16 chain
-    (the swapped GEMM1 writes the intermediate the standalone pass quantizes; ``swap``: None ranks them with the rest, True
-    keeps only them, False excludes them), ordered by the dense mixed class's estimate at ``(M = rows, N = n_active * N,
+    1-CTA tiles in an N-cluster, selects the candidates) and the swapped records the swapped body accepts for the chain
+    (either spelling: the transposed quantizing epilogue; ``swap``: None ranks them with the rest, True keeps only them,
+    False excludes them), ordered by the dense mixed class's estimate at ``(M = rows, N = n_active * N,
     K)`` (``n_active`` the active experts, ``E`` by default; a swapped record priced as the dense model prices a swapped
     decode record) times the pair term (the expected dummy half of the two-tile clusters along M) and the swapped records'
     spill factor (`tiles_term`), plus the last tile's exposed epilogue chain (`exposed_epilogue_cycles_mx`: the chain's
-    nodes, the fused requantization's on the padded records) and the token box's zero-fill (`zero_fill_cycles` at the e4m3
+    nodes, the fused requantization's on either body) and the token box's zero-fill (`zero_fill_cycles` at the e4m3
     row width), at three significant digits; each tile family priced once (at the enumeration's raster: the dense estimate's
     tile-order term is the dense scheduler's, not the grouped one's) and the raster the structural rule gives the grouped
     scheduler (`raster_for`) first among its twins, best first, ties in the spaces' enumeration order (the grouped records
@@ -154,12 +154,6 @@ def rank_grouped_mx(
 
     fam = family or "sm_107"
     dense_n = (n_active or E) * N
-    bf16 = GroupedChain(
-        chain.kind,
-        chain.act,
-        "bf16" if chain.out_fmt == "mxfp8" else chain.out_fmt,
-        chain.params,
-    )
     dense = (
         []
         if swap is True
@@ -175,12 +169,12 @@ def rank_grouped_mx(
         else [
             c
             for c in swapped_knobs_mx(in_fmt)
-            if can_implement_swapped_mxfp4w8a(c, N, K, E, bf16, in_fmt)
+            if can_implement_swapped_mxfp4w8a(c, N, K, E, chain, in_fmt)
         ]
     )
     space = dense + swapped
     guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
-    nodes_padded, nodes_swapped = epilogue_nodes(chain), chain_nodes(bf16)
+    nodes = epilogue_nodes(chain)
 
     def key(i, c):
         canon = dataclasses.replace(c, raster_along="m")
@@ -189,9 +183,7 @@ def rank_grouped_mx(
         )
         est = (
             est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles_mx(
-                c, rows, nodes_swapped if c.swap_ab else nodes_padded
-            )
+            + exposed_epilogue_cycles_mx(c, rows, nodes)
             + zero_fill_cycles(c, rows, K, fam, ACT_FMT)
         )
         return (
