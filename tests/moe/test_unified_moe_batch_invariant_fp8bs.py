@@ -1821,6 +1821,15 @@ def test_block32_is_its_own_class_with_the_same_chains_and_spaces():
         all_valid_configs_fp8bs(1280, 2560 + 64, 513, gemm1_chain("silu"), block=32)
         == []
     )
+    # the dispatcher's spelling rule: the fused epilogue from 128 rows per expert at 128, never at 32
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import fused_quant_default
+
+    assert fused_quant_default(4096, 8, 128) and not fused_quant_default(
+        4096, 8, 128, 32
+    )
+    assert not fused_quant_default(64, 8, 128) and not fused_quant_default(
+        64, 8, 128, 32
+    )
     for T in (1, 7, 64, 300, 4096):
         for family, sm in (("sm_107", 212), ("sm_100", 148)):
             for act, gated in (("silu", True), ("relu2", False)):
@@ -2064,6 +2073,17 @@ def test_block32_tactics_and_graph_replay_keep_the_bits():
         assert torch.equal(
             bits(runner.forward(runner.pack_inputs(pack, W), tactic=t)), ref
         )
+    # at 128 rows per expert (the 128-wide class's fused-epilogue regime) the 32-wide class still takes the standalone pass
+    x_big, logits_big, _, _ = _problem(1024, k, H, I, E, seed=10)
+    xq_big, sx_big = _xq32(x_big)
+    pack_big = _logits_pack(xq_big, sx_big, logits_big)
+    ref_big = bits(layer(pack_big, W))
+    tactics_big = runner.get_valid_tactics(runner.pack_inputs(pack_big, W), None)
+    assert tactics_big and all(t[14] == 0 for t in tactics_big)
+    assert torch.equal(
+        bits(runner.forward(runner.pack_inputs(pack_big, W), tactic=tactics_big[0])),
+        ref_big,
+    )
     with autotune(True):
         assert torch.equal(bits(layer(pack, W)), ref)
     assert torch.equal(bits(layer(pack, W)), ref)
