@@ -162,8 +162,9 @@ class RoutePlanKernel:
             s_pre_pad = smem.allocate_tensor(
                 Int32, cute.make_layout((MAX_E + 1,)), byte_alignment=16
             )
-        for j in cutlass.range(tidx, RANK_WARPS * MAX_E, THREADS):
-            wcnt[j] = Int16(0)
+        # the per-warp counts of the plan's experts alone (entries past E_plan are never read)
+        for j in cutlass.range(tidx, RANK_WARPS * E_plan, THREADS):
+            wcnt[(j // E_plan) * Int32(MAX_E) + j % E_plan] = Int16(0)
         # phase A: the tokens of this warp, the route kernel's per-token code
         out_e = cute.make_rmem_tensor((k,), Int32)
         out_w = cute.make_rmem_tensor((k,), Float32)
@@ -184,27 +185,32 @@ class RoutePlanKernel:
         if warp < Int32(RANK_WARPS):
             base_w = warp * Int32(IDS_PER_THREAD * LANES)
             for c in cutlass.range_constexpr(IDS_PER_THREAD):
-                i = base_w + Int32(c * LANES) + lane
-                valid = i < n
-                e = Int32(-1)
-                if valid:
-                    e = s_exp[i] - e_off  # the local id of a shard's plan
-                ok = (
-                    valid & (e >= Int32(0)) & (e < E_plan)
-                )  # a dropped slot (id outside the plan's range) is ranked by nothing
-                m = cute.arch.match_sync(Uint32(0xFFFFFFFF), e)
-                intra = Int32(cute.arch.popc(m & cute.arch.lanemask_lt()))
-                r = Int32(0)
-                if ok:
-                    r = wcnt[warp * MAX_E + e].to(Int32) + intra
-                cute.arch.sync_warp()
-                if ok & (intra == Int32(0)):
-                    wcnt[warp * MAX_E + e] = (
-                        wcnt[warp * MAX_E + e].to(Int32) + Int32(cute.arch.popc(m))
-                    ).to(Int16)
-                cute.arch.sync_warp()
-                es[c] = e
-                rs[c] = r
+                es[c] = Int32(-1)
+                rs[c] = Int32(0)
+                if (
+                    base_w + Int32(c * LANES) < n
+                ):  # a chunk with no slot of the launch is skipped (warp-uniform)
+                    i = base_w + Int32(c * LANES) + lane
+                    valid = i < n
+                    e = Int32(-1)
+                    if valid:
+                        e = s_exp[i] - e_off  # the local id of a shard's plan
+                    ok = (
+                        valid & (e >= Int32(0)) & (e < E_plan)
+                    )  # a dropped slot (id outside the plan's range) is ranked by nothing
+                    m = cute.arch.match_sync(Uint32(0xFFFFFFFF), e)
+                    intra = Int32(cute.arch.popc(m & cute.arch.lanemask_lt()))
+                    r = Int32(0)
+                    if ok:
+                        r = wcnt[warp * MAX_E + e].to(Int32) + intra
+                    cute.arch.sync_warp()
+                    if ok & (intra == Int32(0)):
+                        wcnt[warp * MAX_E + e] = (
+                            wcnt[warp * MAX_E + e].to(Int32) + Int32(cute.arch.popc(m))
+                        ).to(Int16)
+                    cute.arch.sync_warp()
+                    es[c] = e
+                    rs[c] = r
         cute.arch.barrier()
         # phase B2: per expert, the exclusive prefix over the rank warps (in place) and the total = the histogram
         for e in cutlass.range(tidx, E_plan, THREADS):
