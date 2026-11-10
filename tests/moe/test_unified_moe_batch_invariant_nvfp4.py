@@ -290,10 +290,14 @@ def test_fingerprint_dimensions_and_classes():
         for a in ACTIVATIONS
     }
     assert len(fps) == len(ACTIVATIONS)
-    with pytest.raises(ValueError):
+    # the routing methods of the bf16 backend's surface (TopK, Llama4's TopKSigmoid, the grouped DeepSeek-V3 selection) are
+    # the class's as well: a method is part of the identifier, never a refusal
+    assert (
         bi.fingerprint(
             "fused_moe_nvfp4", arch="sm_107", method=RoutingMethodType.Llama4, **dims
         )
+        != fp
+    )
     with pytest.raises(ValueError):
         bi.fingerprint("fused_moe_nvfp4", arch="sm_107", act="tanh", **dims)
     with pytest.raises(ValueError):
@@ -1153,7 +1157,9 @@ def test_packed_f32_weights_are_rounded_by_the_combine():
     layer = _layer(k, E, I)
     W = _weights(w1, w2)
     ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
-    raw = (weights.float() * (1.0 + 2.0**-12)).cuda()  # not bf16 values: the rounding is real work
+    raw = (
+        weights.float() * (1.0 + 2.0**-12)
+    ).cuda()  # not bf16 values: the rounding is real work
     assert not torch.equal(raw.to(torch.bfloat16).float(), raw)
     out_raw = layer(_routed_pack(x, ids.cuda(), raw, packed=True), W)
     out_rounded = layer(
