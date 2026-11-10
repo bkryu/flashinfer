@@ -155,13 +155,13 @@ def chain_nodes_mx(chain: GroupedChain) -> float:
     amax = alg.leaf("amax", 0)
     sf_d, inv = mx_spec.scale_chain(alg, amax, fmt, rule)
     elem = mx_spec.quant_elem(alg, alg.leaf("y", 0), alg.leaf("inv", 0), fmt, rule)
-    scale_nodes = term.sexpr(inv).count("(")
+    scale_nodes = term.size(inv)  # the DAG's nodes, as `chain_nodes` counts the chain's
     amax_nodes = (
         2 * mx_spec.BLOCK - 1
     )  # the fabs leaves and the pairwise fmaxc combines of one block
     return (
         float(chain_nodes(bf16_twin(chain)))
-        + term.sexpr(elem).count("(")
+        + term.size(elem)
         + (scale_nodes + amax_nodes) / float(mx_spec.BLOCK)
     )
 
