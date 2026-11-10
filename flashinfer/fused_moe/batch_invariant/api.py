@@ -192,6 +192,7 @@ def grouped_gemm(
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
     Tk: Optional[int] = None,
+    grid: Optional[int] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` for the expert segments ``counts`` (int32 ``[E]``, group order = expert order;
     rows ``[off_e, off_e + counts[e])`` of ``a`` belong to expert ``e``). ``a [R >= Tk, K]`` bf16 row-major, ``w [E, N, K]``
@@ -201,8 +202,10 @@ def grouped_gemm(
     the weights on the MMA's M side, :mod:`.blocks.swap_bf16`) the swapped body on the same dense rows -- a placement, the
     same bits. ``Tk`` (default: the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the
     swapped body's last token box then stays inside the buffer instead of being zero-filled past it). The persistent grid is a
-    launch argument: the device's co-resident cluster capacity for the record's cluster size."""
+    launch argument: the device's co-resident cluster capacity for the record's cluster size, clipped to the launch's static
+    tile bound (`schedule.launch_tile_bound`), or ``grid`` as given."""
     from .blocks.compile import get_compiled_grouped, get_compiled_swapped
+    from .schedule import launch_tile_bound
 
     if (
         a.dtype != torch.bfloat16
@@ -265,12 +268,17 @@ def grouped_gemm(
         a = a[
             :Tk
         ]  # the grouped body's A has the output's rows (one symbol); the swapped body's R is free
+    if grid is None:
+        # the persistent grid clipped to the launch's tile bound (a placement: which CTA computes a tile)
+        grid = min(
+            persistent_clusters(a.device, config), launch_tile_bound(config, Tk, E, N)
+        )
     kernel(
         a.unsqueeze(-1),
         w.permute(1, 2, 0),
         out,
         counts,
-        persistent_clusters(a.device, config),
+        grid,
     )
     return out
 
@@ -478,13 +486,16 @@ def fused_moe(
     config2: Optional[Knobs] = None,
     return_intermediates: bool = False,
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    grid_clip: bool = True,
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
     slot order in fp32 and converted once. An expert id outside ``[0, E)`` is a dropped slot: neither gathered nor
     computed, the term ``+0`` in its token's fold whatever its weight (a token whose slots are all dropped gives a zero
     row). ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space gives the same bits; the
-    dispatcher's pick by default)."""
+    dispatcher's pick by default). ``grid_clip``:
+    the GEMMs' persistent grids clipped to the launch's tile bound (the default), or the device's capacity (a placement
+    either way)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
@@ -539,11 +550,13 @@ def fused_moe(
             k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
         )(x, src, x_perm, Tk, H)
     a_buf = torch.empty(Tk + pad2, I, dtype=torch.bfloat16, device=x.device)
+    g1 = None if grid_clip else persistent_clusters(x.device, config1)
+    g2 = None if grid_clip else persistent_clusters(x.device, config2)
     a = grouped_gemm(
-        x_buf, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk
+        x_buf, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
     )  # [Tk, I] bf16
     y = grouped_gemm(
-        a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk
+        a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk, grid=g2
     )  # [Tk, H] bf16
     if T:
         get_compiled_combine(
