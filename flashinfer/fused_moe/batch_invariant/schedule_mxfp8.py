@@ -28,19 +28,30 @@ from ...gemm.batch_invariant.generator import (
     Knobs,
     knob_product,
 )
-from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
+from ...gemm.batch_invariant.heuristic import decode_sane
 from .blocks.epilogue import GroupedChain
+from .blocks.compile_mxfp8 import SWAP_K_BLOCKS, swap_k_block
 from .schedule import (
     TOP_K,
     active_experts,
     chain_nodes,
-    exposed_epilogue_cycles,
+    record_cost,
     rows_per_expert,
-    tiles_term,
-    zero_fill_cycles,
 )
 
 GEMM2_CHAIN = GroupedChain("plain", "silu", "bf16")
+#: SM cycles of one smem-stage round trip of the block-scaled mainloop (the stage's barrier wait, its scale-factor copies to TMEM,
+#: the commit) that the stream does not hide at a few rows per expert: empirical, one value for every part.
+STAGE_ROUND_TRIP_CYCLES = 76.0
+
+
+def stage_round_trip_cycles(cfg: Knobs, K: int, in_fmt: str) -> float:
+    """The mainloop's stage round trips over K at the record's k-block (the swapped body's two-atom stage halves them,
+    `swap_k_block`; the padded body stages one atom) times the round trip's cycles: the term that prices the k-block."""
+    kb = swap_k_block(in_fmt, K) if cfg.swap_ab else SWAP_K_BLOCKS[0]
+    return (K / kb) * STAGE_ROUND_TRIP_CYCLES
+
+
 RASTER_N_ROWS = 128  # an expert spanning a whole 128-row block or more: the grouped scheduler rasters along N
 EPI_WARPGROUPS = 4  # the block-scaled grouped body's epilogue warpgroups (`blocks.blockscaled_kernel.EPI_WARPGROUPS_MX`)
 PACKINGS = ("padded", "dense")
@@ -191,7 +202,6 @@ def rank_grouped_mx(
     )
 
     fam = family or "sm_107"
-    dense_n = (n_active or E) * N
     dense = (
         []
         if swap is True
@@ -216,20 +226,25 @@ def rank_grouped_mx(
     nodes = chain_nodes_mx(chain)
 
     def key(i, c):
-        # the tile family priced once, at the enumeration's raster (the dense estimate's tile-order term is the dense
-        # scheduler's, not the grouped one's); the grouped launch's own terms on the dense estimate: the cluster tile's
-        # dummy share, the swapped records' spill under the load, the last tile's exposed epilogue chain, the token box's
-        # zero-fill; three significant digits, so records the estimate cannot separate fall through to the structural
-        # raster and the enumeration order
-        canon = dataclasses.replace(c, raster_along="m")
-        est = estimate_cycles(
-            canon, rows, dense_n, K, 1, "k", in_fmt, fam, sm_count, nominal=nominal
-        )
-        est = (
-            est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles(c, rows, nodes, epi_warpgroups=EPI_WARPGROUPS)
-            + zero_fill_cycles(c, rows, K, fam, in_fmt)
-        )
+        # the shared contract's cost (`schedule.record_cost`: the dense estimate under the MoE ranking's overrides at the
+        # grouped shape, the pair and spill terms, the fused requantization chain's exposed epilogue over the block-scaled
+        # body's four warpgroups, the token box's exposed fill, the body's fixed cost) plus this class's stage round trips
+        # at the record's k-block; three significant digits, so records the estimate cannot separate fall through to the
+        # structural raster and the enumeration order
+        est = record_cost(
+            c,
+            rows,
+            n_active or E,
+            N,
+            K,
+            nodes,
+            chain.pair,
+            fam,
+            sm_count,
+            in_fmt,
+            nominal,
+            epi_warpgroups=EPI_WARPGROUPS,
+        ) + stage_round_trip_cycles(c, K, in_fmt)
         return (
             float(f"{est:.3g}"),
             0 if (c.swap_ab or c.raster_along == raster) else 1,

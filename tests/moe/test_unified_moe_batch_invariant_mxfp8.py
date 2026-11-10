@@ -399,6 +399,45 @@ def test_shape_rules_and_padded_bound():
     assert padded_rows_bound(0, 8, 128) == 0
 
 
+def test_swapped_k_block_is_a_shape_rule():
+    """The swapped body's k-block (K elements per smem stage) is a function of the class and K alone: two atoms of K when
+    they divide K, else the one-atom default (`swap_k_block`), spelled into the kernel name with the default as 0
+    (`swap_k_block_arg`: one object per k-block), accepted by the body iff it divides K; the padded body and the dense
+    class keep the default (`Knobs.k_block` does not exist in this tree: the record space is untouched)."""
+    from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp8 import (
+        SWAP_K_BLOCKS,
+        can_implement_swapped_mxfp8,
+        swap_k_block,
+        swap_k_block_arg,
+        swapped_kernel_name,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
+
+    assert SWAP_K_BLOCKS == (128, 256)
+    for fmt in ("mxfp8", "mxfp8_k64"):
+        assert [
+            swap_k_block(fmt, K) for K in (128, 256, 384, 512, 640, 768, 2048, 7168)
+        ] == [128, 256, 128, 256, 128, 256, 256, 256]
+        assert swap_k_block_arg(fmt, 640) == 0 and swap_k_block_arg(fmt, 2048) == 256
+        assert (
+            swap_k_block_arg(fmt, 2048, 128) == 0
+            and swap_k_block_arg(fmt, 2048, 256) == 256
+        )
+        cfg = swapped_knobs_mx()[0]
+        f32 = GroupedChain("plain", "silu", "f32")
+        assert swapped_kernel_name(cfg, f32, fmt, 256).endswith(
+            "_kb256"
+        ) and not swapped_kernel_name(cfg, f32, fmt, 0).endswith("_kb256")
+        assert can_implement_swapped_mxfp8(cfg, 256, 2048, 8, f32, fmt, 256)
+        assert not can_implement_swapped_mxfp8(cfg, 256, 640, 8, f32, fmt, 256), (
+            "a k-block that does not divide K is refused"
+        )
+        assert not can_implement_swapped_mxfp8(cfg, 256, 2048, 8, f32, fmt, 512), (
+            "four atoms are not admitted"
+        )
+
+
 @pytest.mark.parametrize(
     "family,sm_count", [("sm_100", 148), ("sm_103", 148), ("sm_107", 204)]
 )
@@ -1456,6 +1495,7 @@ def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
         sf_numel,
     )
     from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp8 import (
+        SWAP_K_BLOCKS,
         can_implement_grouped_mxfp8,
         can_implement_swapped_mxfp8,
     )
@@ -1542,9 +1582,16 @@ def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
                 dense_a=True,
                 sf_rows=sf_rows,
             )
-            for cfg in swapped_knobs_mx():
+            # every swapped record at every k-block the body admits at this K (the two-atom stage is the rule's pick where it
+            # divides K: `swap_k_block`; each is a placement of the same fold)
+            for cfg, kb in [
+                (c, kb)
+                for c in swapped_knobs_mx()
+                for kb in SWAP_K_BLOCKS
+                if K % kb == 0
+            ]:
                 assert can_implement_swapped_mxfp8(
-                    cfg, N, K, E, f32, fmt
+                    cfg, N, K, E, f32, fmt, 0 if kb == SWAP_K_BLOCKS[0] else kb
                 ) and not can_implement_grouped_mxfp8(cfg, N, K, E, f32, fmt)
                 out32 = torch.full(
                     (Tk + DENSE_TAIL, N),
@@ -1564,11 +1611,13 @@ def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
                     out=out32,
                     dense_a=True,
                     sf_rows=sf_rows,
+                    k_block=kb,
                 )
                 assert torch.equal(bits(out32[:Tk].cpu()), bits(ref32.cpu())), (
                     counts[:4],
                     cfg.describe(),
                     fmt,
+                    kb,
                 )
                 assert torch.isnan(out32[Tk:]).all(), (
                     "rows past the live rows are never stored"

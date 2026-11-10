@@ -32,6 +32,7 @@ from ...batch_invariant.quantization.layout import sf_numel as _sf_numel
 from ...batch_invariant.quantization.mx_api import mxfp8_quantize_batch_invariant
 from ...batch_invariant.support import compute_capability, unsupported
 from ...gemm.batch_invariant.api import persistent_clusters, sm_count_of
+from .schedule import launch_tile_bound
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.heuristic import family_of
 from ...gemm.batch_invariant.schedule import chunks_for, mx_class_for
@@ -300,6 +301,8 @@ def grouped_gemm_mxfp8(
     out: Optional[torch.Tensor] = None,
     dense_a: bool = False,
     sf_rows: Optional[int] = None,
+    k_block: Optional[int] = None,
+    grid: Optional[int] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` with the UE8M0 block scales applied inside the block-scaled step, on the padded
     expert segments ``counts`` (int32 ``[E]``; the rows of group ``e`` start at the exclusive prefix of the counts rounded
@@ -318,6 +321,7 @@ def grouped_gemm_mxfp8(
         can_implement_swapped_mxfp8,
         get_compiled_grouped_mxfp8,
         get_compiled_swapped_mxfp8,
+        swap_k_block_arg,
     )
 
     if (
@@ -362,16 +366,29 @@ def grouped_gemm_mxfp8(
     in_fmt = in_fmt or mx_class_of(a.device)
     if in_fmt not in MX_CLASSES:
         raise ValueError(f"grouped_gemm_mxfp8: unknown instruction class {in_fmt!r}")
+
+    def grid_of():
+        # the persistent grid clipped to the launch's tile bound from the static sizes (``a``'s rows bound the live rows): which
+        # CTA computes a tile, never the bits; ``grid`` overrides
+        if grid is not None:
+            return grid
+        return min(
+            persistent_clusters(a.device, config),
+            launch_tile_bound(config, a.shape[0], E, N),
+        )
+
     if config.swap_ab:
         if not dense_a:
             raise ValueError(
                 "grouped_gemm_mxfp8: the swapped decode body reads the dense packing (the scale factors at the padded positions)"
             )
-        if not can_implement_swapped_mxfp8(config, N, K, E, chain, in_fmt):
+        # the stage's K extent: two atoms when they divide K (`swap_k_block`; ``k_block`` overrides), a placement
+        kb = swap_k_block_arg(in_fmt, K, k_block)
+        if not can_implement_swapped_mxfp8(config, N, K, E, chain, in_fmt, kb):
             raise ValueError(
-                f"grouped_gemm_mxfp8: swapped record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
+                f"grouped_gemm_mxfp8: swapped record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt}, k_block={kb or 'default'})"
             )
-        kernel = get_compiled_swapped_mxfp8(config, chain, in_fmt)
+        kernel = get_compiled_swapped_mxfp8(config, chain, in_fmt, kb)
 
         def args(*outs):
             return (
@@ -381,7 +398,7 @@ def grouped_gemm_mxfp8(
                 w_sf,
                 *outs,
                 counts,
-                persistent_clusters(a.device, config),
+                grid_of(),
             )
 
     else:
@@ -399,7 +416,7 @@ def grouped_gemm_mxfp8(
                 w_sf,
                 *outs,
                 counts,
-                persistent_clusters(a.device, config),
+                grid_of(),
             )
 
     n_out = N // 2 if chain.pair else N

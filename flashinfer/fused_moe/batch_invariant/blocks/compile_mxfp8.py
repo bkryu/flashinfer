@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -60,12 +60,35 @@ def kernel_name(
     )
 
 
-def swapped_kernel_name(cfg: Knobs, chain: GroupedChain, in_fmt: str) -> str:
-    """The swapped decode body's object: the instruction class, the chain and the swapped record (its token tile)."""
+def swapped_kernel_name(
+    cfg: Knobs, chain: GroupedChain, in_fmt: str, k_block: int = 0
+) -> str:
+    """The swapped decode body's object: the instruction class, the chain, the swapped record (its token tile) and the
+    k-block when it is not the format's default (``_kb256``: the two-atom stage, `swap_k_block`)."""
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     return jit.sanitize_symbol_name(
         f"swapped_{in_fmt}_{chain.describe()}_{knobs.describe()}"
+        + (f"_kb{k_block}" if k_block else "")
     )
+
+
+#: K elements per smem stage the swapped decode body admits: the format's one 128-byte atom of K and two atoms.
+SWAP_K_BLOCKS = (128, 256)
+
+
+def swap_k_block(in_fmt: str, K: int) -> int:
+    """The swapped decode body's k-block for a GEMM of reduction length ``K``: two atoms of K per stage when they divide
+    ``K``, else the one-atom default -- a function of the fixed dims alone, so a placement of the same fold (the barrier
+    round trips over K halve; the MMA sequence is the class's). The padded body and the dense class keep the default."""
+    kbs = [kb for kb in SWAP_K_BLOCKS if K % kb == 0] or [SWAP_K_BLOCKS[0]]
+    return max(kbs)
+
+
+def swap_k_block_arg(in_fmt: str, K: int, k_block: Optional[int] = None) -> int:
+    """The k-block as the kernel spells it: ``k_block`` (default `swap_k_block`) with the format's default as 0 (one object
+    per k-block)."""
+    kb = k_block or swap_k_block(in_fmt, K)
+    return 0 if kb == SWAP_K_BLOCKS[0] else kb
 
 
 def can_implement_grouped_mxfp8(
@@ -192,7 +215,13 @@ def compile_grouped_mxfp8_fn(
 
 
 def can_implement_swapped_mxfp8(
-    knobs: Knobs, N: int, K: int, E: int, chain: GroupedChain, in_fmt: str
+    knobs: Knobs,
+    N: int,
+    K: int,
+    E: int,
+    chain: GroupedChain,
+    in_fmt: str,
+    k_block: int = 0,
 ) -> bool:
     """Acceptance of the swapped decode body (:mod:`.swap_mxfp8`): a swapped record of the dense MX space at a narrow
     token tile (128 weight rows x 8 / 16 / 32 tokens, 1-CTA, no cluster, swizzle 1) and the grouped operand rules (K a
@@ -208,6 +237,8 @@ def can_implement_swapped_mxfp8(
     if chain.pair and N % (2 * GROUP):
         return False
     n_out = N // 2 if chain.pair else N
+    if k_block and (k_block not in SWAP_K_BLOCKS or K % k_block):
+        return False
     return (
         K % BLOCK == 0
         and N % 8 == 0
@@ -227,9 +258,10 @@ def can_implement_mxfp8(
 
 
 def compile_swapped_mxfp8_fn(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str
+    cfg: Knobs, chain: GroupedChain, in_fmt: str, k_block: int = 0
 ) -> Callable[[], Any]:
-    """The zero-argument compile closure of one swapped MXFP8 specialisation (the dense packing)."""
+    """The zero-argument compile closure of one swapped MXFP8 specialisation (the dense packing; ``k_block`` as
+    `swapped_kernel_name` spells it)."""
     assert in_fmt in MX_FMTS and is_swapped_record(cfg), (in_fmt, cfg.describe())
     in_dt, al = IN_DT[in_fmt], ALIGN[in_fmt]
     out_dt, oal = OUT_DT[chain.out_fmt], ALIGN[chain.out_fmt]
@@ -278,7 +310,7 @@ def compile_swapped_mxfp8_fn(
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
-        obj = SwappedBlockScaledGemmMX(cfg, chain, in_fmt)
+        obj = SwappedBlockScaledGemmMX(cfg, chain, in_fmt, k_block)
         if chain.out_fmt == "mxfp8":
             osf_fake = cute.runtime.make_fake_tensor(
                 cutlass.Uint8,
@@ -316,15 +348,17 @@ def compile_swapped_mxfp8_fn(
 
 
 @functools.cache
-def get_compiled_swapped_mxfp8(cfg: Knobs, chain: GroupedChain, in_fmt: str) -> Any:
+def get_compiled_swapped_mxfp8(
+    cfg: Knobs, chain: GroupedChain, in_fmt: str, k_block: int = 0
+) -> Any:
     """``kernel(a3, sfa, w3, sfw, out2[, out_sf], counts, grid)``: A ``(R, K, 1)`` the dense quantized rows (``R >= Tk +
     token tile``), ``sfa`` their flat 128x4 scale factors at the padded positions, W ``(N, K, E)``, ``sfw`` (``E``
     buffers), out ``(Tk', Nout)`` (``out_sf`` the fused requantization's flat scale bytes of the padded rows)."""
     assert in_fmt in MX_FMTS and is_swapped_record(cfg), (in_fmt, cfg.describe())
     return jit.build_and_load(
         MODULE,
-        swapped_kernel_name(cfg, chain, in_fmt),
-        compile_swapped_mxfp8_fn(cfg, chain, in_fmt),
+        swapped_kernel_name(cfg, chain, in_fmt, k_block),
+        compile_swapped_mxfp8_fn(cfg, chain, in_fmt, k_block),
     )
 
 

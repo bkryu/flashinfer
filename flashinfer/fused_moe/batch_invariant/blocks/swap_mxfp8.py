@@ -80,7 +80,7 @@ from ....gemm.batch_invariant.blocks.blockscaled_mx_mixed import (
 )
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE, BAR_TMEM_ALLOC
 from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs
-from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS
+from ....gemm.batch_invariant.spec import MMA_K_OF, SF_ATOM_KBLOCKS
 from .blockscaled_kernel import (
     GROUP_ALIGN,
     MX_FMTS,
@@ -196,11 +196,13 @@ class SwappedBlockScaledGemmMX:
         chain: GroupedChain,
         in_fmt: str = "mxfp8",
         dense_a: bool = True,
+        k_block: int = 0,
     ):
         """``in_fmt``: the MXFP8 class or the mixed MXFP4-weight x MXFP8-activation class (its swapped twin plan: the e2m1
         weight as the kernel's A). ``dense_a``: the token rows densely packed (the MXFP8 class: the scale factors at the
         padded positions); False: the padded packing (the mixed class: the token rows, their scale factors and the output
-        rows at the padded positions)."""
+        rows at the padded positions). ``k_block``: K elements per smem stage (0: the format's one 128-byte atom, or the
+        record's own ``Knobs.k_block``; 256: two atoms, `swap_k_block`), a placement of the same fold."""
         assert isinstance(chain, GroupedChain), chain
         assert in_fmt in MX_FMTS and in_fmt in SWAP_PLANS, in_fmt
         assert is_swapped_record(knobs), (
@@ -215,6 +217,7 @@ class SwappedBlockScaledGemmMX:
         )
         self.plan_cls = SWAP_PLANS[in_fmt]
         self.token_tile = knobs.tile_n
+        self.k_block = k_block
 
     @cute.jit
     def __call__(
@@ -272,6 +275,7 @@ class SwappedBlockScaledGemmMX:
             self.knobs,
             lambda st: TABLE_BYTES + swap_xch_bytes(self.chain, self.token_tile),
             plan_cls.UMMA_SMEM_ADDR_MAX,
+            (self.k_block // MMA_K_OF[self.in_fmt]) if self.k_block else None,
         )
         self.st = st
         self.block = st.block

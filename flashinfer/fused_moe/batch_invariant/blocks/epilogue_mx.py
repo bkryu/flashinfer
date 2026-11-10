@@ -48,7 +48,7 @@ from ....batch_invariant.quantization.blocks import (
     pack_block_codes,
     sf_offset_128x4_dev,
 )
-from ....batch_invariant.quantization.cute_ext import CuteF32
+from ....batch_invariant.quantization.cute_ext import CuteF32, select_f32
 from ....batch_invariant.quantization.layout import SF_COL_TILE
 from ....batch_invariant.quantization.mx_spec import (
     BLOCK,
@@ -71,6 +71,11 @@ BAR_EPI_XCH = 8  # named barrier ids BAR_EPI_XCH + warpgroup pair (the staged st
 BAR_EPI_JOIN = (
     3  # every epilogue warpgroup once, after its last TMEM load, before the TMEM free
 )
+
+
+# The accumulator a dead lane or dead token column computes its (never stored) chain on: a normal operand through the chain's
+# exact division and the block scale's reciprocal, where a dead row's zero or arbitrary accumulators take the slow sequences.
+DEAD_ACC = 1.0
 
 
 def xch_layout(epi_warpgroups: int):
@@ -270,8 +275,14 @@ def grouped_epilogue_quant_loop(
                 offs[0][0]
             )  # the thread's row inside the cluster tile
             amax = Float32(0.0)
+            live = row_rel < rows_left  # this lane's row is one of the group's
             if warp_active:
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
+                # a dead lane (a row past the group's real end, never stored) computes the chain on a benign constant instead
+                # of its own accumulators: on a dead row's zero or arbitrary operands the chain's exact division and the block
+                # scale's reciprocal take the hardware's slow sequence, and the warp pays it for every lane that does
+                for v in cutlass.range_constexpr(nv):
+                    tTR_rAcc[v] = select_f32(live, tTR_rAcc[v], Float32(DEAD_ACC))
                 # the chain, rounded to bf16 (the class's intermediate), widened exactly: the subtile's outputs in column order
                 for v in cutlass.range_constexpr(nv):
                     if cutlass.const_expr(is_out[v]):
@@ -306,7 +317,7 @@ def grouped_epilogue_quant_loop(
                 ]
                 for w, word in enumerate(pack_block_codes(fp, yq, fmt.elem_fmt)):
                     fy_words[w] = word
-                stored = (row_rel < rows_left) & (blk * Int32(BLOCK) < N_out)
+                stored = live & (blk * Int32(BLOCK) < N_out)
                 if stored:
                     row_g = row0 + row_rel
                     dst = mOut[(row_g, None)]
@@ -450,6 +461,14 @@ def swapped_epilogue_quant_loop(
             wrow = crd0[0]  # this thread's weight row in the tile
             col0 = crd0[1] - Int32(offs[0][1])  # the subtile's first token column
             n_glob = n_tile * Int32(weight_tile) + wrow
+            # a token column past the group's end (rows of another group or the tail, never stored) is replaced by a benign
+            # constant on every lane: the chain's exact division and the block scale's reciprocal take the hardware's slow
+            # sequence on such a row's operands (a select, not a region per register: a dynamic region per register costs the
+            # compiler the interleaving of the column chains)
+            for v in cutlass.range_constexpr(nv):
+                tTR_rAcc[v] = select_f32(
+                    col0 + Int32(cols[v]) < rows_left, tTR_rAcc[v], Float32(DEAD_ACC)
+                )
             gate = None
             if cutlass.const_expr(pair):
                 gate = [
@@ -469,9 +488,8 @@ def swapped_epilogue_quant_loop(
             leader = store_ok & (
                 (out_loc % Int32(BLOCK)) == Int32(0)
             )  # the block's first column stores its scale byte
-            # the chain of every token column (rows past the group's end are finite rows of another group or the tail:
-            # computed, never stored, and a token column's reduction never mixes with another's), the block amax across
-            # the lanes
+            # the chain of every token column (a dead column's is the benign constant's: computed, never stored, and a token
+            # column's reduction never mixes with another's), the block amax across the lanes
             for v in cutlass.range_constexpr(nv):
                 yb = _chain_elem(
                     twin, tTR_rAcc[v], gate[v] if cutlass.const_expr(pair) else None
