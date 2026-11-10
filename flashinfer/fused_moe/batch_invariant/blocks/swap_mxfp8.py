@@ -385,7 +385,8 @@ class SwappedBlockScaledGemmMX:
         # programmatic dependent launch: the wait for the predecessor grid sits in each warp before its first read of the
         # predecessor's output (the token rows, their scale factors) -- the weight loads and the group tables (the plan:
         # complete before this grid launched; no kernel of the chain triggers before its own wait) do not wait, so the
-        # weight ring fills during the launch; no explicit trigger -- the dependents launch at this grid's completion
+        # weight ring fills during the launch; the TMA warp lets the dependents go once this CTA's last tile is issued (with
+        # no trigger the successor's launch sits exposed behind this grid once no kernel runs between the two GEMMs)
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
@@ -575,6 +576,7 @@ class SwappedBlockScaledGemmMX:
                 block_in_cluster_coord_vmnk[1],
                 b_cta_layout,
             )
+            cute.arch.griddepcontrol_launch_dependents()  # this CTA's loads are all issued: the successor may launch
         if warp_idx == SF_WARP:
             tile_sched = GroupScheduler.create(
                 s_off, s_pre, counts, E, N, tn, WEIGHT_TILE, 1, raster_m, 0, 0
