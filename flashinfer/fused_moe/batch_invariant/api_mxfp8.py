@@ -37,7 +37,7 @@ from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.heuristic import family_of
 from ...gemm.batch_invariant.schedule import chunks_for, mx_class_for
 from . import spec as S
-from .api import interleave_fc1, route
+from .api import group_tables, group_tables_buffer, interleave_fc1, route
 from .blocks.epilogue import GroupedChain
 from .spec_mxfp8 import BLOCK, CLASS, MX_CLASSES
 
@@ -303,6 +303,7 @@ def grouped_gemm_mxfp8(
     sf_rows: Optional[int] = None,
     k_block: Optional[int] = None,
     grid: Optional[int] = None,
+    tables: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` with the UE8M0 block scales applied inside the block-scaled step, on the padded
     expert segments ``counts`` (int32 ``[E]``; the rows of group ``e`` start at the exclusive prefix of the counts rounded
@@ -377,6 +378,13 @@ def grouped_gemm_mxfp8(
             launch_tile_bound(config, a.shape[0], E, N),
         )
 
+    # the plan's group tables (the op passes the plan's; a call without them computes them first, one small launch)
+    tables = (
+        group_tables(counts)
+        if tables is None
+        else group_tables_buffer(E, a.device, tables)
+    )
+
     if config.swap_ab:
         if not dense_a:
             raise ValueError(
@@ -398,6 +406,7 @@ def grouped_gemm_mxfp8(
                 w_sf,
                 *outs,
                 counts,
+                tables,
                 grid_of(),
             )
 
@@ -416,6 +425,7 @@ def grouped_gemm_mxfp8(
                 w_sf,
                 *outs,
                 counts,
+                tables,
                 grid_of(),
             )
 
@@ -452,7 +462,7 @@ def grouped_gemm_mxfp8(
 
 
 def permute_plan_padded(
-    experts: torch.Tensor, E: int
+    experts: torch.Tensor, E: int, tables: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(counts [E] int32, dest [T, k] int32, src [Tk_pad] int32)``: the bf16 classes' deterministic permutation
     (expert order, then token-slot order) with the group offsets rounded up to 128 rows; ``src`` has
@@ -471,24 +481,26 @@ def permute_plan_padded(
     dest = torch.empty(n, dtype=torch.int32, device=dev)
     src = torch.full((padded_rows_bound(T, k, E),), -1, dtype=torch.int32, device=dev)
     counts = torch.empty(E, dtype=torch.int32, device=dev)
+    tables = group_tables_buffer(E, dev, tables)
     if n == 0:
         counts.zero_()
+        tables.zero_()
         return counts, dest.view(T, k), src
     if n >= PLAN_MULTI_MIN_N:
         nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
         hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
         get_compiled_plan_multi(GROUP_ALIGN, False, GROUP_ALIGN)(
-            flat, counts, dest, src, dest, dest, hist_blk, n, E, nb
+            flat, counts, dest, src, dest, dest, tables, hist_blk, n, E, nb
         )
     else:
         get_compiled_plan(GROUP_ALIGN, False, GROUP_ALIGN)(
-            flat, counts, dest, src, dest, dest, n, E
+            flat, counts, dest, src, dest, dest, tables, n, E
         )
     return counts, dest.view(T, k), src
 
 
 def permute_plan_dual_padded(
-    experts: torch.Tensor, E: int
+    experts: torch.Tensor, E: int, tables: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(counts [E], dest [T, k], src [Tk], dest_pad [T, k], pos_pad [Tk])``: the dense plan (:func:`.api.permute_plan`)
     plus the positions with the groups padded to 128 rows (``dest_pad[i]``) and the padded position of every dense row
@@ -509,17 +521,19 @@ def permute_plan_dual_padded(
     dest_pad = torch.empty(n, dtype=torch.int32, device=dev)
     pos_pad = torch.empty(n, dtype=torch.int32, device=dev)
     counts = torch.empty(E, dtype=torch.int32, device=dev)
+    tables = group_tables_buffer(E, dev, tables)
     if n == 0:
         counts.zero_()
+        tables.zero_()
     elif n >= PLAN_MULTI_MIN_N:
         nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
         hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
         get_compiled_plan_multi(1, True, GROUP_ALIGN)(
-            flat, counts, dest, src, dest_pad, pos_pad, hist_blk, n, E, nb
+            flat, counts, dest, src, dest_pad, pos_pad, tables, hist_blk, n, E, nb
         )
     else:
         get_compiled_plan(1, True, GROUP_ALIGN)(
-            flat, counts, dest, src, dest_pad, pos_pad, n, E
+            flat, counts, dest, src, dest_pad, pos_pad, tables, n, E
         )
     return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
 
@@ -549,8 +563,8 @@ def fused_moe_mxfp8(
     the same bits) -- ``"padded"`` (every group padded to whole 128-row atoms, the GEMMs' A boxes read the atoms) or
     ``"dense"`` (the rows back to back, the scale factors at the padded positions: the swapped decode body's packing, which
     the padded body reads too; the fused requantization only); None: the dense packing when either record is a swapped
-    one, else the padded one (`schedule_mxfp8.packing_for`). ``plan``: the padded plan's ``(counts, dest, src)`` or the
-    dual plan's ``(counts, dest, src, dest_pad, pos_pad)`` from ``route_plan`` (the same integers as the plans here, one
+    one, else the padded one (`schedule_mxfp8.packing_for`). ``plan``: the padded plan's ``(counts, dest, src, tables)`` or the
+    dual plan's ``(counts, dest, src, dest_pad, pos_pad, tables)`` from ``route_plan`` (the same integers as the plans here, one
     launch with the routing); its form must match the packing. ``return_intermediates``: the live buffers (``counts``,
     ``dest``, ``src``, ``xq``, ``xsf``, ``x_perm`` / ``x_perm_sf``, ``a``, ``aq`` / ``a_sf``, ``y``; the dense packing adds
     ``dest_pad`` / ``pos_pad`` and the row counts ``Tk_a`` / ``Tk_sf``), the records used, the packing and the bodies."""
@@ -649,9 +663,9 @@ def fused_moe_mxfp8(
         raise ValueError(
             "fused_moe_mxfp8: a swapped record reads the dense packing (path='dense')"
         )
-    if plan is not None and len(plan) != (5 if path == "dense" else 3):
+    if plan is not None and len(plan) != (6 if path == "dense" else 4):
         raise ValueError(
-            "fused_moe_mxfp8: the plan's form (padded: 3 tensors, dual: 5) must match the packing"
+            "fused_moe_mxfp8: the plan's form (padded: 3 tensors, dual: 5, plus the group tables) must match the packing"
         )
     nb, pcols = H // BLOCK, padded_sf_cols(H)
     if path == "dense":
@@ -662,8 +676,12 @@ def fused_moe_mxfp8(
             raise ValueError(
                 "fused_moe_mxfp8: the dense packing runs the fused requantization"
             )
-        counts, dest, src, dest_pad, pos_pad = (
-            plan if plan is not None else permute_plan_dual_padded(experts, E)
+        # the plan (the runner's route_plan, or the dual plan here) carries the GEMM launches' group tables as its last element
+        tables = group_tables_buffer(E, dev)
+        counts, dest, src, dest_pad, pos_pad, tables = (
+            plan
+            if plan is not None
+            else (*permute_plan_dual_padded(experts, E, tables), tables)
         )
         Tk = T * k
         Tk_pad = padded_rows_bound(T, k, E)
@@ -693,9 +711,19 @@ def fused_moe_mxfp8(
             in_fmt,
             dense_a=True,
             sf_rows=Tk_sf,
+            tables=tables,
         )
         y = grouped_gemm_mxfp8(
-            aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt, dense_a=True
+            aq,
+            a_sf,
+            w.w2,
+            w.w2_sf,
+            counts,
+            config2,
+            GEMM2_CHAIN,
+            in_fmt,
+            dense_a=True,
+            tables=tables,
         )  # [Tk_a, H] bf16
         get_compiled_combine(
             k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev))
@@ -726,7 +754,10 @@ def fused_moe_mxfp8(
             )
         return out
     # ``plan``: ``route_plan(..., align=GROUP_ALIGN)``'s outputs (the same integers as the padded plan, one launch with the routing)
-    counts, dest, src = plan if plan is not None else permute_plan_padded(experts, E)
+    tables = group_tables_buffer(E, dev)
+    counts, dest, src, tables = (
+        plan if plan is not None else (*permute_plan_padded(experts, E, tables), tables)
+    )
     Tk_pad = src.shape[0]
     x_perm = torch.empty(Tk_pad, H, dtype=torch.float8_e4m3fn, device=dev)
     x_perm_sf = torch.empty(sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
@@ -748,17 +779,33 @@ def fused_moe_mxfp8(
         # the class's second quantization inside GEMM1's epilogue: no bf16 intermediate
         a = None
         aq, a_sf = grouped_gemm_mxfp8(
-            x_perm, x_perm_sf, w.w1, w.w1_sf, counts, config1, w.chain1_quant, in_fmt
+            x_perm,
+            x_perm_sf,
+            w.w1,
+            w.w1_sf,
+            counts,
+            config1,
+            w.chain1_quant,
+            in_fmt,
+            tables=tables,
         )
     else:
         a = grouped_gemm_mxfp8(
-            x_perm, x_perm_sf, w.w1, w.w1_sf, counts, config1, w.chain1, in_fmt
+            x_perm,
+            x_perm_sf,
+            w.w1,
+            w.w1_sf,
+            counts,
+            config1,
+            w.chain1,
+            in_fmt,
+            tables=tables,
         )  # [Tk_pad, I] bf16
         aq, a_sf = quantize_mxfp8_rows(
             a, swizzled=True, enable_pdl=True, valid=src
         )  # the quantizer class, second pass, the live rows
     y = grouped_gemm_mxfp8(
-        aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt
+        aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt, tables=tables
     )  # [Tk_pad, H] bf16
     get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev)))(
         y, dest, scales, out, T, H

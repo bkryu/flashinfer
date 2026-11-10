@@ -53,7 +53,14 @@ from .epilogue import (
     staging_bytes,
     staging_layout,
 )
-from .scheduler import MAX_E, GroupScheduler, build_group_tables, warp_roles
+from .scheduler import (
+    MAX_E,
+    GroupScheduler,
+    build_group_tables,
+    load_group_tables,
+    pre_row_of,
+    warp_roles,
+)
 
 #: The MX classes the grouped body serves: the SM100 / SM103 instruction (K = 32) and the SM107 one (K = 64).
 MX_FMTS = ("mxfp8", "mxfp8_k64")
@@ -277,10 +284,13 @@ class GroupedBlockScaledGemmMX:
         sfb: cute.Tensor,
         out: cute.Tensor,
         counts: cute.Tensor,
+        tables: cute.Tensor,
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self._launch(a, b, sfa, sfb, out, counts, max_active_clusters, stream)
+        """``tables``: the plan's group tables (``[TABLE_ROWS, E + 1]`` int32, ``scheduler.load_group_tables``), loaded by
+        every CTA in place of the per-CTA scan of ``counts``."""
+        self._launch(a, b, sfa, sfb, out, counts, tables, max_active_clusters, stream)
 
     @cute.jit
     def call_quant(
@@ -292,16 +302,29 @@ class GroupedBlockScaledGemmMX:
         out: cute.Tensor,
         out_sf: cute.Tensor,
         counts: cute.Tensor,
+        tables: cute.Tensor,
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         """The fused-requantization chains (``out_fmt == "mxfp8"``): ``out`` the e4m3 codes (uint8 ``[Tk_pad, N_out]``),
         ``out_sf`` the flat uint8 UE8M0 bytes in the 128x4 layout of ``(Tk_pad, N_out)``."""
-        self._launch(a, b, sfa, sfb, out, counts, max_active_clusters, stream, out_sf)
+        self._launch(
+            a, b, sfa, sfb, out, counts, tables, max_active_clusters, stream, out_sf
+        )
 
     # host side (trace time)
     def _launch(
-        self, a, b, sfa, sfb, out, counts, max_active_clusters, stream, out_sf=None
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        out,
+        counts,
+        tables,
+        max_active_clusters,
+        stream,
+        out_sf=None,
     ):
         pc = self.plan_cls
         assert a.element_type is pc.A_DT and b.element_type is pc.B_DT, (
@@ -321,17 +344,21 @@ class GroupedBlockScaledGemmMX:
         # the accumulator-side "C" of the plan is fp32 row-major: it only sizes the epilogue tile; the ring leaves room
         # for the group tables and the epilogue staging buffers
         self.staged = staged_store(self.chain.out_fmt)
-        tables = (2 if self.dense_a else 1) * TABLE_BYTES
+        table_bytes = (
+            2 if self.dense_a else 1
+        ) * TABLE_BYTES  # the group tables (smem)
         st = plan_with_room(
             self.plan_cls,
             self.knobs,
-            lambda st: tables
-            + (
-                staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_MX)
-                if self.staged
-                else 0
-            )
-            + xch_bytes(self.chain, EPI_WARPGROUPS_MX),
+            lambda st: (
+                table_bytes
+                + (
+                    staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_MX)
+                    if self.staged
+                    else 0
+                )
+                + xch_bytes(self.chain, EPI_WARPGROUPS_MX)
+            ),
             self.plan_cls.UMMA_SMEM_ADDR_MAX,
         )
         self.st = st
@@ -365,6 +392,7 @@ class GroupedBlockScaledGemmMX:
             out,
             counts,
             out_sf,
+            tables,
             st.cluster_layout_vmnk,
             st.cluster_layout_sfb_vmnk,
             st.a_smem_layout_staged,
@@ -398,6 +426,7 @@ class GroupedBlockScaledGemmMX:
         mOut: cute.Tensor,
         counts: cute.Tensor,
         mOutSf: Optional[cute.Tensor],
+        mTab: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -498,7 +527,20 @@ class GroupedBlockScaledGemmMX:
         # own prologue at once (this grid is one persistent wave)
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
-        if warp_idx == EPILOGUE_WARPS[0]:
+        if cutlass.const_expr(mTab is not None):
+            # the plan's tables, loaded by every thread (the padded packing's offsets are the atom-aligned ones)
+            load_group_tables(
+                mTab,
+                E,
+                tidx,
+                THREADS,
+                pre_row_of(cluster_rows),
+                s_off,
+                s_pre,
+                s_off_pad,
+                not self.dense_a,
+            )
+        elif warp_idx == EPILOGUE_WARPS[0]:
             if cutlass.const_expr(self.dense_a):
                 build_group_tables(
                     counts, E, cluster_rows, s_off, s_pre, 1

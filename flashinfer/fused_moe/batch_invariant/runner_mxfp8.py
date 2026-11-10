@@ -214,7 +214,13 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
                 and cfg.routing.num_experts <= MAX_E
             ):
                 # routing and the permutation plan in one launch (a placement: the same bits and integers), in the form of
-                # the packing the ranked records run on at this token count
+                # the packing the ranked records run on at this token count; the plan's group tables ride along (the GEMMs
+                # load them in place of a per-CTA scan)
+                from .api import group_tables_buffer
+
+                tables = group_tables_buffer(
+                    cfg.routing.num_experts, act.routing_logits.device
+                )
                 if self._packing(T, H) == "dense":
                     ids, wts, counts, dest, src, dest_pad, pos_pad = route_plan(
                         act.routing_logits,
@@ -224,8 +230,9 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
                         scale,
                         dual=True,
                         pad_align=GROUP_ALIGN,
+                        tables=tables,
                     )
-                    plan = [counts, dest, src, dest_pad, pos_pad]
+                    plan = [counts, dest, src, dest_pad, pos_pad, tables]
                 else:
                     ids, wts, counts, dest, src = route_plan(
                         act.routing_logits,
@@ -234,8 +241,9 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
                         bias,
                         scale,
                         align=GROUP_ALIGN,
+                        tables=tables,
                     )
-                    plan = [counts, dest, src]
+                    plan = [counts, dest, src, tables]
             else:
                 ids, wts = route(act.routing_logits, k, self._method, bias, scale)
         else:
@@ -312,7 +320,7 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         from .api_mxfp8 import MoEWeightsMXFP8, fused_moe_mxfp8
 
         xq, xsf, ids, wts, w1, w1_sf, w2, w2_sf, out = inputs[:9]
-        plan = tuple(inputs[9:]) if len(inputs) >= 12 else None
+        plan = tuple(inputs[9:]) if len(inputs) >= 13 else None  # [.., tables]
         self._hidden = int(xq.shape[1])
         T = int(xq.shape[0])
         if tactic == -1 or tactic is None:

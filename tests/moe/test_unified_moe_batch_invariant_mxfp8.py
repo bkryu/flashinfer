@@ -1769,7 +1769,9 @@ def test_decode_tactics_include_the_swapped_records_and_agree():
     pack = _logits_pack(x, logits)
     ref = bits(layer(pack, W))
     inputs = runner.pack_inputs(pack, W)
-    assert len(inputs) == 14, "the dual plan: counts, dest, src, dest_pad, pos_pad"
+    assert len(inputs) == 15, (
+        "the dual plan: counts, dest, src, dest_pad, pos_pad, and the group tables"
+    )
     tactics = runner.get_valid_tactics(inputs, None)
     assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
     assert all(
@@ -1950,3 +1952,83 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # zero tokens
     out = layer(_logits_pack((xq[:0], xsf[:0]), logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
+
+
+def _group_tables_ref(counts: torch.Tensor, pad_align: int = 128) -> torch.Tensor:
+    """The scheduler's group tables of ``counts`` in torch: ``[TABLE_ROWS, E + 1]`` -- the exclusive prefix of the counts,
+    of the counts rounded up to ``pad_align`` rows, and of ``ceil(counts / extent)`` per extent of ``TABLE_CLUSTER_ROWS``;
+    entry ``E`` the totals."""
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import TABLE_CLUSTER_ROWS
+
+    c = counts.long().cpu()
+    z = torch.zeros(1, dtype=torch.long)
+    rows = [
+        torch.cat([z, c.cumsum(0)]),
+        torch.cat([z, ((c + pad_align - 1) // pad_align * pad_align).cumsum(0)]),
+    ]
+    rows += [
+        torch.cat([z, ((c + cr - 1) // cr).cumsum(0)]) for cr in TABLE_CLUSTER_ROWS
+    ]
+    return torch.stack(rows).to(torch.int32)
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize(
+    "T,k,E", [(3, 2, 8), (257, 6, 64), (100, 8, 1024), (2049, 3, 2), (1, 1, 512)]
+)
+def test_every_plan_form_emits_the_group_tables(T, k, E, multi, monkeypatch):
+    """Every plan (the dense `api.permute_plan`, the padded and the dual padded plans of this class, the one-launch and the
+    two-launch block form, and `api.route_plan` in its three forms) emits the GEMM launches' group tables: the dense and the
+    padded group offsets and a cluster-row prefix per extent of ``TABLE_CLUSTER_ROWS`` (entry E the totals), equal to the
+    torch reference and to the standalone tables kernel (`api.group_tables`); incl. E = 1024, the table bound."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as Q
+
+    monkeypatch.setattr(api, "PLAN_MULTI_MIN_N", 0 if multi else 1 << 30)
+    g = torch.Generator().manual_seed(T + E)
+    ex = (
+        torch.stack([torch.randperm(E, generator=g)[:k] for _ in range(T)])
+        .to(torch.int32)
+        .cuda()
+    )
+    ref = _group_tables_ref(torch.bincount(ex.reshape(-1).long().cpu(), minlength=E))
+    for plan in (api.permute_plan, Q.permute_plan_padded, Q.permute_plan_dual_padded):
+        tab = api.group_tables_buffer(E, "cuda")
+        counts = plan(ex, E, tab)[0]
+        torch.cuda.synchronize()
+        assert torch.equal(tab.cpu(), ref), plan.__name__
+        assert torch.equal(api.group_tables(counts).cpu(), ref), plan.__name__
+    if T <= 16 and E <= 1024:
+        logits = (torch.randn(T, E, generator=g) * 2).float().cuda()
+        for kw in (dict(align=1), dict(align=128), dict(dual=True, pad_align=128)):
+            tab = api.group_tables_buffer(E, "cuda")
+            outs = api.route_plan(logits, k, tables=tab, **kw)
+            torch.cuda.synchronize()
+            counts = outs[2]
+            assert torch.equal(
+                tab.cpu(),
+                _group_tables_ref(
+                    torch.bincount(outs[0].reshape(-1).long().cpu(), minlength=E)
+                ),
+            ), kw
+            assert torch.equal(api.group_tables(counts).cpu(), tab.cpu()), kw
+
+
+def test_every_record_has_a_cluster_row_prefix_in_the_plan_tables():
+    """Every record of the MXFP8 spaces (the padded body's CTA rows x cluster M, the swapped body's token tiles) reads its
+    own cluster-row prefix row of the plan tables (``TABLE_CLUSTER_ROWS``)."""
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import (
+        TABLE_CLUSTER_ROWS,
+        pre_row_of,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        grouped_knobs_mx,
+        swapped_knobs_mx,
+    )
+
+    for in_fmt in ("mxfp8", "mxfp8_k64"):
+        for cfg in grouped_knobs_mx(in_fmt):
+            rows = cfg.cta_tile_mn[0] * cfg.cluster_shape_mn[0]
+            assert rows in TABLE_CLUSTER_ROWS and pre_row_of(rows) >= 2, cfg.describe()
+    for cfg in swapped_knobs_mx():
+        assert cfg.mma_tiler_mn[1] in TABLE_CLUSTER_ROWS, cfg.describe()

@@ -27,7 +27,7 @@ from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC
 from ..mx_permute import get_compiled_scatter_mx  # noqa: F401  (the scatter kernel shares the module)
 from .blockscaled_kernel import GROUP_ALIGN, MX_FMTS, GroupedBlockScaledGemmMX
 from .epilogue import GROUP, GroupedChain
-from .scheduler import MAX_E
+from .scheduler import MAX_E, TABLE_ROWS
 from .swap_mxfp8 import (  # noqa: F401  (re-exported)
     SwappedBlockScaledGemmMX,
     is_swapped_record,
@@ -175,6 +175,12 @@ def compile_grouped_mxfp8_fn(
             assumed_align=16,
         )
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+        t_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (TABLE_ROWS, cute.sym_int(32)),
+            (cute.sym_int64(), 1),
+            assumed_align=4,
+        )  # the plan's tables
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
         obj = GroupedBlockScaledGemmMX(cfg, chain, in_fmt, dense_a)
@@ -194,6 +200,7 @@ def compile_grouped_mxfp8_fn(
                 o_fake,
                 osf_fake,
                 c_fake,
+                t_fake,
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
@@ -206,6 +213,7 @@ def compile_grouped_mxfp8_fn(
             sfb_fake,
             o_fake,
             c_fake,
+            t_fake,
             grid,
             stream_fake,
             options="--enable-tvm-ffi",
@@ -308,6 +316,12 @@ def compile_swapped_mxfp8_fn(
             assumed_align=16,
         )
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+        t_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (TABLE_ROWS, cute.sym_int(32)),
+            (cute.sym_int64(), 1),
+            assumed_align=4,
+        )  # the plan's tables
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
         obj = SwappedBlockScaledGemmMX(cfg, chain, in_fmt, k_block)
@@ -327,6 +341,7 @@ def compile_swapped_mxfp8_fn(
                 o_fake,
                 osf_fake,
                 c_fake,
+                t_fake,
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
@@ -339,6 +354,7 @@ def compile_swapped_mxfp8_fn(
             sfw_fake,
             o_fake,
             c_fake,
+            t_fake,
             grid,
             stream_fake,
             options="--enable-tvm-ffi",
