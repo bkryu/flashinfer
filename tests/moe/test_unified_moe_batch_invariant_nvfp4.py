@@ -1144,6 +1144,27 @@ def test_pdl_chain_alternating_inputs_give_each_call_its_own_bits(body):
 
 
 @needs_device
+def test_packed_f32_weights_are_rounded_by_the_combine():
+    """The packed pre-routed form takes f32 weights that are not bf16 values and rounds them in the combine (the packed word's
+    convention, no host pass): the output equals the same pack given the caller-rounded weights, and the unpacked form given
+    the bf16 weights, bit for bit."""
+    T, k, H, I, E = 133, 4, 512, 256, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=5)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    raw = (weights.float() * (1.0 + 2.0**-12)).cuda()  # not bf16 values: the rounding is real work
+    assert not torch.equal(raw.to(torch.bfloat16).float(), raw)
+    out_raw = layer(_routed_pack(x, ids.cuda(), raw, packed=True), W)
+    out_rounded = layer(
+        _routed_pack(x, ids.cuda(), raw.to(torch.bfloat16), packed=True), W
+    )
+    out_unpacked = layer(_routed_pack(x, ids.cuda(), raw.to(torch.bfloat16)), W)
+    assert torch.equal(bits(out_raw), bits(out_rounded))
+    assert torch.equal(bits(out_raw), bits(out_unpacked))
+
+
+@needs_device
 def test_three_routing_modes_agree_and_runs_are_deterministic():
     T, k, H, I, E = 257, 8, 1024, 512, 128
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=3)

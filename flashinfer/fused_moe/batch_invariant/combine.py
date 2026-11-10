@@ -110,7 +110,7 @@ class CombineKernel:
             if cutlass.const_expr(self.w_round):
                 # pre-routed weights given as f32 enter as their bf16 rounding (the packed word's value): cvt.rn here,
                 # widened exactly, instead of two host passes over the slots
-                ws = [CuteF32.widen(CuteF32.cvt_out(w_, "bf16")) for w_ in ws]
+                ws = [CuteF32.cvt_out(w_, "bf16").to(Float32) for w_ in ws]
             # a dropped slot (dest -1: an expert id outside [0, E)) has no expert row: its loads take row 0 and its term is +0
             oks = [p >= Int32(0) for p in ps]
             ps = [cutlass.max(p, Int32(0)) for p in ps]
