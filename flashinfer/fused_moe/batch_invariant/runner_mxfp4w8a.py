@@ -138,7 +138,6 @@ class BatchInvariantMoeMxfp4w8aRunner(MoERunner):
     def _check_support(self) -> None:
         super()._check_support()
         from .api_mxfp4w8a import granule_of, mx_class_of
-        from .spec import METHOD_OF_FLASHINFER
 
         cfg = self.config
         check_device(self.device, CLASS, MOE_MXFP4W8A_ARCHS)
@@ -179,9 +178,7 @@ class BatchInvariantMoeMxfp4w8aRunner(MoERunner):
             raise unsupported(
                 CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
             )
-        # group-limited routing (n_group / topk_group > 1) is refused only from logits (the class has no grouped routing
-        # term); with pre-routed ids the group structure is irrelevant, the output is the ungrouped configuration's
-        self._method = METHOD_OF_FLASHINFER.get(routing.method)
+        # the routing term (the method, its groups, the Llama4 top-1 rule) is the bf16 runner's: set by the base check
         if not cfg.finalize.do_finalize:
             raise unsupported(
                 CLASS,

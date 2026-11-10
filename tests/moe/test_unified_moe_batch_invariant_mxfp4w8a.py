@@ -321,8 +321,11 @@ def test_fingerprint_dimensions_and_classes():
     assert s107 == spec_fingerprint_mxfp4w8a(
         2048, 768, 8, 128, S.SOFTMAX_RENORM, "silu", (), True, "mxfp4w8a_k64"
     )
+    # the routing terms the bf16 model serves are classes of this backend too (Llama4 = TopK with sigmoid weights); a method
+    # the classes do not implement is refused
+    assert fp(arch="sm_107", method=RoutingMethodType.Llama4) not in distinct
     with pytest.raises(ValueError):
-        fp(arch="sm_107", method=RoutingMethodType.Llama4)
+        fp(arch="sm_107", method=RoutingMethodType.MiniMax2)
     with pytest.raises(ValueError):
         fp(arch="sm_107", act="tanh")
     with pytest.raises(ValueError):
@@ -1934,9 +1937,10 @@ def test_fused_requantization_equals_the_standalone_spelling(act):
 
 @needs_device
 def test_grouped_routing_config_takes_prerouted_ids_and_refuses_logits():
-    """A group-limited routing configuration (``n_group`` / ``topk_group`` > 1) constructs; from logits it is refused (the
-    class has no grouped routing term); with pre-routed ids the group structure is irrelevant and the output is the
-    ungrouped configuration's bit for bit on the same ids and weights."""
+    """A group-limited routing configuration (``n_group`` / ``topk_group`` > 1) constructs; with a method other than
+    DeepSeekV3 it is refused from logits (the groups are a term of the DeepSeekV3 method alone); with pre-routed ids the group
+    structure is irrelevant and the output is the ungrouped configuration's bit for bit on the same ids and weights; the
+    grouped DeepSeekV3 layer runs from logits deterministically (the bf16 model's grouped routing term)."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
     T, k, H, I, E = 64, 8, 512, 256, 64
@@ -1966,6 +1970,27 @@ def test_grouped_routing_config_takes_prerouted_ids_and_refuses_logits():
     out = grouped(_routed_pack((xq, xsf), ids.cuda(), weights.cuda()), W)
     ref = _layer(k, E, I)(_routed_pack((xq, xsf), ids.cuda(), weights.cuda()), W)
     assert torch.equal(bits(out), bits(ref))
+    dsv3 = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E,
+                top_k=k,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=8,
+                topk_group=4,
+            ),
+            quant=_QUANT,
+            experts=ExpertConfig(intermediate_size=I),
+            backend=BackendOptions((BatchInvariantFp4Config(),)),
+            execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=4096),
+        ),
+        device=torch.device("cuda"),
+    )
+    bias = torch.randn(E, device="cuda")
+    out_g = dsv3(_logits_pack((xq, xsf), logits, bias), W)
+    assert out_g.shape == (T, H) and torch.equal(
+        bits(out_g), bits(dsv3(_logits_pack((xq, xsf), logits, bias), W))
+    )
 
 
 @needs_device
@@ -2067,7 +2092,8 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             _logits_pack((xq, xsf), logits),
             _weights(w1[:, :I].contiguous(), w2, ReLU2()),
         )
-    # an unimplemented routing method from logits is refused; the same layer takes pre-routed inputs
+    # Llama4 routing (the top-1 with its sigmoid as the weight) is a routing term the bf16 model serves: the layer runs from
+    # logits, deterministically, and takes pre-routed inputs; a method the classes do not implement is refused from logits
     llama = MoELayer(
         MoEConfig(
             routing=RoutingConfig(
@@ -2079,8 +2105,23 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         ),
         device=torch.device("cuda"),
     )
+    out_l = llama(_logits_pack((xq, xsf), logits), W)
+    assert out_l.shape == (8, H) and torch.equal(
+        bits(out_l), bits(llama(_logits_pack((xq, xsf), logits), W))
+    )
+    minimax = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E, top_k=k, method=RoutingMethodType.MiniMax2
+            ),
+            quant=_QUANT,
+            experts=ExpertConfig(intermediate_size=I),
+            backend=BackendOptions((BatchInvariantFp4Config(),)),
+        ),
+        device=torch.device("cuda"),
+    )
     with pytest.raises(BatchInvariantUnsupportedError):
-        llama(_logits_pack((xq, xsf), logits), W)
+        minimax(_logits_pack((xq, xsf), logits), W)
     ids = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
     assert llama(
         _routed_pack((xq, xsf), ids, torch.ones(8, 1, device="cuda")), W
