@@ -82,7 +82,7 @@ def test_generated_cases_are_current():
         (8, "f32"),
     ]
     assert "(sfb_blk 1 0)" in k32[0][3] and "(sfb_blk 0 0)" in k32[0][2]
-    assert "(op:mma_fp8_k32 (const 0.0)" in k32[0][2]
+    assert "(mma32 (const 0.0) (ab (a 0 0) (b 0 0)))" in k32[0][2]
     for KB, sx in LC.kblock32_loop_cases():
         assert sx.count("(fma ") == KB
     assert "sorry" not in committed and "native_decide" not in committed
