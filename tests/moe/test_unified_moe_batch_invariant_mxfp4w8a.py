@@ -24,6 +24,8 @@ from __future__ import annotations
 import os
 
 import pytest
+import cutlass
+import cutlass.cute as cute
 import torch
 
 from flashinfer import batch_invariant as bi
@@ -1195,6 +1197,122 @@ def test_swapped_body_equals_the_dense_class_per_expert():
 
 
 @needs_device
+def test_swapped_body_ring_stays_inside_the_container_bound():
+    """The container plan's swapped records (the SM100 class, whose e2m1 weight the TMA unpacks into the 8-bit container): the
+    grouped plan keeps the barriers, the group tables and the whole operand ring inside the first 256 KB of shared memory on every
+    record of the swapped space, and the 8-token record at the default stage width -- the one whose unbounded ring would cross that
+    bound on a part with more shared memory -- computes the class at a K that cycles every stage of its ring, bit for bit the
+    dense record's accumulators per expert (an operand ring past the bound reads as zeros under the unpacking container)."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp4w8a import (
+        MoEWeightsMXFP4W8A,
+        grouped_gemm_mxfp4w8a,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.blockscaled_kernel import (
+        ring_bytes,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.blocks.kernel_nvfp4 import grouped_plan
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import MAX_E
+    from flashinfer.fused_moe.batch_invariant.blocks.swap_nvfp4 import (
+        RING_CAP_BYTES,
+        SWAP_PLANS,
+    )
+    from flashinfer.gemm.batch_invariant.blocks.operands import MBAR_RESERVE_BYTES
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+    import flashinfer
+
+    fmt = "mxfp4w8a"
+    plan_cls = SWAP_PLANS[fmt]
+    assert plan_cls.A_SMEM_DT is not None and plan_cls.A_TMA_INTERNAL is not None
+    tables = 4 * (MAX_E + 1) * 4
+    records = [
+        Knobs((128, tn), (1, 1), False, True, "m", 1, swap_ab=True, k_block=kb)
+        for tn in (8, 16, 32)
+        for kb in (0, 256)
+    ]
+    seen = []
+
+    @cute.jit
+    def probe(x: cute.Tensor):
+        for cfg in records:
+            st = grouped_plan(
+                plan_cls, cfg, lambda st: tables, ring_cap_bytes=RING_CAP_BYTES
+            )
+            seen.append(
+                (
+                    cfg.describe(),
+                    ring_bytes(st) + tables + MBAR_RESERVE_BYTES,
+                    st.num_ab_stage,
+                )
+            )
+
+    cute.compile(probe, cute.runtime.make_fake_tensor(cutlass.Float32, (8,), (1,)))
+    assert len(seen) == len(records)
+    for name, footprint, stages in seen:
+        assert footprint <= RING_CAP_BYTES and stages >= 2, (name, footprint, stages)
+    # the 8-token record at the default stage width over a K that cycles every stage of the ring: the dense class's bits
+    counts, N, K = [3, 0, 70, 1, 33], 256, 4096
+    E, Tk = len(counts), sum(counts)
+    g = torch.Generator().manual_seed(29)
+    x = (
+        (
+            torch.randn(Tk, K, generator=g)
+            * torch.exp2(torch.randint(-6, 6, (Tk, K), generator=g).float())
+        )
+        .to(torch.bfloat16)
+        .cuda()
+    )
+    xq, xsf = _quant(x)
+    off = [0]
+    for c in counts:
+        off.append(off[-1] + -(-c // 128) * 128)
+    Tk_pad = off[-1]
+    a8 = torch.zeros(Tk_pad, K, dtype=torch.uint8, device="cuda")
+    sfr = torch.zeros(Tk_pad, K // BLOCK, dtype=torch.uint8, device="cuda")
+    live = torch.zeros(Tk_pad, dtype=torch.bool)
+    pos = 0
+    for e, c in enumerate(counts):
+        a8[off[e] : off[e] + c] = xq.view(torch.uint8)[pos : pos + c]
+        sfr[off[e] : off[e] + c] = xsf[pos : pos + c]
+        live[off[e] : off[e] + c] = True
+        pos += c
+    W = MoEWeightsMXFP4W8A.prepare(
+        (torch.randn(E, N, K, generator=g) * 0.1).to(torch.bfloat16).cuda(),
+        (torch.randn(E, K, N // 2, generator=g) * 0.1).to(torch.bfloat16).cuda(),
+        interleaved=True,
+    )
+    ref = torch.zeros(Tk_pad, N, dtype=torch.float32, device="cuda")
+    for e, c in enumerate(counts):
+        if c:
+            lo, hi = off[e], off[e] + c
+            ref[lo:hi] = (
+                flashinfer.gemm.batch_invariant.api.mm_mxfp8_mxfp4_batch_invariant(
+                    a8[lo:hi].view(torch.float8_e4m3fn),
+                    W.w1[e].t(),
+                    _swizzle(sfr[lo:hi], K),
+                    W.w1_sf[e],
+                    out_dtype=torch.float32,
+                    in_fmt=fmt,
+                    config=Knobs(*_DENSE_RECORD),
+                )
+            )
+    cnt = torch.tensor(counts, dtype=torch.int32, device="cuda")
+    got = grouped_gemm_mxfp4w8a(
+        a8.view(torch.float8_e4m3fn),
+        _swizzle(sfr, K),
+        W.w1,
+        W.w1_sf,
+        cnt,
+        records[0],
+        GroupedChain("plain", "silu", "f32"),
+        fmt,
+    )
+    assert torch.equal(bits(got.cpu()[live]), bits(ref.cpu()[live])), records[
+        0
+    ].describe()
+
+
+@needs_device
 @pytest.mark.parametrize("act", [SwiGLU(), ReLU2()], ids=["swiglu", "relu2"])
 def test_swapped_op_equals_the_padded_op(act):
     """At a decode-sized group the op with the swapped decode body on both GEMMs (the standalone requantization pass behind
@@ -1584,7 +1702,7 @@ def test_poisoned_intermediates_do_not_reach_the_bits(requant, gated):
 def test_fused_requantization_equals_the_standalone_spelling(act):
     """GEMM1's quantizing epilogue (the ``mxfp8.quant`` class applied to the bf16-rounded chain in place, codes and 128x4 block
     scales out) is a placement of the standalone pass: the codes, the scales, GEMM2's output and the op are bit-equal on the
-    live rows for every typed activation; the op's default is the fused spelling."""
+    live rows for every typed activation; the op's default (the dispatcher's body and spelling) gives the same bits."""
     from flashinfer.fused_moe.batch_invariant import api_mxfp4w8a as F
     from flashinfer.fused_moe.batch_invariant.api import route
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
@@ -1599,11 +1717,25 @@ def test_fused_requantization_equals_the_standalone_spelling(act):
         w1, w2, gated=chain.gated, act=chain.act, params=chain.params
     )
     ids, weights = route(logits, k)
+    # the padded body's two spellings (the swapped decode body, the dispatcher's pick at some token counts, writes the bf16
+    # intermediate and runs the standalone pass whatever the spelling asked for)
     out_s, im_s = F.fused_moe_mxfp4w8a(
-        (xq, xsf), ids, weights, W, return_intermediates=True, requant="standalone"
+        (xq, xsf),
+        ids,
+        weights,
+        W,
+        return_intermediates=True,
+        requant="standalone",
+        swap=False,
     )
     out_f, im_f = F.fused_moe_mxfp4w8a(
-        (xq, xsf), ids, weights, W, return_intermediates=True, requant="fused"
+        (xq, xsf),
+        ids,
+        weights,
+        W,
+        return_intermediates=True,
+        requant="fused",
+        swap=False,
     )
     live = (im_s["src"] >= 0).cpu()
     Tk_pad = im_s["Tk_pad"]
