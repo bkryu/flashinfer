@@ -25,6 +25,8 @@ import torch
 
 from ...autotuner import TuningConfig
 from ...batch_invariant.support import check_device, unsupported
+from ...tllm_enums import RoutingMethodType
+
 from ..api import (
     GELU,
     GeGLU,
@@ -158,7 +160,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
     def _check_support(self) -> None:
         super()._check_support()
         from .api_nvfp4 import check_shape_nvfp4
-        from .spec import METHOD_OF_FLASHINFER
+        from .spec import MAX_GROUPS, METHOD_OF_FLASHINFER
 
         cfg = self.config
         check_device(self.device, CLASS, MOE_NVFP4_ARCHS)
@@ -182,6 +184,39 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             None, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
         )
         self._method = METHOD_OF_FLASHINFER.get(routing.method)
+        self._grouped_other = False
+        if self._method is not None:
+            # the routing terms of the bf16 model (the shared routing kernels): the group-limited selection is a term of the
+            # DeepSeekV3 method with the groups as parameters (its shape rule as the bf16 runner's); Llama4 is the top-1 with
+            # its sigmoid as the weight (TopKSigmoid for other k). The pre-routed modes never consult the method.
+            grouped = (routing.n_group or 0) > 1 or (routing.topk_group or 0) > 1
+            if grouped and routing.method is RoutingMethodType.DeepSeekV3:
+                n_group, topk_group = (
+                    int(routing.n_group or 0),
+                    int(routing.topk_group or 0),
+                )
+                E = routing.num_experts
+                if not (
+                    1 <= topk_group <= n_group <= MAX_GROUPS
+                    and E % n_group == 0
+                    and E // n_group >= 2
+                    and routing.top_k <= topk_group * (E // n_group)
+                ):
+                    raise unsupported(
+                        CLASS,
+                        f"n_group {n_group}, topk_group {topk_group} over {E} experts for top_k {routing.top_k}",
+                        f"1 <= topk_group <= n_group <= {MAX_GROUPS}, n_group dividing num_experts into groups of at "
+                        "least two experts, top_k <= topk_group * (num_experts / n_group)",
+                    )
+                self._method = self._method.with_groups(n_group, topk_group)
+            elif grouped:
+                self._grouped_other = True
+            if routing.method is RoutingMethodType.Llama4 and routing.top_k != 1:
+                raise unsupported(
+                    CLASS,
+                    f"Llama4 routing with top_k {routing.top_k}",
+                    "top_k = 1 (the method is the top-1 of the logits with its sigmoid as the weight; TopKSigmoid for other k)",
+                )
         if not cfg.finalize.do_finalize:
             raise unsupported(
                 CLASS,
@@ -352,27 +387,19 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
-            # group-limited selection is a routing term the class does not have; with pre-routed ids the group
-            # structure never enters the computation, so only the logits mode refuses it
-            if cfg.routing.n_group not in (
-                None,
-                0,
-                1,
-            ) or cfg.routing.topk_group not in (
-                None,
-                0,
-                1,
-            ):
+            # the group-limited selection is a term of the DeepSeekV3 method; with another method the groups have no
+            # meaning in this module (with pre-routed ids the group structure never enters the computation)
+            if self._grouped_other:
                 raise unsupported(
                     CLASS,
-                    "group-limited routing (n_group > 1) from logits",
-                    "n_group in (None, 0, 1) from logits, or pre-routed ids for grouped routing",
+                    f"expert groups (n_group / topk_group) with {cfg.routing.method!r} from logits",
+                    "the groups with DeepSeekV3, or pre-routed ids",
                 )
             if self._method is None:
                 raise unsupported(
                     CLASS,
                     f"routing method {cfg.routing.method!r} from logits",
-                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm or DeepSeekV3 with n_group <= 1",
+                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm, TopK, Llama4, TopKSigmoid or DeepSeekV3",
                 )
             bias = act.routing_bias
             if (bias is not None) != self._method.bias:
@@ -532,6 +559,14 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             else (x, sf, pts if pts.numel() == x.shape[0] else None)
         )
         fused_moe_nvfp4(
-            xin, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan, round_scales=self._round_scales
+            xin,
+            ids,
+            wts,
+            w,
+            out=out,
+            config1=c1,
+            config2=c2,
+            plan=plan,
+            round_scales=self._round_scales,
         )
         return out

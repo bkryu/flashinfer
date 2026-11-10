@@ -1965,9 +1965,14 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         ),
         device=torch.device("cuda"),
     )
-    out_g = grouped(_logits_pack(x, logits), W)
+    g_bias = (
+        (torch.randn(E, generator=torch.Generator().manual_seed(12)) * 0.1)
+        .float()
+        .cuda()
+    )  # the DeepSeek-V3 method selects on sigmoid(l) + bias: the bias is part of its term
+    out_g = grouped(_logits_pack(x, logits, bias=g_bias), W)
     assert out_g.shape == (x.shape[0], H) and torch.equal(
-        bits(out_g), bits(grouped(_logits_pack(x, logits), W))
+        bits(out_g), bits(grouped(_logits_pack(x, logits, bias=g_bias), W))
     )
     g_ids, g_wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
     assert torch.equal(
