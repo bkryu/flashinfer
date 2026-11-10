@@ -35,6 +35,8 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass import Boolean, Float32, Int32
+from cutlass._mlir.dialects import arith
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
@@ -46,12 +48,7 @@ from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS, act_elem, glu_elem
 
 GROUP = 8  # gate/up interleave granularity (columns): u x8, g x8, u x8, ...
 KINDS = ("plain", "glu", "act")
-OUT_FMTS = (
-    "bf16",
-    "f16",
-    "f32",
-    "mxfp8",
-)  # mxfp8: the MXFP8 class's fused requantization (epilogue_mx)
+OUT_FMTS = ("bf16", "f16", "f32")
 STAGED_STORE = True  # the shared-memory staged, row-coalesced store of the 16-bit outputs (False: the direct path everywhere)
 BAR_EPI_STAGE = (
     4  # named barrier ids BAR_EPI_STAGE + warpgroup (the dense blocks use 1 and 2)
@@ -98,12 +95,8 @@ class GroupedChain:
     def __post_init__(self):
         assert self.kind in KINDS and self.out_fmt in OUT_FMTS, self
         assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
-        if self.kind == "glu" and self.out_fmt not in ("bf16", "mxfp8"):
-            raise AssertionError(
-                "the gated chain converts to bf16 once (or the MXFP8 class requantizes that value in place)"
-            )
-        if self.out_fmt == "mxfp8" and self.kind not in ("glu", "act"):
-            raise AssertionError("the fused MX requantization quantizes a GEMM1 chain")
+        if self.kind == "glu" and self.out_fmt != "bf16":
+            raise AssertionError("the gated chain converts to bf16 once")
         expected = len(ACT_PARAMS.get(self.act, ())) if self.kind == "glu" else 0
         assert len(self.params) == expected, (self, expected)
 
@@ -221,6 +214,20 @@ class MoeF32(CuteF32):
         """The biased exponent field of ``|a|`` minus 126, as a Float32 (exact)."""
         bits = bitcast_f32_to_i32(a) & Int32(0x7FFFFFFF)
         return (((bits >> 23) & Int32(0xFF)) - Int32(126)).to(Float32)
+
+
+@dsl_user_op
+def select_f32(cond: Boolean, a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """``a`` if ``cond`` else ``b`` (``arith.select`` on a Boolean: a choice between two values, no arithmetic)."""
+    return Float32(
+        arith.select(
+            Boolean(cond).ir_value(loc=loc, ip=ip),
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 def _chain_elem(chain: GroupedChain, acc, acc_gate):
@@ -445,24 +452,26 @@ def grouped_epilogue_loop(
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
                 cC_sub = tRG_cC[(None, None, None, s)]
                 crd0 = cC_sub[((0, 0), 0, 0)]
-                # a dead row (past the group's end) skips its chain per lane: its lanes would run the division's slow path
-                # on the padded rows' zero or garbage operands, and its values are never stored (the loads and barriers
-                # stay warp-wide)
+                # a dead row's accumulators (past the group's end) are replaced by a benign constant right after the TMEM
+                # load (a choice, no arithmetic): its lanes would otherwise run the division's slow path on the padded rows'
+                # zero or garbage operands, and its values are never stored, so the chain runs unconditionally on every lane
+                # (a per-lane region instead costs the compiler the interleaving of the chains)
                 live = {
                     m: (crd0[0] - Int32(offs[0][0]) + Int32(m)) < rows_left
                     for m in rows_in_frag
                 }
+                for v in cutlass.range_constexpr(nv):
+                    tTR_rAcc[v] = select_f32(
+                        live[offs[v][0]], tTR_rAcc[v], Float32(1.0)
+                    )
                 # the chain, in fp32, per element (pair)
                 for v in cutlass.range_constexpr(nv):
                     if cutlass.const_expr(is_out[v]):
-                        if live[offs[v][0]]:
-                            tTR_rC[v] = _chain_elem(
-                                chain,
-                                tTR_rAcc[v],
-                                tTR_rAcc[partner[v]]
-                                if cutlass.const_expr(pair)
-                                else None,
-                            )
+                        tTR_rC[v] = _chain_elem(
+                            chain,
+                            tTR_rAcc[v],
+                            tTR_rAcc[partner[v]] if cutlass.const_expr(pair) else None,
+                        )
                 if cutlass.const_expr(staged):
                     # registers -> this warpgroup's staging buffer (the TMEM load's thread layout); the rows of a skipped warp
                     # (all past the group's end) stay stale and are predicated off below
