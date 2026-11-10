@@ -21,7 +21,8 @@ part of its identifier). The instruction class of each expert weight is the dens
 weight shape, gated by the architecture family on the Python side): `expertClassesK128` states it as a function of the
 model's dimensions only. The generated `MoENvfp4Cases.lean` couples every definition to the Python spec node for node.
 -/
-namespace BIK.MoE
+namespace BIK.MoENvfp4
+open BIK.MoE
 
 /-- W4A4: `s = mul(alpha_e, pts_row)` (the expert's alpha as given times the token's per-token scale). -/
 def w4a4RowScale (alpha pts : MTerm) : MTerm := .mul alpha pts
@@ -90,4 +91,4 @@ theorem grouped_spaces_disjoint (cfg : GEMM.Config) (h : groupedBlockScaledOK cf
   simp [Bool.not_eq_true'] at hswap
   simp [hswap]
 
-end BIK.MoE
+end BIK.MoENvfp4

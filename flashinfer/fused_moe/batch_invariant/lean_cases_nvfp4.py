@@ -30,8 +30,8 @@ from .lean_cases import (
 
 CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "MoENvfp4Cases.lean")
 
-_S1 = '(MoE.w4a4RowScale (.leaf "alpha1" [0]) (.leaf "pts1" []))'
-_S2 = '(MoE.w4a4RowScale (.leaf "alpha2" [0]) (.leaf "pts2" [0]))'
+_S1 = '(MoENvfp4.w4a4RowScale (.leaf "alpha1" [0]) (.leaf "pts1" []))'
+_S2 = '(MoENvfp4.w4a4RowScale (.leaf "alpha2" [0]) (.leaf "pts2" [0]))'
 _G, _U = '(.leaf "g" [0, 0])', '(.leaf "u" [0, 0])'
 
 
@@ -47,7 +47,7 @@ def moe_nvfp4_cases() -> List[Tuple[str, str, str, bool]]:
 
     s0 = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg)
     chain("row_scale", s0.row_scale(1), _S1)
-    chain("gemm2", s0.gemm2(), f'MoE.scaledOutT (.leaf "acc2" [0, 0]) {_S2}')
+    chain("gemm2", s0.gemm2(), f'MoENvfp4.scaledOutT (.leaf "acc2" [0, 0]) {_S2}')
     # the gated GEMM1 chains of every activation and parameter set
     for name, act, params in GLU_CASES:
         s_ = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg, act=act, params=params)
@@ -55,12 +55,33 @@ def moe_nvfp4_cases() -> List[Tuple[str, str, str, bool]]:
         chain(
             f"gemm1_{name}",
             s_.gemm1(),
-            f"MoE.gluScaledT {lean_gact(act, params)} {_G} {_U} {_S1}",
+            f"MoENvfp4.gluScaledT {lean_gact(act, params)} {_G} {_U} {_S1}",
         )
     # the ungated GEMM1 chains
     for name, act in (("act_relu2", "relu2"),) + tuple(ACT_CASES):
         s_ = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg, act=act, gated=False)
-        chain(f"gemm1_{name}", s_.gemm1(), f"MoE.actScaledT {_UACT[act]} {_U} {_S1}")
+        chain(f"gemm1_{name}", s_.gemm1(), f"MoENvfp4.actScaledT {_UACT[act]} {_U} {_S1}")
+    # the static class (`moe.nvfp4.<act>.static`): GEMM1's block scale and first / last code on the fp32 gated values of columns
+    # 0..15 with the expert's static scale `gs2`, for every gated and ungated chain, and GEMM2 with `inv2 = div(1, gs2)`
+    gs2 = '(.leaf "gs2" [0])'
+    for name, act, params in GLU_CASES:
+        s_ = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg, act=act, params=params, intermediate="static")
+        blk = s_.gemm1_block(0, 0)
+        vals = ", ".join(
+            f'MoENvfp4.gluScaledPreT {lean_gact(act, params)} (.leaf "g" [0, {j}]) (.leaf "u" [0, {j}]) {_S1}'
+            for j in range(16)
+        )
+        chain(f"static_sf_{name}", blk["sf"], f"MoENvfp4.staticBlockSfT [{vals}] {gs2}")
+        chain(f"static_code0_{name}", blk["codes"][0], f"MoENvfp4.staticBlockCodeT [{vals}] {gs2} 0")
+        chain(f"static_code15_{name}", blk["codes"][15], f"MoENvfp4.staticBlockCodeT [{vals}] {gs2} 15")
+    for name, act in (("act_relu2", "relu2"),) + tuple(ACT_CASES):
+        s_ = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg, act=act, gated=False, intermediate="static")
+        blk = s_.gemm1_block(0, 0)
+        vals = ", ".join(f'MoENvfp4.actScaledPreT {_UACT[act]} (.leaf "u" [0, {j}]) {_S1}' for j in range(16))
+        chain(f"static_sf_{name}", blk["sf"], f"MoENvfp4.staticBlockSfT [{vals}] {gs2}")
+        chain(f"static_code0_{name}", blk["codes"][0], f"MoENvfp4.staticBlockCodeT [{vals}] {gs2} 0")
+    s_st = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg, intermediate="static")
+    chain("static_gemm2", s_st.gemm2(), 'MoENvfp4.staticGemm2T (.leaf "acc2" [0, 0]) (.leaf "alpha2" [0]) (.leaf "gs2" [0])')
     return out
 
 
