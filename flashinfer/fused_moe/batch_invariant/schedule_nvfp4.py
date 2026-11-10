@@ -48,7 +48,6 @@ from .schedule import (  # noqa: F401  (re-exported)
 
 #: Epilogue warpgroups of the grouped block-scaled body (:data:`.blocks.kernel_nvfp4.EPI_WARPGROUPS_NVFP4`): the exposed
 #: epilogue term splits a tile's chains between them.
-_EPI_WARPGROUPS_NVFP4 = 4
 
 GROUP_ALIGN = (
     128  # the padded group alignment the dispatcher ranks at (one scale-factor atom)
@@ -206,30 +205,23 @@ def rank_grouped_nvfp4(
     grouped records the grouped body accepts for the weight shape, the chain and the instruction class (at a decode-sized ``rows``
     the dense dispatcher's structural guard, `heuristic.decode_sane`, selects the candidates; a record whose M tile is taller than
     the group's padded rows is excluded: the group scheduler's tiles never span groups) and the swapped records the swapped body
-    accepts (``swap``: None ranks them with the rest, True keeps only them, False excludes them), ordered by the dense class's
-    estimate at ``(M = rows, N = n_active * N, K)`` at the instruction class times the pair term and the swapped records' spill
-    factor, plus the last tile's exposed epilogue chain (this class's chain term over four epilogue warpgroups), the token
-    box's zero-fill at the packed fp4 width (a swapped record's at its exposed share) and the body's fixed cost per wave
-    (`schedule.fixed_cycles`, off until the part is measured), rounded to three significant digits; the grouped scheduler's structural raster first
-    among twins, ties in the spaces' enumeration order (the grouped records before the swapped ones, the narrower token tile
-    first). Each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the list: distinct
-    records, at most ``k``, never empty for an implementable shape."""
+    accepts (``swap``: None ranks them with the rest, True keeps only them, False excludes them), ordered by the shared contract's
+    cost (:func:`.schedule.record_cost` at this class's instruction class, with this class's chain term in nodes: the dense estimate
+    under the ranking's overrides times the pair and token-tile terms, the exposed epilogue chain, the token box's exposed zero fill
+    at the packed fp4 width and the body's per-launch fixed cost), rounded to three significant digits; the grouped scheduler's
+    structural raster first among twins, ties in the spaces' enumeration order (the grouped records before the swapped ones, the
+    narrower token tile first). Each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the
+    list: distinct records, at most ``k``, never empty for an implementable shape."""
     import dataclasses
 
-    from ...gemm.batch_invariant.heuristic import (
-        PART_TABLE,
-        decode_sane,
-        estimate_cycles,
-    )
+    from ...gemm.batch_invariant.heuristic import decode_sane
     from .blocks.compile_nvfp4 import (
         can_implement_grouped_nvfp4,
         can_implement_swapped_nvfp4,
     )
-    from .schedule import fixed_cycles
+    from .schedule import record_cost
 
     fam = family or "sm_107"
-    sms = sm_count or PART_TABLE.get(fam, PART_TABLE["sm_107"]).sm_count
-    dense_n = (n_active or E) * N
     m_fit = padded_rows(rows)
     dense = (
         []
@@ -255,15 +247,19 @@ def rank_grouped_nvfp4(
     nodes = chain_nodes_nvfp4(chain)
 
     def key(i, c):
-        canon = dataclasses.replace(c, raster_along="m")
-        est = estimate_cycles(
-            canon, rows, dense_n, K, 1, "k", in_fmt, fam, sm_count, nominal=nominal
-        )
-        est = (
-            est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles_nvfp4(c, rows, nodes)
-            + zero_fill_cycles(c, rows, K, fam, in_fmt)
-            + fixed_cycles(c, rows, n_active or E, N, fam, sms)
+        # the shared contract's cost (`schedule.record_cost`) at this class's instruction class and chain term
+        est = record_cost(
+            c,
+            rows,
+            n_active or E,
+            N,
+            K,
+            nodes,
+            chain.pair,
+            fam,
+            sm_count,
+            in_fmt,
+            nominal,
         )
         return (
             float(f"{est:.3g}"),
@@ -292,18 +288,6 @@ def rank_grouped_nvfp4(
             out.append(rec)
             seen.add(rec)
     return out[:k]
-
-
-def exposed_epilogue_cycles_nvfp4(cfg: Knobs, rows: int, nodes: int) -> float:
-    """The bf16 dispatcher's exposed-epilogue term with this body's epilogue warpgroups: the grouped body splits a tile's columns
-    between four warpgroups, the swapped body computes the live token columns of a weight row per thread."""
-    from .schedule import CHAIN_NODE_CYCLES
-
-    if cfg.swap_ab:
-        chains = min(rows, cfg.tile_n)
-    else:
-        chains = cfg.tile_n / _EPI_WARPGROUPS_NVFP4
-    return chains * nodes * CHAIN_NODE_CYCLES
 
 
 def default_configs_nvfp4(
