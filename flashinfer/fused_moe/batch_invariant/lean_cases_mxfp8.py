@@ -34,6 +34,13 @@ def space():
     return ks
 
 
+def swapped_space():
+    """The swapped record space (the swapped decode body's three token tiles), in enumeration order."""
+    from .schedule_mxfp8 import swapped_knobs_mx
+
+    return swapped_knobs_mx()
+
+
 def cases() -> List[Tuple[str, str, str]]:
     """``(name, python_sexpr, lean_term)``: the class's chain terms and the Lean expressions that must print identically."""
     alg = term.TermAlgebra()
@@ -120,12 +127,41 @@ def render() -> str:
         "(a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), GEMM.tileResultMX8 c₁ S₁ p a b kb nblk = GEMM.tileResultMX8 c₂ S₂ q a b kb nblk := "
         "GEMM.space_invariantMX8 moeMxfp8Space"
     )
+    # the swapped record space (the swapped decode body, `blocks/swap_mxfp8.py`): the three token tiles, members of both dense MX
+    # classes' predicates, disjoint from the grouped space; the union is one guarantee space on both classes
+    sw = swapped_space()
+    L.append(
+        "def moeMxfp8SwapSpace : List GEMM.Config := ["
+        + ", ".join(k.lean() for k in sw)
+        + "]"
+    )
+    L.append(
+        f"theorem moe_mxfp8_swap_space_size : moeMxfp8SwapSpace.length = {len(sw)} := by decide"
+    )
+    L.append(
+        "theorem moe_mxfp8_swap_space_ok : moeMxfp8SwapSpace.all MoEMxfp8.groupedSwapOK = true := by decide +kernel"
+    )
+    L.append(
+        "theorem moe_mxfp8_swap_space_not_grouped : moeMxfp8SwapSpace.all (fun c => !MoEMxfp8.groupedOK c) = true := by decide +kernel"
+    )
+    L.append(
+        "theorem moe_mxfp8_both_spaces_invariant_k64 : ∀ c₁ ∈ moeMxfp8Space ++ moeMxfp8SwapSpace, ∀ c₂ ∈ moeMxfp8Space ++ moeMxfp8SwapSpace, "
+        "∀ (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), "
+        "GEMM.tileResultMX8K64 c₁ S₁ p a b kb nblk = GEMM.tileResultMX8K64 c₂ S₂ q a b kb nblk := "
+        "GEMM.space_invariantMX8K64 (moeMxfp8Space ++ moeMxfp8SwapSpace)"
+    )
+    L.append(
+        "theorem moe_mxfp8_both_spaces_invariant_k32 : ∀ c₁ ∈ moeMxfp8Space ++ moeMxfp8SwapSpace, ∀ c₂ ∈ moeMxfp8Space ++ moeMxfp8SwapSpace, "
+        "∀ (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), "
+        "GEMM.tileResultMX8 c₁ S₁ p a b kb nblk = GEMM.tileResultMX8 c₂ S₂ q a b kb nblk := "
+        "GEMM.space_invariantMX8 (moeMxfp8Space ++ moeMxfp8SwapSpace)"
+    )
     L.append("end BIK")
     return "\n".join(L) + "\n"
 
 
 def summary() -> str:
-    return f"moe mxfp8 lean_cases coverage: chains={len(cases())} space={len(space())}"
+    return f"moe mxfp8 lean_cases coverage: chains={len(cases())} space={len(space())} swapped={len(swapped_space())}"
 
 
 def main(out_path: str = CASES_PATH) -> str:

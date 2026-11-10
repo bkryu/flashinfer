@@ -32,6 +32,7 @@ from ...batch_invariant.quantization.layout import sf_numel as _sf_numel
 from ...batch_invariant.quantization.mx_api import mxfp8_quantize_batch_invariant
 from ...batch_invariant.support import compute_capability, unsupported
 from ...gemm.batch_invariant.api import persistent_clusters, sm_count_of
+from .schedule import launch_tile_bound
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.heuristic import family_of
 from ...gemm.batch_invariant.schedule import chunks_for, mx_class_for
@@ -42,6 +43,11 @@ from .spec_mxfp8 import BLOCK, CLASS, MX_CLASSES
 
 #: The padded group alignment (rows): one 128x4 scale-factor atom.
 GROUP_ALIGN = 128
+#: The dense packing's tail rows: the A buffers carry this many rows past the live ones (the scale buffers past the padded
+#: rows) so the last tiles' TMA boxes stay inside the buffers (an out-of-bounds box costs the TMA engine far more than the
+#: rows it zero-fills); never stored. A 256-row cluster tile of the padded body on the dense packing is the largest box.
+DENSE_TAIL = 256
+PACKINGS = ("padded", "dense")
 #: The routed expert bound of the routing kernel (the bf16 classes' bucket); the group tables take ``MAX_E``.
 E_MAX = 1024
 K_MAX = 16
@@ -293,15 +299,29 @@ def grouped_gemm_mxfp8(
     chain: GroupedChain,
     in_fmt: Optional[str] = None,
     out: Optional[torch.Tensor] = None,
+    dense_a: bool = False,
+    sf_rows: Optional[int] = None,
+    k_block: Optional[int] = None,
+    grid: Optional[int] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` with the UE8M0 block scales applied inside the block-scaled step, on the padded
     expert segments ``counts`` (int32 ``[E]``; the rows of group ``e`` start at the exclusive prefix of the counts rounded
     up to 128): ``a [Tk_pad, K]`` e4m3, ``a_sf`` its 128x4 swizzled scales (``sf_numel(Tk_pad, K)`` bytes), ``w [E, N,
-    K]`` e4m3, ``w_sf [E, sf_numel(N, K)]``. ``chain``: a bf16 class chain (no scale); ``in_fmt`` the instruction class
-    (the device's by default); ``out [Tk_pad, Nout]`` of the chain's dtype (rows past a group's real end are never stored)."""
+    K]`` e4m3, ``w_sf [E, sf_numel(N, K)]``. ``chain``: a bf16 class chain (no scale) or the fused requantization chain
+    (``out_fmt == "mxfp8"``: returns ``(codes, sf)``); ``in_fmt`` the instruction class (the device's by default); ``out
+    [Tk_pad, Nout]`` of the chain's dtype (rows past a group's real end are never stored). ``dense_a``: the dense packing --
+    ``a`` the groups' rows back to back (any row count; the rows past the last group never stored), ``a_sf`` the scales at
+    the padded positions (``sf_numel(sf_rows, K)`` bytes, ``sf_rows`` the padded rows incl. the tail; derived from the
+    buffer when not given), the output's rows ``a``'s; the fused requantization's scales land at the padded positions. The
+    record selects the body: a dense record runs the padded body (on either packing), a swapped record (``config.swap_ab``:
+    128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap_mxfp8`) the swapped body on
+    the dense packing (``a`` carries at least the token tile's rows past the live rows: ``DENSE_TAIL``)."""
     from .blocks.compile_mxfp8 import (
         can_implement_grouped_mxfp8,
+        can_implement_swapped_mxfp8,
         get_compiled_grouped_mxfp8,
+        get_compiled_swapped_mxfp8,
+        swap_k_block_arg,
     )
 
     if (
@@ -315,7 +335,7 @@ def grouped_gemm_mxfp8(
     E, N, K2 = w.shape
     if K != K2 or a.stride(1) != 1 or a.stride(0) != K or not w.is_contiguous():
         raise ValueError("grouped_gemm_mxfp8: K-contiguous operands of one K")
-    if Tk % GROUP_ALIGN:
+    if not dense_a and Tk % GROUP_ALIGN:
         raise ValueError(
             "grouped_gemm_mxfp8: the padded rows are a multiple of the 128-row scale-factor atom"
         )
@@ -326,17 +346,79 @@ def grouped_gemm_mxfp8(
     ):
         raise ValueError("grouped_gemm_mxfp8: counts must be a contiguous int32 [E]")
     a_sf, w_sf = _bytes(a_sf, "a_sf").reshape(-1), _bytes(w_sf, "w_sf").reshape(-1)
-    if a_sf.numel() < sf_numel(Tk, K) or w_sf.numel() < E * sf_numel(N, K):
+    if dense_a:
+        if sf_rows is None:
+            sf_rows = (a_sf.numel() // padded_sf_cols(K)) // GROUP_ALIGN * GROUP_ALIGN
+        if sf_rows % GROUP_ALIGN or sf_rows < Tk:
+            raise ValueError(
+                "grouped_gemm_mxfp8: the dense packing's scale rows are whole 128-row atoms covering the rows"
+            )
+    else:
+        if sf_rows is not None and sf_rows != Tk:
+            raise ValueError(
+                "grouped_gemm_mxfp8: the padded packing's scale rows are the operand's rows"
+            )
+        sf_rows = Tk
+    if a_sf.numel() < sf_numel(sf_rows, K) or w_sf.numel() < E * sf_numel(N, K):
         raise ValueError(
             "grouped_gemm_mxfp8: the scale-factor buffers are smaller than the operands' 128x4 layouts"
         )
     in_fmt = in_fmt or mx_class_of(a.device)
     if in_fmt not in MX_CLASSES:
         raise ValueError(f"grouped_gemm_mxfp8: unknown instruction class {in_fmt!r}")
-    if not can_implement_grouped_mxfp8(config, N, K, E, chain, in_fmt):
-        raise ValueError(
-            f"grouped_gemm_mxfp8: record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
+
+    def grid_of():
+        # the persistent grid clipped to the launch's tile bound from the static sizes (``a``'s rows bound the live rows): which
+        # CTA computes a tile, never the bits; ``grid`` overrides
+        if grid is not None:
+            return grid
+        return min(
+            persistent_clusters(a.device, config),
+            launch_tile_bound(config, a.shape[0], E, N),
         )
+
+    if config.swap_ab:
+        if not dense_a:
+            raise ValueError(
+                "grouped_gemm_mxfp8: the swapped decode body reads the dense packing (the scale factors at the padded positions)"
+            )
+        # the stage's K extent: two atoms when they divide K (`swap_k_block`; ``k_block`` overrides), a placement
+        kb = swap_k_block_arg(in_fmt, K, k_block)
+        if not can_implement_swapped_mxfp8(config, N, K, E, chain, in_fmt, kb):
+            raise ValueError(
+                f"grouped_gemm_mxfp8: swapped record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt}, k_block={kb or 'default'})"
+            )
+        kernel = get_compiled_swapped_mxfp8(config, chain, in_fmt, kb)
+
+        def args(*outs):
+            return (
+                a.unsqueeze(-1),
+                a_sf,
+                w.permute(1, 2, 0),
+                w_sf,
+                *outs,
+                counts,
+                grid_of(),
+            )
+
+    else:
+        if not can_implement_grouped_mxfp8(config, N, K, E, chain, in_fmt):
+            raise ValueError(
+                f"grouped_gemm_mxfp8: record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
+            )
+        kernel = get_compiled_grouped_mxfp8(config, chain, in_fmt, dense_a)
+
+        def args(*outs):
+            return (
+                a.unsqueeze(-1),
+                w.permute(1, 2, 0),
+                a_sf,
+                w_sf,
+                *outs,
+                counts,
+                grid_of(),
+            )
+
     n_out = N // 2 if chain.pair else N
     if chain.out_fmt == "mxfp8":
         # the fused requantization: the codes and the 128x4 scale bytes of the bf16-rounded chain, written by the epilogue
@@ -345,19 +427,9 @@ def grouped_gemm_mxfp8(
                 "grouped_gemm_mxfp8: the fused requantization allocates its two outputs"
             )
         codes = torch.empty(Tk, n_out, dtype=torch.uint8, device=a.device)
-        sf = torch.empty(sf_numel(Tk, n_out), dtype=torch.uint8, device=a.device)
-        kernel = get_compiled_grouped_mxfp8(config, chain, in_fmt)
+        sf = torch.empty(sf_numel(sf_rows, n_out), dtype=torch.uint8, device=a.device)
         if Tk:
-            kernel(
-                a.unsqueeze(-1),
-                w.permute(1, 2, 0),
-                a_sf,
-                w_sf,
-                codes,
-                sf,
-                counts,
-                persistent_clusters(a.device, config),
-            )
+            kernel(*args(codes, sf))
         return codes.view(torch.float8_e4m3fn), sf
     out_dtype = _OUT[chain.out_fmt]
     if out is None:
@@ -371,21 +443,12 @@ def grouped_gemm_mxfp8(
         raise ValueError(
             "grouped_gemm_mxfp8: out must be a 16-byte-aligned row-major [Tk_pad, n_out] of the chain's dtype"
         )
-    kernel = get_compiled_grouped_mxfp8(config, chain, in_fmt)
     if Tk:
-        kernel(
-            a.unsqueeze(-1),
-            w.permute(1, 2, 0),
-            a_sf,
-            w_sf,
-            out,
-            counts,
-            persistent_clusters(a.device, config),
-        )
+        kernel(*args(out))
     return out
 
 
-# ----------------------------------------------------------------------------- the padded permutation
+# ----------------------------------------------------------------------------- the permutations
 
 
 def permute_plan_padded(
@@ -424,6 +487,43 @@ def permute_plan_padded(
     return counts, dest.view(T, k), src
 
 
+def permute_plan_dual_padded(
+    experts: torch.Tensor, E: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(counts [E], dest [T, k], src [Tk], dest_pad [T, k], pos_pad [Tk])``: the dense plan (:func:`.api.permute_plan`)
+    plus the positions with the groups padded to 128 rows (``dest_pad[i]``) and the padded position of every dense row
+    (``pos_pad[p]``): the dense packing's row map (the rows dense, the scale factors at the padded positions)."""
+    from .api import PLAN_MULTI_MIN_N
+    from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
+
+    T, k = experts.shape
+    n = T * k
+    dev = experts.device
+    flat = experts.reshape(-1)
+    if not flat.is_contiguous() or flat.dtype != torch.int32:
+        raise TypeError(
+            "permute_plan_dual_padded: experts must be a contiguous int32 [T, k]"
+        )
+    dest = torch.empty(n, dtype=torch.int32, device=dev)
+    src = torch.empty(n, dtype=torch.int32, device=dev)
+    dest_pad = torch.empty(n, dtype=torch.int32, device=dev)
+    pos_pad = torch.empty(n, dtype=torch.int32, device=dev)
+    counts = torch.empty(E, dtype=torch.int32, device=dev)
+    if n == 0:
+        counts.zero_()
+    elif n >= PLAN_MULTI_MIN_N:
+        nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
+        hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
+        get_compiled_plan_multi(1, True, GROUP_ALIGN)(
+            flat, counts, dest, src, dest_pad, pos_pad, hist_blk, n, E, nb
+        )
+    else:
+        get_compiled_plan(1, True, GROUP_ALIGN)(
+            flat, counts, dest, src, dest_pad, pos_pad, n, E
+        )
+    return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
+
+
 # ----------------------------------------------------------------------------- the op
 
 
@@ -438,19 +538,26 @@ def fused_moe_mxfp8(
     in_fmt: Optional[str] = None,
     return_intermediates: bool = False,
     requant: str = "fused",
-    plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    plan: Optional[Tuple[torch.Tensor, ...]] = None,
+    path: Optional[str] = None,
 ) -> Any:
     """The MXFP8 x MXFP8 MoE FFN for pre-routed tokens: ``x`` a bf16 ``[T, H]`` (quantized here per token by the
     ``mxfp8.quant`` class) or the quantized pack ``(xq [T, H] e4m3, xsf [T, H / 32] uint8 / UE8M0)`` taken as given;
     ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` fp32; the output bf16 ``[T, H]``. ``in_fmt``
-    names the instruction class (the device's by default); ``config1`` / ``config2`` the grouped records (any record of
-    the space gives the same bits; the dispatcher's pick by default). ``return_intermediates``: the live buffers
-    (``counts``, ``dest``, ``src``, ``xq``, ``xsf``, ``x_perm`` / ``x_perm_sf``, ``a``, ``aq`` / ``a_sf``, ``y``) and
-    the records used."""
+    names the instruction class (the device's by default); ``config1`` / ``config2`` the records (any record of either
+    space gives the same bits; the dispatcher's picks by default). ``path``: the packing of the expanded rows (a placement:
+    the same bits) -- ``"padded"`` (every group padded to whole 128-row atoms, the GEMMs' A boxes read the atoms) or
+    ``"dense"`` (the rows back to back, the scale factors at the padded positions: the swapped decode body's packing, which
+    the padded body reads too; the fused requantization only); None: the dense packing when either record is a swapped
+    one, else the padded one (`schedule_mxfp8.packing_for`). ``plan``: the padded plan's ``(counts, dest, src)`` or the
+    dual plan's ``(counts, dest, src, dest_pad, pos_pad)`` from ``route_plan`` (the same integers as the plans here, one
+    launch with the routing); its form must match the packing. ``return_intermediates``: the live buffers (``counts``,
+    ``dest``, ``src``, ``xq``, ``xsf``, ``x_perm`` / ``x_perm_sf``, ``a``, ``aq`` / ``a_sf``, ``y``; the dense packing adds
+    ``dest_pad`` / ``pos_pad`` and the row counts ``Tk_a`` / ``Tk_sf``), the records used, the packing and the bodies."""
     from .combine import get_compiled_combine, warps_per_token
     from .mx_permute import get_compiled_scatter_mx
     from .permute import warps_per_row
-    from .schedule_mxfp8 import GEMM2_CHAIN, default_configs_mx
+    from .schedule_mxfp8 import GEMM2_CHAIN, default_configs_mx, packing_for
 
     H, I, E = w.hidden_size, w.intermediate_size, w.num_experts
     if isinstance(x, torch.Tensor):
@@ -516,14 +623,111 @@ def fused_moe_mxfp8(
                 Tk_pad=0,
             )
         return out
+    if requant not in ("fused", "standalone"):
+        raise ValueError(f"requant must be 'fused' or 'standalone', got {requant!r}")
     if config1 is None or config2 is None:
+        # the standalone requantization is a padded-path spelling: its dispatcher ranks the padded records only
         sm_count, family = _part(dev)
-        c1, c2 = default_configs_mx(T, k, H, I, E, w.chain1, in_fmt, sm_count, family)
+        c1, c2 = default_configs_mx(
+            T,
+            k,
+            H,
+            I,
+            E,
+            w.chain1,
+            in_fmt,
+            sm_count,
+            family,
+            swap=None if (requant == "fused" and path != "padded") else False,
+        )
         config1, config2 = config1 or c1, config2 or c2
+    if path is None:
+        path = packing_for(config1, config2)
+    if path not in PACKINGS:
+        raise ValueError(f"fused_moe_mxfp8: unknown packing {path!r}")
+    if path == "padded" and (config1.swap_ab or config2.swap_ab):
+        raise ValueError(
+            "fused_moe_mxfp8: a swapped record reads the dense packing (path='dense')"
+        )
+    if plan is not None and len(plan) != (5 if path == "dense" else 3):
+        raise ValueError(
+            "fused_moe_mxfp8: the plan's form (padded: 3 tensors, dual: 5) must match the packing"
+        )
+    nb, pcols = H // BLOCK, padded_sf_cols(H)
+    if path == "dense":
+        # the dense packing fed by the dense TMA box: the rows back to back, the scale factors at the padded positions; the A
+        # buffers carry DENSE_TAIL rows past the live rows so the last tiles' boxes stay inside them (never stored), the scale
+        # buffers past the padded rows
+        if requant != "fused":
+            raise ValueError(
+                "fused_moe_mxfp8: the dense packing runs the fused requantization"
+            )
+        counts, dest, src, dest_pad, pos_pad = (
+            plan if plan is not None else permute_plan_dual_padded(experts, E)
+        )
+        Tk = T * k
+        Tk_pad = padded_rows_bound(T, k, E)
+        Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
+        x_perm = torch.empty(Tk_a, H, dtype=torch.float8_e4m3fn, device=dev)
+        x_perm_sf = torch.empty(sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
+        get_compiled_scatter_mx(k, warps_per_row(Tk, H // 16, sm_count_of(dev)))(
+            xq.view(torch.uint8),
+            xsf8.reshape(-1),
+            dest.reshape(-1),
+            dest_pad.reshape(-1),
+            x_perm.view(torch.uint8),
+            x_perm_sf,
+            Tk,
+            H,
+            nb,
+            pcols,
+        )
+        aq, a_sf = grouped_gemm_mxfp8(
+            x_perm,
+            x_perm_sf,
+            w.w1,
+            w.w1_sf,
+            counts,
+            config1,
+            w.chain1_quant,
+            in_fmt,
+            dense_a=True,
+            sf_rows=Tk_sf,
+        )
+        y = grouped_gemm_mxfp8(
+            aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt, dense_a=True
+        )  # [Tk_a, H] bf16
+        get_compiled_combine(
+            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev))
+        )(y, dest, scales, out, T, H)
+        if return_intermediates:
+            return out, dict(
+                counts=counts,
+                dest=dest,
+                src=src,
+                dest_pad=dest_pad,
+                pos_pad=pos_pad,
+                xq=xq,
+                xsf=xsf8,
+                x_perm=x_perm,
+                x_perm_sf=x_perm_sf,
+                a=None,
+                aq=aq,
+                a_sf=a_sf,
+                y=y,
+                config1=config1,
+                config2=config2,
+                in_fmt=in_fmt,
+                Tk_pad=Tk_pad,
+                Tk_a=Tk_a,
+                Tk_sf=Tk_sf,
+                path=path,
+                swap=(config1.swap_ab, config2.swap_ab),
+            )
+        return out
     # ``plan``: ``route_plan(..., align=GROUP_ALIGN)``'s outputs (the same integers as the padded plan, one launch with the routing)
     counts, dest, src = plan if plan is not None else permute_plan_padded(experts, E)
     Tk_pad = src.shape[0]
-    nb, pcols = H // BLOCK, padded_sf_cols(H)
     x_perm = torch.empty(Tk_pad, H, dtype=torch.float8_e4m3fn, device=dev)
     x_perm_sf = torch.empty(sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
     # one launch over the live rows: the e4m3 rows and the UE8M0 scales to their padded positions (the scales re-tiled into
@@ -532,6 +736,7 @@ def fused_moe_mxfp8(
         xq.view(torch.uint8),
         xsf8.reshape(-1),
         dest.reshape(-1),
+        dest.reshape(-1),
         x_perm.view(torch.uint8),
         x_perm_sf,
         T * k,
@@ -539,8 +744,6 @@ def fused_moe_mxfp8(
         nb,
         pcols,
     )
-    if requant not in ("fused", "standalone"):
-        raise ValueError(f"requant must be 'fused' or 'standalone', got {requant!r}")
     if requant == "fused":
         # the class's second quantization inside GEMM1's epilogue: no bf16 intermediate
         a = None
@@ -577,6 +780,8 @@ def fused_moe_mxfp8(
             config2=config2,
             in_fmt=in_fmt,
             Tk_pad=Tk_pad,
+            path=path,
+            swap=(False, False),
         )
     return out
 

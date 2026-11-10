@@ -88,4 +88,39 @@ def groupedOK (cfg : GEMM.Config) : Bool :=
   GEMM.ConfigOKMx8 cfg && GEMM.ConfigOKMx8K64 cfg && cfg.swizzle == 1 && cfg.clusterK == 1 && !cfg.swapAb &&
   !cfg.ctaChunks && cfg.tm != 512
 
+/-! ## The swapped records: a second placement space of the grouped MX GEMM
+
+The swapped decode body (`fused_moe/batch_invariant/blocks/swap_mxfp8.py`) computes `Cᵀ` per expert: the expert's weight rows on
+the MMA's M side (128 rows per CTA, one scale-factor atom) and the group's tokens on its N side as a narrow tile of 8 / 16 / 32
+rows read from the dense packing (their scale factors gathered from the padded positions). The block-scaled step is symmetric in
+its operands and folds the same K sequence per output element whichever carries the token, so every output element is the dense
+MX class's fold of the row's data and the expert's column (`grouped_eq_dense_*`), and the dispatcher ranks the swapped records
+with the grouped ones. The fused requantization in the transposed orientation is the quantizer's term on the same bf16-rounded
+value (`requant_input_is_rounded_chain`), its block amax gathered across lanes: the max of non-negative values is exact in every
+association (`MXQuant.lean`), so the bytes are the standalone quantizer's. The predicate mirrors
+`blocks/swap_mxfp8.is_swapped_record`; the space is the three token tiles, a member of both dense MX classes' predicates. -/
+def groupedSwapOK (cfg : GEMM.Config) : Bool :=
+  GEMM.ConfigOKMx8 cfg && GEMM.ConfigOKMx8K64 cfg && cfg.swizzle == 1 && cfg.clusterK == 1 && cfg.swapAb && cfg.tm == 128 &&
+  (cfg.tn == 8 || cfg.tn == 16 || cfg.tn == 32) && cfg.clusterM == 1 && cfg.clusterN == 1 && !cfg.twoCta && !cfg.ctaChunks
+
+/-- A swapped record is a record of both dense MX classes (the swapped grouped kernel is a placement of either). -/
+theorem grouped_swap_in_mx8 (cfg : GEMM.Config) (h : groupedSwapOK cfg = true) : GEMM.ConfigOKMx8 cfg = true := by
+  unfold groupedSwapOK at h
+  simp only [Bool.and_eq_true] at h
+  exact h.1.1.1.1.1.1.1.1.1.1
+
+theorem grouped_swap_in_mx8k64 (cfg : GEMM.Config) (h : groupedSwapOK cfg = true) : GEMM.ConfigOKMx8K64 cfg = true := by
+  unfold groupedSwapOK at h
+  simp only [Bool.and_eq_true] at h
+  exact h.1.1.1.1.1.1.1.1.1.2
+
+/-- The two spaces are disjoint: no record is both (the swapped flag). -/
+theorem grouped_spaces_disjoint (cfg : GEMM.Config) (h : groupedOK cfg = true) : groupedSwapOK cfg = false := by
+  unfold groupedOK at h
+  unfold groupedSwapOK
+  simp only [Bool.and_eq_true] at h
+  obtain ⟨⟨⟨⟨⟨⟨_, _⟩, _⟩, _⟩, hswap⟩, _⟩, _⟩ := h
+  simp [Bool.not_eq_true'] at hswap
+  simp [hswap]
+
 end BIK.MoEMxfp8

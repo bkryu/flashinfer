@@ -18,4 +18,10 @@ theorem moe_mxfp8_space_in_mx8 : moeMxfp8Space.all (fun c => gemmMx8Space.any (f
 theorem moe_mxfp8_space_in_mx8k64 : moeMxfp8Space.all (fun c => gemmMx8K64Space.any (fun s => s == c)) = true := by decide +kernel
 theorem moe_mxfp8_space_invariant_k64 : ∀ c₁ ∈ moeMxfp8Space, ∀ c₂ ∈ moeMxfp8Space, ∀ (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), GEMM.tileResultMX8K64 c₁ S₁ p a b kb nblk = GEMM.tileResultMX8K64 c₂ S₂ q a b kb nblk := GEMM.space_invariantMX8K64 moeMxfp8Space
 theorem moe_mxfp8_space_invariant_k32 : ∀ c₁ ∈ moeMxfp8Space, ∀ c₂ ∈ moeMxfp8Space, ∀ (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), GEMM.tileResultMX8 c₁ S₁ p a b kb nblk = GEMM.tileResultMX8 c₂ S₂ q a b kb nblk := GEMM.space_invariantMX8 moeMxfp8Space
+def moeMxfp8SwapSpace : List GEMM.Config := [⟨128, 8, 1, 1, false, true, 1, false, 1, true⟩, ⟨128, 16, 1, 1, false, true, 1, false, 1, true⟩, ⟨128, 32, 1, 1, false, true, 1, false, 1, true⟩]
+theorem moe_mxfp8_swap_space_size : moeMxfp8SwapSpace.length = 3 := by decide
+theorem moe_mxfp8_swap_space_ok : moeMxfp8SwapSpace.all MoEMxfp8.groupedSwapOK = true := by decide +kernel
+theorem moe_mxfp8_swap_space_not_grouped : moeMxfp8SwapSpace.all (fun c => !MoEMxfp8.groupedOK c) = true := by decide +kernel
+theorem moe_mxfp8_both_spaces_invariant_k64 : ∀ c₁ ∈ moeMxfp8Space ++ moeMxfp8SwapSpace, ∀ c₂ ∈ moeMxfp8Space ++ moeMxfp8SwapSpace, ∀ (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), GEMM.tileResultMX8K64 c₁ S₁ p a b kb nblk = GEMM.tileResultMX8K64 c₂ S₂ q a b kb nblk := GEMM.space_invariantMX8K64 (moeMxfp8Space ++ moeMxfp8SwapSpace)
+theorem moe_mxfp8_both_spaces_invariant_k32 : ∀ c₁ ∈ moeMxfp8Space ++ moeMxfp8SwapSpace, ∀ c₂ ∈ moeMxfp8Space ++ moeMxfp8SwapSpace, ∀ (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), GEMM.tileResultMX8 c₁ S₁ p a b kb nblk = GEMM.tileResultMX8 c₂ S₂ q a b kb nblk := GEMM.space_invariantMX8 (moeMxfp8Space ++ moeMxfp8SwapSpace)
 end BIK
