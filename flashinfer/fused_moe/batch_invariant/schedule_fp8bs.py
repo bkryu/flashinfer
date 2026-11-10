@@ -27,11 +27,14 @@ from .blocks.fp8bs_compile import (
     gemm1_chain,
     swapped_knobs_fp8bs,
 )
+from .spec_fp8bs import BLOCK as QBLOCK
+from .spec_fp8bs import STAGE_K, check_block
 from .schedule import (
     TOP_K,
     active_experts,
     chain_nodes,
     exposed_epilogue_cycles,
+    fixed_cycles,
     pair_term,
     raster_for,
     rows_per_expert,
@@ -66,24 +69,25 @@ def all_valid_configs_fp8bs(
     chain: Fp8BsChain = GEMM2_CHAIN,
     clusters=None,
     interleaved: Optional[bool] = None,
+    block: int = QBLOCK,
 ) -> List[Knobs]:
-    """The configuration space the grouped block-scale guarantee is claimed over, for a weight shape and a chain (the fused
-    requantization's chain admits the tiles whose outputs are whole 128-column blocks)."""
+    """The configuration space the grouped block-scale guarantee is claimed over, for a weight shape, a chain and a block (the
+    fused requantization's chain admits the 128-wide class's tiles whose outputs are whole 128-column blocks)."""
     return [
         k
         for k in grouped_knobs_fp8bs(clusters)
-        if can_implement_grouped_fp8bs(k, N, K, E, chain, interleaved)
+        if can_implement_grouped_fp8bs(k, N, K, E, chain, interleaved, block)
     ]
 
 
 def all_valid_configs_fp8bs_swapped(
-    N: int, K: int, E: int, chain: Fp8BsChain = GEMM2_CHAIN
+    N: int, K: int, E: int, chain: Fp8BsChain = GEMM2_CHAIN, block: int = QBLOCK
 ) -> List[Knobs]:
-    """The swapped decode records the swapped body accepts for a weight shape and a chain (the bf16 / f32 chains)."""
+    """The swapped decode records the swapped body accepts for a weight shape, a chain and a block (the bf16 / f32 chains)."""
     return [
         k
         for k in swapped_knobs_fp8bs()
-        if can_implement_swapped_fp8bs(k, N, K, E, chain)
+        if can_implement_swapped_fp8bs(k, N, K, E, chain, None, block)
     ]
 
 
@@ -109,20 +113,25 @@ def rank_grouped_fp8bs(
     nominal: bool = False,
     n_active: Optional[int] = None,
     swap: Optional[bool] = None,
+    block: int = QBLOCK,
 ) -> List[Knobs]:
     """The ranked records for one block-scale GEMM over both record spaces, as the bf16 backend's ``schedule.rank_grouped``: the
     grouped records the padded body accepts (at a decode-sized ``rows`` the dense dispatcher's structural guard and its few-token
     N-cluster rule select the candidates) and the swapped decode records the swapped body accepts (``swap``: None ranks them with
     the rest, True keeps only them, False excludes them), ordered by the dense block-scale class's estimate at ``(M = rows, N =
     n_active * N, K)`` (a swapped record priced in the swapped orientation) times the pair term and the swapped records' spill
-    factor (`tiles_term`), plus the last tile's exposed epilogue chain (`exposed_epilogue_cycles` on the chain's term) and the token
-    box's zero-fill (`zero_fill_cycles` at the e4m3 element width), to three significant digits; each tile family priced once at the
+    factor (`tiles_term`), plus the last tile's exposed epilogue chain (`exposed_epilogue_cycles` on the chain's term), the token
+    box's zero-fill (`zero_fill_cycles` at the e4m3 element width; a swapped record's box at the shared contract's exposed share) and
+    the per-body fixed cost per wave (`fixed_cycles`, the shared body table), to three significant digits; each tile family priced once at the
     enumeration's raster and the grouped scheduler's structural raster first among its twins; each of the best ceil(k/2) records
     followed by its raster twin, then the rank order fills the list: distinct records, at most ``k``, never empty for an
-    implementable shape. Numerics-neutral: every record of either space computes the class."""
+    implementable shape. Numerics-neutral: every record of either space computes the class. ``block``: the class -- the
+    estimate's promotion term is charged per instruction step at the 32-wide class (four promotions per smem stage), and the
+    swapped body's single promotion warpgroup at half the padded body's rate, through the dense model's constants."""
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import (
+        CONSTANTS,
         PART_TABLE,
         TOKEN_BOX_ROWS,
         capacity_for,
@@ -130,7 +139,9 @@ def rank_grouped_fp8bs(
         estimate_cycles,
     )
 
+    check_block(block)
     fam = family or "sm_107"
+    sms = sm_count or PART_TABLE.get(fam, PART_TABLE["sm_107"]).sm_count
     dense_n = (n_active or E) * N
     dense = (
         []
@@ -138,7 +149,7 @@ def rank_grouped_fp8bs(
         else [
             c
             for c in grouped_knobs_fp8bs()
-            if can_implement_grouped_fp8bs(c, N, K, E, chain)
+            if can_implement_grouped_fp8bs(c, N, K, E, chain, None, block)
         ]
     )
     swapped = (
@@ -147,9 +158,25 @@ def rank_grouped_fp8bs(
         else [
             c
             for c in swapped_knobs_fp8bs()
-            if can_implement_swapped_fp8bs(c, N, K, E, chain)
+            if can_implement_swapped_fp8bs(c, N, K, E, chain, None, block)
         ]
     )
+    # the promotion term per record family: blocks per smem stage (the 32-wide class promotes every step) and the swapped
+    # body's one promotion warpgroup (half the padded body's two)
+    spb = STAGE_K // block
+
+    def constants(c: Knobs):
+        groups = 1.0 if c.swap_ab else 2.0
+        return dict(
+            CONSTANTS,
+            promote_handoff_clk=CONSTANTS["promote_handoff_clk"] * spb,
+            promote_pair_clk=CONSTANTS["promote_pair_clk"] * spb,
+            promote_bytes_per_clk=CONSTANTS["promote_bytes_per_clk"]
+            * groups
+            / 2.0
+            / spb,
+        )
+
     space = dense + swapped
     if not space:
         return []
@@ -173,12 +200,23 @@ def rank_grouped_fp8bs(
     def key(i, c):
         canon = dataclasses.replace(c, raster_along="m")
         est = estimate_cycles(
-            canon, rows, dense_n, K, 1, "k", IN_FMT, fam, sm_count, nominal=nominal
+            canon,
+            rows,
+            dense_n,
+            K,
+            1,
+            "k",
+            IN_FMT,
+            fam,
+            sm_count,
+            c=constants(c),
+            nominal=nominal,
         )
         est = (
             est * pair_term(c, rows) * tiles_term(c, rows)
             + exposed_epilogue_cycles(c, rows, nodes)
             + zero_fill_cycles(c, rows, K, fam, IN_FMT)
+            + fixed_cycles(c, rows, n_active or E, N, fam, sms)
         )
         return (
             float(f"{est:.3g}"),
@@ -229,10 +267,12 @@ def default_configs_fp8bs(
     fused: bool = False,
     nominal: bool = False,
     swap: Optional[bool] = None,
+    block: int = QBLOCK,
 ) -> Tuple[Knobs, Knobs]:
-    """``(config for GEMM1 (N = 2I, K = H; N = I ungated), config for GEMM2 (N = H, K = I))`` of the block-scale class: the first
-    record of each ranked list over the grouped and the swapped records (``swap`` None / True / False ranks / keeps / excludes the
-    swapped records); ``fused`` ranks GEMM1 over the fused requantization's records (which the swapped body does not serve)."""
+    """``(config for GEMM1 (N = 2I, K = H; N = I ungated), config for GEMM2 (N = H, K = I))`` of a block-scale class (``block``
+    128 / 32): the first record of each ranked list over the grouped and the swapped records (``swap`` None / True / False ranks /
+    keeps / excludes the swapped records); ``fused`` ranks GEMM1 over the fused requantization's records (which the swapped
+    body does not serve and the 32-wide class does not take)."""
     rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
     n1 = 2 * I if gated else I
     c1 = rank_grouped_fp8bs(
@@ -247,13 +287,14 @@ def default_configs_fp8bs(
         nominal,
         n_act,
         swap,
+        block,
     )
     c2 = rank_grouped_fp8bs(
-        rows, H, I, E, GEMM2_CHAIN, sm_count, family, 1, nominal, n_act, swap
+        rows, H, I, E, GEMM2_CHAIN, sm_count, family, 1, nominal, n_act, swap, block
     )
     if not c1 or not c2:
         raise ValueError(
-            f"no grouped block-scale record implements (H={H}, I={I}, E={E}, gated={gated}, fused={fused})"
+            f"no grouped block-scale record implements (H={H}, I={I}, E={E}, gated={gated}, fused={fused}, block={block})"
         )
     return c1[0], c2[0]
 

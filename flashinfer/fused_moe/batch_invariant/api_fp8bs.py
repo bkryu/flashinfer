@@ -29,15 +29,25 @@ import torch
 from ...batch_invariant.fp_interface import exact as fp32
 from ...batch_invariant.support import unsupported
 from ...gemm.batch_invariant.api import persistent_clusters, sm_count_of
+from .schedule import launch_tile_bound
 from ...gemm.batch_invariant.generator import Knobs
-from ...gemm.batch_invariant.spec import BLOCK_K, SCALE_BLOCK_N
+from ...gemm.batch_invariant.spec import BLOCK_K
 from . import spec as S
 from .api import interleave_fc1, permute_plan
 from .blocks.fp8bs_compile import GEMM2_CHAIN, OUT_FMT_QUANT, Fp8BsChain, gemm1_chain
 from .blocks.scheduler import MAX_E
 from .reference import TorchF32
 from .spec_fp8bs import BLOCK as QBLOCK
-from .spec_fp8bs import CLASS, E4M3_MAX, block_chain, quant_pre
+from .spec_fp8bs import (
+    BLOCKS,
+    CLASS,
+    CLASS_OF,
+    E4M3_MAX,
+    IN_FMT_OF,
+    block_chain,
+    check_block,
+    quant_pre,
+)
 
 ALIGN_E4M3 = 16  # e4m3 elements per 16-byte row: the TMA alignment of every operand
 TAIL_ROWS = 256  # rows past the live rows of every packed buffer: the largest cluster tile's TMA box stays in bounds
@@ -51,10 +61,14 @@ K_MAX = 16
 
 
 # ----------------------------------------------------------------------------- the quantizer
-def quant_warps_per_row(M: int, K: int, sms: Optional[int] = None) -> int:
-    """The quantizer's placement at (rows, K): warps per row, a power of two of at most 8 and at most the row's block pairs,
-    doubled while the launch holds fewer than ``ROW_WARPS_PER_SM_SMALL`` warps per SM (a placement: the block trees never move)."""
-    pairs = max(1, (K // QBLOCK + 1) // 2)
+def quant_warps_per_row(
+    M: int, K: int, sms: Optional[int] = None, block: int = QBLOCK
+) -> int:
+    """The quantizer's placement at (rows, K): warps per row, a power of two of at most 8 and at most the row's block groups (the
+    blocks of one warp pass: two at 128, eight at 32), doubled while the launch holds fewer than ``ROW_WARPS_PER_SM_SMALL`` warps
+    per SM (a placement: the block trees never move)."""
+    bpp = 32 // (check_block(block) // 8)
+    pairs = max(1, (K // block + bpp - 1) // bpp)
     cap = 1
     while cap * 2 <= min(8, pairs):
         cap *= 2
@@ -72,12 +86,14 @@ def fp8_block_quantize(
     wpr: Optional[int] = None,
     enable_pdl: bool = True,
     trigger: str = "none",
+    block: int = QBLOCK,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(q [M, K] float8_e4m3fn, s fp32)`` of ``x [M, K]`` (bf16 / f16, 16-byte-aligned rows, ``K`` a whole number of 128-element
-    blocks): per block ``s = fmaxc(div(amax |x|, 448), 1e-12)``, ``q = cvt.rn.satfinite.e4m3(mul(x, div(1, s)))``. ``s`` is
-    ``[K / 128, M]`` (``"MN"``, FlashInfer's DeepSeek activation layout) or ``[M, K / 128]`` (``"K"``). ``out = (q, s)`` writes
-    into the caller's tensors (``s`` in the requested layout, any strides). Bitwise identical for every ``wpr``
-    (:func:`quant_warps_per_row`), every batch composition and across runs."""
+    """``(q [M, K] float8_e4m3fn, s fp32)`` of ``x [M, K]`` (bf16 / f16, 16-byte-aligned rows, ``K`` a whole number of
+    ``block``-element blocks; ``block`` 128, or 32 for the ``moe.e4m3bs32`` classes): per block ``s = fmaxc(div(amax |x|, 448),
+    1e-12)``, ``q = cvt.rn.satfinite.e4m3(mul(x, div(1, s)))``. ``s`` is ``[K / block, M]`` (``"MN"``, FlashInfer's DeepSeek
+    activation layout) or ``[M, K / block]`` (``"K"``). ``out = (q, s)`` writes into the caller's tensors (``s`` in the requested
+    layout, any strides). Bitwise identical for every ``wpr`` (:func:`quant_warps_per_row`), every batch composition and across
+    runs."""
     from .blocks.fp8bs_compile import get_compiled_fp8bs_quant
 
     if x.dim() != 2 or x.dtype not in _DTYPE_STR:
@@ -86,10 +102,14 @@ def fp8_block_quantize(
             f"input {tuple(x.shape)} of {x.dtype}",
             "a 2-D bf16 / f16 tensor",
         )
-    M, K = x.shape
-    if K <= 0 or K % QBLOCK:
+    if block not in BLOCKS:
         raise unsupported(
-            "fp8bs.quant", f"K = {K}", f"a whole number of {QBLOCK}-element blocks"
+            "fp8bs.quant", f"deepseek_fp8_block_size {block}", f"one of {BLOCKS}"
+        )
+    M, K = x.shape
+    if K <= 0 or K % block:
+        raise unsupported(
+            "fp8bs.quant", f"K = {K}", f"a whole number of {block}-element blocks"
         )
     if x.stride(1) != 1 or x.stride(0) % 8 or x.data_ptr() % 16:
         raise unsupported(
@@ -101,7 +121,7 @@ def fp8_block_quantize(
         raise unsupported(
             "fp8bs.quant", f"scale_layout {scale_layout!r}", '"MN" or "K"'
         )
-    KB = K // QBLOCK
+    KB = K // block
     want = (KB, M) if scale_layout == "MN" else (M, KB)
     if out is None:
         q = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
@@ -126,8 +146,12 @@ def fp8_block_quantize(
     s_view = (
         s.t() if scale_layout == "MN" else s
     )  # the kernel addresses (M, KB) through the tensor's strides
-    w = wpr if wpr is not None else quant_warps_per_row(M, K, sm_count_of(x.device))
-    get_compiled_fp8bs_quant(_DTYPE_STR[x.dtype], w, trigger, enable_pdl)(
+    w = (
+        wpr
+        if wpr is not None
+        else quant_warps_per_row(M, K, sm_count_of(x.device), block)
+    )
+    get_compiled_fp8bs_quant(_DTYPE_STR[x.dtype], w, trigger, enable_pdl, block)(
         x, q.view(torch.uint8), s_view, M, K
     )
     return q, s
@@ -145,23 +169,26 @@ def _on_device(dev: torch.device):
     return OnDevice
 
 
-def quantize_weight_blocks(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The class per 128x128 block of ``w [N, K]`` (bf16): ``(q [N, K] float8_e4m3fn, s [N / 128, K / 128] fp32)`` as torch ops
-    on the device, each a single IEEE rounding (``amax`` exact, ``div`` / ``mul`` correctly rounded, the saturating RNE
-    conversion of the exact model); the rounded values are e4m3 values, so the final cast is exact. The same chain as the
+def quantize_weight_blocks(
+    w: torch.Tensor, block: int = QBLOCK
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The class per ``block x block`` block of ``w [N, K]`` (bf16): ``(q [N, K] float8_e4m3fn, s [N / block, K / block] fp32)``
+    as torch ops on the device, each a single IEEE rounding (``amax`` exact, ``div`` / ``mul`` correctly rounded, the saturating
+    RNE conversion of the exact model); the rounded values are e4m3 values, so the final cast is exact. The same chain as the
     activations' blocks."""
     if w.dim() != 2 or w.dtype != torch.bfloat16:
         raise unsupported(
             "fp8bs.quant", f"weight {tuple(w.shape)} of {w.dtype}", "a 2-D bf16 weight"
         )
+    check_block(block)
     N, K = w.shape
-    if N % QBLOCK or K % QBLOCK or N == 0 or K == 0:
+    if N % block or K % block or N == 0 or K == 0:
         raise unsupported(
-            "fp8bs.quant", f"weight ({N}, {K})", f"whole {QBLOCK}x{QBLOCK} blocks"
+            "fp8bs.quant", f"weight ({N}, {K})", f"whole {block}x{block} blocks"
         )
     blocks = (
         w.to(torch.float32)
-        .view(N // QBLOCK, QBLOCK, K // QBLOCK, QBLOCK)
+        .view(N // block, block, K // block, block)
         .permute(0, 2, 1, 3)
     )
     amax = blocks.abs().amax(dim=(-1, -2), keepdim=True)
@@ -174,31 +201,38 @@ def quantize_weight_blocks(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
 
 
 # ----------------------------------------------------------------------------- the weights
-def check_shape_fp8bs(H: int, I: int, E: int, k: Optional[int] = None) -> None:
-    """The class's shape rule: ``H`` and ``I`` positive multiples of 128 (whole 128-element scale blocks of the quantized
+def check_shape_fp8bs(
+    H: int, I: int, E: int, k: Optional[int] = None, block: int = QBLOCK
+) -> None:
+    """The classes' shape rule: ``H`` and ``I`` positive multiples of 128 (whole 128-element scale blocks of the quantized
     activations (K = H), of the quantized intermediate (K = I) and whole 128-row scale blocks of both expert weights, the
-    gated weight's up and gate halves each; the 16-byte e4m3 rows and the gate / up pairing are implied), ``1 <= E <= MAX_E``
-    (the group tables), ``1 <= k <= min(E, 16)``. Everything else about a shape is placement; the class has no split variant."""
-    if H <= 0 or I <= 0 or H % QBLOCK or I % QBLOCK:
+    gated weight's up and gate halves each; the 16-byte e4m3 rows and the gate / up pairing are implied; the 32-wide class
+    keeps the rule: its smem stage is four blocks), ``1 <= E <= MAX_E`` (the group tables), ``1 <= k <= min(E, 16)``.
+    Everything else about a shape is placement; the classes have no split variant."""
+    if block not in BLOCKS:
+        raise unsupported(CLASS, f"deepseek_fp8_block_size {block}", f"one of {BLOCKS}")
+    name = CLASS_OF[block]
+    if H <= 0 or I <= 0 or H % BLOCK_K or I % BLOCK_K:
         raise unsupported(
-            CLASS,
+            name,
             f"hidden size {H}, intermediate size {I}",
-            f"positive multiples of {QBLOCK} (whole scale blocks of every operand)",
+            f"positive multiples of {BLOCK_K} (whole smem stages of scale blocks of every operand)",
         )
     if not 1 <= E <= MAX_E:
-        raise unsupported(CLASS, f"num_experts {E}", f"1 <= num_experts <= {MAX_E}")
+        raise unsupported(name, f"num_experts {E}", f"1 <= num_experts <= {MAX_E}")
     if k is not None and not 1 <= k <= min(E, K_MAX):
         raise unsupported(
-            CLASS, f"top_k {k}", f"1 <= top_k <= min(num_experts, {K_MAX})"
+            name, f"top_k {k}", f"1 <= top_k <= min(num_experts, {K_MAX})"
         )
 
 
 @dataclass
 class MoEWeightsE4M3BS:
     """The block-scale experts as the kernels consume them: ``w1 [E, N1, H]`` e4m3 (``N1 = 2I`` gate / up interleaved in groups of 8
-    rows for the gated chains, ``I`` as given for the ungated ones), ``w1_sf [E, N1 / 128, H / 128]`` fp32 -- the scales of the
-    ORIGINAL rows' 128x128 blocks (the interleave permutes the quantized rows only; the kernel reads an interleaved column's
-    scale from its original block), ``w2 [E, H, I]`` e4m3, ``w2_sf [E, H / 128, I / 128]``; ``act`` / ``params`` name the GEMM1 chain."""
+    rows for the gated chains, ``I`` as given for the ungated ones), ``w1_sf [E, N1 / block, H / block]`` fp32 -- the scales of the
+    ORIGINAL rows' square blocks (the interleave permutes the quantized rows only; the kernel reads an interleaved column's
+    scale from its original block), ``w2 [E, H, I]`` e4m3, ``w2_sf [E, H / block, I / block]``; ``act`` / ``params`` name the GEMM1
+    chain; ``block`` the class (``deepseek_fp8_block_size``: 128 for ``moe.e4m3bs.<act>``, 32 for ``moe.e4m3bs32.<act>``)."""
 
     w1: torch.Tensor
     w1_sf: torch.Tensor
@@ -207,6 +241,7 @@ class MoEWeightsE4M3BS:
     gated: bool = True
     act: str = "silu"
     params: Tuple[Optional[float], ...] = ()
+    block: int = QBLOCK
 
     @staticmethod
     def prepare(
@@ -218,12 +253,19 @@ class MoEWeightsE4M3BS:
         quantized: Optional[
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = None,
+        block: int = QBLOCK,
     ) -> "MoEWeightsE4M3BS":
         """Quantize bf16 experts (``fc1 [E, 2I, H]`` rows ``[up, gate]``, or ``[E, I, H]`` (``gated=False``), ``fc2 [E, H, I]``) per
-        128x128 block with the ``fp8bs.quant`` chain (:func:`quantize_weight_blocks`, one expert at a time), then interleave the
-        gated weight's quantized rows. ``quantized = (w1_q, w1_sf, w2_q, w2_sf)``: the caller's block quantization of the canonical
-        (non-interleaved) weights, e4m3 ``[E, N1, H]`` with fp32 ``[E, N1 / 128, H / 128]`` scales, taken as given (FlashInfer's
-        DeepSeek weight view: ``gemm1_weights`` / ``gemm1_weights_scale`` / ``gemm2_weights`` / ``gemm2_weights_scale``)."""
+        ``block x block`` block with the ``fp8bs.quant`` chain (:func:`quantize_weight_blocks`, one expert at a time), then
+        interleave the gated weight's quantized rows. ``quantized = (w1_q, w1_sf, w2_q, w2_sf)``: the caller's block quantization
+        of the canonical (non-interleaved) weights, e4m3 ``[E, N1, H]`` with fp32 ``[E, N1 / block, H / block]`` scales, taken as
+        given (FlashInfer's DeepSeek weight view: ``gemm1_weights`` / ``gemm1_weights_scale`` / ``gemm2_weights`` /
+        ``gemm2_weights_scale``; the block read off the scales' shape by :meth:`from_quantized`). ``block``: 128 (the DeepSeek
+        recipe) or 32 (the re-blocked recipe of the ``kblock32`` class)."""
+        if block not in BLOCKS:
+            raise unsupported(
+                CLASS, f"deepseek_fp8_block_size {block}", f"one of {BLOCKS}"
+            )
         act = act if act is not None else ("silu" if gated else "relu2")
         if act not in (S.ACTS if gated else S.UNGATED_ACTS):
             raise ValueError(f"no {'gated' if gated else 'ungated'} chain {act!r}")
@@ -256,20 +298,20 @@ class MoEWeightsE4M3BS:
                 )
             E, N1, H = w1q.shape
         I = N1 // 2 if gated else N1
-        check_shape_fp8bs(H, I, E)
+        check_shape_fp8bs(H, I, E, block=block)
         if quantized is not None:
             if tuple(w2q.shape) != (E, H, I):
                 raise ValueError(
                     f"w2 {tuple(w2q.shape)} does not match w1 {tuple(w1q.shape)} (gated={gated})"
                 )
             if (
-                tuple(w1s.shape) != (E, N1 // QBLOCK, H // QBLOCK)
-                or tuple(w2s.shape) != (E, H // QBLOCK, I // QBLOCK)
+                tuple(w1s.shape) != (E, N1 // block, H // block)
+                or tuple(w2s.shape) != (E, H // block, I // block)
                 or w1s.dtype != torch.float32
                 or w2s.dtype != torch.float32
             ):
                 raise ValueError(
-                    f"{CLASS}: the block scales are fp32 [E, N / 128, K / 128] of each weight"
+                    f"{CLASS_OF[block]}: the block scales are fp32 [E, N / {block}, K / {block}] of each weight"
                 )
             w1q, w1s, w2q, w2s = (
                 w1q.contiguous(),
@@ -284,24 +326,45 @@ class MoEWeightsE4M3BS:
                 )
             w1q = torch.empty(E, N1, H, dtype=torch.float8_e4m3fn, device=fc1.device)
             w1s = torch.empty(
-                E, N1 // QBLOCK, H // QBLOCK, dtype=torch.float32, device=fc1.device
+                E, N1 // block, H // block, dtype=torch.float32, device=fc1.device
             )
             w2q = torch.empty(E, H, I, dtype=torch.float8_e4m3fn, device=fc1.device)
             w2s = torch.empty(
-                E, H // QBLOCK, I // QBLOCK, dtype=torch.float32, device=fc1.device
+                E, H // block, I // block, dtype=torch.float32, device=fc1.device
             )
             for e in range(E):  # one expert at a time: bounded fp32 temporaries
-                w1q[e], w1s[e] = quantize_weight_blocks(fc1[e])
-                w2q[e], w2s[e] = quantize_weight_blocks(fc2[e])
+                w1q[e], w1s[e] = quantize_weight_blocks(fc1[e], block)
+                w2q[e], w2s[e] = quantize_weight_blocks(fc2[e], block)
         if gated:
             w1q = interleave_fc1(
                 w1q
             )  # a row permutation of the quantized rows: no arithmetic
-        return MoEWeightsE4M3BS(w1q.contiguous(), w1s, w2q, w2s, gated, act, key)
+        return MoEWeightsE4M3BS(w1q.contiguous(), w1s, w2q, w2s, gated, act, key, block)
+
+    @staticmethod
+    def block_of(w1q: torch.Tensor, w1_sf: torch.Tensor) -> int:
+        """The scale block size a quantized weight's scales imply (``N / w1_sf.shape[1]``), one of ``BLOCKS``."""
+        if w1_sf.dim() != 3 or w1_sf.shape[1] == 0 or w1q.shape[1] % w1_sf.shape[1]:
+            raise ValueError(
+                f"{CLASS}: weight scales {tuple(w1_sf.shape)} do not tile the weight {tuple(w1q.shape)}"
+            )
+        block = w1q.shape[1] // w1_sf.shape[1]
+        if block not in BLOCKS:
+            raise unsupported(
+                CLASS,
+                f"a scale block of {block} rows",
+                f"one of {BLOCKS} (deepseek_fp8_block_size)",
+            )
+        return block
 
     @property
     def num_experts(self) -> int:
         return self.w1.shape[0]
+
+    @property
+    def in_fmt(self) -> str:
+        """The class's format key: ``"e4m3_bs"`` (128-wide blocks) or ``"e4m3_bs32"``."""
+        return IN_FMT_OF[self.block]
 
     @property
     def hidden_size(self) -> int:
@@ -325,11 +388,18 @@ class MoEWeightsE4M3BS:
             "gated": self.gated,
             "act": self.act,
             "params": self.params,
+            "deepseek_fp8_block_size": self.block,
         }
 
     @staticmethod
     def from_view(view: Dict[str, Any]) -> "MoEWeightsE4M3BS":
         gated = bool(view.get("gated", True))
+        block = int(
+            view.get(
+                "deepseek_fp8_block_size",
+                MoEWeightsE4M3BS.block_of(view["w1"], view["w1_sf"]),
+            )
+        )
         return MoEWeightsE4M3BS(
             view["w1"],
             view["w1_sf"],
@@ -338,11 +408,14 @@ class MoEWeightsE4M3BS:
             gated,
             str(view.get("act", "silu" if gated else "relu2")),
             tuple(view.get("params", ())),
+            block,
         )
 
 
 # ----------------------------------------------------------------------------- the grouped GEMM
-def scale_mn_view(s: torch.Tensor, KB: int, rows: int, name: str) -> torch.Tensor:
+def scale_mn_view(
+    s: torch.Tensor, KB: int, rows: int, name: str, block: int = QBLOCK
+) -> torch.Tensor:
     """A block-scale tensor of ``rows`` rows as the kernel's ``(rows, KB)`` view with its own strides: the MN layout ``[KB, rows]``
     (FlashInfer's DeepSeek activation layout, the layout the block-scale GEMM's row-scale ring reads) or the K layout
     ``[rows, KB]`` (accepted when the shapes tell them apart)."""
@@ -359,7 +432,7 @@ def scale_mn_view(s: torch.Tensor, KB: int, rows: int, name: str) -> torch.Tenso
     raise unsupported(
         CLASS,
         f"{name} of shape {tuple(s.shape)}",
-        f"[{KB}, {rows}] (one fp32 scale per 1x{QBLOCK} block) or [{rows}, {KB}]",
+        f"[{KB}, {rows}] (one fp32 scale per 1x{block} block) or [{rows}, {KB}]",
     )
 
 
@@ -376,11 +449,13 @@ def grouped_gemm_fp8bs(
     interleaved: Optional[bool] = None,
 ):
     """``out[p] = chain( fold_kb fma(mul(sfa[p, kb], w_sf[e(p), blk(n), kb]), P_kb, acc) )`` on the dense expert segments
-    ``counts``: ``a [Tk, K]`` e4m3, ``sfa [K / 128, Tk]`` fp32 (MN; or ``[Tk, K / 128]``), ``w [E, N, K]`` e4m3, ``w_sf [E, N /
-    128, K / 128]`` fp32. ``chain``: the bf16 / f32 chains (one tensor returned) or the fused requantization (``out_fmt =
-    "e4m3bs"``: ``(codes [Tk, Nout] float8_e4m3fn, scales [Nout / 128, Tk] fp32)``). ``interleaved``: the weight's rows are gate /
-    up interleaved (default: the chain's pairing; the f32 oracle output of GEMM1 reads the interleaved weight with the plain
-    chain). The persistent grid is a launch argument."""
+    ``counts``: ``a [Tk, K]`` e4m3, ``sfa [K / block, Tk]`` fp32 (MN; or ``[Tk, K / block]``), ``w [E, N, K]`` e4m3, ``w_sf [E, N /
+    block, K / block]`` fp32 -- the block (128 or 32: the class) is read off the weight scales' shape. ``chain``: the bf16 / f32
+    chains (one tensor returned) or the fused requantization (``out_fmt = "e4m3bs"``, the 128-wide class: ``(codes [Tk, Nout]
+    float8_e4m3fn, scales [Nout / 128, Tk] fp32)``). ``interleaved``: the weight's rows are gate / up interleaved (default: the
+    chain's pairing; the f32 oracle output of GEMM1 reads the interleaved weight with the plain chain). The persistent grid is a
+    launch argument, the device's capacity clipped to the launch's tile bound (`schedule.launch_tile_bound`: which CTA computes a
+    tile, never the bits)."""
     from .blocks.fp8bs_compile import (
         can_implement_grouped_fp8bs,
         can_implement_swapped_fp8bs,
@@ -414,25 +489,27 @@ def grouped_gemm_fp8bs(
         or not counts.is_contiguous()
     ):
         raise ValueError("grouped_gemm_fp8bs: counts must be a contiguous int32 [E]")
-    KB, NB = K // BLOCK_K, N // SCALE_BLOCK_N
+    block = MoEWeightsE4M3BS.block_of(w, w_sf)
+    KB, NB = K // block, N // block
     if (
         tuple(w_sf.shape) != (E, NB, KB)
         or w_sf.dtype != torch.float32
         or not w_sf.is_contiguous()
+        or w_sf.data_ptr() % 16
     ):
         raise ValueError(
-            f"grouped_gemm_fp8bs: w_sf must be a contiguous fp32 {(E, NB, KB)}, got {tuple(w_sf.shape)}"
+            f"grouped_gemm_fp8bs: w_sf must be a contiguous, 16-byte-aligned fp32 {(E, NB, KB)}, got {tuple(w_sf.shape)}"
         )
     accepted = (
-        can_implement_swapped_fp8bs(config, N, K, E, chain, interleaved)
+        can_implement_swapped_fp8bs(config, N, K, E, chain, interleaved, block)
         if config.swap_ab
-        else can_implement_grouped_fp8bs(config, N, K, E, chain, interleaved)
+        else can_implement_grouped_fp8bs(config, N, K, E, chain, interleaved, block)
     )
     if not accepted:
         raise ValueError(
-            f"grouped_gemm_fp8bs: {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, interleaved={interleaved})"
+            f"grouped_gemm_fp8bs: {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, interleaved={interleaved}, block={block})"
         )
-    sfa_v = scale_mn_view(sfa, KB, Tk, "sfa")
+    sfa_v = scale_mn_view(sfa, KB, Tk, "sfa", block)
     n_out = N // 2 if chain.pair else N
     quant = chain.out_fmt == OUT_FMT_QUANT
     if quant:
@@ -477,17 +554,20 @@ def grouped_gemm_fp8bs(
         )  # the scale output is unread: any fp32 (1, 1) tensor
     if Tk and config.swap_ab:
         # the swapped decode body: the same operands, the same bits (no fused requantization output)
-        get_compiled_swapped_fp8bs(config, chain, interleaved)(
+        get_compiled_swapped_fp8bs(config, chain, interleaved, block)(
             a.unsqueeze(-1),
             sfa_v,
             w.permute(1, 2, 0),
             w_sf,
             out_k,
             counts,
-            persistent_clusters(a.device, config),
+            min(
+                persistent_clusters(a.device, config),
+                launch_tile_bound(config, Tk, E, N),
+            ),
         )
     elif Tk:
-        get_compiled_grouped_fp8bs(config, chain, interleaved)(
+        get_compiled_grouped_fp8bs(config, chain, interleaved, block)(
             a.unsqueeze(-1),
             sfa_v,
             w.permute(1, 2, 0),
@@ -495,7 +575,10 @@ def grouped_gemm_fp8bs(
             out_k,
             sfo_k,
             counts,
-            persistent_clusters(a.device, config),
+            min(
+                persistent_clusters(a.device, config),
+                launch_tile_bound(config, Tk, E, N),
+            ),
         )
     return (out, sfo) if quant else out
 
@@ -521,9 +604,9 @@ def fused_moe_fp8bs(
     default); ``fuse_quant``: the intermediate's requantization in GEMM1's epilogue (True) or by the standalone pass (False):
     a placement, the same bytes either way (:func:`.schedule_fp8bs.fused_quant_default` by default). ``plan``:
     ``route_plan``'s ``(counts, dest, src)``."""
-    from .blocks.fp8bs_compile import get_compiled_gather_scales
+    from .blocks.fp8bs_compile import get_compiled_gather_rows_scales
     from .combine import get_compiled_combine, warps_per_token
-    from .permute import get_compiled_gather, warps_per_row
+    from .permute import warps_per_row
     from .schedule_fp8bs import default_configs_fp8bs, fused_quant_default
 
     if (
@@ -555,12 +638,12 @@ def fused_moe_fp8bs(
         raise TypeError("fused_moe_fp8bs: token_final_scales must be a float32 [T, k]")
     experts = token_selected_experts.contiguous()
     scales = token_final_scales.contiguous()
-    E, I = w.num_experts, w.intermediate_size
-    check_shape_fp8bs(H, I, E, k)
+    E, I, block = w.num_experts, w.intermediate_size, w.block
+    check_shape_fp8bs(H, I, E, k, block)
     dev = xq.device
-    KB = H // QBLOCK
+    KB = H // block
     sx_kt = scale_mn_view(
-        sx, KB, T, "hidden_states_scale"
+        sx, KB, T, "hidden_states_scale", block
     ).t()  # as [KB, T] (a view; the gather reads its strides)
     if out is None:
         out = torch.empty(T, H, dtype=torch.bfloat16, device=dev)
@@ -574,14 +657,35 @@ def fused_moe_fp8bs(
             "fused_moe_fp8bs: out must be a row-major, 16-byte-aligned bf16 [T, H]"
         )
     if fuse_quant is None:
-        fuse_quant = fused_quant_default(T, k, E) if config1 is None else False
+        fuse_quant = (
+            fused_quant_default(T, k, E) and block == QBLOCK
+            if config1 is None
+            else False
+        )  # the 32-wide class requantizes by the standalone pass
+    if fuse_quant and block != QBLOCK:
+        raise unsupported(
+            CLASS_OF[block],
+            "the fused requantization",
+            "the standalone requantization pass (the fused spelling is the 128-wide class's)",
+        )
     chain1 = w.chain1(fuse_quant)
     if config1 is None or config2 is None:
         from ...gemm.batch_invariant.api import part_of
 
         sm_count, family = part_of(dev)
         c1, c2 = default_configs_fp8bs(
-            T, k, H, I, E, sm_count, family, w.act, w.gated, w.params, fuse_quant
+            T,
+            k,
+            H,
+            I,
+            E,
+            sm_count,
+            family,
+            w.act,
+            w.gated,
+            w.params,
+            fuse_quant,
+            block=block,
         )
         config1, config2 = config1 or c1, config2 or c2
     counts, dest, src = (
@@ -594,10 +698,19 @@ def fused_moe_fp8bs(
     x_perm = torch.empty(Tk_a, H, dtype=torch.float8_e4m3fn, device=dev)
     sx_perm = torch.empty(KB, Tk_a, dtype=torch.float32, device=dev)
     if Tk:
-        get_compiled_gather(k, "e4m3", warps_per_row(Tk, H // 16, sm_count_of(dev)))(
-            xq, src, x_perm[:Tk], Tk, H
-        )  # the live rows: the kernel's row count is the index tensor's
-        get_compiled_gather_scales(k)(sx_kt, src.reshape(-1), sx_perm, Tk, KB)
+        # the e4m3 rows and their scale columns to the expanded rows in one launch (a copy)
+        get_compiled_gather_rows_scales(
+            k, warps_per_row(Tk, H // 16, sm_count_of(dev))
+        )(
+            xq.view(torch.uint8),
+            src.reshape(-1),
+            x_perm.view(torch.uint8),
+            sx_kt,
+            sx_perm,
+            Tk,
+            H,
+            KB,
+        )
     a = None
     if fuse_quant:
         aq, sa = grouped_gemm_fp8bs(
@@ -608,10 +721,10 @@ def fused_moe_fp8bs(
             x_perm, sx_perm, w.w1, w.w1_sf, counts, config1, chain1
         )  # [Tk_a, I] bf16
         aq = torch.empty(Tk_a, I, dtype=torch.float8_e4m3fn, device=dev)
-        sa = torch.empty(I // QBLOCK, Tk_a, dtype=torch.float32, device=dev)
+        sa = torch.empty(I // block, Tk_a, dtype=torch.float32, device=dev)
         if Tk:
             fp8_block_quantize(
-                a[:Tk], "MN", out=(aq[:Tk], sa[:, :Tk])
+                a[:Tk], "MN", out=(aq[:Tk], sa[:, :Tk]), block=block
             )  # the live rows only
     y = grouped_gemm_fp8bs(
         aq, sa, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN

@@ -251,15 +251,30 @@ def _moe_fp8bs_fingerprint(
     act: object = "swiglu",
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
+    deepseek_fp8_block_size: int = 128,
 ) -> str:
     """The block-scale fp8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8BlockConfig`` under
-    ``QuantConfig(DeepSeekFp8, DeepSeekFp8)``: the dimensions of
-    ``fused_moe`` (``method`` / ``act`` / ``params`` / ``gated`` as there); the block scales, like the operands, are inputs."""
+    ``QuantConfig(DeepSeekFp8, DeepSeekFp8)``: the dimensions of ``fused_moe`` (``method`` / ``act`` / ``params`` / ``gated``
+    as there) and the scale block size (``deepseek_fp8_block_size``: 128 for ``moe.e4m3bs.<act>``, 32 for
+    ``moe.e4m3bs32.<act>``, a dimension of the class); the block scales, like the operands, are inputs."""
     from flashinfer.fused_moe.batch_invariant import spec
-    from flashinfer.fused_moe.batch_invariant.spec_fp8bs import spec_fingerprint_fp8bs
+    from flashinfer.fused_moe.batch_invariant.spec_fp8bs import (
+        check_block,
+        spec_fingerprint_fp8bs,
+    )
 
     rm, name, params, gated = _moe_dims(spec, method, act, params, gated)
-    return spec_fingerprint_fp8bs(H, I, top_k, num_experts, rm, name, params, gated)
+    return spec_fingerprint_fp8bs(
+        H,
+        I,
+        top_k,
+        num_experts,
+        rm,
+        name,
+        params,
+        gated,
+        block=check_block(int(deepseek_fp8_block_size)),
+    )
 
 
 def _moe_mxfp8_fingerprint(
@@ -342,7 +357,7 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.e4m3bs",
         ("H", "I", "top_k", "num_experts"),
         _moe_fp8bs_fingerprint,
-        ("method", "act", "params", "gated"),
+        ("method", "act", "params", "gated", "deepseek_fp8_block_size"),
     ),
     # the unified MoE layer with `BatchInvariantFp8BlockConfig` under `QuantConfig(MXFP8, MXFP8)` (the fp8-block backend
     # groups the fp8 formats with block scales under one key, the pair selecting the classes: this entry and the

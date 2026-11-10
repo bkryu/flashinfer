@@ -28,6 +28,7 @@ from ..spec_fp8bs import (
     block_amax_placement,
     block_chain,
     block_reduction,
+    check_block,
     leaf_value,
     quant_pre,
 )
@@ -41,6 +42,18 @@ SCATTER_THREADS = 256
 SCALE_BLOCKS_PER_THREAD = (
     8  # block columns per thread of the scale gather, their loads issued together
 )
+#: The fused row + scale gather runs the row gather's block (``permute.GatherKernel``: ``WARPS`` warps of ``LANES`` lanes).
+GATHER_WARPS = 4
+GATHER_LANES = 32
+
+
+def lanes_per_block(block: int) -> int:
+    return check_block(block) // V
+
+
+def blocks_per_pass(block: int) -> int:
+    """Blocks one warp pass of the quantizer covers: 2 at the 128-wide class, 8 at the 32-wide one."""
+    return LANES // lanes_per_block(block)
 
 
 class _Loader:
@@ -54,16 +67,29 @@ class _Loader:
 
 
 class BSQuantKernel:
-    """``codes[m, k] = cvt_e4m3(mul(x[m, k], inv(m, k // 128)))``, ``s[m, k // 128]`` for rows of 16-bit values."""
+    """``codes[m, k] = cvt_e4m3(mul(x[m, k], inv(m, k // block)))``, ``s[m, k // block]`` for rows of 16-bit values; ``block``
+    128 (sixteen lanes per block, two blocks per warp pass) or 32 (four lanes per block, eight blocks per pass)."""
 
-    def __init__(self, dtype: cutlass.Numeric, wpr: int, trigger: str = "none"):
+    def __init__(
+        self,
+        dtype: cutlass.Numeric,
+        wpr: int,
+        trigger: str = "none",
+        block: int = BLOCK,
+    ):
         assert dtype.width == 16, dtype
         assert wpr >= 1 and wpr & (wpr - 1) == 0 and wpr <= 8, wpr
         assert trigger in TRIGGERS, trigger
-        self.dtype, self.wpr, self.trigger = dtype, wpr, trigger
-        self.red = block_reduction(leaf_x=None)
-        self.plan = canon.plan(self.red, block_amax_placement(V))
-        assert self.plan.units["lane"] == LANES_PER_BLOCK and self.plan.n_reg == 1
+        self.dtype, self.wpr, self.trigger, self.block = (
+            dtype,
+            wpr,
+            trigger,
+            check_block(block),
+        )
+        self.lpb, self.bpp = lanes_per_block(block), blocks_per_pass(block)
+        self.red = block_reduction(leaf_x=None, block=block)
+        self.plan = canon.plan(self.red, block_amax_placement(V, block))
+        assert self.plan.units["lane"] == self.lpb and self.plan.n_reg == 1
 
     @cute.jit
     def __call__(
@@ -107,15 +133,12 @@ class BSQuantKernel:
         part = g % Int32(wpr)
         valid = row_raw < M
         row = cutlass.min(row_raw, M - Int32(1))
-        half = lane // Int32(
-            LANES_PER_BLOCK
-        )  # which of the pass's two blocks this lane holds
-        sub = lane % Int32(
-            LANES_PER_BLOCK
-        )  # the lane's eight elements inside the block
-        nb = K // Int32(BLOCK)
-        n_pairs = (nb + Int32(1)) // Int32(2)
-        n_mine = (n_pairs - part + Int32(wpr - 1)) // Int32(wpr)
+        lpb, bpp = self.lpb, self.bpp
+        which = lane // Int32(lpb)  # which of the pass's blocks this lane holds
+        sub = lane % Int32(lpb)  # the lane's eight elements inside the block
+        nb = K // Int32(self.block)
+        n_groups = (nb + Int32(bpp - 1)) // Int32(bpp)  # block groups of one pass
+        n_mine = (n_groups - part + Int32(wpr - 1)) // Int32(wpr)
         atom_x = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             mX.element_type,
@@ -132,10 +155,10 @@ class BSQuantKernel:
             cute.recast_ptr(fy_words.iterator, dtype=Uint8), cute.make_layout((V,))
         )
         for jj in cutlass.range(0, n_mine, 1):
-            blk = (jj * Int32(wpr) + part) * Int32(2) + half
+            blk = (jj * Int32(wpr) + part) * Int32(bpp) + which
             live = valid & (blk < nb)
             blk_c = cutlass.min(blk, nb - Int32(1))
-            chunk = blk_c * Int32(LANES_PER_BLOCK) + sub
+            chunk = blk_c * Int32(lpb) + sub
             cute.copy(
                 atom_x, cute.local_tile(row_x, (V,), (chunk,)), frag
             )  # the lane's eight elements (clamped: a dead lane's bytes are never stored)
@@ -207,4 +230,105 @@ class GatherScalesKernel:
             if valid:
                 if kb < KB:
                     mSp[(kb, p)] = vals[j]
+        pdl.trigger_one_wave()
+
+
+class GatherRowsScalesKernel:
+    """``x_perm[p, :] = x[src[p] // k, :]`` (the first ``n_rows_blocks`` blocks: ``wpr`` warps per expanded row, 16-byte vectors,
+    the row gather's body) and ``sf_perm[kb, p] = sf[kb, src[p] // k]`` (the remaining blocks: thread = expanded row,
+    ``SCALE_BLOCKS_PER_THREAD`` block columns per thread, the scale gather's body) in one launch; ``-1`` entries (dropped slots)
+    gather nothing. A placement of the two copies: one launch on the chain instead of two."""
+
+    def __init__(self, k: int, wpr: int = 1):
+        assert wpr >= 1 and wpr & (wpr - 1) == 0, wpr
+        self.k, self.wpr = k, wpr
+
+    @cute.jit
+    def __call__(
+        self,
+        mX: cute.Tensor,
+        mSrc: cute.Tensor,
+        mXp: cute.Tensor,
+        mS: cute.Tensor,
+        mSp: cute.Tensor,
+        Tk: Int32,
+        B: Int32,
+        KB: Int32,
+        stream,
+    ):
+        n_rows_blocks = cute.ceil_div(Tk * Int32(self.wpr), GATHER_WARPS)
+        n_scale_blocks = cute.ceil_div(Tk, GATHER_WARPS * GATHER_LANES) * cute.ceil_div(
+            KB, SCALE_BLOCKS_PER_THREAD
+        )
+        self.kernel(mX, mSrc, mXp, mS, mSp, Tk, B, KB, n_rows_blocks).launch(
+            grid=[n_rows_blocks + n_scale_blocks, 1, 1],
+            block=[GATHER_WARPS * GATHER_LANES, 1, 1],
+            stream=stream,
+            use_pdl=True,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mX: cute.Tensor,
+        mSrc: cute.Tensor,
+        mXp: cute.Tensor,
+        mS: cute.Tensor,
+        mSp: cute.Tensor,
+        Tk: Int32,
+        B: Int32,
+        KB: Int32,
+        n_rows_blocks: Int32,
+    ):
+        wpr = self.wpr
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        lane = cute.arch.lane_idx()
+        cute.arch.griddepcontrol_wait()
+        if bidx < n_rows_blocks:
+            # the rows (``permute.GatherKernel``'s body on the e4m3 bytes)
+            g = bidx * GATHER_WARPS + tidx // GATHER_LANES
+            p_raw = g // Int32(wpr)
+            part = g % Int32(wpr)
+            valid = p_raw < Tk
+            p = cutlass.min(p_raw, Tk - Int32(1))
+            src = mSrc[p]
+            valid = valid & (src >= Int32(0))  # -1: a dropped slot, nothing to gather
+            t = cutlass.max(src, Int32(0)) // Int32(self.k)
+            atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), Uint8, num_bits_per_copy=128
+            )
+            n_vec = B // Int32(16)
+            frag = cute.make_rmem_tensor((16,), Uint8)
+            row_x = mX[(t, None)]
+            row_p = mXp[(p, None)]
+            n_slabs = (n_vec + Int32(GATHER_LANES - 1)) // Int32(GATHER_LANES)
+            n_mine = (n_slabs - part + Int32(wpr - 1)) // Int32(wpr)
+            for jj in cutlass.range(0, n_mine, 1):
+                j = (jj * Int32(wpr) + part) * GATHER_LANES + lane
+                jc = cutlass.min(j, n_vec - Int32(1))
+                cute.copy(atom, cute.local_tile(row_x, (16,), (jc,)), frag)
+                if valid & (j < n_vec):
+                    cute.copy(atom, frag, cute.local_tile(row_p, (16,), (jc,)))
+        else:
+            # the scale columns (``GatherScalesKernel``'s body, its two grid dimensions linearised)
+            b = bidx - n_rows_blocks
+            n_pb = cute.ceil_div(Tk, GATHER_WARPS * GATHER_LANES)
+            bx = b % n_pb
+            by = b // n_pb
+            p_raw = bx * Int32(GATHER_WARPS * GATHER_LANES) + tidx
+            valid = p_raw < Tk
+            p = cutlass.min(p_raw, Tk - Int32(1))
+            src = mSrc[p]
+            valid = valid & (src >= Int32(0))
+            tt = cutlass.max(src, Int32(0)) // Int32(self.k)
+            kb0 = by * SCALE_BLOCKS_PER_THREAD
+            vals = []
+            for j in cutlass.range_constexpr(SCALE_BLOCKS_PER_THREAD):
+                vals.append(mS[(cutlass.min(kb0 + j, KB - Int32(1)), tt)])
+            for j in cutlass.range_constexpr(SCALE_BLOCKS_PER_THREAD):
+                kb = kb0 + j
+                if valid:
+                    if kb < KB:
+                        mSp[(kb, p)] = vals[j]
         pdl.trigger_one_wave()

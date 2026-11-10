@@ -183,6 +183,67 @@ theorem s_bits_equal {α : Type} (P : Prims α) (row : Nat → Term) (b : Nat) (
   obtain ⟨a, a', ha, hk, hs, _⟩ := block_outputs_invariant row b ps cs hp hc
   exact ⟨a, a', ha, hk, eval_equiv P hs⟩
 
+/-! ## The 32-wide instance (`deepseek_fp8_block_size = 32`: the `moe.e4m3bs32` classes' quantizer, `spec_fp8bs` at `block = 32`)
+
+The same chains over a block of 32 leaves: the amax digit is `[5]`, the standalone kernel's placement `[(3, reg), (2, lane)]`
+(eight elements per lane, four lanes per block). A different class on the Python side (its fingerprint names the block); the
+generated `fp8bsq32*` cases couple its terms. -/
+
+def blockLeaf32 (row : Nat → Term) (b : Nat) (bs : List Bool) : Option Term :=
+  some (leaf row (32 * b + bitsToNat (takeN 5 bs)))
+
+def blockAmax32 (row : Nat → Term) (b : Nat) : Option Term := treeC .fmaxc 5 (blockLeaf32 row b)
+
+theorem blockAmax32_some (row : Nat → Term) (b : Nat) : ∃ a, blockAmax32 row b = some a :=
+  treeC_some .fmaxc 5 _ (fun _ => ⟨_, rfl⟩)
+
+theorem elem_lt_32 (bs : List Bool) : bitsToNat (takeN 5 bs) < 32 := by
+  have h1 := Quant.bitsToNat_lt (takeN 5 bs)
+  have h2 := Quant.takeN_length_le 5 bs
+  have h3 : 2 ^ (takeN 5 bs).length ≤ 2 ^ 5 := Nat.pow_le_pow_right (by decide) h2
+  omega
+
+theorem block_amax_invariance32 (row : Nat → Term) (b : Nat) (ps : List (List Factor)) (cs : List (List Bool))
+    (hp : PlacementOK [5] ps) (hc : CoordsOK (flatten ps) cs) :
+    OEquiv (execC .fmaxc (flatten ps) (blockLeaf32 row b) cs) (blockAmax32 row b) := by
+  have h := config_invarianceC .fmaxc [5] ps (blockLeaf32 row b) cs hp hc
+  rw [canonicalDigitsC_eq_treeC] at h
+  exact h
+
+theorem placementElem_ok32 (vb lb : Nat) (h : vb + lb = 5) : PlacementOK [5] (placementElem vb lb) := by
+  unfold placementElem
+  refine ⟨?_, trivial⟩
+  show vb + (lb + 0) = 5
+  omega
+
+def specS32 (row : Nat → Term) (b : Nat) : Option Term := (blockAmax32 row b).map scaleT
+
+def specCode32 (row : Nat → Term) (i : Nat) : Option Term :=
+  (blockAmax32 row (i / 32)).map fun a => quantElemT (row i) (invT (scaleT a))
+
+theorem block_outputs_invariant32 (row : Nat → Term) (b : Nat) (ps : List (List Factor)) (cs : List (List Bool))
+    (hp : PlacementOK [5] ps) (hc : CoordsOK (flatten ps) cs) :
+    ∃ a a', blockAmax32 row b = some a ∧ execC .fmaxc (flatten ps) (blockLeaf32 row b) cs = some a' ∧
+      Equiv (scaleT a') (scaleT a) ∧
+      ∀ e, Equiv (quantElemT (row (32 * b + e)) (invT (scaleT a'))) (quantElemT (row (32 * b + e)) (invT (scaleT a))) := by
+  obtain ⟨a, ha⟩ := blockAmax32_some row b
+  have h := block_amax_invariance32 row b ps cs hp hc
+  rw [ha] at h
+  obtain ⟨a', hk, he⟩ := OEquiv.some_right h
+  exact ⟨a, a', ha, hk, scaleT_equiv he, fun e => code_equiv _ he⟩
+
+theorem block_locality32 (row row' : Nat → Term) (b : Nat) (h : ∀ j, j < 32 → row (32 * b + j) = row' (32 * b + j)) :
+    specS32 row b = specS32 row' b ∧ ∀ j, j < 32 → specCode32 row (32 * b + j) = specCode32 row' (32 * b + j) := by
+  have hl : blockLeaf32 row b = blockLeaf32 row' b := by
+    funext bs
+    simp only [blockLeaf32, leaf]
+    rw [h _ (elem_lt_32 bs)]
+  have ha : blockAmax32 row b = blockAmax32 row' b := by unfold blockAmax32; rw [hl]
+  refine ⟨by unfold specS32; rw [ha], fun j hj => ?_⟩
+  unfold specCode32
+  have hb : (32 * b + j) / 32 = b := by omega
+  rw [hb, ha, h j hj]
+
 /-! ## The launch model: a block's outputs depend on its 128 inputs alone -/
 
 /-- Block `b` of a row reads elements `128 b .. 128 b + 127` only: two rows that agree there give the same scale and codes. -/

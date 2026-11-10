@@ -26,7 +26,7 @@ from ..runners import _validate_logits_inputs, _validate_prerouted_inputs
 from .runner import _TACTIC_FIELDS, MOE_BF16_ARCHS, _configs_from_tactic, _tactic
 from .runner_fp8_block import PAIR_DEEPSEEK_FP8, BatchInvariantFp8BlockRunner
 from .spec_fp8bs import BLOCK as QBLOCK
-from .spec_fp8bs import CLASS
+from .spec_fp8bs import CLASS, CLASS_OF
 
 #: The compute capabilities the classes are stated for (the dense block-scale GEMM class's parts).
 MOE_FP8BS_ARCHS: Tuple[Tuple[int, int], ...] = MOE_BF16_ARCHS
@@ -40,6 +40,13 @@ def _tactic_bs(c1, c2, fused: bool) -> tuple:
     tuple of scalars (the autotuner's cache round-trips every knob the records carry; the swizzle and the grid are the class's
     constants)."""
     return _tactic(c1, c2) + (int(bool(fused)),)
+
+
+def MoEWeightsE4M3BS_block_of(inputs: List[torch.Tensor]) -> int:
+    """The scale block size of the packed inputs' weights (``w1`` and its scales)."""
+    from .api_fp8bs import MoEWeightsE4M3BS
+
+    return MoEWeightsE4M3BS.block_of(inputs[4], inputs[5])
 
 
 def _configs_from_tactic_bs(t: tuple):
@@ -138,7 +145,7 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
             raise unsupported(
                 CLASS,
                 "no hidden_states_scale",
-                f"the fp32 block scales [hidden_size / {QBLOCK}, num_tokens] of the activations",
+                f"the fp32 block scales [hidden_size / {QBLOCK}, num_tokens] of the activations (/ 32 for the 32-wide class)",
             )
         x = x.contiguous()
         T = x.shape[0]
@@ -147,16 +154,22 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
             raise unsupported(
                 CLASS,
                 f"hidden size {x.shape[1]}",
-                f"a multiple of {QBLOCK} (whole scale blocks)",
+                f"a multiple of {QBLOCK} (whole smem stages of scale blocks)",
             )
+        w = MoEWeightsE4M3BS.from_view(weights.get_view(self.backend_key))
+        # the class is the prepared weights' (`deepseek_fp8_block_size`): the activation scales must be of the same block
+        self._block = w.block
         sx = (
             scale_mn_view(
-                act.hidden_states_scale, x.shape[1] // QBLOCK, T, "hidden_states_scale"
+                act.hidden_states_scale,
+                x.shape[1] // w.block,
+                T,
+                "hidden_states_scale",
+                w.block,
             )
             .t()
             .contiguous()
         )
-        w = MoEWeightsE4M3BS.from_view(weights.get_view(self.backend_key))
         if (
             x.shape[1] != w.hidden_size
             or w.num_experts != E
@@ -240,6 +253,7 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
             cfg.experts.intermediate_size,
         )
         H = self._hidden
+        block = getattr(self, "_block", QBLOCK)
         rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
@@ -256,9 +270,19 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
                 family,
                 TOP_K,
                 n_active=n_act,
+                block=block,
             ),
             rank_grouped_fp8bs(
-                rows, H, I, E, GEMM2_CHAIN, sm_count, family, TOP_K, n_active=n_act
+                rows,
+                H,
+                I,
+                E,
+                GEMM2_CHAIN,
+                sm_count,
+                family,
+                TOP_K,
+                n_active=n_act,
+                block=block,
             ),
         )
 
@@ -275,6 +299,7 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         the class)."""
         self._require_built()
         self._hidden = int(inputs[_X].shape[1])
+        self._block = MoEWeightsE4M3BS_block_of(inputs)
         T = int(inputs[_X].shape[0])
         _, _, default_fused = self._default(T)
         out: List[Any] = []
@@ -284,7 +309,9 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         return out
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + ("moe.e4m3bs-v1",)
+        return super()._cache_key_extras() + (
+            CLASS_OF[getattr(self, "_block", QBLOCK)] + "-v1",
+        )
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(
@@ -300,12 +327,15 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         x, sx, ids, wts, w1, w1_sf, w2, w2_sf, out = inputs[:9]
         plan = tuple(inputs[9:12]) if len(inputs) >= 12 else None
         self._hidden = int(x.shape[1])
+        self._block = MoEWeightsE4M3BS.block_of(w1, w1_sf)
         if tactic == -1 or tactic is None:
             c1, c2, fused = self._default(int(x.shape[0]))
         else:
             c1, c2, fused = _configs_from_tactic_bs(tuple(tactic))
         a = self._activation()
-        w = MoEWeightsE4M3BS(w1, w1_sf, w2, w2_sf, a.gated, a.act, a.params)
+        w = MoEWeightsE4M3BS(
+            w1, w1_sf, w2, w2_sf, a.gated, a.act, a.params, self._block
+        )
         fused_moe_fp8bs(
             x,
             sx,

@@ -55,10 +55,36 @@ def test_generated_cases_are_current():
     )
     assert out["code0"].startswith("(cvt e4m3 (mul ")
     names = [n for n, _, _ in LC.moe_cases()]
-    assert names == ["e4m3bs_gemm1_silu", "e4m3bs_gemm1_relu2", "e4m3bs_gemm2"]
+    assert names == [
+        "e4m3bs_gemm1_silu",
+        "e4m3bs_gemm1_relu2",
+        "e4m3bs_gemm2",
+        "e4m3bs32_gemm1_silu",
+        "e4m3bs32_gemm1_relu2",
+        "e4m3bs32_gemm2",
+    ]
     for name in names:
         assert f"theorem moe_{name} :" in committed
     assert len(LC.space()) == 54 and len(LC.dispatch_cases()) >= 1
+    assert len(LC.dispatch_cases(32)) >= 1
+    # the 32-wide class: its own quantizer instance (the same chains over 32 leaves), its GEMM core's terms, the per-step loop
+    assert [c["name"] for c in LC.fp8bsq32_cases()] == ["V32", "V16", "V8", "V4"]
+    assert all(c["kernel"] == c["spec"] for c in LC.fp8bsq32_cases())
+    out32 = LC.fp8bsq32_out_cases()
+    assert (
+        out32["amax0"] != LC.fp8bsq_out_cases()["amax0"]
+        and out32["amax0"] in out32["s0"]
+    )
+    k32 = LC.kblock32_cases()
+    assert [(KB, fmt) for KB, fmt, _, _ in k32] == [
+        (1, "bf16"),
+        (4, "bf16"),
+        (8, "f32"),
+    ]
+    assert "(sfb_blk 1 0)" in k32[0][3] and "(sfb_blk 0 0)" in k32[0][2]
+    assert "(op:mma_fp8_k32 (const 0.0)" in k32[0][2]
+    for KB, sx in LC.kblock32_loop_cases():
+        assert sx.count("(fma ") == KB
     assert "sorry" not in committed and "native_decide" not in committed
 
 
@@ -100,6 +126,18 @@ def test_lean_model_matches_python_spec_and_engine():
         elif tag == "moe":
             _, name, sx = line.split(" ", 2)
             lean[("moe", name)] = sx
+        elif tag == "fp8bsq32":
+            _, name, kind, sx = line.split(" ", 3)
+            lean[("fp8bsq32", name, kind)] = sx
+        elif tag == "fp8bsq32out":
+            _, which, sx = line.split(" ", 2)
+            lean[("fp8bsq32out", which)] = sx
+        elif tag in ("kblock32", "kblock32b"):
+            _, KB, fmt, sx = line.split(" ", 3)
+            lean[(tag, int(KB), fmt)] = sx
+        elif tag == "kblock32loop":
+            _, KB, sx = line.split(" ", 2)
+            lean[(tag, int(KB))] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -116,7 +154,23 @@ def test_lean_model_matches_python_spec_and_engine():
             f"MoE model differs from the Python spec: {name}"
         )
         checked += 1
-    assert checked == len(lean) == 19
+    # the 32-wide class
+    for c in LC.fp8bsq32_cases():
+        assert lean[("fp8bsq32", c["name"], "spec")] == c["spec"], c["name"]
+        assert lean[("fp8bsq32", c["name"], "kernel")] == c["kernel"], c["name"]
+        checked += 2
+    out32 = LC.fp8bsq32_out_cases()
+    for which in LC.FP8BSQ_OUT_WHICH:
+        assert lean[("fp8bsq32out", which)] == out32[which], which
+        checked += 1
+    for KB, fmt, sx0, sx1 in LC.kblock32_cases():
+        assert lean[("kblock32", KB, fmt)] == sx0, (KB, fmt)
+        assert lean[("kblock32b", KB, fmt)] == sx1, (KB, fmt)
+        checked += 2
+    for KB, sx in LC.kblock32_loop_cases():
+        assert lean[("kblock32loop", KB)] == sx, KB
+        checked += 1
+    assert checked == len(lean) == 19 + 3 + 8 + 4 + 6 + 3
 
 
 @needs_lake

@@ -20,6 +20,14 @@ promotion warpgroups, which exchange their half-block amax through shared memory
 tree over 128 leaves is the combine of the two halves' trees), or one warpgroup holds a whole block (the ungated chain on
 the 256-wide tile).
 
+The 32-wide class ``moe.e4m3bs32.<act>`` (``block = 32``, the dense core ``gemm.e4m3.kblock32``: :mod:`..spec_fp8bs`) runs on
+the same body with the block as a parameter: a 128-element smem stage holds ``spb = 4`` blocks, the MMA warp commits every
+instruction step to its own accumulator stage (:func:`grouped_blockscale_mma_loop`), the scale ring stage carries the stage's
+four block scales per row and per weight slot (a tile spans ``tile_n / 32`` weight scale blocks: one scale product per 32
+columns per thread and block), and the promotion drains the four partials in block order -- four times the 128-wide class's
+TMEM reads and fmas per K, the recipe's cost. The fused requantization is the 128-wide class's alone (the 32-wide class
+requantizes by the standalone pass).
+
 The gated chain's weight is gate / up interleaved in groups of 8 rows (:func:`..api.interleave_fc1`) AFTER its quantization:
 the scale of an interleaved column is its original row's 128-row block, so a tile holds one up block and one gate block
 (``tile_n <= 256``, ``I % 128 == 0``), the scale ring stage carries both, and the promotion multiplies each register by the
@@ -52,7 +60,6 @@ from ....batch_invariant.quantization.cute_ext import CuteF32
 from ....gemm.batch_invariant.blocks.blockscale_fp8 import (
     IN_FMT,
     MMA_WARP_BS,
-    NUM_B_BLOCKS,
     NUM_PROMO_GROUPS,
     NUM_PROMO_WARPS,
     NUM_SCALE_STAGES,
@@ -63,10 +70,10 @@ from ....gemm.batch_invariant.blocks.blockscale_fp8 import (
     TMA_WARP_BS,
     UNIFORM_REGS,
     _elem,
+    _vec4,
     acc_stages_for,
-    blockscale_mma_loop,
-    scale_ring_bytes,
 )
+from ....gemm.batch_invariant.blocks.mainloop import mma_fold
 from ....gemm.batch_invariant.blocks.operands import (
     ACC_DTYPE,
     BAR_TMEM_ALLOC,
@@ -75,11 +82,11 @@ from ....gemm.batch_invariant.blocks.operands import (
     TmaSetup,
 )
 from ....gemm.batch_invariant.generator import Knobs, MainloopBlock
-from ....gemm.batch_invariant.spec import BLOCK_K, SCALE_BLOCK_N
+from ....gemm.batch_invariant.spec import BLOCK_K
 from .. import pdl
 from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS, act_elem, glu_elem
 from ..spec_fp8bs import BLOCK as QBLOCK
-from ..spec_fp8bs import block_chain, elem_digit, leaf_value, quant_pre
+from ..spec_fp8bs import block_chain, check_block, elem_digit, leaf_value, quant_pre
 from .epilogue import (
     BAR_EPI_STAGE,
     GROUP,
@@ -103,6 +110,117 @@ BAR_PROMO_JOIN = (
     BAR_XCH + 1
 )  # both promotion warpgroups once, after their last TMEM loads, before the TMEM free
 VEC_BYTES = 16
+#: The scale ring's depth in smem stages per class: the 128-wide class's (one block per stage) and the 32-wide class's (four
+#: blocks per stage: a stage holds four times the scales, so fewer stages hold as many blocks ahead).
+NUM_SCALE_STAGES_OF = {128: NUM_SCALE_STAGES, 32: NUM_SCALE_STAGES // 2}
+
+
+def blocks_per_stage(block: int) -> int:
+    """Scale blocks per 128-element smem stage: 1 for the 128-wide class, 4 for the 32-wide one."""
+    assert BLOCK_K % check_block(block) == 0, block
+    return BLOCK_K // block
+
+
+def n_scale_slots(cols: int, block: int, interleaved: bool) -> int:
+    """The weight scale blocks a span of ``cols`` interleaved-or-plain weight columns reads: plain -- the span's ``block``-column
+    blocks (at least one); interleaved -- its up rows' blocks and its gate rows' blocks (the span's ``cols / 2`` up rows: at least
+    one block each half). The ring stage holds one slot per block (slot ``t``: :func:`slot_blocks`); the two halves of the
+    interleaved weight occupy the slots' first and second half."""
+    return 2 * max(1, (cols // 2) // block) if interleaved else max(1, cols // block)
+
+
+def slot_blocks(n0, NB, NS: int, block: int, interleaved: bool):
+    """The weight scale block (clamped to the tensor: a tile past N reads a finite scale and multiplies a zero-filled partial) of
+    every slot of a tile whose first interleaved-or-plain column is ``n0``: plain -- ``n0 / block + t``; interleaved -- the up
+    blocks of the tile's up rows ``(n0 / 2) / block + t`` for the first half of the slots, the gate blocks ``NB / 2 + (n0 / 2) /
+    block + t`` for the second."""
+    out = []
+    for t in range(NS):
+        if interleaved:
+            half, tt = NS // 2, t % (NS // 2)
+            base = (n0 // Int32(2)) // Int32(block) + Int32(tt)
+            if t >= half:
+                base = base + NB // Int32(2)
+        else:
+            base = n0 // Int32(block) + Int32(t)
+        out.append(cutlass.min(base, NB - Int32(1)))
+    return out
+
+
+def group_slot_table(
+    per_group: int, V: int, P: int, cols_g: int, NS: int, block: int, interleaved: bool
+):
+    """The weight scale slot of every register of a promotion group (static per register; the group's slot base is a runtime
+    offset that enters addresses only): ``(n_slots_g, g_mult, slot_of[k][e])`` -- the group's slots per ring stage, the group
+    index's multiplier and the local slot of register ``e`` of the group's subtile ``k`` (``P`` accumulator columns per subtile).
+    Plain: the register's ``block``-column block of the group's ``cols_g`` columns (one slot where they lie in one block); gated:
+    the block of the register's original up row (the up columns 16q .. 16q + 7 of the tile) in the slots' first half, its gate
+    column's block in the second (:func:`n_scale_slots`, :func:`slot_blocks`)."""
+    slot_of = []
+    if interleaved:
+        half_cols = cols_g // 2  # the group's up (= gate) rows
+        n_slots_g = 2 * max(1, half_cols // block)
+        g_mult = (n_slots_g // 2) if half_cols >= block else 0
+        for k in range(per_group):
+            row = []
+            for e in range(V):
+                u = (
+                    k * (P // 2) + (e // (2 * GROUP)) * GROUP + e % GROUP
+                )  # the register's original row within the group's half
+                t = (u // block) if half_cols >= block else 0
+                if (e % (2 * GROUP)) >= GROUP:
+                    t += n_slots_g // 2  # a gate column: the gate half's slots
+                row.append(t)
+            slot_of.append(row)
+        assert g_mult * (NUM_PROMO_GROUPS - 1) + n_slots_g // 2 <= NS // 2, (
+            g_mult,
+            n_slots_g,
+            NS,
+        )
+    else:
+        n_slots_g = max(1, cols_g // block)
+        g_mult = n_slots_g if cols_g >= block else 0
+        for k in range(per_group):
+            slot_of.append(
+                [((k * P + e) // block) if cols_g >= block else 0 for e in range(V)]
+            )
+        assert g_mult * (NUM_PROMO_GROUPS - 1) + n_slots_g <= NS, (
+            g_mult,
+            n_slots_g,
+            NS,
+        )
+    assert all(
+        slot_of[k][e] == slot_of[k][e + 1]
+        for k in range(per_group)
+        for e in range(0, V, 2)
+    ), "a packed pair straddles two weight blocks"
+    return n_slots_g, g_mult, slot_of
+
+
+def group_slot_indices(gsel, g_mult: int, n_slots_g: int, NS: int, interleaved: bool):
+    """The ring-stage slot of every local slot of promotion group ``gsel`` (a runtime index): the group's base ``gsel * g_mult``
+    into the up (or plain) slots, then into the gate slots at ``NS / 2``."""
+    out = []
+    for t in range(n_slots_g):
+        if interleaved and t >= n_slots_g // 2:
+            out.append(
+                Int32(NS // 2) + gsel * Int32(g_mult) + Int32(t - n_slots_g // 2)
+            )
+        else:
+            out.append(gsel * Int32(g_mult) + Int32(t))
+    return out
+
+
+def grouped_scale_ring_bytes(knobs: Knobs, block: int, interleaved: bool) -> int:
+    """Smem of the scale ring: per stage the CTA tile's row scales and the tile's weight slot scales, ``blocks_per_stage`` of
+    each, fp32."""
+    spb = blocks_per_stage(block)
+    return (
+        NUM_SCALE_STAGES_OF[block]
+        * (knobs.cta_tile_mn[0] + n_scale_slots(knobs.tile_n, block, interleaved))
+        * spb
+        * (ACC_DTYPE.width // 8)
+    )
 
 
 @dataclass(frozen=True)
@@ -179,19 +297,29 @@ class GroupedBlockScaleFp8Gemm:
     """``out[p, n] = chain( fold_kb fma(mul(sfa[p, kb], sfb[e(p), blk(n), kb]), P_kb(p, n), acc) )`` for every row ``p`` of every group."""
 
     def __init__(
-        self, knobs: Knobs, chain: Fp8BsChain, interleaved: Optional[bool] = None
+        self,
+        knobs: Knobs,
+        chain: Fp8BsChain,
+        interleaved: Optional[bool] = None,
+        block: int = QBLOCK,
     ):
         """``interleaved``: the weight's rows are gate / up interleaved (the gated chains' weight; default ``chain.pair``) -- a
         property of the operand's layout that decides which weight scale block a column reads (the f32 oracle output of GEMM1
-        reads the interleaved weight with the plain chain)."""
+        reads the interleaved weight with the plain chain). ``block``: the class -- 128 (``moe.e4m3bs``) or 32 (``moe.e4m3bs32``)."""
         assert isinstance(chain, Fp8BsChain), chain
         assert (
             knobs.well_formed(IN_FMT)
             and knobs.swizzle_size == 1
             and knobs.tile_n in TILES_N_GROUPED
         ), knobs
+        self.block = check_block(block)
+        self.spb = blocks_per_stage(block)
         if chain.out_fmt == OUT_FMT_QUANT:
-            assert fused_quant_ok(chain, knobs.tile_n), (chain, knobs.tile_n)
+            assert block == QBLOCK and fused_quant_ok(chain, knobs.tile_n), (
+                chain,
+                knobs.tile_n,
+                block,
+            )
         self.interleaved = chain.pair if interleaved is None else bool(interleaved)
         assert self.interleaved or not chain.pair, (
             "the gated chain pairs the interleaved weight's columns"
@@ -201,6 +329,8 @@ class GroupedBlockScaleFp8Gemm:
         self.quant = chain.out_fmt == OUT_FMT_QUANT
         self.staged = chain.out_fmt == "bf16"
         self.twin = quant_twin(chain) if self.quant else chain
+        self.n_slots = n_scale_slots(knobs.tile_n, block, self.interleaved)
+        self.n_scale_stages = NUM_SCALE_STAGES_OF[block]
 
     @cute.jit
     def __call__(
@@ -239,7 +369,9 @@ class GroupedBlockScaleFp8Gemm:
                 extra_smem_bytes=tables + extra,
                 in_fmt=IN_FMT,
                 acc_stages=acc_stages_for(self.knobs),
-                reserve_smem_bytes=scale_ring_bytes(self.knobs),
+                reserve_smem_bytes=grouped_scale_ring_bytes(
+                    self.knobs, self.block, self.interleaved
+                ),
             )
 
         st = plan(0)
@@ -251,12 +383,11 @@ class GroupedBlockScaleFp8Gemm:
             if self.staged
             else None
         )
-        self.block = MainloopBlock(IN_FMT)
-        self.lowering = self.block.lowering()
-        assert st.mma_tiler[2] == self.block.k_block == BLOCK_K, (
-            st.mma_tiler,
-            self.block.k_block,
-        )  # one stage = one scale block
+        self.mainloop = MainloopBlock(IN_FMT)
+        self.lowering = self.mainloop.lowering()
+        assert (
+            st.mma_tiler[2] == self.mainloop.k_block == BLOCK_K == self.spb * self.block
+        ), (st.mma_tiler, self.mainloop.k_block)  # one stage = spb scale blocks
         tma = TmaSetup(st, a, b, None)
         self.num_tma_load_bytes = tma.tx_bytes
         cm, cn = self.cluster_shape_mn
@@ -331,13 +462,14 @@ class GroupedBlockScaleFp8Gemm:
         class SharedStorage:
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, st.num_ab_stage * 2]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, st.num_acc_stage * 2]
-            scale_mbar_ptr: cute.struct.MemRange[cutlass.Int64, NUM_SCALE_STAGES * 2]
+            scale_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.n_scale_stages * 2]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             group_off: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
             group_pre: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
             xch: cute.struct.MemRange[cutlass.Float32, xch_floats()]
 
+        spb, NS, n_stages = self.spb, self.n_slots, self.n_scale_stages
         smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
@@ -362,7 +494,7 @@ class GroupedBlockScaleFp8Gemm:
         )
         scale_pipeline = pipeline.PipelineCpAsync.create(
             barrier_storage=storage.scale_mbar_ptr.data_ptr(),
-            num_stages=NUM_SCALE_STAGES,
+            num_stages=n_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, 32 * len(PROMO_WARPS)
@@ -409,14 +541,18 @@ class GroupedBlockScaleFp8Gemm:
             byte_alignment=128,
             swizzle=b_smem_layout_staged.inner,
         )
+        # the scale ring: a stage holds the CTA tile's row scales and the tile's weight slot scales of the stage's `spb` blocks (a
+        # row's or a slot's `spb` scales contiguous: one 16-byte copy of a slot's four at the 32-wide class)
         sSFA = smem.allocate_tensor(
             element_type=ACC_DTYPE,
-            layout=cute.make_layout((tile_m, NUM_SCALE_STAGES)),
+            layout=cute.make_layout(
+                (tile_m, spb, n_stages), stride=(spb, 1, tile_m * spb)
+            ),
             byte_alignment=16,
         )
         sSFB = smem.allocate_tensor(
             element_type=ACC_DTYPE,
-            layout=cute.make_layout((NUM_B_BLOCKS, NUM_SCALE_STAGES)),
+            layout=cute.make_layout((NS, spb, n_stages), stride=(spb, 1, NS * spb)),
             byte_alignment=16,
         )
         sC = None
@@ -512,6 +648,7 @@ class GroupedBlockScaleFp8Gemm:
                 cta_row_rel,
                 Tk,
                 self.interleaved,
+                self.block,
             )
         if warp_idx == MMA_WARP_BS:
             cute.arch.setmaxregister_decrease(UNIFORM_REGS)
@@ -531,8 +668,9 @@ class GroupedBlockScaleFp8Gemm:
                 mma_m_in_cluster,
                 cta_n_in_cluster,
             )
-            blockscale_mma_loop(
+            grouped_blockscale_mma_loop(
                 self.lowering,
+                spb,
                 st.num_acc_stage,
                 k_tile_cnt,
                 is_leader_cta,
@@ -587,6 +725,7 @@ class GroupedBlockScaleFp8Gemm:
                 cta_row_rel,
                 sC,
                 sX,
+                self.block,
             )
             tmem.relinquish_alloc_permit()
             # the allocator warp alone frees the columns: both promotion warpgroups join here after their last TMEM loads (the
@@ -597,6 +736,87 @@ class GroupedBlockScaleFp8Gemm:
             cute.arch.setmaxregister_decrease(
                 UNIFORM_REGS
             )  # the warps padding the last warpgroup: no role
+
+
+@cute.jit
+def grouped_blockscale_mma_loop(
+    lowering,
+    spb: cutlass.Constexpr,
+    num_acc_stage: cutlass.Constexpr,
+    k_tile_cnt: Int32,
+    is_leader_cta,
+    tile_sched,
+    tiled_mma: cute.TiledMma,
+    ab_consumer,
+    acc_pipeline,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    tCtAcc_base: cute.Tensor,
+):
+    """Per tile, per k-tile (stages ascending), per scale block of the stage (``spb`` of them, ascending): the block's steps from
+    a reset accumulator into the next accumulator stage, committed to the epilogue -- the dense block-scale body's mainloop
+    (``blockscale_mma_loop``: one block per stage, ``mma_fold`` once per k-tile) for the 128-wide class, and one instruction
+    step per block for the 32-wide class (the stage released after its last block's steps are issued). Every block's partial is
+    the spec's ``P_kb``."""
+    assert cute.size(tCrA, mode=[2]) == lowering.inner and lowering.inner % spb == 0, (
+        "one smem stage holds exactly the lowering's inner steps"
+    )
+    steps = lowering.inner // spb  # instruction steps per scale block
+    acc_state = pipeline.make_pipeline_state(
+        pipeline.PipelineUserType.Producer, num_acc_stage
+    )
+    work_tile = tile_sched.initial_work_tile_info()
+    while work_tile.is_valid_tile:
+        if cutlass.const_expr(spb == 1):
+            for _kb in range(
+                k_tile_cnt
+            ):  # blocks ascending, each a fold from +0 into the next stage
+                ab_consumer, acc_state = mma_fold(
+                    lowering,
+                    1,
+                    is_leader_cta,
+                    tiled_mma,
+                    ab_consumer,
+                    acc_pipeline,
+                    acc_state,
+                    tCrA,
+                    tCrB,
+                    tCtAcc_base,
+                )
+        else:
+            ab_consumer.reset()
+            peek_full = cutlass.Boolean(1)
+            if is_leader_cta:
+                peek_full = ab_consumer.try_wait()
+            for _kt in range(k_tile_cnt):  # stages ascending
+                if is_leader_cta:
+                    handle = ab_consumer.wait_and_advance(peek_full)
+                    for jb in cutlass.range_constexpr(
+                        spb
+                    ):  # the stage's blocks ascending, each from +0 into its own stage
+                        acc_pipeline.producer_acquire(
+                            acc_state
+                        )  # the epilogue has drained this TMEM buffer
+                        tCtAcc = tCtAcc_base[(None, None, None, acc_state.index)]
+                        for j in cutlass.range_constexpr(steps):
+                            tiled_mma.set(
+                                tcgen05.Field.ACCUMULATE, j > 0
+                            )  # off on the block's first step only
+                            crd = (None, None, jb * steps + j, handle.index)
+                            cute.gemm(tiled_mma, tCtAcc, tCrA[crd], tCrB[crd], tCtAcc)
+                        acc_pipeline.producer_commit(
+                            acc_state
+                        )  # the block's partial is complete: hand to the promotion
+                        acc_state.advance()
+                    handle.release()
+                    peek_full = cutlass.Boolean(1)
+                    if handle.count + 1 < k_tile_cnt:
+                        peek_full = ab_consumer.try_wait()
+                else:
+                    acc_state.advance(spb)
+        tile_sched.advance_to_next_work()
+        work_tile = tile_sched.get_current_work()
+    acc_pipeline.producer_tail(acc_state)
 
 
 @cute.jit
@@ -625,22 +845,29 @@ def grouped_blockscale_producer_loop(
     cta_row_rel: Int32,
     Tk: Int32,
     interleaved: cutlass.Constexpr,
+    block: cutlass.Constexpr,
 ):
     """The grouped TMA producer (A re-partitioned from the group-offset view, B indexed by the expert) with the dense body's
-    scale ring: per block the warp's 32 lanes ``cp.async`` this CTA's 128 row scales (``mSFA[(row, kb)]``, rows clamped to the
-    last expanded row: a row past the end multiplies a partial that is never stored) and lanes 0 / 1 the tile's two weight
-    block scales -- the gated chain's up and gate blocks (the interleaved weight: block ``n0 / 256`` and the same block of the
-    gate half, ``NB / 2`` on), or the plain tile's block and its successor (the 256-wide tile spans two) -- into the next ring
-    stage. Order and staging only."""
+    scale ring: per stage (its ``spb`` blocks) the warp's 32 lanes ``cp.async`` this CTA's 128 row scales of each block
+    (``mSFA[(row, kb)]``, rows clamped to the last expanded row: a row past the end multiplies a partial that is never stored)
+    and lanes ``t < NS`` the tile's weight slot scales (:func:`slot_blocks`: the gated chain's up and gate blocks of the
+    interleaved weight, or the plain tile's blocks; the 32-wide class's four blocks of a slot in one 16-byte copy -- the weight
+    scales are K-contiguous and ``K / 32`` a multiple of four) into the next ring stage. Order and staging only."""
     lane = cute.arch.lane_idx()
     NB = mSFB.shape[1]
     tile_n = st.mma_tiler[1]
     rows_per_lane = cute.size(sSFA, mode=[0]) // 32
+    spb = cute.size(sSFA, mode=[1])
+    NS = cute.size(sSFB, mode=[0])
+    n_stages = cute.size(sSFA, mode=[2])
     atom_g2s = cute.make_copy_atom(
         cpasync.CopyG2SOp(), ACC_DTYPE, num_bits_per_copy=ACC_DTYPE.width
     )
+    atom_g2s4 = cute.make_copy_atom(
+        cpasync.CopyG2SOp(), ACC_DTYPE, num_bits_per_copy=4 * ACC_DTYPE.width
+    )
     scale_state = pipeline.make_pipeline_state(
-        pipeline.PipelineUserType.Producer, NUM_SCALE_STAGES
+        pipeline.PipelineUserType.Producer, n_stages
     )
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
@@ -661,14 +888,7 @@ def grouped_blockscale_producer_loop(
         e = work_tile.e
         row_base = work_tile.row0 + cta_row_rel
         n0 = work_tile.n_tile * Int32(tile_n)
-        if cutlass.const_expr(interleaved):
-            nb0 = cutlass.min(
-                (n0 // Int32(2)) // Int32(SCALE_BLOCK_N), NB - Int32(1)
-            )  # the tile's up block
-            nb1 = cutlass.min(nb0 + NB // Int32(2), NB - Int32(1))  # its gate block
-        else:
-            nb0 = cutlass.min(n0 // Int32(SCALE_BLOCK_N), NB - Int32(1))
-            nb1 = cutlass.min(nb0 + Int32(1), NB - Int32(1))
+        nbs = slot_blocks(n0, NB, NS, block, interleaved)
         ab_producer.reset()
         peek_empty = ab_producer.try_acquire()
         for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
@@ -690,26 +910,30 @@ def grouped_blockscale_producer_loop(
             scale_pipeline.producer_acquire(
                 scale_state
             )  # ring stage free (the promotion released it)
+            kb0 = handle.count * Int32(spb)  # the stage's first scale block
             for r in cutlass.range_constexpr(rows_per_lane):
                 i = r * 32 + lane
                 row = cutlass.min(row_base + i, Tk - Int32(1))
-                cute.copy(
-                    atom_g2s,
-                    _elem(mSFA, (row, handle.count)),
-                    _elem(sSFA, (i, scale_state.index)),
-                )
-            if lane == 0:
-                cute.copy(
-                    atom_g2s,
-                    _elem(mSFB, (e, nb0, handle.count)),
-                    _elem(sSFB, (0, scale_state.index)),
-                )
-            if lane == 1:
-                cute.copy(
-                    atom_g2s,
-                    _elem(mSFB, (e, nb1, handle.count)),
-                    _elem(sSFB, (1, scale_state.index)),
-                )
+                for j in cutlass.range_constexpr(spb):
+                    cute.copy(
+                        atom_g2s,
+                        _elem(mSFA, (row, kb0 + Int32(j))),
+                        _elem(sSFA, (i, j, scale_state.index)),
+                    )
+            for t in cutlass.range_constexpr(NS):
+                if lane == t:
+                    if cutlass.const_expr(spb == 4):
+                        cute.copy(
+                            atom_g2s4,
+                            _vec4(mSFB, (e, nbs[t], kb0)),
+                            _vec4(sSFB, (t, 0, scale_state.index)),
+                        )
+                    else:
+                        cute.copy(
+                            atom_g2s,
+                            _elem(mSFB, (e, nbs[t], kb0)),
+                            _elem(sSFB, (t, 0, scale_state.index)),
+                        )
             scale_pipeline.producer_commit(
                 scale_state
             )  # arrives when this lane's copies have landed
@@ -762,12 +986,14 @@ def grouped_blockscale_epilogue_loop(
     cta_row_rel: Int32,
     sC: cute.Tensor = None,
     sX: cute.Tensor = None,
+    block: cutlass.Constexpr = QBLOCK,
 ):
     """The promotion (the dense body's: two warpgroups, each a contiguous column half of the tile, the block partials folded
-    with packed fmas into a register running sum, one stage released per block) and the group-masked store of the chain's
-    output: the staged row-coalesced store (bf16), the direct vector store (the f32 oracle output) or the fused requantization
-    (e4m3 codes and fp32 block scales, module docstring). The gated chain's registers take the up or the gate block's scale
-    by their column (a static choice per register)."""
+    with packed fmas into a register running sum, one accumulator stage released per block, one scale ring stage per smem
+    stage) and the group-masked store of the chain's output: the staged row-coalesced store (bf16), the direct vector store
+    (the f32 oracle output) or the fused requantization (e4m3 codes and fp32 block scales, module docstring). Every register
+    reads the scale of its own weight block (a static slot per register: the gated chain's up or gate block, the 32-wide
+    class's ``block``-column block of the group's columns)."""
     pair = chain.pair
     quant = chain.out_fmt == OUT_FMT_QUANT
     out_dt = mOut.element_type
@@ -826,22 +1052,25 @@ def grouped_blockscale_epilogue_loop(
         groups,
     )
     cols_g = per_group * P  # this group's columns
-    assert cols_g % 2 == 0 and tn <= NUM_B_BLOCKS * SCALE_BLOCK_N, (cols_g, tn)
+    assert cols_g % 2 == 0, cols_g
     assert per_group % PROMO_BATCH == 0 or per_group < PROMO_BATCH, (
         per_group,
         PROMO_BATCH,
     )
     batch = min(per_group, PROMO_BATCH)
     VW = per_group * V
-    # the weight block of every register (static): gated -- the gate columns (16q + 8 .. 16q + 15 of the tile; P is a multiple
-    # of 16, so the register's column parity decides) take the gate block's slot, the up columns the up block's; plain -- the
-    # group's block (slot g at the 256-wide tile, slot 0 below), a runtime select once per block
+    spb = cute.size(sSFA, mode=[1])  # scale blocks per smem stage (1 / 4)
+    NS = cute.size(
+        sSFB, mode=[0]
+    )  # weight scale slots per ring stage (the tile's blocks)
+    n_stages = cute.size(sSFA, mode=[2])
+    # the weight scale slot of every register (static per register; the group's slot base is a runtime offset that enters
+    # addresses only): plain -- the register's `block`-column block of the group's columns; gated -- the block of the register's
+    # original up row in the slots' first half, its gate column's block in the second (`group_slot_table`)
     assert P % (2 * GROUP) == 0, P
-    use_slot1 = [interleaved and (e % (2 * GROUP)) >= GROUP for e in range(V)]
-    assert all(use_slot1[e] == use_slot1[e + 1] for e in range(0, V, 2)), (
-        "a packed pair straddles two weight blocks"
+    n_slots_g, g_mult, slot_of = group_slot_table(
+        per_group, V, P, cols_g, NS, block, interleaved
     )
-    plain_group_slot = (not interleaved) and tn > SCALE_BLOCK_N
     bufs = [cute.make_rmem_tensor(frag.shape, ACC_DTYPE) for _ in range(batch)]
     tTR_rSum = cute.make_rmem_tensor((VW,), ACC_DTYPE)
     # the chain's output positions: the up positions of the pair (half the registers) or every register; the outputs of a
@@ -863,9 +1092,12 @@ def grouped_blockscale_epilogue_loop(
         pipeline.PipelineUserType.Consumer, st.num_acc_stage
     )
     scale_state = pipeline.make_pipeline_state(
-        pipeline.PipelineUserType.Consumer, NUM_SCALE_STAGES
+        pipeline.PipelineUserType.Consumer, n_stages
     )
     gsel = g
+    slot_idx = group_slot_indices(
+        gsel, g_mult, n_slots_g, NS, interleaved
+    )  # the group's slots in a ring stage
     # -- the staged bf16 store (the bf16 class's: this group's subtiles through its staging buffer, whole lines per warp instruction)
     epi_m = epi_n = CH = RS = SM = SN = NP = 1
     S_ = 0
@@ -1002,54 +1234,60 @@ def grouped_blockscale_epilogue_loop(
         warp_active = rows_left > cta_row_rel + warp_row0
         for i in cutlass.range_constexpr(VW):
             tTR_rSum[i] = CuteF32.const(0.0)  # acc_0 = +0
-        for _kb in range(k_tile_cnt):  # blocks ascending: the block fold digit
+        for _kt in range(
+            k_tile_cnt
+        ):  # stages ascending, their blocks ascending: the block fold digit
             scale_pipeline.consumer_wait(
                 scale_state
-            )  # block kb's scales are in the ring
-            sa = sSFA[(irow, scale_state.index)]
-            scale0 = CuteF32.mul(
-                sa, sSFB[(0, scale_state.index)]
-            )  # mul.rn(s_a[m, kb], s_b[blk, kb]), once per block slot
-            scale1 = CuteF32.mul(sa, sSFB[(1, scale_state.index)])
-            scale_g = scale0
-            if cutlass.const_expr(plain_group_slot):
-                if gsel == 1:  # the group's weight block at the 256-wide plain tile
-                    scale_g = scale1
+            )  # the stage's blocks' scales are in the ring
+            sidx = scale_state.index
+            scs = []  # [block of the stage][group slot]: mul.rn(s_a[m, kb], s_b[blk, kb]), once per slot and block
+            for jb in cutlass.range_constexpr(spb):
+                sa = sSFA[(irow, jb, sidx)]
+                scs.append(
+                    [
+                        CuteF32.mul(sa, sSFB[(slot_idx[t], jb, sidx)])
+                        for t in range(n_slots_g)
+                    ]
+                )
             scale_pipeline.consumer_release(scale_state)
             scale_state.advance()
-            acc_pipeline.consumer_wait(acc_state)  # block kb's fold is complete
-            if warp_active:
-                tTR_tAcc = cute.group_modes(
-                    tTR_tAcc_base[(None, None, None, None, None, acc_state.index)], 3, 5
-                )
-                for b0 in cutlass.range_constexpr(
-                    0, per_group, batch
-                ):  # the group's subtiles in batches: a batch's loads first
-                    for j in cutlass.range_constexpr(batch):
-                        cute.copy(
-                            tiled_copy_t2r,
-                            tTR_tAcc[(None, None, None, gsel * per_group + b0 + j)],
-                            bufs[j],
-                        )
-                    for j in cutlass.range_constexpr(batch):
-                        k = b0 + j
-                        for e in cutlass.range_constexpr(0, V, 2):
-                            # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2 (each lane the same correctly rounded
-                            # fma) with the scale of the register's weight block (a static choice per register)
-                            sc = scale1 if cutlass.const_expr(use_slot1[e]) else scale_g
-                            r0, r1 = CuteF32.fma2(
-                                (sc, sc),
-                                (bufs[j][e], bufs[j][e + 1]),
-                                (tTR_rSum[k * V + e], tTR_rSum[k * V + e + 1]),
+            for jb in cutlass.range_constexpr(spb):
+                acc_pipeline.consumer_wait(acc_state)  # the block's fold is complete
+                if warp_active:
+                    tTR_tAcc = cute.group_modes(
+                        tTR_tAcc_base[(None, None, None, None, None, acc_state.index)],
+                        3,
+                        5,
+                    )
+                    for b0 in cutlass.range_constexpr(
+                        0, per_group, batch
+                    ):  # the group's subtiles in batches: a batch's loads first
+                        for j in cutlass.range_constexpr(batch):
+                            cute.copy(
+                                tiled_copy_t2r,
+                                tTR_tAcc[(None, None, None, gsel * per_group + b0 + j)],
+                                bufs[j],
                             )
-                            tTR_rSum[k * V + e] = r0
-                            tTR_rSum[k * V + e + 1] = r1
-            cute.arch.fence_view_async_tmem_load()  # this warp's reads of the partial are complete
-            with cute.arch.elect_one():
-                acc_pipeline.consumer_release(
-                    acc_state
-                )  # one arrive per warp: the stage is free once all arrived
-            acc_state.advance()
+                        for j in cutlass.range_constexpr(batch):
+                            k = b0 + j
+                            for e in cutlass.range_constexpr(0, V, 2):
+                                # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2 (each lane the same correctly
+                                # rounded fma) with the scale of the register's weight block (a static slot per register)
+                                sc = scs[jb][slot_of[k][e]]
+                                r0, r1 = CuteF32.fma2(
+                                    (sc, sc),
+                                    (bufs[j][e], bufs[j][e + 1]),
+                                    (tTR_rSum[k * V + e], tTR_rSum[k * V + e + 1]),
+                                )
+                                tTR_rSum[k * V + e] = r0
+                                tTR_rSum[k * V + e + 1] = r1
+                cute.arch.fence_view_async_tmem_load()  # this warp's reads of the partial are complete
+                with cute.arch.elect_one():
+                    acc_pipeline.consumer_release(
+                        acc_state
+                    )  # one arrive per warp: the stage is free once all arrived
+                acc_state.advance()
         # ===== the chain and the store of this group's half of the tile's fold =====
         if cutlass.const_expr(quant):
             # the fused requantization: the bf16-rounded chain values of the group's outputs in column order, then the block amax

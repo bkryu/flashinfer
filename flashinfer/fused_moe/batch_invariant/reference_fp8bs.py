@@ -19,7 +19,14 @@ from ...batch_invariant.fp_interface import exact as fp32
 from ...batch_invariant.quantization.nvfp4_reference import e4m3_bytes
 from .blocks.epilogue import GROUP
 from .reference import ExactF32, TorchF32
-from .spec_fp8bs import BLOCK, block_chain, block_reduction, quant_elem
+from .spec_fp8bs import (
+    BLOCK,
+    BLOCKS,
+    block_chain,
+    block_reduction,
+    check_block,
+    quant_elem,
+)
 
 
 def _f32(t: torch.Tensor) -> torch.Tensor:
@@ -27,44 +34,50 @@ def _f32(t: torch.Tensor) -> torch.Tensor:
 
 
 def quantize_rows_reference(
-    x: torch.Tensor, scale_layout: str = "MN"
+    x: torch.Tensor, scale_layout: str = "MN", block: int = BLOCK
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The class on rows ``x [M, K]`` (bf16 / f16 / f32; ``K % 128 == 0``): ``(codes, s)`` with ``codes`` the e4m3 values as an
-    f32 ``[M, K]`` tensor (:func:`e4m3_bytes` gives the bytes) and ``s`` the fp32 scales, ``[K / 128, M]`` (``"MN"``: the layout
-    FlashInfer's DeepSeek activation pair carries and the block-scale GEMM's row-scale ring reads) or ``[M, K / 128]`` (``"K"``)."""
+    """The class on rows ``x [M, K]`` (bf16 / f16 / f32; ``K % block == 0``): ``(codes, s)`` with ``codes`` the e4m3 values as an
+    f32 ``[M, K]`` tensor (:func:`e4m3_bytes` gives the bytes) and ``s`` the fp32 scales, ``[K / block, M]`` (``"MN"``: the layout
+    FlashInfer's DeepSeek activation pair carries and the block-scale GEMM's row-scale ring reads) or ``[M, K / block]`` (``"K"``);
+    ``block`` 128, or 32 for the ``moe.e4m3bs32`` classes."""
+    check_block(block)
     xf = _f32(x)
     M, K = xf.shape
-    if K % BLOCK:
+    if K % block:
         raise ValueError(
-            f"fp8bs.quant: K = {K} is not a whole number of {BLOCK}-element blocks"
+            f"fp8bs.quant: K = {K} is not a whole number of {block}-element blocks"
         )
-    blocks = xf.view(M, K // BLOCK, BLOCK)
+    blocks = xf.view(M, K // block, block)
     amax = TorchF32.fabs(blocks).amax(dim=-1, keepdim=True)  # exact
     s, inv = block_chain(TorchF32, amax)
     codes = quant_elem(TorchF32, blocks, inv).view(M, K)
-    s = s.view(M, K // BLOCK)
+    s = s.view(M, K // block)
     return codes, (s.t().contiguous() if scale_layout == "MN" else s.contiguous())
 
 
 def quantize_rows_bytes(
-    x: torch.Tensor, scale_layout: str = "MN"
+    x: torch.Tensor, scale_layout: str = "MN", block: int = BLOCK
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """:func:`quantize_rows_reference` with the codes as uint8 bytes."""
-    codes, s = quantize_rows_reference(x, scale_layout)
+    codes, s = quantize_rows_reference(x, scale_layout, block)
     return e4m3_bytes(codes), s
 
 
-def quantize_weight_reference(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The class on a weight ``w [N, K]`` per 128x128 block: ``(codes [N, K] e4m3 values f32, s [N / 128, K / 128] fp32)``."""
+def quantize_weight_reference(
+    w: torch.Tensor, block: int = BLOCK
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The class on a weight ``w [N, K]`` per ``block x block`` block: ``(codes [N, K] e4m3 values f32, s [N / block, K / block]
+    fp32)``."""
+    check_block(block)
     wf = _f32(w)
     N, K = wf.shape
-    if N % BLOCK or K % BLOCK:
+    if N % block or K % block:
         raise ValueError(
-            f"fp8bs.quant: a weight of shape ({N}, {K}) is not whole {BLOCK}x{BLOCK} blocks"
+            f"fp8bs.quant: a weight of shape ({N}, {K}) is not whole {block}x{block} blocks"
         )
-    blocks = wf.view(N // BLOCK, BLOCK, K // BLOCK, BLOCK).permute(
+    blocks = wf.view(N // block, block, K // block, block).permute(
         0, 2, 1, 3
-    )  # (NB, KB, 128, 128)
+    )  # (NB, KB, block, block)
     amax = TorchF32.fabs(blocks).amax(dim=(-1, -2), keepdim=True)
     s, inv = block_chain(TorchF32, amax)
     codes = quant_elem(TorchF32, blocks, inv).permute(0, 2, 1, 3).reshape(N, K)
@@ -72,12 +85,12 @@ def quantize_weight_reference(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
 
 
 def exact_block(xs: Sequence[float]) -> Tuple[float, float, list]:
-    """The scalar exact model of one block (128 Python floats, binary32 values): ``(s, inv, [128 e4m3 values])`` through the
-    exact arithmetic, the canonical tree of the ``elem`` digit."""
+    """The scalar exact model of one block (128 or 32 Python floats, binary32 values): ``(s, inv, [e4m3 values])`` through the
+    exact arithmetic, the canonical tree of the ``elem`` digit at the block's radix."""
     vals = [fp32.to_f32(float(v)) for v in xs]
-    if len(vals) != BLOCK:
-        raise ValueError(f"a block has {BLOCK} elements, got {len(vals)}")
-    amax = block_reduction(lambda fp, e: vals[e]).canonical(ExactF32)
+    if len(vals) not in BLOCKS:
+        raise ValueError(f"a block has one of {BLOCKS} elements, got {len(vals)}")
+    amax = block_reduction(lambda fp, e: vals[e], len(vals)).canonical(ExactF32)
     s, inv = block_chain(ExactF32, amax)
     return s, inv, [quant_elem(ExactF32, v, inv) for v in vals]
 
