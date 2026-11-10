@@ -53,7 +53,13 @@ from .epilogue import (
     staging_bytes,
     staging_layout,
 )
-from .scheduler import MAX_E, GroupScheduler, build_group_tables, warp_roles
+from .scheduler import (
+    MAX_E,
+    GroupScheduler,
+    build_group_tables,
+    build_group_tables_dual,
+    warp_roles,
+)
 
 #: The MX classes the grouped body serves: the SM100 / SM103 instruction (K = 32) and the SM107 one (K = 64).
 MX_FMTS = ("mxfp8", "mxfp8_k64")
@@ -69,7 +75,7 @@ from .epilogue_mx import (  # noqa: E402
 
 EPI_WARPGROUPS_MX = 4
 EPILOGUE_WARPS, MMA_WARP, TMA_WARP, THREADS = warp_roles(EPI_WARPGROUPS_MX)
-TABLE_BYTES = 2 * (MAX_E + 1) * 4  # the two group tables
+TABLE_BYTES = (MAX_E + 1) * 4  # one group table
 
 
 def sf_view_experts(sf: cute.Tensor, rows, k, E, vec: int, sf_dtype):
@@ -321,17 +327,19 @@ class GroupedBlockScaledGemmMX:
         # the accumulator-side "C" of the plan is fp32 row-major: it only sizes the epilogue tile; the ring leaves room
         # for the group tables and the epilogue staging buffers
         self.staged = staged_store(self.chain.out_fmt)
-        tables = (2 if self.dense_a else 1) * TABLE_BYTES
+        tables = (3 if self.dense_a else 2) * TABLE_BYTES
         st = plan_with_room(
             self.plan_cls,
             self.knobs,
-            lambda st: tables
-            + (
-                staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_MX)
-                if self.staged
-                else 0
-            )
-            + xch_bytes(self.chain, EPI_WARPGROUPS_MX),
+            lambda st: (
+                tables
+                + (
+                    staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_MX)
+                    if self.staged
+                    else 0
+                )
+                + xch_bytes(self.chain, EPI_WARPGROUPS_MX)
+            ),
             self.plan_cls.UMMA_SMEM_ADDR_MAX,
         )
         self.st = st
@@ -488,9 +496,6 @@ class GroupedBlockScaledGemmMX:
             s_off_pad = smem.allocate_tensor(
                 Int32, cute.make_layout((MAX_E + 1,)), byte_alignment=16
             )
-            s_pre_pad = smem.allocate_tensor(
-                Int32, cute.make_layout((MAX_E + 1,)), byte_alignment=16
-            )
         cluster_rows = st.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
         # programmatic dependent launch: the prologue above (descriptor prefetch, barrier and pipeline setup, the TMEM
         # allocator) reads nothing of the predecessor's, so it overlaps the predecessor's tail; every thread waits here,
@@ -500,11 +505,10 @@ class GroupedBlockScaledGemmMX:
         cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == EPILOGUE_WARPS[0]:
             if cutlass.const_expr(self.dense_a):
-                build_group_tables(
-                    counts, E, cluster_rows, s_off, s_pre, 1
-                )  # dense group offsets (the A rows, the output)
-                build_group_tables(
-                    counts, E, cluster_rows, s_off_pad, s_pre_pad, GROUP_ALIGN
+                # one pass for both tables: the dense group offsets (the A rows, the output) and the padded
+                # scale-factor positions
+                build_group_tables_dual(
+                    counts, E, cluster_rows, s_off, s_pre, s_off_pad, GROUP_ALIGN
                 )
             else:
                 build_group_tables(
