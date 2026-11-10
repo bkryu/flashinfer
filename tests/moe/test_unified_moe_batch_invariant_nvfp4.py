@@ -291,13 +291,17 @@ def test_fingerprint_dimensions_and_classes():
     }
     assert len(fps) == len(ACTIVATIONS)
     # the routing methods of the bf16 backend's surface (TopK, Llama4's TopKSigmoid, the grouped DeepSeek-V3 selection) are
-    # the class's as well: a method is part of the identifier, never a refusal
+    # the class's as well: a method is part of the identifier; a method the classes do not implement is refused
     assert (
         bi.fingerprint(
             "fused_moe_nvfp4", arch="sm_107", method=RoutingMethodType.Llama4, **dims
         )
         != fp
     )
+    with pytest.raises(ValueError):
+        bi.fingerprint(
+            "fused_moe_nvfp4", arch="sm_107", method=RoutingMethodType.MiniMax2, **dims
+        )
     with pytest.raises(ValueError):
         bi.fingerprint("fused_moe_nvfp4", arch="sm_107", act="tanh", **dims)
     with pytest.raises(ValueError):
@@ -1943,8 +1947,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             intermediate_size=I,
             quant=QuantConfig(),
         )
-    # group-limited routing is refused from logits only: with pre-routed ids the group structure never enters the
-    # computation, and the output equals the ungrouped configuration's on the same ids and weights
+    # the grouped selection (DeepSeek-V3's n_group / topk_group) is a routing term the bf16 model serves: the layer runs from
+    # logits, deterministically; with pre-routed ids the group structure never enters the computation, and the output equals
+    # the ungrouped configuration's on the same ids and weights
     grouped = MoELayer(
         MoEConfig(
             routing=RoutingConfig(
@@ -1960,9 +1965,10 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         ),
         device=torch.device("cuda"),
     )
-    with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
-        grouped(_logits_pack(x, logits), W)
-    assert "n_group" in str(excinfo.value)
+    out_g = grouped(_logits_pack(x, logits), W)
+    assert out_g.shape == (x.shape[0], H) and torch.equal(
+        bits(out_g), bits(grouped(_logits_pack(x, logits), W))
+    )
     g_ids, g_wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
     assert torch.equal(
         bits(grouped(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
@@ -1979,8 +1985,12 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         ),
         device=torch.device("cuda"),
     )
-    with pytest.raises(BatchInvariantUnsupportedError):
-        llama(_logits_pack(x, logits), W)
+    # Llama4 routing (TopK with sigmoid weights) is a routing term the bf16 model serves: the layer runs from logits,
+    # deterministically
+    out_l = llama(_logits_pack(x, logits), W)
+    assert out_l.shape == (x.shape[0], H) and torch.equal(
+        bits(out_l), bits(llama(_logits_pack(x, logits), W))
+    )
     ids = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
     assert llama(_routed_pack(x, ids, torch.ones(8, 1, device="cuda")), W).shape == (
         8,
