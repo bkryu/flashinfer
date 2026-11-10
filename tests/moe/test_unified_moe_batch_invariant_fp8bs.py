@@ -340,6 +340,33 @@ def test_fingerprint_dimensions_and_classes():
         bi.fingerprint("fused_moe_fp8bs", method=RoutingMethodType.MiniMax2, **dims)
     with pytest.raises(TypeError):
         bi.fingerprint("fused_moe_fp8bs", block=128, **dims)
+    # the group-limited selection is a parameter of the DeepSeekV3 term: a dimension of the class, refused with another method
+    ds = bi.fingerprint("fused_moe_fp8bs", method=RoutingMethodType.DeepSeekV3, **dims)
+    g84 = bi.fingerprint(
+        "fused_moe_fp8bs",
+        method=RoutingMethodType.DeepSeekV3,
+        n_group=8,
+        topk_group=4,
+        **dims,
+    )
+    assert g84 != ds and g84 == bi.fingerprint(
+        "fused_moe_fp8bs", method="sigmoid_renorm_bias_scaled_g8x4", **dims
+    )
+    assert g84 != bi.fingerprint(
+        "fused_moe_fp8bs",
+        method=RoutingMethodType.DeepSeekV3,
+        n_group=4,
+        topk_group=2,
+        **dims,
+    )
+    with pytest.raises(ValueError):
+        bi.fingerprint(
+            "fused_moe_fp8bs",
+            method=RoutingMethodType.Renormalize,
+            n_group=8,
+            topk_group=4,
+            **dims,
+        )
     for cfg in ACTIVATIONS:
         a = S.activation_of(cfg)
         assert bi.fingerprint(
@@ -1331,15 +1358,21 @@ def test_routing_methods_from_logits_match_the_cpu_model():
         .cuda()
     )
     W = _weights(w1, w2)
-    for method in (
-        RoutingMethodType.Default,
-        RoutingMethodType.Renormalize,
-        RoutingMethodType.Sigmoid,
-        RoutingMethodType.SigmoidRenorm,
-        RoutingMethodType.DeepSeekV3,
+    for method, groups in (
+        (RoutingMethodType.Default, None),
+        (RoutingMethodType.Renormalize, None),
+        (RoutingMethodType.Sigmoid, None),
+        (RoutingMethodType.SigmoidRenorm, None),
+        (RoutingMethodType.DeepSeekV3, None),
+        (RoutingMethodType.DeepSeekV3, (8, 4)),
+        (RoutingMethodType.DeepSeekV3, (4, 1)),
     ):
         rm = S.METHOD_OF_FLASHINFER[method]
         kwargs = {"routed_scaling_factor": 1.75} if rm.scaled else {}
+        if groups is not None:
+            # the group-limited selection: a term of the DeepSeekV3 method (the shared routing_term builds the grouped method)
+            rm = rm.with_groups(*groups)
+            kwargs["n_group"], kwargs["topk_group"] = groups
         layer = MoELayer(
             MoEConfig(
                 routing=RoutingConfig(num_experts=E, top_k=k, method=method, **kwargs),
@@ -1361,14 +1394,15 @@ def test_routing_methods_from_logits_match_the_cpu_model():
             1.75 if rm.scaled else None,
         )
         ref = layer(_routed_pack(xq, sx, ex.cuda(), w.cuda()), W)
-        assert torch.equal(bits(out), bits(ref)), method
+        assert torch.equal(bits(out), bits(ref)), (method, groups)
+        assert torch.equal(bits(out), bits(layer(_logits_pack(xq, sx, logits, b), W)))
 
 
 @needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     """The error contract: a configuration outside the classes raises the mode's error at build or at the first call (top_k /
-    num_experts outside the bounds, fused shared experts, an expert-parallel shard, group-limited routing, no finalize, an
-    intermediate size that is not a multiple of 128, a hidden size that is not, bf16 activations handed to the fp8 layer, no
+    num_experts outside the bounds, fused shared experts, an expert-parallel shard, expert groups with a method other than
+    DeepSeekV3 from logits, a group shape outside the rule, no finalize, an intermediate size that is not a multiple of 128, a hidden size that is not, bf16 activations handed to the fp8 layer, no
     activation scale tensor, a scale tensor of the wrong shape, weights prepared for another activation, an unimplemented routing
     method from logits); a zero-token call returns an empty output."""
     k, H, I, E = 6, 512, 256, 64
@@ -1393,12 +1427,6 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ),
             "fused shared experts",
         ),
-        (
-            dict(
-                routing=RoutingConfig(num_experts=E, top_k=k, n_group=2, topk_group=1)
-            ),
-            "n_group",
-        ),
         (dict(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize"),
     ):
         with pytest.raises(errors) as excinfo:
@@ -1413,6 +1441,30 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                 device=torch.device("cuda"),
             )
         assert what in str(excinfo.value) or "moe.e4m3bs" in str(excinfo.value), what
+    # the group shape rule of the DeepSeekV3 term is checked at construction (the shared routing_term)
+    for n_group, topk_group, kk in ((3, 1, k), (64, 4, k), (8, 9, k), (8, 1, 9)):
+        with pytest.raises(errors) as excinfo:
+            MoELayer(
+                MoEConfig(
+                    routing=RoutingConfig(
+                        num_experts=E,
+                        top_k=kk,
+                        method=RoutingMethodType.DeepSeekV3,
+                        n_group=n_group,
+                        topk_group=topk_group,
+                        routed_scaling_factor=1.0,
+                    ),
+                    quant=QUANT,
+                    experts=experts,
+                    backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+                ),
+                device=torch.device("cuda"),
+            )
+        assert "n_group" in str(excinfo.value) or "top_k" in str(excinfo.value), (
+            n_group,
+            topk_group,
+            kk,
+        )
     # an expert-parallel shard (the layer's local expert range): the fp8-block backend declares no expert parallelism, so the
     # layer's candidate filter and the runner's support check refuse the shard by name (the bf16 backend's base runner, which
     # computes shards, is not this runner's base)
@@ -1497,6 +1549,31 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert llama(
         _routed_pack(xq, sx, ids, torch.ones(8, 1, device="cuda")), W
     ).shape == (8, H)
+    # expert groups are a parameter of the DeepSeekV3 term: with another method they are refused from logits only (with
+    # pre-routed ids the group structure never enters the computation: the ungrouped layer's bits on the same ids and weights)
+    grouped = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E,
+                top_k=k,
+                method=RoutingMethodType.Renormalize,
+                n_group=2,
+                topk_group=1,
+            ),
+            quant=QUANT,
+            experts=experts,
+            backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+        ),
+        device=torch.device("cuda"),
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+        grouped(_logits_pack(xq, sx, logits), W)
+    assert "n_group" in str(excinfo.value)
+    g_ids, g_wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    assert torch.equal(
+        bits(grouped(_routed_pack(xq, sx, g_ids.cuda(), g_wts.cuda()), W)),
+        bits(layer(_routed_pack(xq, sx, g_ids.cuda(), g_wts.cuda()), W)),
+    )
     out = layer(_logits_pack(xq[:0], sx[:, :0].contiguous(), logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
 
