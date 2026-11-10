@@ -55,7 +55,11 @@ from .epilogue import (
     store_plan,
 )
 
-SCALES = ("none", "w4a4", "w4a4s")  # w4a4s: the static class's GEMM2 scale mul(alpha[e], inv2[e]), once per tile
+SCALES = (
+    "none",
+    "w4a4",
+    "w4a4s",
+)  # w4a4s: the static class's GEMM2 scale mul(alpha[e], inv2[e]), once per tile
 #: The chain's output formats: the bf16 class's, the f32 oracle, and ``nvfp4`` -- the static class's GEMM1, whose epilogue
 #: quantizes the fp32 chain value per 16-column block (codes and scale bytes out).
 OUT_FMTS_NVFP4 = ("bf16", "f32", "nvfp4")
@@ -94,7 +98,9 @@ class W4A4Chain(GroupedChain):
         return self.out_fmt == "nvfp4" or self.scale == "w4a4s"
 
     def describe(self) -> str:
-        base = super().describe()  # the output format names the static class's GEMM1 (`..._nvfp4`)
+        base = (
+            super().describe()
+        )  # the output format names the static class's GEMM1 (`..._nvfp4`)
         return base if self.scale == "none" else f"{self.scale}_{base}"
 
 
@@ -127,7 +133,9 @@ def static_block_plan(offs: List[Tuple[int, int]], pair: bool) -> List[List[int]
     for v, (m, n) in enumerate(offs):
         if pair and n % (2 * GROUP) >= GROUP:
             continue
-        groups.setdefault((m, key(n) // NVFP4_BLOCK), []).append((key(n) % NVFP4_BLOCK, v))
+        groups.setdefault((m, key(n) // NVFP4_BLOCK), []).append(
+            (key(n) % NVFP4_BLOCK, v)
+        )
     blocks = []
     for (m, b), lst in sorted(groups.items()):
         if sorted(pos for pos, _ in lst) != list(range(NVFP4_BLOCK)):
@@ -192,6 +200,7 @@ def grouped_w4a4_epilogue_loop(
     cta_v: Int32,
     mOutSf: cute.Tensor = None,
     mAux: cute.Tensor = None,
+    live_only: cutlass.Constexpr = True,
 ):
     """``mAlpha``: the per-expert alpha (as given); ``mPts``: the per-row scale of the A operand at the padded positions;
     ``s_off`` / ``s_off_pad``: the dense and the padded group offsets (``dense_a``: the row scale of output row ``p`` of
@@ -203,7 +212,9 @@ def grouped_w4a4_epilogue_loop(
     flat 128x4 scale-factor buffer at the (padded) row positions, ``mAux[e]`` the expert's static scale ``gs2``; the thread forms
     every 16-output block of its row from its own registers (:func:`static_block_plan`) and stores 8 code bytes and 1 scale byte
     per block. GEMM2 of that class (``chain.scale == "w4a4s"``): ``s = mul(alpha[e], mAux[e])``, ``mAux[e] = inv2[e]``, once per
-    tile."""
+    tile. ``live_only``: the chain (and the block quantization) is computed only on the lanes whose row is a live row of the
+    group (a dead row's accumulators are zero or stale bytes, whose exact divisions take the slow path and hold the warp; the
+    rows are never stored either way) -- a placement, the ``live_all`` variant computes every lane."""
     pair = chain.pair
     scaled = chain.scale != "none"
     static_q = chain.out_fmt == "nvfp4"
@@ -318,7 +329,9 @@ def grouped_w4a4_epilogue_loop(
     blocks = []
     mOut32 = None
     n_blocks = pcols = Int32(0)
-    tTR_cF_all = thr_t2r.partition_D(cF_epi)  # the flat (row, accumulator column) coordinates
+    tTR_cF_all = thr_t2r.partition_D(
+        cF_epi
+    )  # the flat (row, accumulator column) coordinates
     if cutlass.const_expr(static_q):
         assert len(rows_in_frag) == 1 and not staged, (
             "the static class's fused quantization takes the 128-row layouts (thread = row), unstaged"
@@ -326,8 +339,12 @@ def grouped_w4a4_epilogue_loop(
         blocks = static_block_plan(offs, pair)
         N_out = N // 2 if pair else N
         n_blocks = N_out // Int32(NVFP4_BLOCK)  # scale blocks per output row
-        pcols = ((n_blocks + Int32(3)) // Int32(4)) * Int32(4)  # scale columns of the 128x4 buffer
-        ld32 = cute.assume(ld // Int32(4), divby=4)  # the code row in 32-bit words (16-byte rows)
+        pcols = ((n_blocks + Int32(3)) // Int32(4)) * Int32(
+            4
+        )  # scale columns of the 128x4 buffer
+        ld32 = cute.assume(
+            ld // Int32(4), divby=4
+        )  # the code row in 32-bit words (16-byte rows)
         mOut32 = cute.make_tensor(
             cute.recast_ptr(mOut.iterator, dtype=Uint32),
             cute.make_layout((Tk, n_blocks * Int32(2)), stride=(ld32, 1)),
@@ -354,7 +371,9 @@ def grouped_w4a4_epilogue_loop(
         alpha_e = None
         gs6 = inv_gs = None
         if cutlass.const_expr(chain.scale == "w4a4s"):
-            alpha_e = w4a4_row_scale(MoeF32, mAlpha[e], mAux[e])  # mul(alpha2[e], inv2[e]): the static class's GEMM2 scale
+            alpha_e = w4a4_row_scale(
+                MoeF32, mAlpha[e], mAux[e]
+            )  # mul(alpha2[e], inv2[e]): the static class's GEMM2 scale
         elif cutlass.const_expr(scaled):
             alpha_e = mAlpha[e]  # the tile's expert alpha, as given
             if cutlass.const_expr(static_q):
@@ -400,47 +419,70 @@ def grouped_w4a4_epilogue_loop(
                 # the row scale once per distinct row of the fragment: s = mul(alpha_e, pts[row]); a tile past the padded end
                 # reads a valid row and stores nothing (the static class's GEMM2: the per-tile scale for every row)
                 row_scale = {}
+                crd0 = cC_sub[((0, 0), 0, 0)]
                 if cutlass.const_expr(chain.scale == "w4a4s"):
                     for m in rows_in_frag:
                         row_scale[m] = alpha_e
                 elif cutlass.const_expr(scaled):
-                    crd0 = cC_sub[((0, 0), 0, 0)]
                     for m in rows_in_frag:
                         p = row0 + pts_shift + (crd0[0] - Int32(offs[0][0]) + Int32(m))
                         p = cutlass.min(
                             cutlass.max(p, Int32(0)), mPts.shape[0] - Int32(1)
                         )
                         row_scale[m] = w4a4_row_scale(MoeF32, alpha_e, mPts[p])
+                # the lane's rows that are live rows of the group: the chain is computed there only (`live_only`)
+                live = {}
+                for m in rows_in_frag:
+                    live[m] = (crd0[0] - Int32(offs[0][0]) + Int32(m)) < rows_left
                 if cutlass.const_expr(static_q):
-                    # the static class: the fp32 chain values, then every 16-output block of the row quantized from this thread's
-                    # registers; 8 code bytes to the packed-code row, the scale byte to the (padded) row's 128x4 position
+                    # the static class: every 16-output block of the row quantized from this thread's registers -- the fp32 chain
+                    # values of the block, its scale and codes; 8 code bytes to the packed-code row, the scale byte to the (padded)
+                    # row's 128x4 position
                     crdF0 = tTR_cF_tile[(None, None, None, s)][(0, 0, 0)]
                     pre = [None] * nv
-                    for v in cutlass.range_constexpr(nv):
-                        if cutlass.const_expr(is_out[v]):
-                            pre[v] = _scaled_elem(
-                                chain,
-                                tTR_rAcc[v],
-                                tTR_rAcc[partner[v]] if cutlass.const_expr(pair) else None,
-                                row_scale[offs[v][0]],
-                            )
+                    if cutlass.const_expr(not live_only):
+                        for v in cutlass.range_constexpr(nv):
+                            if cutlass.const_expr(is_out[v]):
+                                pre[v] = _scaled_elem(
+                                    chain,
+                                    tTR_rAcc[v],
+                                    tTR_rAcc[partner[v]]
+                                    if cutlass.const_expr(pair)
+                                    else None,
+                                    row_scale[offs[v][0]],
+                                )
                     for blk in blocks:
                         rrow = crdF0[0] - Int32(offs[0][0]) + Int32(offs[blk[0]][0])
                         acc_col = crdF0[1] - Int32(offs[0][1]) + Int32(offs[blk[0]][1])
                         out_col = (
-                            (acc_col // Int32(2 * GROUP)) * Int32(GROUP) + acc_col % Int32(GROUP)
+                            (acc_col // Int32(2 * GROUP)) * Int32(GROUP)
+                            + acc_col % Int32(GROUP)
                             if cutlass.const_expr(pair)
                             else acc_col
                         )
                         bcol = out_col // Int32(NVFP4_BLOCK)
                         if (rrow < rows_left) & (bcol < n_blocks):
-                            sf_byte, w0, w1 = static_block_quant(
-                                [pre[v] for v in blk], gs6, inv_gs
-                            )
+                            if cutlass.const_expr(live_only):
+                                vals = [
+                                    _scaled_elem(
+                                        chain,
+                                        tTR_rAcc[v],
+                                        tTR_rAcc[partner[v]]
+                                        if cutlass.const_expr(pair)
+                                        else None,
+                                        row_scale[offs[v][0]],
+                                    )
+                                    for v in blk
+                                ]
+                            else:
+                                vals = [pre[v] for v in blk]
+                            sf_byte, w0, w1 = static_block_quant(vals, gs6, inv_gs)
                             prow = row0 + rrow
                             mOut32[(prow, Int32(2) * bcol)] = w0
                             mOut32[(prow, Int32(2) * bcol + Int32(1))] = w1
-                            mOutSf[sf_byte_offset(prow + pts_shift, bcol, pcols)] = sf_byte.to(Uint8)
+                            mOutSf[sf_byte_offset(prow + pts_shift, bcol, pcols)] = (
+                                sf_byte.to(Uint8)
+                            )
                 else:
                     for v in cutlass.range_constexpr(nv):
                         if cutlass.const_expr(is_out[v]):
@@ -449,12 +491,25 @@ def grouped_w4a4_epilogue_loop(
                                 if cutlass.const_expr(scaled)
                                 else None
                             )
-                            tTR_rC[v] = _scaled_elem(
-                                chain,
-                                tTR_rAcc[v],
-                                tTR_rAcc[partner[v]] if cutlass.const_expr(pair) else None,
-                                sv,
-                            )
+                            if cutlass.const_expr(live_only):
+                                if live[offs[v][0]]:
+                                    tTR_rC[v] = _scaled_elem(
+                                        chain,
+                                        tTR_rAcc[v],
+                                        tTR_rAcc[partner[v]]
+                                        if cutlass.const_expr(pair)
+                                        else None,
+                                        sv,
+                                    )
+                            else:
+                                tTR_rC[v] = _scaled_elem(
+                                    chain,
+                                    tTR_rAcc[v],
+                                    tTR_rAcc[partner[v]]
+                                    if cutlass.const_expr(pair)
+                                    else None,
+                                    sv,
+                                )
                 if cutlass.const_expr(staged):
                     cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, wg)])
                 elif cutlass.const_expr(not static_q):

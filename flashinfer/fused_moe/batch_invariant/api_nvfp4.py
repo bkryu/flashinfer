@@ -505,7 +505,11 @@ def grouped_gemm_nvfp4(
                 grid,
             )
         return out
-    kernel = get_compiled_grouped_nvfp4(config, chain, in_fmt, dense_a)
+    from .blocks import compile_nvfp4 as CN
+
+    kernel = get_compiled_grouped_nvfp4(
+        config, chain, in_fmt, dense_a, CN.GROUPED_VARIANT
+    )
     if static:
         kernel(
             a4.unsqueeze(-1),

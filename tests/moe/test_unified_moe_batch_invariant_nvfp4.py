@@ -2372,3 +2372,34 @@ def test_static_class_through_the_layer_batch_invariance_graph_replay_and_pack_c
     with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
         layer(_logits_pack(x, logits), per_token)
     assert "intermediate" in str(excinfo.value)
+
+
+@needs_device
+def test_padded_body_live_lane_variant_gives_the_bits(monkeypatch):
+    """The padded body's epilogue computes the chain (and the static class's block quantization) on the lanes of live rows
+    only; the ``live_all`` variant computes every lane of an active warp: the same bits for the per-token and the static class,
+    on the dense and the padded packing, at a shape whose tiles are mostly dead rows."""
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        MoEWeightsNVFP4,
+        fused_moe_nvfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks import compile_nvfp4 as CN
+    from flashinfer.fused_moe.batch_invariant.blocks.kernel_nvfp4 import (
+        GROUPED_VARIANTS,
+    )
+
+    assert GROUPED_VARIANTS == ("live_all",)
+    T, k, H, I, E = 37, 4, 512, 256, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=26)
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    for inter in ("per_token", "static"):
+        W = MoEWeightsNVFP4.prepare(w1, w2, intermediate=inter)
+        for path in ("dense", "padded"):
+            outs = {}
+            for variant in ("", "live_all"):
+                monkeypatch.setattr(CN, "GROUPED_VARIANT", variant)
+                outs[variant] = bits(
+                    fused_moe_nvfp4(x, ids, wts, W, path=path, swap=False)
+                )
+            assert torch.equal(outs[""], outs["live_all"]), (inter, path)
