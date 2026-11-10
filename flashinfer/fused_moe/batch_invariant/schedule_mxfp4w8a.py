@@ -54,10 +54,12 @@ REQUANT_NODES = 3
 SWAPPED_QUANT_COLUMN_CYCLES = 150.0
 
 
-#: Cycles per launch of the swapped body's own prologue on the MX classes beyond the grouped body's: its second group table and
-#: the token scale-factor gather, paid once per CTA whatever the live rows and whatever the chain (GEMM2's conversion as much as
-#: GEMM1's quantizing chain). One declared empirical constant of this class, the smallest that puts the padded body first at the
-#: one-live-row cells of the small models; the padded body carries no such term.
+#: Cycles per launch of the swapped body's own prologue on the MX classes beyond the grouped body's: its group tables (the dense
+#: and the padded offsets in one fused scan) and the token scale-factor gather, paid once per CTA whatever the live rows and whatever
+#: the chain (GEMM2's conversion as much as GEMM1's quantizing chain). One declared empirical constant of this class, fitted on the
+#: decode cells of the campaign; a per-launch term cannot also price the swapped records' per-k-tile deficit at sixteen rows per
+#: expert (the padded body's lead there is per k-tile: docs, the open follow-on), so the value is kept where no value keeps every
+#: stamped cell within the regret bound. The padded body carries no such term.
 SWAPPED_FIXED_CYCLES = 12000.0
 
 
