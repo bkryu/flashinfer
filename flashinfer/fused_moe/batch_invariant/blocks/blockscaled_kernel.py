@@ -181,23 +181,27 @@ def ring_bytes(st) -> int:
 
 
 def umma_ring_bytes(st) -> int:
-    """Shared memory of the operand rings a UMMA reads (A and B, all stages)."""
-    return cute.size_in_bytes(st.a_dtype, st.a_smem_layout_staged) + cute.size_in_bytes(
-        st.b_dtype, st.b_smem_layout_staged
-    )
+    """Shared memory of the M-side operand ring a UMMA reads (A, all stages: the first ring behind the barriers and the kernel's
+    own buffers in every grouped body), the ring the plans' address bound applies to."""
+    return cute.size_in_bytes(st.a_dtype, st.a_smem_layout_staged)
 
 
 def plan_with_room(
-    plan_cls, knobs: Knobs, own_bytes, umma_addr_max: Optional[int] = None
+    plan_cls,
+    knobs: Knobs,
+    own_bytes,
+    umma_addr_max: Optional[int] = None,
+    k_blocks: Optional[int] = None,
 ):
     """The block-scaled plan whose operand ring leaves room for the grouped kernel's own shared memory (the group tables,
     the epilogue staging buffers): built once; if the ring plus ``own_bytes(st)`` plus the barrier reserve overflows the
     CTA's shared memory, rebuilt with the budget shortened by the overflow (one stage fewer). ``umma_addr_max``: the
-    operand rings a UMMA reads (A and B, behind the barriers and the kernel's own buffers) end below this many bytes of
-    the CTA's shared memory -- the plan's ``UMMA_SMEM_ADDR_MAX``, the bound below which every operand layout observed
-    computes the class on the sm_100 instruction plans of this part (the long-K test over every record is the guard). A
-    placement: the ring depth moves no bits."""
-    st = plan_cls(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR)
+    M-side operand ring a UMMA reads (A, first behind the barriers and the kernel's own buffers) ends below this many bytes of
+    the CTA's shared memory -- the plan's ``UMMA_SMEM_ADDR_MAX``, the bound above which the M-side operand ring (A) reads
+    wrong data on the sm_100 instruction plans of this part; the B and scale-factor rings above it compute the class (the
+    long-K test over every record is the guard). ``k_blocks``: the plan's K steps per stage (the swapped body's two-atom
+    stage; default the format's). A placement: the ring depth moves no bits."""
+    st = plan_cls(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR, k_blocks=k_blocks)
     over = ring_bytes(st) + own_bytes(st) + MBAR_RESERVE_BYTES - st.smem_capacity
     if umma_addr_max is not None:
         over = max(
@@ -219,7 +223,7 @@ def plan_with_room(
                 finally:
                     self.smem_capacity += cut
 
-        st2 = _Plan(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR)
+        st2 = _Plan(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR, k_blocks=k_blocks)
         fits = (
             ring_bytes(st2) + own_bytes(st2) + MBAR_RESERVE_BYTES <= st2.smem_capacity
         )
@@ -328,6 +332,7 @@ class GroupedBlockScaledGemmMX:
                 else 0
             )
             + xch_bytes(self.chain, EPI_WARPGROUPS_MX),
+            self.plan_cls.UMMA_SMEM_ADDR_MAX,
         )
         self.st = st
         self.c_smem_layout_staged = (

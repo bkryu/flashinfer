@@ -67,7 +67,7 @@ from ....gemm.batch_invariant.blocks.blockscaled import (
 )
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE, BAR_TMEM_ALLOC
 from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs
-from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS
+from ....gemm.batch_invariant.spec import MMA_K_OF, SF_ATOM_KBLOCKS
 from .blockscaled_kernel import (
     GROUP_ALIGN,
     MX_FMTS,
@@ -174,7 +174,11 @@ class SwappedBlockScaledGemmMX:
     group: the dense MX class's fold per row with the weights on the MMA's M side, the bf16 classes' chain or the fused
     requantization on the accumulators (the UE8M0 block scales are operands of the instruction: no row or expert scale)."""
 
-    def __init__(self, knobs: Knobs, chain: GroupedChain, in_fmt: str = "mxfp8"):
+    def __init__(
+        self, knobs: Knobs, chain: GroupedChain, in_fmt: str = "mxfp8", k_block: int = 0
+    ):
+        """``k_block``: K elements per smem stage (0: the format's one 128-byte atom; 256: two atoms, `swap_k_block`), a
+        placement of the same fold."""
         assert isinstance(chain, GroupedChain), chain
         assert in_fmt in MX_FMTS and in_fmt in PLANS, in_fmt
         assert is_swapped_record(knobs), (
@@ -184,6 +188,7 @@ class SwappedBlockScaledGemmMX:
         self.knobs, self.chain, self.in_fmt = knobs, chain, in_fmt
         self.plan_cls = PLANS[in_fmt]
         self.token_tile = knobs.tile_n
+        self.k_block = k_block
 
     @cute.jit
     def __call__(
@@ -236,6 +241,7 @@ class SwappedBlockScaledGemmMX:
             self.knobs,
             lambda st: TABLE_BYTES + swap_xch_bytes(self.chain, self.token_tile),
             plan_cls.UMMA_SMEM_ADDR_MAX,
+            (self.k_block // MMA_K_OF[self.in_fmt]) if self.k_block else None,
         )
         self.st = st
         self.block = st.block
