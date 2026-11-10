@@ -165,7 +165,9 @@ class MoEWeightsNVFP4:
         from ...batch_invariant.quantization.nvfp4_api import nvfp4_quantize_rows
 
         if intermediate not in INTERMEDIATES:
-            raise ValueError(f"intermediate must be one of {INTERMEDIATES}, not {intermediate!r}")
+            raise ValueError(
+                f"intermediate must be one of {INTERMEDIATES}, not {intermediate!r}"
+            )
         act = act if act is not None else ("silu" if gated else "relu2")
         if act not in (S.ACTS if gated else S.UNGATED_ACTS):
             raise ValueError(f"no {'gated' if gated else 'ungated'} chain {act!r}")
@@ -223,9 +225,15 @@ class MoEWeightsNVFP4:
                 .reshape(E)
                 .contiguous()
             )
-            if not (bool((gs_inter > 0).all()) and bool(torch.isfinite(gs_inter).all())):
-                raise ValueError("the static intermediate scales are positive finite multipliers [E]")
-            inv_inter = torch.reciprocal(gs_inter).contiguous()  # div.rn: the quantizer's correctly rounded reciprocal
+            if not (
+                bool((gs_inter > 0).all()) and bool(torch.isfinite(gs_inter).all())
+            ):
+                raise ValueError(
+                    "the static intermediate scales are positive finite multipliers [E]"
+                )
+            inv_inter = torch.reciprocal(
+                gs_inter
+            ).contiguous()  # div.rn: the quantizer's correctly rounded reciprocal
         return MoEWeightsNVFP4(
             torch.stack(w1s).contiguous(),
             torch.stack(sf1s).contiguous(),
@@ -445,7 +453,9 @@ def grouped_gemm_nvfp4(
                 "grouped_gemm_nvfp4: the static class's chains take aux, the per-expert static scales [E] (gs2 for GEMM1, inv2 for GEMM2)"
             )
         if out_sf is None:
-            out_sf = _dummy_sf(a4.device)  # GEMM2 of the static class: the scale-byte operand is unread
+            out_sf = _dummy_sf(
+                a4.device
+            )  # GEMM2 of the static class: the scale-byte operand is unread
     if out is None:
         out = torch.zeros(rows, n_out, dtype=out_dtype, device=a4.device)
     if (
@@ -746,8 +756,8 @@ def fused_moe_nvfp4(
     ``in_fmts`` names the instruction class per GEMM (default: the dense rule on each expert weight shape and the device's
     family); ``config1`` / ``config2`` the grouped records (any record of the space gives the same bits; the dispatcher's pick
     by default); ``path`` the packing of the expanded rows (``"dense"`` / ``"padded"``: placements); ``swap`` the dense path's
-    body -- None: the dispatcher's structural rule (the swapped decode body when the rows per active expert fit a narrow token
-    tile), True / False: the swapped / the padded body on both GEMMs (placements: the same bits); explicit records select the
+    body -- None: the dispatcher's ranking (the swapped decode body's records ranked with the grouped records by the dense
+    estimate at the grouped shape), True / False: the swapped / the padded body on both GEMMs (placements: the same bits); explicit records select the
     body themselves (a swapped record needs the dense path). ``plan``: the dense packing's precomputed plan, the outputs of
     :func:`route_plan_dual` after the ids and weights (``counts, dest, src, dest_pad, pos_pad``: the same integers as
     :func:`permute_plan_dual`'s, one launch saved)."""
@@ -811,7 +821,9 @@ def fused_moe_nvfp4(
                 "fused_moe_nvfp4: the quantized triple is (x4 [T, H/2] uint8, x_sf 128x4 uint8 of >= sf_numel(T, H) bytes or the linear [T, H/16] bytes, x_pts [T] f32 or None)"
             )
         if unit_pts:
-            x_pts = _gs_inv(1.0, dev)  # a placeholder the unit-scale scatter never reads
+            x_pts = _gs_inv(
+                1.0, dev
+            )  # a placeholder the unit-scale scatter never reads
     k = token_selected_experts.shape[1]
     check_shape_nvfp4(H, I, E, k, w.gated)
     if (
@@ -927,7 +939,9 @@ def fused_moe_nvfp4(
                 out_sf=a_sf_pad,
                 aux=w.gs2,
             )
-            a_pts_pad = x_perm_pts  # GEMM2's row-scale operand is unread by the static chain
+            a_pts_pad = (
+                x_perm_pts  # GEMM2's row-scale operand is unread by the static chain
+            )
         else:
             a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
             grouped_gemm_nvfp4(
@@ -1065,7 +1079,17 @@ def fused_moe_nvfp4(
         )
         a, a_pts = None, x_perm_pts
         y = grouped_gemm_nvfp4(
-            a4, a_sf, a_pts, w.w2, w.w2_sf, w.w2_alpha, counts, config2, chain2, in2, aux=w.inv2
+            a4,
+            a_sf,
+            a_pts,
+            w.w2,
+            w.w2_sf,
+            w.w2_alpha,
+            counts,
+            config2,
+            chain2,
+            in2,
+            aux=w.inv2,
         )
     else:
         a = grouped_gemm_nvfp4(
@@ -1084,7 +1108,16 @@ def fused_moe_nvfp4(
             a, gsi
         )  # the class, second pass (padding rows included: zeros)
         y = grouped_gemm_nvfp4(
-            a4, a_sf, a_pts, w.w2, w.w2_sf, w.w2_alpha, counts, config2, GEMM2_CHAIN, in2
+            a4,
+            a_sf,
+            a_pts,
+            w.w2,
+            w.w2_sf,
+            w.w2_alpha,
+            counts,
+            config2,
+            GEMM2_CHAIN,
+            in2,
         )
     if T:
         get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count))(

@@ -498,6 +498,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
         MoEWeightsNVFP4,
     )
     from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        active_experts,
         all_valid_configs_nvfp4,
         all_valid_configs_nvfp4_swapped,
         default_configs_nvfp4,
@@ -587,12 +588,24 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     c1.describe(),
                     c2.describe(),
                 )
-                # the structural rule: the swapped decode body iff the rows per active expert fit a narrow token tile, its
-                # record the narrowest such tile; the padded body's records with the body forbidden
-                tn = token_tile_default(rows_per_expert(T, k, E))
-                assert c1.swap_ab == c2.swap_ab == (tn is not None) and (
-                    tn is None or c1.tile_n == c2.tile_n == tn
-                ), (family, T, H, I, E, k, c1.describe())
+                # the ranking decides the body (both record spaces ranked together): the pick is the ranked list's head; the
+                # swapped body forced is a swapped record, forbidden a grouped one
+                rows = rows_per_expert(T, k, E)
+                a1, a2 = default_configs_nvfp4(
+                    T,
+                    k,
+                    H,
+                    I,
+                    E,
+                    (in1, in2),
+                    chain1,
+                    GEMM2_CHAIN,
+                    sm_count,
+                    family,
+                    nominal=True,
+                    swap=True,
+                )
+                assert a1 in w1 and a2 in w2 and a1.swap_ab and a2.swap_ab
                 d1, d2 = default_configs_nvfp4(
                     T,
                     k,
@@ -609,7 +622,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                 )
                 assert d1 in s1 and d2 in s2 and not d1.swap_ab and not d2.swap_ab
                 ranked = rank_grouped_nvfp4(
-                    rows_per_expert(T, k, E),
+                    rows,
                     H,
                     I,
                     E,
@@ -619,17 +632,37 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     family,
                     3,
                     nominal=True,
+                    n_active=active_experts(T, k, E),
                 )
                 assert (
                     1 <= len(ranked) <= 3
                     and len(set(ranked)) == len(ranked)
                     and all(c in s2 | w2 for c in ranked)
+                    and ranked[0] == c2
                 )
-                assert (
-                    sum(1 for c in ranked if c.swap_ab) == (1 if tn is not None else 0)
-                ) and (
-                    tn is None or ranked[0].swap_ab
-                )  # the swapped record leads the ranking where the rule picks it
+                # one row per active expert ranks the swapped body first on both GEMMs; at a group of many padded atoms no
+                # swapped record ranks first (the regret of the ranking between is measured, not asserted)
+                if rows == 1:
+                    assert c1.swap_ab and c2.swap_ab, (
+                        family,
+                        T,
+                        H,
+                        I,
+                        E,
+                        k,
+                        c1.describe(),
+                    )
+                if rows > 128:
+                    assert not c1.swap_ab and not c2.swap_ab, (
+                        family,
+                        T,
+                        H,
+                        I,
+                        E,
+                        k,
+                        c1.describe(),
+                        c2.describe(),
+                    )
                 # the tile-fit guard: at a group of one padded atom the picks and the ranked list are 128-row tiles (a
                 # 256-row 2-CTA tile would compute a second atom of padding); at taller groups every tile is a candidate
                 if padded_rows(rows_per_expert(T, k, E)) == 128:
@@ -1263,9 +1296,9 @@ def test_batch_permutation_and_subbatch_invariance():
 @needs_device
 @pytest.mark.parametrize("T", [300, 8], ids=["mid", "decode"])
 def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
-    """Every autotuner tactic (the dispatcher's top records of the two GEMMs, both record spaces) computes the class; the tactic
-    round-trips its record (the swapped-record flag included: at decode the list leads with the swapped body's record and the
-    rest are dense records), and autotuning keeps the bits."""
+    """Every autotuner tactic (the dispatcher's ranked records of the two GEMMs, both record spaces ranked together) computes the
+    class; the list is the ranking's product in rank order, the tactic round-trips its record (the swapped-record flag included:
+    at decode the ranking leads with the swapped body's records), and autotuning keeps the bits."""
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe.batch_invariant.runner_nvfp4 import (
         _configs_from_tactic_nvfp4,
@@ -1287,14 +1320,12 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
     inputs = runner.pack_inputs(pack, W)
     tactics = runner.get_valid_tactics(inputs, None)
     assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
-    swapped = token_tile_default(rows_per_expert(T, k, E)) is not None
+    r1, r2 = runner._ranked(T, H)
+    assert tactics == [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
     c1, c2 = _configs_from_tactic_nvfp4(tactics[0])
-    assert (
-        _tactic_nvfp4(c1, c2) == tactics[0] and c1.swap_ab == c2.swap_ab == swapped
-    ), (T, c1.describe(), c2.describe())
-    assert any(
-        not _configs_from_tactic_nvfp4(t)[0].swap_ab for t in tactics
-    )  # the dense records follow in the list
+    assert _tactic_nvfp4(c1, c2) == tactics[0] and (c1, c2) == (r1[0], r2[0])
+    if token_tile_default(rows_per_expert(T, k, E)) is not None:
+        assert c1.swap_ab and c2.swap_ab, (T, c1.describe(), c2.describe())
     for t in tactics:
         out = runner.forward(runner.pack_inputs(pack, W), tactic=t)
         assert torch.equal(bits(out), ref), t
