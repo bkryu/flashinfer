@@ -33,8 +33,8 @@ from ...batch_invariant import canon, jit
 from ...batch_invariant.fp_interface.cute import get_cutlass_dtype
 from . import spec as S
 from . import pdl
-from .blocks.scheduler import MAX_E, build_group_tables
-from .permute import LANES, MODULE
+from .blocks.scheduler import MAX_E, TABLE_ROWS, build_group_tables
+from .permute import LANES, MODULE, emit_tables
 from .route import route_token
 
 THREADS = 1024  # 32 warps route the tokens
@@ -91,6 +91,7 @@ class RoutePlanKernel:
         mSrc: cute.Tensor,
         mDestPad: cute.Tensor,
         mPosPad: cute.Tensor,
+        mTab: cute.Tensor,
         T: Int32,
         E: Int32,
         E_plan: Int32,
@@ -108,6 +109,7 @@ class RoutePlanKernel:
             mSrc,
             mDestPad,
             mPosPad,
+            mTab,
             T,
             E,
             E_plan,
@@ -127,6 +129,7 @@ class RoutePlanKernel:
         mSrc: cute.Tensor,
         mDestPad: cute.Tensor,
         mPosPad: cute.Tensor,
+        mTab: cute.Tensor,
         T: Int32,
         E: Int32,
         E_plan: Int32,
@@ -222,6 +225,7 @@ class RoutePlanKernel:
                 build_group_tables(
                     hist, E_plan, 1, s_off_pad, s_pre_pad, self.pad_align
                 )
+        emit_tables(hist, E_plan, self.pad_align, mTab, warp)
         cute.arch.barrier()
         # phase B3: the positions
         if warp < Int32(RANK_WARPS):
@@ -316,6 +320,12 @@ def get_compiled_route_plan(
         src_fake = cute.runtime.make_fake_tensor(Int32, (sym_p,), (1,), assumed_align=4)
         dp_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         pp_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
+        t_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (TABLE_ROWS, cute.sym_int(32)),
+            (cute.sym_int64(), 1),
+            assumed_align=4,
+        )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
             RoutePlanKernel(Ep, k, method, align, dual, pad_align),
@@ -329,6 +339,7 @@ def get_compiled_route_plan(
             src_fake,
             dp_fake,
             pp_fake,
+            t_fake,
             Int32(1),
             Int32(1),
             Int32(1),

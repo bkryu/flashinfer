@@ -2339,10 +2339,12 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
                 nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
                 hist_blk = torch.empty(nb * E, dtype=torch.int32, device="cuda")
                 get_compiled_plan_multi(1, True, 128)(
-                    flat, c2, d2, s2, dp, pp, hist_blk, n, E, nb
+                    flat, c2, d2, s2, dp, pp, _plan_tables(E), hist_blk, n, E, nb
                 )
             else:
-                get_compiled_plan(1, True, 128)(flat, c2, d2, s2, dp, pp, n, E)
+                get_compiled_plan(1, True, 128)(
+                    flat, c2, d2, s2, dp, pp, _plan_tables(E), n, E
+                )
             torch.cuda.synchronize()
             assert torch.equal(c2, counts) and torch.equal(d2.view(T, k), dest)
             assert torch.equal(s2, src)
@@ -2425,7 +2427,9 @@ def test_multi_launch_plan_equals_the_host_plan(T, k, E):
     c1 = torch.empty(E, dtype=torch.int32, device="cuda")
     d1 = torch.empty(n, dtype=torch.int32, device="cuda")
     s1 = torch.empty(n, dtype=torch.int32, device="cuda")
-    get_compiled_plan(1, False)(ids.cuda().view(-1), c1, d1, s1, d1, d1, n, E)
+    get_compiled_plan(1, False)(
+        ids.cuda().view(-1), c1, d1, s1, d1, d1, _plan_tables(E), n, E
+    )
     assert torch.equal(c1, counts) and torch.equal(d1.view(T, k), dest)
     assert torch.equal(s1, src)
 
@@ -2454,3 +2458,65 @@ def test_f32_prerouted_weights_round_in_the_combine_kernel():
     a = fused_moe(x, ids.cuda(), weights.cuda(), Wm, w_round=True)
     b = fused_moe(x, ids.cuda(), w16.float().cuda(), Wm)
     assert torch.equal(bits(a), bits(b))
+
+
+def _plan_tables(E: int) -> torch.Tensor:
+    """A plan kernel's group-tables output buffer (``[TABLE_ROWS, E + 1]`` int32), for the tests that launch the plan kernels directly."""
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import TABLE_ROWS
+
+    return torch.empty(TABLE_ROWS, E + 1, dtype=torch.int32, device="cuda")
+
+
+def _group_tables_ref(counts: torch.Tensor, pad_align: int = 128) -> torch.Tensor:
+    """The scheduler's group tables of ``counts`` in torch: ``[TABLE_ROWS, E + 1]`` -- the exclusive prefix of the counts,
+    of the counts rounded up to ``pad_align`` rows, and of ``ceil(counts / extent)`` per extent of ``TABLE_CLUSTER_ROWS``;
+    entry ``E`` the totals."""
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import TABLE_CLUSTER_ROWS
+
+    c = counts.long().cpu()
+    z = torch.zeros(1, dtype=torch.long)
+    rows = [
+        torch.cat([z, c.cumsum(0)]),
+        torch.cat([z, ((c + pad_align - 1) // pad_align * pad_align).cumsum(0)]),
+    ]
+    rows += [
+        torch.cat([z, ((c + cr - 1) // cr).cumsum(0)]) for cr in TABLE_CLUSTER_ROWS
+    ]
+    return torch.stack(rows).to(torch.int32)
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize(
+    "T,k,E", [(3, 2, 8), (257, 6, 64), (100, 8, 1024), (2049, 3, 2), (1, 1, 512)]
+)
+def test_the_plans_emit_the_group_tables(T, k, E, multi, monkeypatch):
+    """Every plan (`api.permute_plan` in its one-launch and two-launch block forms, `api.route_plan` in its three forms) emits
+    the GEMM launches' group tables: the dense and the padded group offsets and a cluster-row prefix per extent of
+    ``TABLE_CLUSTER_ROWS`` (entry E the totals), equal to the torch reference and to the standalone tables kernel
+    (`api.group_tables`); incl. E = 1024, the table bound."""
+    from flashinfer.fused_moe.batch_invariant import api
+
+    monkeypatch.setattr(api, "PLAN_MULTI_MIN_N", 0 if multi else 1 << 30)
+    g = torch.Generator().manual_seed(T + E)
+    ex = (
+        torch.stack([torch.randperm(E, generator=g)[:k] for _ in range(T)])
+        .to(torch.int32)
+        .cuda()
+    )
+    ref = _group_tables_ref(torch.bincount(ex.reshape(-1).long().cpu(), minlength=E))
+    tab = api.group_tables_buffer(E, torch.device("cuda"))
+    counts = api.permute_plan(ex, E, tab)[0]
+    torch.cuda.synchronize()
+    assert torch.equal(tab.cpu(), ref)
+    assert torch.equal(api.group_tables(counts).cpu(), ref)
+    if T <= 16:
+        logits = (torch.randn(T, E, generator=g) * 2).float().cuda()
+        for kw in (dict(align=1), dict(align=128), dict(dual=True, pad_align=128)):
+            tab = api.group_tables_buffer(E, torch.device("cuda"))
+            outs = api.route_plan(logits, k, tables=tab, **kw)
+            torch.cuda.synchronize()
+            ref2 = _group_tables_ref(
+                torch.bincount(outs[0].reshape(-1).long().cpu(), minlength=E)
+            )
+            assert torch.equal(tab.cpu(), ref2), kw
+            assert torch.equal(api.group_tables(outs[2]).cpu(), ref2), kw
