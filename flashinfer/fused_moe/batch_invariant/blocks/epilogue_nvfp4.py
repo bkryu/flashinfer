@@ -24,7 +24,7 @@ from typing import List, Tuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass import Boolean, Float32, Int32, Int64, Uint8, Uint32
+from cutlass import Boolean, Int32, Int64, Uint8, Uint32
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
@@ -178,16 +178,6 @@ def static_block_quant(vals, gs6, inv_gs):
 
 
 @cute.jit
-def _select_f32(cond, a, b):
-    """``a`` if ``cond`` else ``b`` on fp32 values (``selp``, no arithmetic): the dead-lane replacement after the TMEM load."""
-    from cutlass._mlir.dialects import arith
-
-    return Float32(
-        arith.select(cond.ir_value(), Float32(a).ir_value(), Float32(b).ir_value())
-    )
-
-
-@cute.jit
 def grouped_w4a4_epilogue_loop(
     st,
     chain: cutlass.Constexpr,
@@ -222,9 +212,9 @@ def grouped_w4a4_epilogue_loop(
     flat 128x4 scale-factor buffer at the (padded) row positions, ``mAux[e]`` the expert's static scale ``gs2``; the thread forms
     every 16-output block of its row from its own registers (:func:`static_block_plan`) and stores 8 code bytes and 1 scale byte
     per block. GEMM2 of that class (``chain.scale == "w4a4s"``): ``s = mul(alpha[e], mAux[e])``, ``mAux[e] = inv2[e]``, once per
-    tile. ``live_only``: a dead row's accumulators (zero or stale bytes, whose exact divisions take the slow path and hold the
-    warp) are replaced by a benign constant right after the load, so the chain and the block quantization run on benign values
-    there; the rows are never stored either way -- a placement, the ``live_all`` variant computes on the raw accumulators."""
+    tile. ``live_only``: the chain (and the block quantization) is computed only on the lanes whose row is a live row of the
+    group (a dead row's accumulators are zero or stale bytes, whose exact divisions take the slow path and hold the warp; the
+    rows are never stored either way) -- a placement, the ``live_all`` variant computes every lane."""
     pair = chain.pair
     scaled = chain.scale != "none"
     static_q = chain.out_fmt == "nvfp4"
@@ -426,21 +416,10 @@ def grouped_w4a4_epilogue_loop(
             if warp_active:
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
                 cC_sub = tRG_cC[(None, None, None, s)]
-                crd0 = cC_sub[((0, 0), 0, 0)]
-                if cutlass.const_expr(live_only):
-                    # a dead row's accumulators (zero or stale bytes, whose exact divisions take the slow path and hold the
-                    # warp) are replaced by a benign constant right after the load; the chain below runs unconditionally with
-                    # its interleaving intact, and a dead row's values are never stored
-                    for v in cutlass.range_constexpr(nv):
-                        live_v = (
-                            crd0[0] - Int32(offs[0][0]) + Int32(offs[v][0])
-                        ) < rows_left
-                        tTR_rAcc[v] = _select_f32(
-                            live_v, tTR_rAcc[v], MoeF32.const(1.0)
-                        )
                 # the row scale once per distinct row of the fragment: s = mul(alpha_e, pts[row]); a tile past the padded end
                 # reads a valid row and stores nothing (the static class's GEMM2: the per-tile scale for every row)
                 row_scale = {}
+                crd0 = cC_sub[((0, 0), 0, 0)]
                 if cutlass.const_expr(chain.scale == "w4a4s"):
                     for m in rows_in_frag:
                         row_scale[m] = alpha_e
@@ -451,21 +430,27 @@ def grouped_w4a4_epilogue_loop(
                             cutlass.max(p, Int32(0)), mPts.shape[0] - Int32(1)
                         )
                         row_scale[m] = w4a4_row_scale(MoeF32, alpha_e, mPts[p])
+                # the lane's rows that are live rows of the group: the chain is computed there only (`live_only`)
+                live = {}
+                for m in rows_in_frag:
+                    live[m] = (crd0[0] - Int32(offs[0][0]) + Int32(m)) < rows_left
                 if cutlass.const_expr(static_q):
-                    # the static class: the fp32 chain values, then every 16-output block of the row quantized from this thread's
-                    # registers; 8 code bytes to the packed-code row, the scale byte to the (padded) row's 128x4 position
+                    # the static class: every 16-output block of the row quantized from this thread's registers -- the fp32 chain
+                    # values of the block, its scale and codes; 8 code bytes to the packed-code row, the scale byte to the (padded)
+                    # row's 128x4 position
                     crdF0 = tTR_cF_tile[(None, None, None, s)][(0, 0, 0)]
                     pre = [None] * nv
-                    for v in cutlass.range_constexpr(nv):
-                        if cutlass.const_expr(is_out[v]):
-                            pre[v] = _scaled_elem(
-                                chain,
-                                tTR_rAcc[v],
-                                tTR_rAcc[partner[v]]
-                                if cutlass.const_expr(pair)
-                                else None,
-                                row_scale[offs[v][0]],
-                            )
+                    if cutlass.const_expr(not live_only):
+                        for v in cutlass.range_constexpr(nv):
+                            if cutlass.const_expr(is_out[v]):
+                                pre[v] = _scaled_elem(
+                                    chain,
+                                    tTR_rAcc[v],
+                                    tTR_rAcc[partner[v]]
+                                    if cutlass.const_expr(pair)
+                                    else None,
+                                    row_scale[offs[v][0]],
+                                )
                     for blk in blocks:
                         rrow = crdF0[0] - Int32(offs[0][0]) + Int32(offs[blk[0]][0])
                         acc_col = crdF0[1] - Int32(offs[0][1]) + Int32(offs[blk[0]][1])
@@ -477,9 +462,21 @@ def grouped_w4a4_epilogue_loop(
                         )
                         bcol = out_col // Int32(NVFP4_BLOCK)
                         if (rrow < rows_left) & (bcol < n_blocks):
-                            sf_byte, w0, w1 = static_block_quant(
-                                [pre[v] for v in blk], gs6, inv_gs
-                            )
+                            if cutlass.const_expr(live_only):
+                                vals = [
+                                    _scaled_elem(
+                                        chain,
+                                        tTR_rAcc[v],
+                                        tTR_rAcc[partner[v]]
+                                        if cutlass.const_expr(pair)
+                                        else None,
+                                        row_scale[offs[v][0]],
+                                    )
+                                    for v in blk
+                                ]
+                            else:
+                                vals = [pre[v] for v in blk]
+                            sf_byte, w0, w1 = static_block_quant(vals, gs6, inv_gs)
                             prow = row0 + rrow
                             mOut32[(prow, Int32(2) * bcol)] = w0
                             mOut32[(prow, Int32(2) * bcol + Int32(1))] = w1
@@ -494,14 +491,25 @@ def grouped_w4a4_epilogue_loop(
                                 if cutlass.const_expr(scaled)
                                 else None
                             )
-                            tTR_rC[v] = _scaled_elem(
-                                chain,
-                                tTR_rAcc[v],
-                                tTR_rAcc[partner[v]]
-                                if cutlass.const_expr(pair)
-                                else None,
-                                sv,
-                            )
+                            if cutlass.const_expr(live_only):
+                                if live[offs[v][0]]:
+                                    tTR_rC[v] = _scaled_elem(
+                                        chain,
+                                        tTR_rAcc[v],
+                                        tTR_rAcc[partner[v]]
+                                        if cutlass.const_expr(pair)
+                                        else None,
+                                        sv,
+                                    )
+                            else:
+                                tTR_rC[v] = _scaled_elem(
+                                    chain,
+                                    tTR_rAcc[v],
+                                    tTR_rAcc[partner[v]]
+                                    if cutlass.const_expr(pair)
+                                    else None,
+                                    sv,
+                                )
                 if cutlass.const_expr(staged):
                     cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, wg)])
                 elif cutlass.const_expr(not static_q):
