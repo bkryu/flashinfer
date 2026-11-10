@@ -12,7 +12,7 @@ a toolchain, and with ``lake`` builds it and compares the Lean model's terms thr
 * the MoE class (``spec_fp8bs.Fp8BsMoESpec`` vs ``MoEFp8Bs.lean``): GEMM1's gated and ungated chains are the bf16 classes',
   GEMM2 the plain conversion;
 * the grouped block-scale space (``schedule_fp8bs.grouped_knobs_fp8bs``): every record checked against the kernel's static
-  constraints (``MoE.groupedBlockScaleFp8OK``), a member of the dense block-scale space, the ``space_invariantKB`` theorem
+  constraints (``MoEFp8Bs.groupedBlockScaleFp8OK``), a member of the dense block-scale space, the ``space_invariantKB`` theorem
   instantiated on it; the dispatcher's picks over the bench geometries at every nominal part, both requantization spellings,
   members of the space;
 * the 32-wide classes ``moe.e4m3bs32.<act>`` (``deepseek_fp8_block_size = 32``): the GEMM core ``gemm.e4m3.kblock32``'s output
@@ -172,33 +172,33 @@ def moe_cases() -> List[Tuple[str, str, str]]:
         (
             "e4m3bs_gemm1_silu",
             mterm.sexpr(s.gemm1()),
-            'MoE.e4m3bsGemm1T .silu (.leaf "g" [0, 0]) (.leaf "u" [0, 0])',
+            'MoEFp8Bs.e4m3bsGemm1T .silu (.leaf "g" [0, 0]) (.leaf "u" [0, 0])',
         ),
         (
             "e4m3bs_gemm1_relu2",
             mterm.sexpr(su.gemm1()),
-            'MoE.e4m3bsGemm1UngatedT .relu2 (.leaf "u" [0, 0])',
+            'MoEFp8Bs.e4m3bsGemm1UngatedT .relu2 (.leaf "u" [0, 0])',
         ),
         (
             "e4m3bs_gemm2",
             mterm.sexpr(s.gemm2()),
-            'MoE.e4m3bsGemm2T (.leaf "acc2" [0, 0])',
+            'MoEFp8Bs.e4m3bsGemm2T (.leaf "acc2" [0, 0])',
         ),
         # the 32-wide classes: the same chains
         (
             "e4m3bs32_gemm1_silu",
             mterm.sexpr(s32.gemm1()),
-            'MoE.e4m3bs32Gemm1T .silu (.leaf "g" [0, 0]) (.leaf "u" [0, 0])',
+            'MoEFp8Bs.e4m3bs32Gemm1T .silu (.leaf "g" [0, 0]) (.leaf "u" [0, 0])',
         ),
         (
             "e4m3bs32_gemm1_relu2",
             mterm.sexpr(su32.gemm1()),
-            'MoE.e4m3bs32Gemm1UngatedT .relu2 (.leaf "u" [0, 0])',
+            'MoEFp8Bs.e4m3bs32Gemm1UngatedT .relu2 (.leaf "u" [0, 0])',
         ),
         (
             "e4m3bs32_gemm2",
             mterm.sexpr(s32.gemm2()),
-            'MoE.e4m3bs32Gemm2T (.leaf "acc2" [0, 0])',
+            'MoEFp8Bs.e4m3bs32Gemm2T (.leaf "acc2" [0, 0])',
         ),
     ]
 
@@ -366,7 +366,7 @@ def render() -> str:
         f"theorem moe_e4m3bs_space_size : moeE4m3BsSpace.length = {len(sp)} := by decide"
     )
     L.append(
-        "theorem moe_e4m3bs_space_ok : moeE4m3BsSpace.all MoE.groupedBlockScaleFp8OK = true := by decide +kernel"
+        "theorem moe_e4m3bs_space_ok : moeE4m3BsSpace.all MoEFp8Bs.groupedBlockScaleFp8OK = true := by decide +kernel"
     )
     L.append(
         "theorem moe_e4m3bs_space_in_dense : moeE4m3BsSpace.all (fun c => gemmFp8BsSpace.any (fun s => s == c)) = true := by decide +kernel"
@@ -392,10 +392,10 @@ def render() -> str:
         f"theorem moe_e4m3bs_swap_space_size : moeE4m3BsSwapSpace.length = {len(sw)} := by decide"
     )
     L.append(
-        "theorem moe_e4m3bs_swap_space_ok : moeE4m3BsSwapSpace.all MoE.groupedBlockScaleFp8SwapOK = true := by decide +kernel"
+        "theorem moe_e4m3bs_swap_space_ok : moeE4m3BsSwapSpace.all MoEFp8Bs.groupedBlockScaleFp8SwapOK = true := by decide +kernel"
     )
     L.append(
-        "theorem moe_e4m3bs_swap_space_not_dense : moeE4m3BsSwapSpace.all (fun c => !MoE.groupedBlockScaleFp8OK c) = true := by decide +kernel"
+        "theorem moe_e4m3bs_swap_space_not_dense : moeE4m3BsSwapSpace.all (fun c => !MoEFp8Bs.groupedBlockScaleFp8OK c) = true := by decide +kernel"
     )
     L.append(
         "theorem moe_e4m3bs_both_spaces_invariant : ∀ c₁ ∈ moeE4m3BsSpace ++ moeE4m3BsSwapSpace, ∀ c₂ ∈ moeE4m3BsSpace ++ moeE4m3BsSwapSpace, "
@@ -429,10 +429,10 @@ def render() -> str:
     )
     for i, (KB, fmt, sx0, sx1) in enumerate(kblock32_cases()):
         L.append(
-            f'theorem kblock32_{i}_spec : (MoE.outputKblock32 "{fmt}" ⟨0⟩ ⟨0⟩ {KB}).sexpr = {lean_str(sx0)} := by decide +kernel  -- K={KB * 32}'
+            f'theorem kblock32_{i}_spec : (MoEFp8Bs.outputKblock32 "{fmt}" ⟨0⟩ ⟨0⟩ {KB}).sexpr = {lean_str(sx0)} := by decide +kernel  -- K={KB * 32}'
         )
         L.append(
-            f'theorem kblock32_{i}_spec2 : (MoE.outputKblock32 "{fmt}" ⟨3⟩ ⟨33⟩ {KB}).sexpr = {lean_str(sx1)} := by decide +kernel'
+            f'theorem kblock32_{i}_spec2 : (MoEFp8Bs.outputKblock32 "{fmt}" ⟨3⟩ ⟨33⟩ {KB}).sexpr = {lean_str(sx1)} := by decide +kernel'
         )
     L.append(
         "def kblock32OutCases : List (Nat × String) := ["
@@ -440,12 +440,12 @@ def render() -> str:
         + "]"
     )
     L.append(
-        "theorem kblock32_loop_eq_class : ∀ (S KB : Nat) (a : RowData) (b : ColData), MoE.promoteLoop32 a b S KB = MoE.kblock32 a b KB := "
-        "fun S KB a b => MoE.promoteLoop32_eq_kblock32 a b S KB"
+        "theorem kblock32_loop_eq_class : ∀ (S KB : Nat) (a : RowData) (b : ColData), MoEFp8Bs.promoteLoop32 a b S KB = MoEFp8Bs.kblock32 a b KB := "
+        "fun S KB a b => MoEFp8Bs.promoteLoop32_eq_kblock32 a b S KB"
     )
     for i, (KB, sx) in enumerate(kblock32_loop_cases()):
         L.append(
-            f"theorem kblock32loop{i} : (MoE.promoteLoop32 ⟨0⟩ ⟨0⟩ 3 {KB}).sexpr = {lean_str(sx)} := by decide +kernel"
+            f"theorem kblock32loop{i} : (MoEFp8Bs.promoteLoop32 ⟨0⟩ ⟨0⟩ 3 {KB}).sexpr = {lean_str(sx)} := by decide +kernel"
         )
     L.append(
         "def kblock32LoopCases : List Nat := ["
@@ -453,12 +453,12 @@ def render() -> str:
         + "]"
     )
     L.append(
-        "theorem kblock32_ne_kblock128_sexpr : (MoE.kblock32 ⟨0⟩ ⟨0⟩ 4).sexpr ≠ (kblock128 ⟨0⟩ ⟨0⟩ 1).sexpr := by decide +kernel"
+        "theorem kblock32_ne_kblock128_sexpr : (MoEFp8Bs.kblock32 ⟨0⟩ ⟨0⟩ 4).sexpr ≠ (kblock128 ⟨0⟩ ⟨0⟩ 1).sexpr := by decide +kernel"
     )
     L.append(
         "theorem moe_e4m3bs32_both_spaces_invariant : ∀ c₁ ∈ moeE4m3BsSpace ++ moeE4m3BsSwapSpace, ∀ c₂ ∈ moeE4m3BsSpace ++ moeE4m3BsSwapSpace, "
-        "∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (KB : Nat), MoE.tileResultKB32 c₁ S₁ p a b KB = MoE.tileResultKB32 c₂ S₂ q a b KB := "
-        "MoE.space_invariantKB32 (moeE4m3BsSpace ++ moeE4m3BsSwapSpace)"
+        "∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (KB : Nat), MoEFp8Bs.tileResultKB32 c₁ S₁ p a b KB = MoEFp8Bs.tileResultKB32 c₂ S₂ q a b KB := "
+        "MoEFp8Bs.space_invariantKB32 (moeE4m3BsSpace ++ moeE4m3BsSwapSpace)"
     )
     disp32 = dispatch_cases(32)
     L.append(

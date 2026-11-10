@@ -24,7 +24,7 @@ def main : IO Unit := do
   IO.println s!"fp8bsq32out code0 {osexpr (FP8BQ.specCode32 fp8bsqRow 0)}"
   IO.println s!"fp8bsq32out codeL {osexpr (FP8BQ.specCode32 fp8bsqRow 63)}"
   for (KB, fmt) in kblock32OutCases do
-    IO.println s!"kblock32 {KB} {fmt} {(MoE.outputKblock32 fmt ⟨0⟩ ⟨0⟩ KB).sexpr}"
-    IO.println s!"kblock32b {KB} {fmt} {(MoE.outputKblock32 fmt ⟨3⟩ ⟨33⟩ KB).sexpr}"
+    IO.println s!"kblock32 {KB} {fmt} {(MoEFp8Bs.outputKblock32 fmt ⟨0⟩ ⟨0⟩ KB).sexpr}"
+    IO.println s!"kblock32b {KB} {fmt} {(MoEFp8Bs.outputKblock32 fmt ⟨3⟩ ⟨33⟩ KB).sexpr}"
   for KB in kblock32LoopCases do
-    IO.println s!"kblock32loop {KB} {(MoE.promoteLoop32 ⟨0⟩ ⟨0⟩ 3 KB).sexpr}"
+    IO.println s!"kblock32loop {KB} {(MoEFp8Bs.promoteLoop32 ⟨0⟩ ⟨0⟩ 3 KB).sexpr}"

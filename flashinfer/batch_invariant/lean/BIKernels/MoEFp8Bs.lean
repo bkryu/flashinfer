@@ -1,7 +1,7 @@
 import BIKernels.MoE
 import BIKernels.FP8BlockQuant
 /-!
-# The block-scale fp8 MoE classes `moe.e4m3bs.<act>` (`fused_moe/batch_invariant/spec_fp8bs.py`)
+# The block-scale fp8 MoE classes `moe.e4m3bs.<act>` / `moe.e4m3bs32.<act>` (`fused_moe/batch_invariant/spec_fp8bs.py`); namespace `BIK.MoEFp8Bs` over the bf16 MoE model `BIK.MoE`
 
 DeepSeek-style fp8: e4m3 experts with one fp32 scale per 128x128 block, e4m3 activations with one fp32 scale per 1x128 block,
 both by the `fp8bs.quant` class (`FP8BlockQuant.lean`). The grouped kernel is a placement of the dense block-scale class
@@ -10,7 +10,9 @@ both by the `fp8bs.quant` class (`FP8BlockQuant.lean`). The grouped kernel is a 
 promoted accumulators, GEMM2 the plain conversion, and the intermediate's requantization is the `fp8bs.quant` class on the
 bf16-rounded chain value -- fused into GEMM1's epilogue or as the standalone pass, two placements of one term.
 -/
-namespace BIK.MoE
+namespace BIK.MoEFp8Bs
+
+open BIK.MoE
 
 /-- The grouped block-scale kernel's result for an expanded row: the dense class's block fold over `KB` blocks; the placement (the
 expert segment, the load, the position in the segment, the tile and its scale ring) is erased. -/
@@ -194,4 +196,4 @@ def e4m3bs32Gemm2T (acc : MTerm) : MTerm := e4m3bsGemm2T acc
 theorem e4m3bs32_chains_are_e4m3bs (a : GAct) (u : UAct) (g x acc : MTerm) :
     (e4m3bs32Gemm1T a g x, e4m3bs32Gemm1UngatedT u x, e4m3bs32Gemm2T acc) = (e4m3bsGemm1T a g x, e4m3bsGemm1UngatedT u x, e4m3bsGemm2T acc) := rfl
 
-end BIK.MoE
+end BIK.MoEFp8Bs
