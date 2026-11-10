@@ -227,7 +227,7 @@ def rank_grouped_mx(
         )
         est = (
             est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles(c, rows, nodes, EPI_WARPGROUPS)
+            + exposed_epilogue_cycles(c, rows, nodes, epi_warpgroups=EPI_WARPGROUPS)
             + zero_fill_cycles(c, rows, K, fam, in_fmt)
         )
         return (
