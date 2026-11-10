@@ -46,6 +46,30 @@ ACT_FMT = "mxfp8"
 REQUANT_NODES = 3
 
 
+#: Cycles per dead token column per tile of the swapped body's fused requantization epilogue: the block amax exchange, the
+#: scale and its traffic run for every column of the token tile whatever the live rows, so a wide tile at a few live rows pays
+#: for its dead columns beyond what the chain's node count sees. One declared empirical constant of this class, fitted on the
+#: 8 / 16 / 32-token ladders at four and twelve live rows per expert; a fully live tile, the padded body and the bf16 chains
+#: carry no such term.
+SWAPPED_QUANT_COLUMN_CYCLES = 150.0
+
+
+def swapped_quant_column_cycles(
+    cfg: Knobs, rows: int, n_active: int, N: int, chain: GroupedChain, sm_count: int
+) -> float:
+    """``SWAPPED_QUANT_COLUMN_CYCLES x the token tile's dead columns x the record's tiles per SM`` for a swapped record
+    running the fused requantization chain (the dead columns: the tile less the live rows per expert; the tiles: the active
+    experts' token tiles times the weight tiles, over the part's SMs); zero for a fully live tile, the padded body and the
+    bf16 chains."""
+    if not cfg.swap_ab or chain.out_fmt != ACT_FMT:
+        return 0.0
+    dead = max(0, cfg.tile_n - max(1, rows))
+    tiles = (
+        max(1, n_active) * -(-max(1, rows) // cfg.tile_n) * -(-N // cfg.mma_tiler_mn[0])
+    )
+    return SWAPPED_QUANT_COLUMN_CYCLES * dead * tiles / max(1, sm_count)
+
+
 def epilogue_nodes(chain: GroupedChain) -> int:
     """The per-element epilogue work of a GEMM1 chain: the bf16 chain's nodes, plus the requantization's for the fused
     spelling (``out_fmt == "mxfp8"``); GEMM2's plain conversion is one node."""
@@ -123,8 +147,8 @@ def rank_grouped_mx(
     K)`` (``n_active`` the active experts, ``E`` by default; a swapped record priced as the dense model prices a swapped decode
     record) under the MoE ranking's overrides, times the pair term and the swapped records' spill factor, plus the last tile's
     exposed epilogue chain (the chain's nodes, the fused requantization's on either body; the padded body's four epilogue
-    warpgroups), the token box's exposed zero-fill at the e4m3 row width and the body's per-launch fixed cost (the shared body
-    table, off until the part is measured)), at three significant digits; each tile family priced once (at the enumeration's raster: the dense estimate's
+    warpgroups) and the token box's exposed zero-fill at the e4m3 row width), plus this class's per-column cost of the swapped
+    body's fused requantization epilogue over the token tile (`swapped_quant_column_cycles`), at three significant digits; each tile family priced once (at the enumeration's raster: the dense estimate's
     tile-order term is the dense scheduler's, not the grouped one's) and the raster the structural rule gives the grouped
     scheduler (`raster_for`) first among its twins, best first, ties in the spaces' enumeration order (the grouped records
     before the swapped ones, the narrower token tile before the wider). As in the dense ``rank_topk``, each of the best
@@ -138,9 +162,11 @@ def rank_grouped_mx(
         swapped_knobs_mx,
     )
 
+    from ...gemm.batch_invariant.heuristic import PART_TABLE
     from .blocks.blockscaled_kernel import EPI_WARPGROUPS_MX
 
     fam = family or "sm_107"
+    sms = sm_count or PART_TABLE.get(fam, PART_TABLE["sm_107"]).sm_count
     dense = (
         []
         if swap is True
@@ -181,7 +207,7 @@ def rank_grouped_mx(
             nominal,
             fill_fmt=ACT_FMT,
             epi_warpgroups=EPI_WARPGROUPS_MX,
-        )
+        ) + swapped_quant_column_cycles(c, rows, n_active or E, N, chain, sms)
         return (
             float(f"{est:.3g}"),
             0 if (c.swap_ab or c.raster_along == raster_for(c, rows)) else 1,
