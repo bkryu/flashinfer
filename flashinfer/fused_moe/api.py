@@ -3420,7 +3420,24 @@ class BatchInvariantFp4Config:
     ``hidden_states_scale`` (the 128x4 swizzled scales of ``nvfp4_quantize(..., per_token_activation=True,
     batch_invariant=True)`` or the linear ``[num_tokens, H / 16]`` layout) and ``per_token_scale`` (unit scales when
     absent: the per-tensor pack of :class:`TrtllmFp4Config`).
+
+    ``intermediate`` selects the intermediate's quantization, two classes of the NVFP4 pair: ``"per_token"`` (the default,
+    ``moe.nvfp4.<act>``: the bf16 intermediate quantized per token by the mode's quantizer) or ``"static"``
+    (``moe.nvfp4.<act>.static``: GEMM1's epilogue quantizes the fp32 gated value per 16-column block with the expert's static
+    global scale -- the recipe of the TRTLLM-Gen, CuTe-DSL, CUTLASS and Frost backends, with every op correctly rounded -- and
+    GEMM2 carries the per-expert constant ``1 / scale``; no bf16 intermediate, one launch less). The static scales are
+    ``prepare_weights(..., intermediate="static", intermediate_scales=[E] f32 multipliers)``, default ones (the open backends'
+    unified-layer value, FlashInfer's ``fc2_input_scale`` convention); the weight view carries the class, and a pack prepared for
+    the other class is refused.
     """
+
+    intermediate: str = "per_token"
+
+    def __post_init__(self) -> None:
+        if self.intermediate not in ("per_token", "static"):
+            raise ValueError(
+                f"BatchInvariantFp4Config.intermediate must be 'per_token' or 'static', got {self.intermediate!r}."
+            )
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -3437,12 +3454,15 @@ class BatchInvariantFp4Config:
         intermediate_size: Optional[int] = None,
         activation: Optional["ActivationConfig"] = None,
         device: Optional[torch.device] = None,
+        intermediate: str = "per_token",
+        intermediate_scales: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """The backend's weight view for the pair ``quant`` selects (``None``: NVFP4 x NVFP4), to register under
         ``BatchInvariantFp4Runner.backend_key``; the activation's chain is part of the view (``activation`` defaults to
         ``SwiGLU()``). NVFP4 x NVFP4: every expert quantized to NVFP4 with its own per-tensor global scale (the gate / up
         rows interleaved first for a gated activation), the 128x4 swizzled block scales and the alphas
-        (``1 / global scale``)."""
+        (``1 / global scale``); ``intermediate`` / ``intermediate_scales`` select the static-intermediate class and its
+        per-expert scales (see the class docstring)."""
         from .batch_invariant.spec import activation_of
 
         pair = _fp4_pair(quant)
@@ -3458,6 +3478,8 @@ class BatchInvariantFp4Config:
                 gated=chain.gated,
                 act=chain.act,
                 params=chain.params,
+                intermediate=intermediate,
+                intermediate_scales=intermediate_scales,
             ).view()
         raise AssertionError(f"unreachable: {pair!r} passed _fp4_pair")
 
@@ -3473,7 +3495,11 @@ class BatchInvariantFp4Config:
         raise AssertionError(f"unreachable: {pair!r} passed _fp4_pair")
 
     def __repr__(self) -> str:
-        return "BatchInvariantFp4Config()"
+        return (
+            "BatchInvariantFp4Config()"
+            if self.intermediate == "per_token"
+            else f"BatchInvariantFp4Config(intermediate={self.intermediate!r})"
+        )
 
 
 # Union type for backend config

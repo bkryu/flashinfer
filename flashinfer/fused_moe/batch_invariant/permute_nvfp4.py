@@ -45,9 +45,16 @@ class ScatterFp4Kernel:
     lanes stride over its 32-chunk slabs of the 16-byte row chunks, then over its slabs of the 4-byte scale groups; lane 0 of
     the row's first warp moves the per-token scale."""
 
-    def __init__(self, k: int, wpr: int = 1):
+    def __init__(
+        self, k: int, wpr: int = 1, sf_src: str = "128x4", unit_pts: bool = False
+    ):
+        """``sf_src``: the source scale factors' layout -- ``"128x4"`` (the quantizer's swizzled buffer) or ``"linear"`` (row-major
+        ``[T, K / 16]`` bytes, the layout of the per-tensor activation pack of the TRTLLM backends: the kernel assembles each 4-byte
+        group of the destination atom from the row's bytes, a zero past the row's last block); ``unit_pts``: the rows' per-token
+        scales are one (the per-tensor pack: nothing to read, the destination gets ``1.0``). Both placements of the same bytes."""
         assert wpr >= 1 and wpr & (wpr - 1) == 0, wpr
-        self.k, self.wpr = k, wpr
+        assert sf_src in ("128x4", "linear"), sf_src
+        self.k, self.wpr, self.sf_src, self.unit_pts = k, wpr, sf_src, unit_pts
 
     @cute.jit
     def __call__(
@@ -118,6 +125,7 @@ class ScatterFp4Kernel:
         )
         n_groups = pcols // Int32(SF_COL_TILE)
         n_sf = (n_groups - lane - part * Int32(LANES) + step - Int32(1)) // step
+        nb = B // Int32(8)  # scale blocks per row (K / 16): the linear row's bytes
         if w < stride:
             for r in cutlass.range(0, n_rows, 1):
                 i = w + r * stride
@@ -125,7 +133,10 @@ class ScatterFp4Kernel:
                 p = mDest[i]
                 ps = mDestSf[i]
                 if (lane == 0) & (part == 0):
-                    mPtsp[ps] = mPts[t]
+                    if cutlass.const_expr(self.unit_pts):
+                        mPtsp[ps] = Float32(1.0)
+                    else:
+                        mPtsp[ps] = mPts[t]
                 row_x = mX[(t, None)]
                 row_p = mXp[(p, None)]
                 for jj in cutlass.range(0, n_mine, 1):
@@ -134,9 +145,22 @@ class ScatterFp4Kernel:
                     cute.copy(atom, frag, cute.local_tile(row_p, (16,), (j,)))
                 for jj in cutlass.range(0, n_sf, 1):
                     gg = (jj * wpr + part) * Int32(LANES) + lane
-                    dst32[_sf_group_offset(ps, gg, pcols) // 4] = src32[
-                        _sf_group_offset(t, gg, pcols) // 4
-                    ]
+                    if cutlass.const_expr(self.sf_src == "linear"):
+                        # the row's bytes 4gg .. 4gg + 3 assembled little-endian into the atom's 4-byte group (zero past the
+                        # row's blocks)
+                        base = t.to(Int64) * nb.to(Int64) + Int64(4) * gg.to(Int64)
+                        word = Uint32(0)
+                        for c in cutlass.range_constexpr(4):
+                            col = Int32(4) * gg + Int32(c)
+                            if col < nb:
+                                word = word | (
+                                    mSf[base + Int64(c)].to(Uint32) << Uint32(8 * c)
+                                )
+                        dst32[_sf_group_offset(ps, gg, pcols) // 4] = word
+                    else:
+                        dst32[_sf_group_offset(ps, gg, pcols) // 4] = src32[
+                            _sf_group_offset(t, gg, pcols) // 4
+                        ]
         cute.arch.griddepcontrol_launch_dependents()
 
 
@@ -218,9 +242,13 @@ def scatter_grid(Tk: Int32) -> Int32:
 
 
 @functools.cache
-def get_compiled_scatter_fp4(k: int, wpr: int = 1) -> Any:
+def get_compiled_scatter_fp4(
+    k: int, wpr: int = 1, sf_src: str = "128x4", unit_pts: bool = False
+) -> Any:
     """``kernel(x4 [T, B] u8, sf [n_src] u8, pts [T] f32, dest [T k] i32, dest_sf [T k] i32, x_perm [rows, B] u8, sf_perm
-    [n_dst] u8, pts_perm [rows_sf] f32, Tk, B, pcols)``, ``B % 16 == 0``; ``wpr`` warps per row (``warps_per_row``)."""
+    [n_dst] u8, pts_perm [rows_sf] f32, Tk, B, pcols)``, ``B % 16 == 0``; ``wpr`` warps per row (``warps_per_row``); ``sf_src``
+    the source scale factors' layout (``"128x4"`` / ``"linear"``: ``sf`` then the row-major ``[T, K / 16]`` bytes, any count);
+    ``unit_pts``: the per-token scales are one (``pts`` unread, a 1-element placeholder)."""
 
     def compile_fn():
         sym_t, sym_n, sym_p, sym_b = (
@@ -229,8 +257,10 @@ def get_compiled_scatter_fp4(k: int, wpr: int = 1) -> Any:
             cute.sym_int(32),
             cute.sym_int(32, divisibility=16),
         )
-        sym_s, sym_sp, sym_pp = (
-            cute.sym_int(32, divisibility=512),
+        sym_s = (
+            cute.sym_int(32) if sf_src == "linear" else cute.sym_int(32, divisibility=512)
+        )
+        sym_sp, sym_pp = (
             cute.sym_int(32, divisibility=512),
             cute.sym_int(32),
         )
@@ -240,9 +270,11 @@ def get_compiled_scatter_fp4(k: int, wpr: int = 1) -> Any:
             (cute.sym_int64(divisibility=16), 1),
             assumed_align=16,
         )
-        sf_fake = cute.runtime.make_fake_tensor(Uint8, (sym_s,), (1,), assumed_align=16)
+        sf_fake = cute.runtime.make_fake_tensor(
+            Uint8, (sym_s,), (1,), assumed_align=16 if sf_src == "128x4" else 1
+        )
         pts_fake = cute.runtime.make_fake_tensor(
-            Float32, (sym_t,), (1,), assumed_align=4
+            Float32, (cute.sym_int(32) if unit_pts else sym_t,), (1,), assumed_align=4
         )
         d_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         ds_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
@@ -260,7 +292,7 @@ def get_compiled_scatter_fp4(k: int, wpr: int = 1) -> Any:
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            ScatterFp4Kernel(k, wpr),
+            ScatterFp4Kernel(k, wpr, sf_src, unit_pts),
             x_fake,
             sf_fake,
             pts_fake,
@@ -279,7 +311,10 @@ def get_compiled_scatter_fp4(k: int, wpr: int = 1) -> Any:
     return jit.build_and_load(
         MODULE,
         jit.sanitize_symbol_name(
-            f"moe_scatter_fp4_k{k}" + (f"_w{wpr}" if wpr > 1 else "")
+            f"moe_scatter_fp4_k{k}"
+            + (f"_w{wpr}" if wpr > 1 else "")
+            + ("_lin" if sf_src == "linear" else "")
+            + ("_unit" if unit_pts else "")
         ),
         compile_fn,
     )

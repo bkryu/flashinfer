@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 from typing import Any, Callable
 
 import cutlass
@@ -36,7 +37,34 @@ SF_BUFFER_DIVISIBILITY = (
 OUT_FMTS = (
     "bf16",
     "f32",
-)  # the class's output (bf16) and the fp32 oracle output of the tests
+    "nvfp4",
+)  # the class's output (bf16), the fp32 oracle output of the tests, the static class's packed codes (+ scale bytes)
+
+
+def static_body_ok(knobs: Knobs) -> bool:
+    """The records whose epilogue fragment holds whole 16-output blocks of one row (the static class's fused quantization):
+    the 128-row CTA tiles (thread = TMEM lane = row; the 1-CTA 128-row and the 2-CTA 256-row instructions)."""
+    return knobs.tile_m == (256 if knobs.use_2cta_instrs else 128)
+
+
+def _out_dtype(chain: W4A4Chain):
+    """``(dtype, row alignment in elements)`` of the chain's output buffer: the packed codes (uint8, 16-byte rows) for the
+    static class's GEMM1, the chain's format otherwise."""
+    if chain.out_fmt == "nvfp4":
+        return cutlass.Uint8, 16
+    return OUT_DT[chain.out_fmt], ALIGN[chain.out_fmt]
+
+
+def _static_fakes(sym_e):
+    """The static class's extra operands at compile time: the flat scale-byte buffer and the per-expert scales."""
+    osf_fake = cute.runtime.make_fake_tensor(
+        cutlass.Uint8,
+        (cute.sym_int(32, divisibility=SF_BUFFER_DIVISIBILITY),),
+        (1,),
+        assumed_align=16,
+    )
+    aux_fake = cute.runtime.make_fake_tensor(Float32, (sym_e,), (1,), assumed_align=4)
+    return osf_fake, aux_fake
 
 
 def kernel_name(
@@ -74,22 +102,28 @@ def can_implement_grouped_nvfp4(
         return False
     if chain.pair and N % (2 * GROUP):
         return False
+    if chain.static_quant and not static_body_ok(knobs):
+        return False
     n_out = N // 2 if chain.pair else N
-    return (
-        K % ALIGN[in_fmt] == 0
-        and N % 8 == 0
-        and n_out % ALIGN[chain.out_fmt] == 0
-        and 1 <= E <= MAX_E
-    )
+    oal = 32 if chain.out_fmt == "nvfp4" else ALIGN[chain.out_fmt]  # the fp4 codes: 16-byte rows, whole scale blocks
+    return K % ALIGN[in_fmt] == 0 and N % 8 == 0 and n_out % oal == 0 and 1 <= E <= MAX_E
 
 
-def swapped_kernel_name(cfg: Knobs, chain: W4A4Chain, in_fmt: str) -> str:
-    """The swapped decode body's object: the instruction class, the chain and the swapped record (its token tile)."""
+def swapped_kernel_name(
+    cfg: Knobs, chain: W4A4Chain, in_fmt: str, variant: str = ""
+) -> str:
+    """The swapped decode body's object: the instruction class, the chain, the swapped record (its token tile) and a placement
+    variant (``swap_nvfp4.VARIANTS``, the A/B records; the default placement carries no tag)."""
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     tag = "nvfp4k128" if in_fmt == "nvfp4_k128" else "nvfp4"
     return jit.sanitize_symbol_name(
         f"swapped_{tag}_{chain.describe()}_{knobs.describe()}"
+        + (f"_v_{variant}" if variant else "")
     )
+
+
+#: The swapped body's placement variant for every launch (the A/B benches set it; the default is the shipped placement).
+SWAP_VARIANT = os.environ.get("FLASHINFER_BI_MOE_SWAP_VARIANT", "")
 
 
 def can_implement_swapped_nvfp4(
@@ -108,12 +142,8 @@ def can_implement_swapped_nvfp4(
     if chain.pair and N % (2 * GROUP):
         return False
     n_out = N // 2 if chain.pair else N
-    return (
-        K % ALIGN[in_fmt] == 0
-        and N % 8 == 0
-        and n_out % ALIGN[chain.out_fmt] == 0
-        and 1 <= E <= MAX_E
-    )
+    oal = 32 if chain.out_fmt == "nvfp4" else ALIGN[chain.out_fmt]
+    return K % ALIGN[in_fmt] == 0 and N % 8 == 0 and n_out % oal == 0 and 1 <= E <= MAX_E
 
 
 def can_implement_nvfp4(
@@ -127,12 +157,13 @@ def can_implement_nvfp4(
 
 
 def compile_swapped_nvfp4_fn(
-    cfg: Knobs, chain: W4A4Chain, in_fmt: str
+    cfg: Knobs, chain: W4A4Chain, in_fmt: str, variant: str = ""
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one swapped specialisation: ``kernel(a3, sfa, w3, sfw, out2, counts, alpha, pts,
     grid)`` -- A ``(rows, K/2, 1)`` the dense rows (at least the token tile past the live rows), ``sfa`` their scale factors at
     the padded positions, W ``(N, K/2, E)``, ``sfw``, out ``(rows', Nout)``, ``pts`` at the padded positions (a multiple of 128)."""
-    out_dt, oal = OUT_DT[chain.out_fmt], ALIGN[chain.out_fmt]
+    out_dt, oal = _out_dtype(chain)
+    static = chain.needs_aux
 
     def compile_fn():
         sym_r, sym_m, sym_n, sym_kh, sym_e = (
@@ -183,8 +214,27 @@ def compile_swapped_nvfp4_fn(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
+        obj = SwappedBlockScaledGemm(cfg, chain, in_fmt, variant)
+        if static:
+            osf_fake, aux_fake = _static_fakes(sym_e)
+            return cute.compile(
+                obj.call_static,
+                a_fake,
+                sfa_fake,
+                w_fake,
+                sfw_fake,
+                o_fake,
+                osf_fake,
+                c_fake,
+                alpha_fake,
+                pts_fake,
+                aux_fake,
+                grid,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
         return cute.compile(
-            SwappedBlockScaledGemm(cfg, chain, in_fmt),
+            obj,
             a_fake,
             sfa_fake,
             w_fake,
@@ -203,9 +253,10 @@ def compile_swapped_nvfp4_fn(
 
 @functools.cache
 def get_compiled_swapped_nvfp4(
-    cfg: Knobs, chain: W4A4Chain, in_fmt: str = "nvfp4"
+    cfg: Knobs, chain: W4A4Chain, in_fmt: str = "nvfp4", variant: str = ""
 ) -> Any:
-    """The swapped decode body's object for a swapped record, chain and instruction class (``compile_swapped_nvfp4_fn``)."""
+    """The swapped decode body's object for a swapped record, chain, instruction class and placement variant
+    (``compile_swapped_nvfp4_fn``)."""
     assert (
         in_fmt in NVFP4_FMTS
         and isinstance(chain, W4A4Chain)
@@ -214,8 +265,8 @@ def get_compiled_swapped_nvfp4(
     ), (in_fmt, chain, cfg.describe())
     return jit.build_and_load(
         MODULE,
-        swapped_kernel_name(cfg, chain, in_fmt),
-        compile_swapped_nvfp4_fn(cfg, chain, in_fmt),
+        swapped_kernel_name(cfg, chain, in_fmt, variant),
+        compile_swapped_nvfp4_fn(cfg, chain, in_fmt, variant),
     )
 
 
@@ -223,7 +274,8 @@ def compile_grouped_nvfp4_fn(
     cfg: Knobs, chain: W4A4Chain, in_fmt: str, dense_a: bool
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one grouped block-scaled specialisation."""
-    out_dt, oal = OUT_DT[chain.out_fmt], ALIGN[chain.out_fmt]
+    out_dt, oal = _out_dtype(chain)
+    static = chain.needs_aux
 
     def compile_fn():
         sym_m = (
@@ -277,8 +329,27 @@ def compile_grouped_nvfp4_fn(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
+        obj = GroupedBlockScaledGemm(cfg, chain, in_fmt, dense_a)
+        if static:
+            osf_fake, aux_fake = _static_fakes(sym_e)
+            return cute.compile(
+                obj.call_static,
+                a_fake,
+                b_fake,
+                sfa_fake,
+                sfb_fake,
+                o_fake,
+                osf_fake,
+                c_fake,
+                alpha_fake,
+                pts_fake,
+                aux_fake,
+                grid,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
         return cute.compile(
-            GroupedBlockScaledGemm(cfg, chain, in_fmt, dense_a),
+            obj,
             a_fake,
             b_fake,
             sfa_fake,

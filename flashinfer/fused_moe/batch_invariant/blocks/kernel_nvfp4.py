@@ -22,6 +22,8 @@ the same per-row fold.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -209,7 +211,7 @@ class GroupedBlockScaledGemm:
         """``dense_a``: the A rows densely packed (group offsets at align 1), the scale factors and the row scales at the
         padded positions (``pts`` has the padded row count, the scale-factor buffer the padded rows), the output ``Tk`` dense
         rows. Default: the padded packing (the rows of every group start at a multiple of ``GROUP_ALIGN``)."""
-        assert isinstance(chain, W4A4Chain) and chain.out_fmt in ("bf16", "f32"), chain
+        assert isinstance(chain, W4A4Chain) and chain.out_fmt in ("bf16", "f32", "nvfp4"), chain
         assert in_fmt in NVFP4_FMTS, in_fmt
         self.knobs, self.chain, self.in_fmt, self.dense_a = (
             knobs,
@@ -233,6 +235,46 @@ class GroupedBlockScaledGemm:
         pts: cute.Tensor,
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
+    ):
+        self._launch(a, b, sfa, sfb, out, counts, alpha, pts, max_active_clusters, stream)
+
+    @cute.jit
+    def call_static(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        sfa: cute.Tensor,
+        sfb: cute.Tensor,
+        out: cute.Tensor,
+        out_sf: cute.Tensor,
+        counts: cute.Tensor,
+        alpha: cute.Tensor,
+        pts: cute.Tensor,
+        aux: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The static class's chains: GEMM1 (``out_fmt == "nvfp4"``: ``out`` the packed codes uint8 ``[rows, I/2]``, ``out_sf`` the
+        flat 128x4 scale bytes at the (padded) row positions, ``aux[e] = gs2[e]``) and GEMM2 (``scale == "w4a4s"``: ``aux[e] =
+        inv2[e]``, ``out_sf`` unused)."""
+        self._launch(
+            a, b, sfa, sfb, out, counts, alpha, pts, max_active_clusters, stream, out_sf, aux
+        )
+
+    def _launch(
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        out,
+        counts,
+        alpha,
+        pts,
+        max_active_clusters,
+        stream,
+        out_sf=None,
+        aux=None,
     ):
         plan_cls = self.plan_cls
         a4 = fp4_view(a)
@@ -289,6 +331,8 @@ class GroupedBlockScaledGemm:
             counts,
             alpha,
             pts,
+            out_sf,
+            aux,
             st.cluster_layout_vmnk,
             st.cluster_layout_sfb_vmnk,
             st.a_smem_layout_staged,
@@ -322,6 +366,8 @@ class GroupedBlockScaledGemm:
         counts: cute.Tensor,
         mAlpha: cute.Tensor,
         mPts: cute.Tensor,
+        mOutSf: Optional[cute.Tensor],
+        mAux: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -667,6 +713,8 @@ class GroupedBlockScaledGemm:
                 s_off_pad,
                 sC,
                 mma_tile_coord_v,
+                mOutSf,
+                mAux,
             )
             tmem.relinquish_alloc_permit()
             # the allocator warp alone frees the columns: every epilogue warpgroup joins here after its last TMEM load (the

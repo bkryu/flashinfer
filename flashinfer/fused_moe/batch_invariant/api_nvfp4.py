@@ -34,7 +34,14 @@ from ...gemm.batch_invariant.spec import NVFP4_FMTS
 from . import spec as S
 from .api import interleave_fc1, permute_plan, route  # noqa: F401  (route re-exported for the class's callers)
 from .blocks.epilogue_nvfp4 import W4A4Chain
-from .spec_nvfp4 import CLASS, E2M1_MAX, E4M3_MAX, TE_GS_INV, expert_classes
+from .spec_nvfp4 import (
+    CLASS,
+    E2M1_MAX,
+    E4M3_MAX,
+    INTERMEDIATES,
+    TE_GS_INV,
+    expert_classes,
+)
 
 #: 16-byte rows of the packed fp4 operands (the TMA alignment) and whole 64-element scale-factor column groups.
 ALIGN_NVFP4 = 32
@@ -130,6 +137,12 @@ class MoEWeightsNVFP4:
     gated: bool = True
     act: str = "silu"
     params: Tuple[Optional[float], ...] = ()
+    #: the intermediate's quantization: ``per_token`` (`moe.nvfp4.<act>`) or ``static`` (`moe.nvfp4.<act>.static`: GEMM1's
+    #: epilogue quantizes the fp32 gated value per 16-column block with the expert's static scale ``gs2 [E]``, a multiplier in
+    #: FlashInfer's ``fc2_input_scale`` convention; ``inv2 [E] = 1 / gs2`` formed here once, read by GEMM2 as given)
+    intermediate: str = "per_token"
+    gs2: Optional[torch.Tensor] = None
+    inv2: Optional[torch.Tensor] = None
 
     @staticmethod
     def prepare(
@@ -140,13 +153,19 @@ class MoEWeightsNVFP4:
         act: Optional[str] = None,
         params: Sequence[Optional[float]] = (),
         global_scales: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        intermediate: str = "per_token",
+        intermediate_scales: Optional[torch.Tensor] = None,
     ) -> "MoEWeightsNVFP4":
         """Quantize bf16 experts (``fc1 [E, 2I, H]`` rows ``[up, gate]``, or ``[E, I, H]`` ungated; ``fc2 [E, H, I]``) with the
         batch-invariant per-tensor NVFP4 class, one global scale per expert and GEMM (``global_scales = (gs1 [E], gs2 [E])``,
         or FlashInfer's ``448 * 6 / amax``). The gate / up interleave is a row permutation applied before the quantization (a
-        per-tensor global scale commutes with it). ``act`` defaults to the class's default chain of the gating."""
+        per-tensor global scale commutes with it). ``act`` defaults to the class's default chain of the gating.
+        ``intermediate="static"``: the static class, whose GEMM1 quantizes the intermediate in place with the per-expert static
+        scales ``intermediate_scales [E]`` (f32 multipliers; default ones, every open backend's unified-layer value)."""
         from ...batch_invariant.quantization.nvfp4_api import nvfp4_quantize_rows
 
+        if intermediate not in INTERMEDIATES:
+            raise ValueError(f"intermediate must be one of {INTERMEDIATES}, not {intermediate!r}")
         act = act if act is not None else ("silu" if gated else "relu2")
         if act not in (S.ACTS if gated else S.UNGATED_ACTS):
             raise ValueError(f"no {'gated' if gated else 'ungated'} chain {act!r}")
@@ -195,6 +214,18 @@ class MoEWeightsNVFP4:
             w2s.append(q2)
             sf2s.append(sf2.reshape(-1))
             a2s.append(torch.reciprocal(gs2.to(w1i.device)))
+        gs_inter = inv_inter = None
+        if intermediate == "static":
+            gs_inter = (
+                torch.ones(E, dtype=torch.float32, device=w1i.device)
+                if intermediate_scales is None
+                else intermediate_scales.to(device=w1i.device, dtype=torch.float32)
+                .reshape(E)
+                .contiguous()
+            )
+            if not (bool((gs_inter > 0).all()) and bool(torch.isfinite(gs_inter).all())):
+                raise ValueError("the static intermediate scales are positive finite multipliers [E]")
+            inv_inter = torch.reciprocal(gs_inter).contiguous()  # div.rn: the quantizer's correctly rounded reciprocal
         return MoEWeightsNVFP4(
             torch.stack(w1s).contiguous(),
             torch.stack(sf1s).contiguous(),
@@ -207,6 +238,9 @@ class MoEWeightsNVFP4:
             gated,
             act,
             key,
+            intermediate,
+            gs_inter,
+            inv_inter,
         )
 
     @property
@@ -225,12 +259,25 @@ class MoEWeightsNVFP4:
         )
 
     @property
+    def static(self) -> bool:
+        return self.intermediate == "static"
+
+    @property
     def chain1(self) -> W4A4Chain:
         """The GEMM1 chain of the class: the gated ``act`` on the scaled (gate, up) pair or the ungated ``act`` on the scaled
-        accumulator, with the parameters; bf16 output."""
+        accumulator, with the parameters; bf16 output, or the fused block quantization (``nvfp4``) of the static class."""
         return W4A4Chain(
-            "glu" if self.gated else "act", self.act, "bf16", self.params, "w4a4"
+            "glu" if self.gated else "act",
+            self.act,
+            "nvfp4" if self.static else "bf16",
+            self.params,
+            "w4a4",
         )
+
+    @property
+    def chain2(self) -> W4A4Chain:
+        """The GEMM2 chain: ``cvt_bf16(mul(acc, mul(alpha2[e], pts2)))``, or the static class's with the per-expert ``inv2[e]``."""
+        return GEMM2_STATIC_CHAIN if self.static else GEMM2_CHAIN
 
     def view(self) -> Dict[str, object]:
         """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for this backend."""
@@ -246,6 +293,9 @@ class MoEWeightsNVFP4:
             "gated": self.gated,
             "act": self.act,
             "params": self.params,
+            "intermediate": self.intermediate,
+            "intermediate_scale": self.gs2,
+            "intermediate_inv_scale": self.inv2,
         }
 
     @staticmethod
@@ -263,10 +313,15 @@ class MoEWeightsNVFP4:
             gated,
             str(view.get("act", "silu" if gated else "relu2")),
             tuple(view.get("params", ())),  # type: ignore[arg-type]
+            str(view.get("intermediate", "per_token")),
+            view.get("intermediate_scale"),  # type: ignore[arg-type]
+            view.get("intermediate_inv_scale"),  # type: ignore[arg-type]
         )
 
 
 GEMM2_CHAIN = W4A4Chain("plain", "silu", "bf16", (), "w4a4")
+#: GEMM2 of the static class: ``cvt_bf16(mul(acc, mul(alpha2[e], inv2[e])))``, the scale once per tile.
+GEMM2_STATIC_CHAIN = W4A4Chain("plain", "silu", "bf16", (), "w4a4s")
 F32_CHAIN = W4A4Chain(
     "plain", "silu", "f32", (), "none"
 )  # the unscaled oracle: the raw fp32 fold
@@ -285,6 +340,8 @@ def grouped_gemm_nvfp4(
     in_fmt: str,
     out: Optional[torch.Tensor] = None,
     dense_a: bool = False,
+    out_sf: Optional[torch.Tensor] = None,
+    aux: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a4[p] @ w4[e(p)].T, alpha[e(p)], pts[p])`` on the expert segments ``counts`` (int32 ``[E]``, group
     order = expert order). Padded packing (default): ``a4 [rows, K/2]`` uint8 with every group's rows starting at a multiple
@@ -295,7 +352,10 @@ def grouped_gemm_nvfp4(
     ``pts`` ignored). The record selects the body: a dense record runs the padded body on either packing, a swapped record
     (``config.swap_ab``: 128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap_nvfp4`) runs
     the swapped decode body on the dense packing (``a4`` carries at least the token tile's rows past the live rows: the op's
-    ``DENSE_TAIL``). The persistent grid is a launch argument: the device's co-resident cluster capacity for the record."""
+    ``DENSE_TAIL``). The persistent grid is a launch argument: the device's co-resident cluster capacity for the record. The
+    static class: GEMM1 with ``chain.out_fmt == "nvfp4"`` writes the packed codes to ``out`` (uint8 ``[rows, N_out/2]``) and the
+    scale bytes to ``out_sf`` (the flat 128x4 buffer of the (padded) rows) with ``aux = gs2 [E]``; GEMM2 with ``chain.scale ==
+    "w4a4s"`` takes ``aux = inv2 [E]`` (``a_pts`` unread)."""
     from .blocks.compile_nvfp4 import (
         can_implement_grouped_nvfp4,
         can_implement_swapped_nvfp4,
@@ -365,7 +425,27 @@ def grouped_gemm_nvfp4(
             f"grouped_gemm_nvfp4: record {config.describe()} does not implement ({N}, {K}, {E}, {chain}, {in_fmt})"
         )
     n_out = N // 2 if chain.pair else N
-    out_dtype = _OUT[chain.out_fmt]
+    static = chain.needs_aux
+    if chain.static_quant:
+        n_out //= 2  # the packed codes: two per byte
+        out_dtype = torch.uint8
+        if (
+            out_sf is None
+            or out_sf.dtype != torch.uint8
+            or out_sf.numel() < sf_numel(rows_sf, N // 2 if chain.pair else N)
+        ):
+            raise ValueError(
+                "grouped_gemm_nvfp4: the static class's GEMM1 takes out_sf, the flat 128x4 scale bytes of the (padded) rows"
+            )
+    else:
+        out_dtype = _OUT[chain.out_fmt]
+    if static:
+        if aux is None or aux.dtype != torch.float32 or aux.numel() != E:
+            raise ValueError(
+                "grouped_gemm_nvfp4: the static class's chains take aux, the per-expert static scales [E] (gs2 for GEMM1, inv2 for GEMM2)"
+            )
+        if out_sf is None:
+            out_sf = _dummy_sf(a4.device)  # GEMM2 of the static class: the scale-byte operand is unread
     if out is None:
         out = torch.zeros(rows, n_out, dtype=out_dtype, device=a4.device)
     if (
@@ -380,10 +460,56 @@ def grouped_gemm_nvfp4(
     if rows == 0:
         return out
     if config.swap_ab:
-        get_compiled_swapped_nvfp4(config, chain, in_fmt)(
+        from .blocks import compile_nvfp4 as CN
+
+        kernel = get_compiled_swapped_nvfp4(config, chain, in_fmt, CN.SWAP_VARIANT)
+        if static:
+            kernel(
+                a4.unsqueeze(-1),
+                a_sf.reshape(-1),
+                w4.permute(1, 2, 0),
+                w_sf.reshape(-1),
+                out,
+                out_sf.reshape(-1),
+                counts,
+                alpha.reshape(-1),
+                a_pts.reshape(-1),
+                aux.reshape(-1),
+                persistent_clusters(a4.device, config),
+            )
+        else:
+            kernel(
+                a4.unsqueeze(-1),
+                a_sf.reshape(-1),
+                w4.permute(1, 2, 0),
+                w_sf.reshape(-1),
+                out,
+                counts,
+                alpha.reshape(-1),
+                a_pts.reshape(-1),
+                persistent_clusters(a4.device, config),
+            )
+        return out
+    kernel = get_compiled_grouped_nvfp4(config, chain, in_fmt, dense_a)
+    if static:
+        kernel(
             a4.unsqueeze(-1),
-            a_sf.reshape(-1),
             w4.permute(1, 2, 0),
+            a_sf.reshape(-1),
+            w_sf.reshape(-1),
+            out,
+            out_sf.reshape(-1),
+            counts,
+            alpha.reshape(-1),
+            a_pts.reshape(-1),
+            aux.reshape(-1),
+            persistent_clusters(a4.device, config),
+        )
+    else:
+        kernel(
+            a4.unsqueeze(-1),
+            w4.permute(1, 2, 0),
+            a_sf.reshape(-1),
             w_sf.reshape(-1),
             out,
             counts,
@@ -391,19 +517,6 @@ def grouped_gemm_nvfp4(
             a_pts.reshape(-1),
             persistent_clusters(a4.device, config),
         )
-        return out
-    kernel = get_compiled_grouped_nvfp4(config, chain, in_fmt, dense_a)
-    kernel(
-        a4.unsqueeze(-1),
-        w4.permute(1, 2, 0),
-        a_sf.reshape(-1),
-        w_sf.reshape(-1),
-        out,
-        counts,
-        alpha.reshape(-1),
-        a_pts.reshape(-1),
-        persistent_clusters(a4.device, config),
-    )
     return out
 
 
@@ -452,6 +565,16 @@ def permute_plan_dual(
 _GS_INV: Dict[
     Tuple[str, float], torch.Tensor
 ] = {}  # the recipe's constant per device, filled once (no fill launch per call)
+_DUMMY_SF: Dict[str, torch.Tensor] = {}
+
+
+def _dummy_sf(device: torch.device) -> torch.Tensor:
+    """A 512-byte placeholder for an unread scale-byte operand (one atom: the kernels' alignment assumption), per device."""
+    key = str(torch.device(device))
+    t = _DUMMY_SF.get(key)
+    if t is None:
+        t = _DUMMY_SF[key] = torch.zeros(512, dtype=torch.uint8, device=device)
+    return t
 
 
 def route_plan_dual(
@@ -653,6 +776,7 @@ def fused_moe_nvfp4(
         T = x.shape[0]
         dev = x.device
         x_rows: Optional[torch.Tensor] = x.contiguous()
+        sf_src, unit_pts = "128x4", False
         if path == "dense" and INPUT_SCATTER == "fused":
             x4 = x_sf = x_pts = None  # quantized straight into the grouped layout below
         else:
@@ -662,19 +786,32 @@ def fused_moe_nvfp4(
         x4, x_sf, x_pts = x
         T = x4.shape[0]
         dev = x4.device
-        x_sf = x_sf.reshape(-1)
+        # the pack's scale factors: the class's flat 128x4 buffer, or the row-major ``[T, H / 16]`` bytes of the per-tensor pack
+        # of the TRTLLM backends (the scatter assembles the atoms from them: no re-tiling pass); ``x_pts = None``: unit per-token
+        # scales (the per-tensor pack: nothing to read, no fill)
+        sf_src = (
+            "linear"
+            if x_sf.dim() == 2 and tuple(x_sf.shape) == (T, H // 16)
+            else "128x4"
+        )
+        x_sf = x_sf.contiguous().reshape(-1)
+        unit_pts = x_pts is None
         if (
             x4.dtype != torch.uint8
             or tuple(x4.shape) != (T, H // 2)
             or not x4.is_contiguous()
             or x_sf.dtype != torch.uint8
-            or x_sf.numel() < sf_numel(T, H)
-            or tuple(x_pts.shape) != (T,)
-            or x_pts.dtype != torch.float32
+            or (sf_src == "128x4" and x_sf.numel() < sf_numel(T, H))
+            or (
+                not unit_pts
+                and (tuple(x_pts.shape) != (T,) or x_pts.dtype != torch.float32)
+            )
         ):
             raise TypeError(
-                "fused_moe_nvfp4: the quantized triple is (x4 [T, H/2] uint8, x_sf 128x4 uint8 of >= sf_numel(T, H) bytes, x_pts [T] f32)"
+                "fused_moe_nvfp4: the quantized triple is (x4 [T, H/2] uint8, x_sf 128x4 uint8 of >= sf_numel(T, H) bytes or the linear [T, H/16] bytes, x_pts [T] f32 or None)"
             )
+        if unit_pts:
+            x_pts = _gs_inv(1.0, dev)  # a placeholder the unit-scale scatter never reads
     k = token_selected_experts.shape[1]
     check_shape_nvfp4(H, I, E, k, w.gated)
     if (
@@ -704,7 +841,8 @@ def fused_moe_nvfp4(
         )
     sm_count, family = _part(dev)
     in1, in2 = in_fmts if in_fmts is not None else w.classes(family)
-    chain1 = w.chain1
+    chain1, chain2 = w.chain1, w.chain2
+    static = w.static
     if config1 is None or config2 is None:
         c1, c2 = default_configs_nvfp4(
             T,
@@ -714,7 +852,7 @@ def fused_moe_nvfp4(
             E,
             (in1, in2),
             chain1,
-            GEMM2_CHAIN,
+            chain2,
             sm_count,
             family,
             swap=swap if path == "dense" else False,
@@ -752,7 +890,9 @@ def fused_moe_nvfp4(
                 (x_perm4, x_perm_sf, x_perm_pts),
             )
         elif Tk:
-            get_compiled_scatter_fp4(k, warps_per_row(Tk, H // 32, sm_count))(
+            get_compiled_scatter_fp4(
+                k, warps_per_row(Tk, H // 32, sm_count), sf_src, unit_pts
+            )(
                 x4,
                 x_sf,
                 x_pts,
@@ -765,35 +905,58 @@ def fused_moe_nvfp4(
                 H // 2,
                 pcols_h,
             )
-        a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
-        grouped_gemm_nvfp4(
-            x_perm4,
-            x_perm_sf,
-            x_perm_pts,
-            w.w1,
-            w.w1_sf,
-            w.w1_alpha,
-            counts,
-            config1,
-            chain1,
-            in1,
-            out=a,
-            dense_a=True,
-        )
-        # the class's second pass over the live rows: the codes stay dense; the scale factors and the row scales are re-tiled
-        # to the padded positions for GEMM2's atom-aligned scale boxes (a byte move)
         a4 = torch.empty(Tk_a, I // 2, dtype=torch.uint8, device=dev)
         a_sf_pad = torch.empty(sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
-        a_pts_pad = torch.empty(Tk_sf, dtype=torch.float32, device=dev)
-        a_sf = a_pts = None
-        if Tk and INTERMEDIATE_RETILE == "mapped":
-            quantize_rows_mapped(a[:Tk], gsi, pos_pad, (a4[:Tk], a_sf_pad, a_pts_pad))
-        elif Tk:
-            a_sf = torch.empty(sf_numel(Tk, I), dtype=torch.uint8, device=dev)
-            _, _, a_pts = quantize_activations(a[:Tk], gsi, out=(a4[:Tk], a_sf))
-            get_compiled_scatter_sf(1)(
-                a_sf, a_pts, pos_pad, a_sf_pad, a_pts_pad, Tk, pcols_i
+        a = a_sf = a_pts = None
+        if static:
+            # the static class: GEMM1's epilogue writes the intermediate's codes (dense rows) and scale bytes (the padded
+            # positions) itself -- no bf16 intermediate, no quantizer launch; GEMM2's scale is mul(alpha2[e], inv2[e])
+            grouped_gemm_nvfp4(
+                x_perm4,
+                x_perm_sf,
+                x_perm_pts,
+                w.w1,
+                w.w1_sf,
+                w.w1_alpha,
+                counts,
+                config1,
+                chain1,
+                in1,
+                out=a4,
+                dense_a=True,
+                out_sf=a_sf_pad,
+                aux=w.gs2,
             )
+            a_pts_pad = x_perm_pts  # GEMM2's row-scale operand is unread by the static chain
+        else:
+            a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
+            grouped_gemm_nvfp4(
+                x_perm4,
+                x_perm_sf,
+                x_perm_pts,
+                w.w1,
+                w.w1_sf,
+                w.w1_alpha,
+                counts,
+                config1,
+                chain1,
+                in1,
+                out=a,
+                dense_a=True,
+            )
+            # the class's second pass over the live rows: the codes stay dense; the scale factors and the row scales are re-tiled
+            # to the padded positions for GEMM2's atom-aligned scale boxes (a byte move)
+            a_pts_pad = torch.empty(Tk_sf, dtype=torch.float32, device=dev)
+            if Tk and INTERMEDIATE_RETILE == "mapped":
+                quantize_rows_mapped(
+                    a[:Tk], gsi, pos_pad, (a4[:Tk], a_sf_pad, a_pts_pad)
+                )
+            elif Tk:
+                a_sf = torch.empty(sf_numel(Tk, I), dtype=torch.uint8, device=dev)
+                _, _, a_pts = quantize_activations(a[:Tk], gsi, out=(a4[:Tk], a_sf))
+                get_compiled_scatter_sf(1)(
+                    a_sf, a_pts, pos_pad, a_sf_pad, a_pts_pad, Tk, pcols_i
+                )
         y = torch.empty(Tk_a, H, dtype=torch.bfloat16, device=dev)
         grouped_gemm_nvfp4(
             a4,
@@ -804,10 +967,11 @@ def fused_moe_nvfp4(
             w.w2_alpha,
             counts,
             config2,
-            GEMM2_CHAIN,
+            chain2,
             in2,
             out=y,
             dense_a=True,
+            aux=w.inv2 if static else None,
         )
         if T:
             get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count))(
@@ -826,7 +990,7 @@ def fused_moe_nvfp4(
                 x_perm4=x_perm4[:Tk],
                 x_perm_sf=x_perm_sf[: sf_numel(Tk_pad, H)],
                 x_perm_pts=x_perm_pts[:Tk_pad],
-                a=a[:Tk],
+                a=None if static else a[:Tk],
                 a4=a4[:Tk],
                 a_sf=a_sf,
                 a_pts=a_pts,
@@ -865,7 +1029,9 @@ def fused_moe_nvfp4(
     x_perm_pts = torch.zeros(Tk_pad, dtype=torch.float32, device=dev)
     if Tk:
         flat_dest = dest.reshape(-1)
-        get_compiled_scatter_fp4(k, warps_per_row(Tk, H // 32, sm_count))(
+        get_compiled_scatter_fp4(
+            k, warps_per_row(Tk, H // 32, sm_count), sf_src, unit_pts
+        )(
             x4,
             x_sf,
             x_pts,
@@ -878,24 +1044,48 @@ def fused_moe_nvfp4(
             H // 2,
             pcols_h,
         )
-    a = grouped_gemm_nvfp4(
-        x_perm4,
-        x_perm_sf,
-        x_perm_pts,
-        w.w1,
-        w.w1_sf,
-        w.w1_alpha,
-        counts,
-        config1,
-        chain1,
-        in1,
-    )
-    a4, a_sf, a_pts = quantize_activations(
-        a, gsi
-    )  # the class, second pass (padding rows included: zeros)
-    y = grouped_gemm_nvfp4(
-        a4, a_sf, a_pts, w.w2, w.w2_sf, w.w2_alpha, counts, config2, GEMM2_CHAIN, in2
-    )
+    if static:
+        # the static class on the padded packing: the codes and scale bytes at the padded rows (the group's rows start at an atom)
+        a4 = torch.zeros(Tk_pad, I // 2, dtype=torch.uint8, device=dev)
+        a_sf = torch.zeros(sf_numel(Tk_pad, I), dtype=torch.uint8, device=dev)
+        grouped_gemm_nvfp4(
+            x_perm4,
+            x_perm_sf,
+            x_perm_pts,
+            w.w1,
+            w.w1_sf,
+            w.w1_alpha,
+            counts,
+            config1,
+            chain1,
+            in1,
+            out=a4,
+            out_sf=a_sf,
+            aux=w.gs2,
+        )
+        a, a_pts = None, x_perm_pts
+        y = grouped_gemm_nvfp4(
+            a4, a_sf, a_pts, w.w2, w.w2_sf, w.w2_alpha, counts, config2, chain2, in2, aux=w.inv2
+        )
+    else:
+        a = grouped_gemm_nvfp4(
+            x_perm4,
+            x_perm_sf,
+            x_perm_pts,
+            w.w1,
+            w.w1_sf,
+            w.w1_alpha,
+            counts,
+            config1,
+            chain1,
+            in1,
+        )
+        a4, a_sf, a_pts = quantize_activations(
+            a, gsi
+        )  # the class, second pass (padding rows included: zeros)
+        y = grouped_gemm_nvfp4(
+            a4, a_sf, a_pts, w.w2, w.w2_sf, w.w2_alpha, counts, config2, GEMM2_CHAIN, in2
+        )
     if T:
         get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count))(
             y, dest, scales, out, T, H
@@ -948,6 +1138,7 @@ __all__ = [
     "DENSE_TAIL",
     "F32_CHAIN",
     "GEMM2_CHAIN",
+    "GEMM2_STATIC_CHAIN",
     "GROUP_ALIGN",
     "MAX_TOP_K",
     "MoEWeightsNVFP4",

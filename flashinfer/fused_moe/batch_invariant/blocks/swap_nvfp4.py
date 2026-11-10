@@ -36,7 +36,7 @@ positions, ``Tk_pad`` entries at least).
 from __future__ import annotations
 
 from dataclasses import dataclass
-
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -44,7 +44,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as bs_layout
-from cutlass import Boolean, Int32, Uint8
+from cutlass import Boolean, Int32, Int64, Uint8, Uint32
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import (
     Agent,
@@ -59,6 +59,10 @@ from cutlass.pipeline.helpers import MbarrierArray
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
+from ....batch_invariant.quantization.cvt_fp8 import (
+    cvt_f32_to_e4m3,
+    cvt_f32x8_to_e2m1x8,
+)
 from ....gemm.batch_invariant.blocks.blockscaled import (
     PLANS,
     SF_ATOM_BYTES,
@@ -68,11 +72,11 @@ from ....gemm.batch_invariant.blocks.blockscaled import (
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE, BAR_TMEM_ALLOC
 from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs
 from ....gemm.batch_invariant.spec import NVFP4_FMTS, SF_ATOM_KBLOCKS
-from ..spec_nvfp4 import w4a4_row_scale
+from ..spec_nvfp4 import NVFP4_BLOCK, NVFP4_C_SIXTH, w4a4_row_scale
 from .epilogue import BAR_EPI_JOIN, GROUP, MoeF32, fragment_offsets
-from .epilogue_nvfp4 import W4A4Chain, _scaled_elem
+from .epilogue_nvfp4 import W4A4Chain, _scaled_elem, sf_byte_offset
 from .kernel_nvfp4 import GROUP_ALIGN, grouped_plan, sf_view_experts
-from .scheduler import MAX_E, GroupScheduler, build_group_tables
+from .scheduler import MAX_E, GroupScheduler, build_group_tables, build_group_tables_dual
 
 EPILOGUE_WARPS = (
     0,
@@ -89,6 +93,23 @@ TOKEN_TILES = TILES_N_NARROW  # the swapped records' token tiles (8, 16, 32): on
 SF_GROUP = (
     4  # scale-factor bytes per 4-byte cp.async (one 4-block column group of the atom)
 )
+# TMA L2 cache-policy words (CUTLASS's CacheHintSm90): a weight tile read by one CTA only is evicted first, the token box
+# every weight tile of the group re-reads is kept
+L2_EVICT_NORMAL, L2_EVICT_FIRST, L2_EVICT_LAST = (
+    0x1000000000000000,
+    0x12F0000000000000,
+    0x14F0000000000000,
+)
+#: Placement variants of the body (A/B records; the kernel name carries them): ``legacy_tables`` = the epilogue's allocator
+#: warp scans the group tables twice before the TMEM allocation; ``l2`` = the weight / token TMA cache hints. The default is
+#: the one-pass scan on the scale-factor warp with the TMEM allocation issued first.
+VARIANTS = ("legacy_tables", "l2")
+
+
+def variant_tokens(variant: str) -> tuple:
+    toks = tuple(t for t in variant.split("+") if t)
+    assert all(t in VARIANTS for t in toks), (variant, VARIANTS)
+    return toks
 
 
 def is_swapped_record(knobs: Knobs) -> bool:
@@ -151,14 +172,18 @@ class PipelineCpAsyncUmma(PipelineAsync):
 class SwappedBlockScaledGemm:
     """``out[p, n] = chain(sum_k MMA(W[n, e(p)], SFW[n, e(p)], A[p], SFA[pad(p)]))`` for every dense row ``p`` of every group."""
 
-    def __init__(self, knobs: Knobs, chain: W4A4Chain, in_fmt: str = "nvfp4"):
-        assert isinstance(chain, W4A4Chain) and chain.out_fmt in ("bf16", "f32"), chain
+    def __init__(
+        self, knobs: Knobs, chain: W4A4Chain, in_fmt: str = "nvfp4", variant: str = ""
+    ):
+        assert isinstance(chain, W4A4Chain) and chain.out_fmt in ("bf16", "f32", "nvfp4"), chain
         assert in_fmt in NVFP4_FMTS and in_fmt in PLANS, in_fmt
         assert is_swapped_record(knobs), (
             "the swapped block-scaled body takes the narrow swapped records (128 weight rows x 8 / 16 / 32 tokens, 1-CTA)",
             knobs,
         )
         self.knobs, self.chain, self.in_fmt = knobs, chain, in_fmt
+        toks = variant_tokens(variant)
+        self.legacy_tables, self.l2_hints = "legacy_tables" in toks, "l2" in toks
         self.plan_cls = PLANS[in_fmt]
         self.token_tile = knobs.tile_n
 
@@ -175,6 +200,45 @@ class SwappedBlockScaledGemm:
         pts: cute.Tensor,
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
+    ):
+        self._launch(a, sfa, w, sfw, out, counts, alpha, pts, max_active_clusters, stream)
+
+    @cute.jit
+    def call_static(
+        self,
+        a: cute.Tensor,
+        sfa: cute.Tensor,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        out_sf: cute.Tensor,
+        counts: cute.Tensor,
+        alpha: cute.Tensor,
+        pts: cute.Tensor,
+        aux: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The static class's chains (as ``GroupedBlockScaledGemm.call_static``): ``out`` the packed codes, ``out_sf`` the flat 128x4
+        scale bytes at the padded positions, ``aux[e]`` the expert's ``gs2`` (GEMM1) or ``inv2`` (GEMM2, ``out_sf`` unused)."""
+        self._launch(
+            a, sfa, w, sfw, out, counts, alpha, pts, max_active_clusters, stream, out_sf, aux
+        )
+
+    def _launch(
+        self,
+        a,
+        sfa,
+        w,
+        sfw,
+        out,
+        counts,
+        alpha,
+        pts,
+        max_active_clusters,
+        stream,
+        out_sf=None,
+        aux=None,
     ):
         plan_cls = self.plan_cls
         a4 = fp4_view(a)  # (R, K, 1): the dense token rows, the MMA's B operand
@@ -241,6 +305,8 @@ class SwappedBlockScaledGemm:
             counts,
             alpha,
             pts,
+            out_sf,
+            aux,
             st.cluster_layout_vmnk,
             st.a_smem_layout_staged,
             st.b_smem_layout_staged,
@@ -270,6 +336,8 @@ class SwappedBlockScaledGemm:
         counts: cute.Tensor,
         mAlpha: cute.Tensor,
         mPts: cute.Tensor,
+        mOutSf: Optional[cute.Tensor],
+        mAux: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -369,13 +437,23 @@ class SwappedBlockScaledGemm:
         s_pre = storage.group_pre.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_off_pad = storage.group_off_pad.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_pre_pad = storage.group_pre_pad.get_tensor(cute.make_layout((MAX_E + 1,)))
-        if warp_idx == EPILOGUE_WARPS[0]:
-            build_group_tables(
-                counts, E, tn, s_off, s_pre, 1
-            )  # the dense rows: the token tiles of a group
-            build_group_tables(
-                counts, E, tn, s_off_pad, s_pre_pad, GROUP_ALIGN
-            )  # the padded positions of the scale factors and row scales
+        if cutlass.const_expr(self.legacy_tables):
+            if warp_idx == EPILOGUE_WARPS[0]:
+                build_group_tables(
+                    counts, E, tn, s_off, s_pre, 1
+                )  # the dense rows: the token tiles of a group
+                build_group_tables(
+                    counts, E, tn, s_off_pad, s_pre_pad, GROUP_ALIGN
+                )  # the padded positions of the scale factors and row scales
+        else:
+            # the three tables in one scan on the scale-factor warp (idle until its first tile) while the allocator warp issues
+            # the TMEM allocation: the two longest legs of the prologue overlap instead of running back to back
+            if warp_idx == SF_WARP:
+                build_group_tables_dual(
+                    counts, E, tn, s_off, s_pre, s_off_pad, GROUP_ALIGN
+                )
+            if warp_idx < len(EPILOGUE_WARPS):
+                tmem.allocate(st.num_tmem_alloc_cols)
         pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
 
         sW = smem.allocate_tensor(
@@ -472,6 +550,7 @@ class SwappedBlockScaledGemm:
                 thr_mma,
                 block_in_cluster_coord_vmnk[1],
                 b_cta_layout,
+                self.l2_hints,
             )
         if warp_idx == SF_WARP:
             tile_sched = GroupScheduler.create(
@@ -531,7 +610,8 @@ class SwappedBlockScaledGemm:
                 sSFA,
             )
         if warp_idx < len(EPILOGUE_WARPS):
-            tmem.allocate(st.num_tmem_alloc_cols)
+            if cutlass.const_expr(self.legacy_tables):
+                tmem.allocate(st.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -555,11 +635,38 @@ class SwappedBlockScaledGemm:
                 mPts,
                 s_off,
                 s_off_pad,
+                mOutSf,
+                mAux,
             )
             tmem.relinquish_alloc_permit()
             # the allocator warp alone frees the columns: the epilogue warpgroup's warps join here after their last TMEM loads
+            # (the allocation issued in the prologue's own region: the column count is given explicitly)
             epi_join.arrive_and_wait()
-            tmem.free(tmem_ptr)
+            if cutlass.const_expr(self.legacy_tables):
+                tmem.free(tmem_ptr)
+            else:
+                tmem.free(tmem_ptr, st.num_tmem_alloc_cols)
+
+
+@cute.jit
+def _weight_hint(tile_sched, e: Int32, l2_hints: cutlass.Constexpr):
+    """The weight tile's cache policy for expert ``e``: evict-first when the group spans one token tile (this CTA is its only
+    reader), normal otherwise."""
+    hint = Int64(L2_EVICT_NORMAL)
+    if cutlass.const_expr(l2_hints):
+        ee = cutlass.min(cutlass.max(e, Int32(0)), Int32(MAX_E - 1))
+        single = (tile_sched.s_pre[ee + Int32(1)] - tile_sched.s_pre[ee]) == Int32(1)
+        if single:
+            hint = Int64(L2_EVICT_FIRST)
+    return hint
+
+
+@cute.jit
+def _copy_hinted(atom, src, dst, bar, hint: Int64, l2_hints: cutlass.Constexpr):
+    if cutlass.const_expr(l2_hints):
+        cute.copy(atom, src, dst, tma_bar_ptr=bar, cache_policy=hint)
+    else:
+        cute.copy(atom, src, dst, tma_bar_ptr=bar)
 
 
 @cute.jit
@@ -580,6 +687,7 @@ def swap_tma_producer_loop(
     thr_mma,
     b_cta_coord,
     b_cta_layout,
+    l2_hints: cutlass.Constexpr = False,
 ):
     """The TMA producer: per tile the expert's 128 weight rows ``n_tile`` and their scale-factor atom (the expert as the batch
     coordinate) and the token box re-addressed at the group's dense row ``row0`` (``token_tile`` rows: the rows past the group's
@@ -587,10 +695,13 @@ def swap_tma_producer_loop(
     three. The weights are inputs of the whole chain, the token rows the predecessor's output: the first tile's weight stages
     (as many as the ring holds) are issued before the programmatic-dependent-launch wait and their token boxes right after it,
     so the ring fills while the predecessor drains; the stage's transaction barrier completes when all three copies have landed,
-    whatever their order."""
+    whatever their order. ``l2_hints``: the weight tile and its scale factors carry the evict-first cache policy when the group
+    spans one token tile (no other CTA reads them) and the normal one otherwise, the token box the evict-last policy (every
+    weight tile of the group reads it); the hints steer the L2's replacement, never the bytes."""
 
     work_tile = tile_sched.initial_work_tile_info()
     n_pre = cutlass.min(Int32(st.num_ab_stage), k_tile_cnt)
+    w_hint = _weight_hint(tile_sched, work_tile.e, l2_hints)
     if not work_tile.is_valid_tile:
         n_pre = Int32(0)  # a CTA without tiles issues nothing
     tWgW_slice = tWgW[(None, work_tile.n_tile, None, work_tile.e)]
@@ -614,26 +725,32 @@ def swap_tma_producer_loop(
     )  # the same stages, walked again for the token boxes
     for _k_tile in cutlass.range(0, n_pre, 1, unroll=1):
         handle = tma_producer.acquire_and_advance()
-        cute.copy(
+        _copy_hinted(
             tma_atom_w,
             tWgW_slice[(None, handle.count)],
             tWsW[(None, handle.index)],
-            tma_bar_ptr=handle.barrier,
+            handle.barrier,
+            w_hint,
+            l2_hints,
         )
-        cute.copy(
+        _copy_hinted(
             tma_atom_sfw,
             tWgSFW_slice[(None, handle.count)],
             tWsSFW[(None, handle.index)],
-            tma_bar_ptr=handle.barrier,
+            handle.barrier,
+            w_hint,
+            l2_hints,
         )
     cute.arch.griddepcontrol_wait()  # the token rows are the predecessor's
     for _k_tile in cutlass.range(0, n_pre, 1, unroll=1):
         handle = tok_producer.current_handle()
-        cute.copy(
+        _copy_hinted(
             tma_atom_tok,
             tTgTok_slice[(None, handle.count)],
             tTsTok[(None, handle.index)],
-            tma_bar_ptr=handle.barrier,
+            handle.barrier,
+            Int64(L2_EVICT_LAST),
+            l2_hints,
         )
         tok_producer.advance()
     k_start = n_pre
@@ -653,28 +770,35 @@ def swap_tma_producer_loop(
             cute.group_modes(tCgTok, 0, 3),
         )
         tTgTok_slice = tTgTok[(None, 0, None, 0)]
+        w_hint = _weight_hint(tile_sched, work_tile.e, l2_hints)
         peek_empty = cutlass.Boolean(1)
         if k_start < k_tile_cnt:
             peek_empty = tma_producer.try_acquire()
         for _k_tile in cutlass.range(k_start, k_tile_cnt, 1, unroll=1):
             handle = tma_producer.acquire_and_advance(peek_empty)
-            cute.copy(
+            _copy_hinted(
                 tma_atom_w,
                 tWgW_slice[(None, handle.count)],
                 tWsW[(None, handle.index)],
-                tma_bar_ptr=handle.barrier,
+                handle.barrier,
+                w_hint,
+                l2_hints,
             )
-            cute.copy(
+            _copy_hinted(
                 tma_atom_sfw,
                 tWgSFW_slice[(None, handle.count)],
                 tWsSFW[(None, handle.index)],
-                tma_bar_ptr=handle.barrier,
+                handle.barrier,
+                w_hint,
+                l2_hints,
             )
-            cute.copy(
+            _copy_hinted(
                 tma_atom_tok,
                 tTgTok_slice[(None, handle.count)],
                 tTsTok[(None, handle.index)],
-                tma_bar_ptr=handle.barrier,
+                handle.barrier,
+                Int64(L2_EVICT_LAST),
+                l2_hints,
             )
             peek_empty = cutlass.Boolean(1)
             if handle.count + 1 < k_tile_cnt:
@@ -914,6 +1038,8 @@ def swapped_w4a4_epilogue_loop(
     mPts: cute.Tensor,
     s_off: cute.Tensor,
     s_off_pad: cute.Tensor,
+    mOutSf: cute.Tensor = None,
+    mAux: cute.Tensor = None,
 ):
     """The transposed group-masked epilogue: the accumulator tile is (weight rows, tokens); the 128-row TMEM layout gives
     thread ``t`` weight row ``t`` of the tile and its token columns (the record's N tile). Gated chain: the gate accumulators
@@ -922,9 +1048,20 @@ def swapped_w4a4_epilogue_loop(
     ``row0 + j``, stored iff ``< row_end``. The W4A4 per-token scale is per column, ``s_j = mul(alpha_e, pts[row0 + j +
     off_pad[e] - off[e]])`` (the row scales at the padded positions); the unscaled oracle chains take the accumulators as is.
     Every output element's chain is computed by one thread from the same accumulator value in the same fp32 sequence as the
-    padded body's epilogue."""
+    padded body's epilogue. The static class's GEMM1 (``out_fmt == "nvfp4"``) quantizes every live token column's 16-output
+    block across the warp's output lanes (a block = the up lanes of one warp for the gated chain, 16 consecutive lanes for the
+    ungated one): the block amax by a butterfly (exact in every association), the e4m3 scale and the encode scale on every lane,
+    the codes paired into bytes by the even lanes (``mOut`` the packed-code buffer ``[rows, I/2]`` uint8, ``mOutSf`` the flat
+    128x4 scale bytes at the padded positions, ``mAux[e] = gs2[e]``); its GEMM2 (``scale == "w4a4s"``): ``s = mul(alpha[e],
+    mAux[e])`` once per tile."""
     pair = chain.pair
     scaled = chain.scale != "none"
+    static_q = chain.out_fmt == "nvfp4"
+    n_blocks = pcols = Int32(0)
+    if cutlass.const_expr(static_q):
+        N_out = N // Int32(2) if cutlass.const_expr(pair) else N
+        n_blocks = N_out // Int32(NVFP4_BLOCK)
+        pcols = ((n_blocks + Int32(3)) // Int32(4)) * Int32(4)
     tiler_mn = cute.slice_(st.mma_tiler, (None, None, 0))
     tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
     copy_atom_t2r = get_tmem_load_op(
@@ -972,8 +1109,15 @@ def swapped_w4a4_epilogue_loop(
         rows_left = cutlass.min(row_end, Tk) - row0  # valid tokens of this tile
         shift = s_off_pad[e] - s_off[e]  # the row scales at the padded positions
         alpha_e = None
-        if cutlass.const_expr(scaled):
+        gs6 = inv_gs = None
+        if cutlass.const_expr(chain.scale == "w4a4s"):
+            alpha_e = w4a4_row_scale(MoeF32, mAlpha[e], mAux[e])  # mul(alpha2[e], inv2[e]), once per tile
+        elif cutlass.const_expr(scaled):
             alpha_e = mAlpha[e]
+            if cutlass.const_expr(static_q):
+                gs_e = mAux[e]  # the expert's static intermediate scale
+                gs6 = MoeF32.mul(gs_e, MoeF32.const(NVFP4_C_SIXTH))
+                inv_gs = MoeF32.div(MoeF32.const(1.0), gs_e)
         tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_state.index)]
         acc_pipeline.consumer_wait(acc_state)
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
@@ -1003,20 +1147,60 @@ def swapped_w4a4_epilogue_loop(
                 store_ok = n_glob < N
             # the chain of a token column is computed only where the column is a live token of the group (a warp-uniform
             # branch: every lane of the warp holds the same column), so a tile with few live tokens pays few chains
-            for v in cutlass.range_constexpr(nv):
-                j = col0 + Int32(cols[v])
-                if j < rows_left:
-                    sv = None
-                    if cutlass.const_expr(scaled):
+            if cutlass.const_expr(static_q):
+                # the static class's GEMM1: per live token column, the block of this warp's output lanes
+                if cutlass.const_expr(pair):
+                    bcol = n_tile * Int32(WEIGHT_TILE // (2 * NVFP4_BLOCK)) + wrow // Int32(2 * NVFP4_BLOCK)  # 16 outputs = 32 weight rows
+                    even = (wrow % Int32(GROUP)) % Int32(2) == Int32(0)
+                    sf_lane = (wrow % Int32(32)) == Int32(0)
+                else:
+                    bcol = n_tile * Int32(WEIGHT_TILE // NVFP4_BLOCK) + wrow // Int32(NVFP4_BLOCK)
+                    even = (wrow % Int32(2)) == Int32(0)
+                    sf_lane = (wrow % Int32(NVFP4_BLOCK)) == Int32(0)
+                byte_col = out_col // Int32(2)
+                for v in cutlass.range_constexpr(nv):
+                    j = col0 + Int32(cols[v])
+                    if j < rows_left:
                         sv = _col_scale(alpha_e, mPts, row0, j, rows_left, shift)
-                    val = _scaled_elem(
-                        chain,
-                        tTR_rAcc[v],
-                        gate[v] if cutlass.const_expr(pair) else None,
-                        sv,
-                    )
-                    if store_ok:
-                        mOut[(row0 + j, out_col)] = val
+                        val = _scaled_elem(
+                            chain,
+                            tTR_rAcc[v],
+                            gate[v] if cutlass.const_expr(pair) else None,
+                            sv,
+                        )
+                        amax = MoeF32.fabs(val)
+                        for off in (1, 2, 4, 16) if cutlass.const_expr(pair) else (1, 2, 4, 8):
+                            amax = MoeF32.fmaxc(amax, cute.arch.shuffle_sync_bfly(amax, offset=off))
+                        sf_byte, sf_d = cvt_f32_to_e4m3(MoeF32.mul(amax, gs6))
+                        inv_b = MoeF32.fmin(
+                            MoeF32.div(MoeF32.const(1.0), MoeF32.mul(sf_d, inv_gs)),
+                            MoeF32.const(3.4028234663852886e38),
+                        )
+                        y = MoeF32.mul(val, inv_b)
+                        y_odd = cute.arch.shuffle_sync_down(y, offset=1)  # the neighbouring output column's value
+                        word = cvt_f32x8_to_e2m1x8(y, y_odd, y, y, y, y, y, y)  # byte 0 = (this column, the next)
+                        prow = row0 + j
+                        if store_ok & even & (bcol < n_blocks):
+                            mOut[(prow, byte_col)] = (word & Uint32(0xFF)).to(Uint8)
+                        if sf_lane & (bcol < n_blocks):
+                            mOutSf[sf_byte_offset(prow + shift, bcol, pcols)] = sf_byte.to(Uint8)
+            else:
+                for v in cutlass.range_constexpr(nv):
+                    j = col0 + Int32(cols[v])
+                    if j < rows_left:
+                        sv = None
+                        if cutlass.const_expr(chain.scale == "w4a4s"):
+                            sv = alpha_e
+                        elif cutlass.const_expr(scaled):
+                            sv = _col_scale(alpha_e, mPts, row0, j, rows_left, shift)
+                        val = _scaled_elem(
+                            chain,
+                            tTR_rAcc[v],
+                            gate[v] if cutlass.const_expr(pair) else None,
+                            sv,
+                        )
+                        if store_ok:
+                            mOut[(row0 + j, out_col)] = val
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(acc_state)
         acc_state.advance()

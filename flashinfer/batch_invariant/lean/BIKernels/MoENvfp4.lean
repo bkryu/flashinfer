@@ -52,6 +52,78 @@ theorem w4a4RowScale_unit (alpha : MTerm) : w4a4RowScale alpha (c "1.0") = .mul 
 the alpha. -/
 theorem scaledOutT_eq (acc s : MTerm) : scaledOutT acc s = .cvt "bf16" (.mul acc s) := rfl
 
+/-! ## The static-intermediate class `moe.nvfp4.<act>.static`: GEMM1's epilogue quantizes the fp32 gated value per 16-column block
+with the expert's static global scale `gs2[e]` by the per-tensor NVFP4 quantizer's chain (`Quant.lean`'s `sfValue` / `sfQuant` /
+`invScale` / `quantElem`, restated on `MTerm`; the Python spec pins the two restatements to one S-expression), GEMM2 carries the
+per-expert constant `inv2[e] = div(1, gs2[e])`. -/
+
+def nvfp4CSixth : MTerm := c "0.1666666716337204"
+def nvfp4FltMax : MTerm := c "3.4028234663852886e+38"
+
+/-- `sf_f = mul(amax, mul(gs, 1/6))`. -/
+def nvfp4SfValue (amax gs : MTerm) : MTerm := .mul amax (.mul gs nvfp4CSixth)
+
+/-- `sf_d = cvt_e4m3(sf_f)`: the stored scale byte as its widened value. -/
+def nvfp4SfQuant (sf : MTerm) : MTerm := .cvt "e4m3" sf
+
+/-- `inv = fmin(div(1, mul(sf_d, div(1, gs))), FLT_MAX)`: the quantizer's encode scale, the same `div` primitive as `staticInv2T`. -/
+def nvfp4InvScale (sfd gs : MTerm) : MTerm := .fmin (.div (c "1.0") (.mul sfd (.div (c "1.0") gs))) nvfp4FltMax
+
+/-- `q = cvt_e2m1(mul(x, inv))`. -/
+def nvfp4QuantElem (x inv : MTerm) : MTerm := .cvt "e2m1" (.mul x inv)
+
+def pairUp : List MTerm → List MTerm
+  | a :: b :: rest => MTerm.fmaxc a b :: pairUp rest
+  | rest => rest
+
+/-- One pairing round per unit of fuel (the list length bounds the rounds: structural recursion, no measure). -/
+def pairwiseMaxFuel : Nat → List MTerm → MTerm
+  | _, [x] => x
+  | 0, xs => xs.headD (c "0.0")
+  | n + 1, xs => pairwiseMaxFuel n (pairUp xs)
+
+/-- The adjacent pairwise `fmaxc` tree over a power-of-two list: the quantizer's canonical block reduction (exact in every
+association: the max of non-negative values). -/
+def pairwiseMax (xs : List MTerm) : MTerm := pairwiseMaxFuel xs.length xs
+
+/-- The block amax of 16 values: the pairwise `fmaxc` tree over `fabs(x)`. -/
+def nvfp4BlockAmax (xs : List MTerm) : MTerm := pairwiseMax (xs.map MTerm.fabs)
+
+/-- The fp32 gated value of the W4A4 chain before any rounding: `glu_pre(mul(g, s), mul(u, s))`. -/
+def gluScaledPreT (a : GAct) (g u s : MTerm) : MTerm := gluPreT a (.mul g s) (.mul u s)
+
+/-- The fp32 ungated value before any rounding: `act(mul(acc, s))`. -/
+def actScaledPreT (a : UAct) (acc s : MTerm) : MTerm := ungatedT a (.mul acc s)
+
+/-- The block's scale byte: the per-tensor chain on the block's 16 fp32 values with the expert's static scale. -/
+def staticBlockSfT (vals : List MTerm) (gs : MTerm) : MTerm := nvfp4SfQuant (nvfp4SfValue (nvfp4BlockAmax vals) gs)
+
+/-- The block's `i`-th code: `cvt_e2m1(mul(v_i, inv))` with `inv` from the block's scale byte. -/
+def staticBlockCodeT (vals : List MTerm) (gs : MTerm) (i : Nat) : MTerm :=
+  nvfp4QuantElem (vals.getD i (c "0.0")) (nvfp4InvScale (staticBlockSfT vals gs) gs)
+
+/-- GEMM2's static factor `inv2[e] = div(1, gs2[e])`: the quantizer's `div`, formed once per expert on the host and read as given. -/
+def staticInv2T (gs : MTerm) : MTerm := .div (c "1.0") gs
+
+/-- The static class's GEMM2: `cvt_bf16(mul(acc, mul(alpha2[e], inv2[e])))`. -/
+def staticGemm2T (acc alpha gs : MTerm) : MTerm := scaledOutT acc (w4a4RowScale alpha (staticInv2T gs))
+
+/-- The gated W4A4 chain of the per-token class is the bf16 rounding of the static class's fp32 value: the two classes share
+the value and differ only in what quantizes it (the per-token row pass vs the in-place block chain). -/
+theorem gluScaledT_is_cvt_of_pre (a : GAct) (g u s : MTerm) : gluScaledT a g u s = .cvt "bf16" (gluScaledPreT a g u s) := rfl
+
+theorem actScaledT_is_cvt_of_pre (a : UAct) (acc s : MTerm) : actScaledT a acc s = .cvt "bf16" (actScaledPreT a acc s) := rfl
+
+/-- **The fused epilogue is the per-tensor quantizer's chain on the fp32 gated values**: the block's scale and codes are
+`sfQuant (sfValue amax gs)` and `quantElem v (invScale sf gs)` with `amax` the canonical block tree -- the fusion moves no
+arithmetic. -/
+theorem static_block_is_quant_chain (vals : List MTerm) (gs : MTerm) (i : Nat) :
+    staticBlockSfT vals gs = .cvt "e4m3" (.mul (pairwiseMax (vals.map MTerm.fabs)) (.mul gs nvfp4CSixth))
+      ∧ staticBlockCodeT vals gs i = .cvt "e2m1" (.mul (vals.getD i (c "0.0")) (nvfp4InvScale (staticBlockSfT vals gs) gs)) := ⟨rfl, rfl⟩
+
+/-- The static class's GEMM2 is the W4A4 GEMM2 chain with the per-expert constant in place of the per-token scale. -/
+theorem staticGemm2T_is_scaledOut (acc alpha gs : MTerm) : staticGemm2T acc alpha gs = scaledOutT acc (.mul alpha (.div (c "1.0") gs)) := rfl
+
 /-- The NVFP4 instruction class of each expert weight shape by the dense rule (Rule A per weight: GEMM1 on `(N1, H)`,
 GEMM2 on `(H, I)`), a function of the model's fixed dimensions only: a token's class cannot depend on the batch, the
 expert load or the slot. -/

@@ -204,6 +204,7 @@ def _moe_nvfp4_fingerprint(
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
     arch=None,
+    intermediate: str = "per_token",
 ) -> str:
     """The NVFP4 (W4A4) MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the NVFP4 x NVFP4 pair): ``method``
     and ``act`` as for ``fused_moe``; ``arch`` (an architecture family, a compute capability or a device; the current CUDA
@@ -256,6 +257,7 @@ def _moe_nvfp4_fingerprint(
         params,
         gated,
         expert_classes(H, I, family, bool(gated)),
+        intermediate=intermediate,
     )
 
 
@@ -308,7 +310,7 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.nvfp4",
         ("H", "I", "top_k", "num_experts"),
         _moe_nvfp4_fingerprint,
-        ("method", "act", "params", "gated", "arch"),
+        ("method", "act", "params", "gated", "arch", "intermediate"),
     ),
 }
 

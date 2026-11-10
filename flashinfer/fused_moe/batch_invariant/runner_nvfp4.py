@@ -58,13 +58,14 @@ _NO_SCALES: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
 
 def _no_scales(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     """The placeholder scale operands of a bf16 activation (never read: the class quantizes the rows itself), one pair
-    per device so a call launches no fill."""
+    per device so a call launches no fill. The empty per-token placeholder also marks a pre-quantized pack without per-token
+    scales (the per-tensor pack of the TRTLLM backends): the op takes its rows at unit scale with nothing to read or fill."""
     key = str(device)
     t = _NO_SCALES.get(key)
     if t is None:
         t = _NO_SCALES[key] = (
             torch.empty(1, dtype=torch.uint8, device=device),
-            torch.empty(1, dtype=torch.float32, device=device),
+            torch.empty(0, dtype=torch.float32, device=device),
         )
     return t
 
@@ -142,6 +143,10 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         # exact shapes: the dispatcher's pick is a function of the token count (every tactic computes the same bits)
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
+        self._scale: Optional[torch.Tensor] = None
+        # the intermediate's class (`per_token` / `static`): the bound backend config's field
+        cands = [c for c in config.backend if hasattr(c, "intermediate")]
+        self._intermediate: str = cands[0].intermediate if cands else "per_token"
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
@@ -187,6 +192,34 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         from ...gemm.batch_invariant.api import part_of
 
         self._part = part_of(self.device)
+        method = getattr(self, "_method", None)
+        if (
+            method is not None
+            and method.scaled
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # the routed scaling factor is a constant of the configuration: its tensor is built here, at the layer's
+            # construction, so no forward (a first one under CUDA graph capture included) copies it to the device
+            self._scale = self._scale_constant()
+
+    def _scale_constant(self) -> torch.Tensor:
+        """The routed scaling factor as a one-element fp32 tensor on the runner's device: a blocking host copy outside CUDA
+        graph capture (complete before any stream reads it), a device fill (a node of that capture alone) inside one."""
+        v = self.config.routing.routed_scaling_factor
+        v = 1.0 if v is None else float(v)
+        if torch.cuda.is_current_stream_capturing():
+            return torch.full((1,), v, dtype=torch.float32, device=self.device)
+        return torch.tensor([v], dtype=torch.float32).to(self.device)
+
+    def _scale_tensor(self) -> torch.Tensor:
+        """The scale tensor the route kernel reads as given: the one built at construction; a runner built inside a capture
+        takes a fill per call until it runs outside one, which then keeps the constant."""
+        if self._scale is not None:
+            return self._scale
+        s = self._scale_constant()
+        if not torch.cuda.is_current_stream_capturing():
+            self._scale = s
+        return s
 
     # ---- inputs ----------------------------------------------------------------------------------------------------
     def _validate_pack_contract(self, act: MoEActivationPack) -> None:
@@ -209,10 +242,10 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
 
     def _activation_scales(
         self, act: MoEActivationPack, T: int, H: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """The pre-quantized pack's scale factors as the flat 128x4 swizzled buffer and its per-token scales (unit scales
-        when the pack carries none: the per-tensor pack of the TRTLLM backends)."""
-        from ...batch_invariant.quantization.layout import swizzle_sf
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """The pre-quantized pack's scale factors (the flat 128x4 swizzled buffer, or the linear ``[T, H/16]`` bytes of the
+        per-tensor pack of the TRTLLM backends, which the op's scatter re-tiles itself) and its per-token scales (``None`` for a
+        pack without them: the op takes the rows at unit scale with nothing to fill)."""
         from ...batch_invariant.quantization.nvfp4_schedule import BLOCK, sf_numel
 
         sf = act.hidden_states_scale
@@ -231,9 +264,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
                 "uint8 or float8_e4m3fn scale bytes",
             )
         if sf.ndim == 2 and tuple(sf.shape) == (T, H // BLOCK) and sf.is_contiguous():
-            sf_flat = swizzle_sf(
-                sf, T, H, BLOCK, "128x4"
-            )  # the linear layout: re-tiled (a byte permutation)
+            sf_flat = sf  # the linear layout: the op's scatter assembles the 128x4 atoms from the rows
         elif sf.numel() >= sf_numel(T, H) and (
             sf.is_contiguous() or (sf.ndim == 2 and sf.t().is_contiguous())
         ):
@@ -246,7 +277,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             )
         pts = act.per_token_scale
         if pts is None:
-            pts = torch.ones(T, dtype=torch.float32, device=act.hidden_states_q.device)
+            pts = _no_scales(act.hidden_states_q.device)[1]  # the empty marker: unit scales
         else:
             if tuple(pts.shape) != (T,):
                 raise unsupported(
@@ -297,6 +328,12 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
                 f"{type(cfg.activation).__name__} with weights prepared for the chain {w.act!r} ({'gated' if w.gated else 'ungated'})",
                 "weights prepared with the layer's activation",
             )
+        if w.intermediate != self._intermediate:
+            raise unsupported(
+                CLASS,
+                f"intermediate={self._intermediate!r} with weights prepared for intermediate={w.intermediate!r}",
+                "weights prepared with the backend config's intermediate class",
+            )
         check_shape_nvfp4(H, w.intermediate_size, E, k, w.gated)
         if x.dtype == torch.bfloat16:
             if act.hidden_states_scale is not None or act.per_token_scale is not None:
@@ -340,9 +377,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
                     "a routing bias" if bias is not None else "no routing bias",
                     "a bias exactly for the methods that select on sigmoid(l) + bias",
                 )
-            scale = cfg.routing.routed_scaling_factor if self._method.scaled else None
-            if self._method.scaled and scale is None:
-                scale = 1.0
+            scale = self._scale_tensor() if self._method.scaled else None
             from .blocks.scheduler import MAX_E
             from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
 
@@ -392,7 +427,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int, H: int) -> Tuple[list, list]:
-        from .api_nvfp4 import GEMM2_CHAIN
+        from .api_nvfp4 import GEMM2_CHAIN, GEMM2_STATIC_CHAIN
         from .blocks.epilogue_nvfp4 import W4A4Chain
         from .schedule_nvfp4 import (
             TOP_K,
@@ -412,14 +447,22 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
         in1, in2 = expert_classes(H, I, family, a.gated)
-        chain1 = W4A4Chain("glu" if a.gated else "act", a.act, "bf16", a.params, "w4a4")
+        static = self._intermediate == "static"
+        chain1 = W4A4Chain(
+            "glu" if a.gated else "act",
+            a.act,
+            "nvfp4" if static else "bf16",
+            a.params,
+            "w4a4",
+        )
+        chain2 = GEMM2_STATIC_CHAIN if static else GEMM2_CHAIN
         n1 = 2 * I if a.gated else I
         return (
             rank_grouped_nvfp4(
                 rows, n1, H, E, chain1, in1, sm_count, family, TOP_K, n_active=n_act
             ),
             rank_grouped_nvfp4(
-                rows, H, I, E, GEMM2_CHAIN, in2, sm_count, family, TOP_K, n_active=n_act
+                rows, H, I, E, chain2, in2, sm_count, family, TOP_K, n_active=n_act
             ),
         )
 
@@ -433,7 +476,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         return [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + ("moe.nvfp4-v2",)
+        return super()._cache_key_extras() + ("moe.nvfp4-v3", self._intermediate)
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(
@@ -468,6 +511,12 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             a.act,
             a.params,
         )
-        xin = x if x.dtype == torch.bfloat16 else (x, sf, pts)
+        # a pre-quantized pack: the empty per-token placeholder means unit scales (the per-tensor pack), the 2-D scale tensor the
+        # linear layout; both are the op's own placements (no fill, no re-tiling launch)
+        xin = (
+            x
+            if x.dtype == torch.bfloat16
+            else (x, sf, pts if pts.numel() == x.shape[0] else None)
+        )
         fused_moe_nvfp4(xin, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan)
         return out
