@@ -54,6 +54,18 @@ REQUANT_NODES = 3
 SWAPPED_QUANT_COLUMN_CYCLES = 150.0
 
 
+#: Cycles per launch of the swapped body's own prologue on the MX classes beyond the grouped body's: its second group table and
+#: the token scale-factor gather, paid once per CTA whatever the live rows. One declared empirical constant of this class, the
+#: smallest that puts the padded body first at the one-live-row cells of the small models and leaves the picks from sixteen rows
+#: per expert swapped; the padded body and the bf16 chains carry no such term.
+SWAPPED_FIXED_CYCLES = 12000.0
+
+
+def swapped_fixed_cycles(cfg: Knobs, chain: GroupedChain) -> float:
+    """``SWAPPED_FIXED_CYCLES`` for a swapped record running the fused requantization chain; zero otherwise."""
+    return SWAPPED_FIXED_CYCLES if (cfg.swap_ab and chain.out_fmt == ACT_FMT) else 0.0
+
+
 def swapped_quant_column_cycles(
     cfg: Knobs, rows: int, n_active: int, N: int, chain: GroupedChain, sm_count: int
 ) -> float:
@@ -148,7 +160,8 @@ def rank_grouped_mx(
     record) under the MoE ranking's overrides, times the pair term and the swapped records' spill factor, plus the last tile's
     exposed epilogue chain (the chain's nodes, the fused requantization's on either body; the padded body's four epilogue
     warpgroups) and the token box's exposed zero-fill at the e4m3 row width), plus this class's per-column cost of the swapped
-    body's fused requantization epilogue over the token tile (`swapped_quant_column_cycles`), at three significant digits; each tile family priced once (at the enumeration's raster: the dense estimate's
+    body's fused requantization epilogue over the token tile (`swapped_quant_column_cycles`) and the swapped body's per-launch
+    prologue cost on the MX classes (`swapped_fixed_cycles`), at three significant digits; each tile family priced once (at the enumeration's raster: the dense estimate's
     tile-order term is the dense scheduler's, not the grouped one's) and the raster the structural rule gives the grouped
     scheduler (`raster_for`) first among its twins, best first, ties in the spaces' enumeration order (the grouped records
     before the swapped ones, the narrower token tile before the wider). As in the dense ``rank_topk``, each of the best
@@ -193,21 +206,25 @@ def rank_grouped_mx(
         # the shared contract's cost (`schedule.record_cost`): the dense mixed estimate at the grouped shape under the MoE
         # ranking's overrides and the launch's own terms, the fill term at the e4m3 token width and the padded body's four
         # epilogue warpgroups
-        est = record_cost(
-            c,
-            rows,
-            n_active or E,
-            N,
-            K,
-            nodes,
-            chain.pair,
-            fam,
-            sm_count,
-            in_fmt,
-            nominal,
-            fill_fmt=ACT_FMT,
-            epi_warpgroups=EPI_WARPGROUPS_MX,
-        ) + swapped_quant_column_cycles(c, rows, n_active or E, N, chain, sms)
+        est = (
+            record_cost(
+                c,
+                rows,
+                n_active or E,
+                N,
+                K,
+                nodes,
+                chain.pair,
+                fam,
+                sm_count,
+                in_fmt,
+                nominal,
+                fill_fmt=ACT_FMT,
+                epi_warpgroups=EPI_WARPGROUPS_MX,
+            )
+            + swapped_quant_column_cycles(c, rows, n_active or E, N, chain, sms)
+            + swapped_fixed_cycles(c, chain)
+        )
         return (
             float(f"{est:.3g}"),
             0 if (c.swap_ab or c.raster_along == raster_for(c, rows)) else 1,
