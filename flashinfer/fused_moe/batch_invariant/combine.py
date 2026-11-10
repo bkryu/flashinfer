@@ -55,7 +55,9 @@ def _fold_slots(plan, frags, ws, oks, i):
 
 
 class CombineKernel:
-    def __init__(self, k: int, out_fmt: str = "bf16", wpt: int = 1, w_round: bool = False):
+    def __init__(
+        self, k: int, out_fmt: str = "bf16", wpt: int = 1, w_round: bool = False
+    ):
         assert wpt >= 1 and wpt & (wpt - 1) == 0, wpt
         self.k, self.out_fmt, self.wpt, self.w_round = k, out_fmt, wpt, w_round
         red = S.combine_reduction(k, lambda fp, r: None)
@@ -108,8 +110,8 @@ class CombineKernel:
             ps = [mDest[t, r] for r in range(k)]
             ws = [mW[t, r] for r in range(k)]
             if cutlass.const_expr(self.w_round):
-                # pre-routed weights given as f32 enter as their bf16 rounding (the packed word's value): cvt.rn here,
-                # widened exactly, instead of two host passes over the slots
+                # pre-routed weights given as f32 enter as their bf16 rounding (the packed word's value): the engine's
+                # conversion here and the value's own exact widening, instead of two host passes over the slots
                 ws = [CuteF32.cvt_out(w_, "bf16").to(Float32) for w_ in ws]
             # a dropped slot (dest -1: an expert id outside [0, E)) has no expert row: its loads take row 0 and its term is +0
             oks = [p >= Int32(0) for p in ps]
@@ -167,15 +169,23 @@ def warps_per_token(T: int, H: int, sms: int) -> int:
     return w
 
 
-def combine_kernel_name(k: int, out_fmt: str, y_fmt: str, wpt: int, w_round: bool = False) -> str:
+def combine_kernel_name(
+    k: int, out_fmt: str, y_fmt: str, wpt: int, w_round: bool = False
+) -> str:
     return jit.sanitize_symbol_name(
-        f"moe_combine_k{k}_{y_fmt}_{out_fmt}" + (f"_w{wpt}" if wpt > 1 else "") + ("_wr" if w_round else "")
+        f"moe_combine_k{k}_{y_fmt}_{out_fmt}"
+        + (f"_w{wpt}" if wpt > 1 else "")
+        + ("_wr" if w_round else "")
     )
 
 
 @functools.cache
 def get_compiled_combine(
-    k: int, out_fmt: str = "bf16", y_fmt: str = "bf16", wpt: int = 1, w_round: bool = False
+    k: int,
+    out_fmt: str = "bf16",
+    y_fmt: str = "bf16",
+    wpt: int = 1,
+    w_round: bool = False,
 ) -> Any:
     """``kernel(y [rows, H], dest [T, k] i32, w [T, k] f32, out [T, H], T, H)``; ``wpt`` warps per token (``warps_per_token``);
     ``w_round``: the weights enter as their bf16 rounding (the pre-routed packed-word convention)."""
