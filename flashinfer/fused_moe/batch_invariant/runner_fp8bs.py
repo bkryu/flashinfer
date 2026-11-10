@@ -23,7 +23,7 @@ import torch
 from ...batch_invariant.support import check_device, unsupported
 from ..api import MoEActivationPack, MoEWeightPack, RoutingInputMode
 from ..runners import _validate_logits_inputs, _validate_prerouted_inputs
-from .runner import MOE_BF16_ARCHS, _configs_from_tactic, _tactic
+from .runner import _TACTIC_FIELDS, MOE_BF16_ARCHS, _configs_from_tactic, _tactic
 from .runner_fp8_block import PAIR_DEEPSEEK_FP8, BatchInvariantFp8BlockRunner
 from .spec_fp8bs import BLOCK as QBLOCK
 from .spec_fp8bs import CLASS
@@ -36,24 +36,16 @@ _X, _SX, _IDS, _W, _W1, _W1SF, _W2, _W2SF, _OUT = range(9)
 
 
 def _tactic_bs(c1, c2, fused: bool) -> tuple:
-    """A pair of grouped records and the requantization spelling as a flat tuple of scalars (the autotuner's cache round-trips
-    every knob the records carry: the base tuple's six per record, the spelling, and each record's swapped flag -- the swapped
-    decode records of this class; the swizzle and the grid are the class's constants)."""
-    return _tactic(c1, c2) + (
-        int(bool(fused)),
-        int(bool(c1.swap_ab)),
-        int(bool(c2.swap_ab)),
-    )
+    """A pair of records (each with its swapped flag: the grouped or the swapped body) and the requantization spelling as a flat
+    tuple of scalars (the autotuner's cache round-trips every knob the records carry; the swizzle and the grid are the class's
+    constants)."""
+    return _tactic(c1, c2) + (int(bool(fused)),)
 
 
 def _configs_from_tactic_bs(t: tuple):
-    import dataclasses
-
-    c1, c2 = _configs_from_tactic(tuple(t[:12]))
-    if len(t) > 13:
-        c1 = dataclasses.replace(c1, swap_ab=bool(t[13]))
-        c2 = dataclasses.replace(c2, swap_ab=bool(t[14]))
-    return c1, c2, bool(t[12])
+    n = 2 * _TACTIC_FIELDS
+    c1, c2 = _configs_from_tactic(tuple(t[:n]))
+    return c1, c2, bool(t[n])
 
 
 class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):

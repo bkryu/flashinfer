@@ -1145,6 +1145,7 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
         2 <= len(tactics) <= 18
         and len(set(tactics)) == len(tactics)
         and {t[-1] for t in tactics} == {0, 1}
+        and all(len(t) == 15 for t in tactics)
     )
     for t in tactics:
         assert torch.equal(
@@ -1267,14 +1268,14 @@ def test_swapped_decode_body_equals_the_padded_body(act):
     layer = _layer(k, E, I, act=act)
     W = _weights(w1, w2, act=act)
     runner = layer.runners[0]
+    pack = _logits_pack(xq, sx, logits)
+    got = bits(layer(pack, W))  # the launch binds the hidden size the dispatcher reads
     c1, c2, fused = runner._default(T)
     assert c1.swap_ab and c2.swap_ab and not fused, (
         c1.describe(),
         c2.describe(),
         fused,
     )
-    pack = _logits_pack(xq, sx, logits)
-    got = bits(layer(pack, W))
     Wd = MoEWeightsE4M3BS.from_view(W.get_view(runner.backend_key))
     ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
     ids, wts = ids.cuda(), wts.cuda()
@@ -1301,7 +1302,8 @@ def test_swapped_decode_body_equals_the_padded_body(act):
         )
         assert torch.equal(bits(out), ref), ("gemm2", c.describe())
     tactics = runner.get_valid_tactics(runner.pack_inputs(pack, W), None)
-    assert tactics[0][13] == 1 and tactics[0][14] == 1 and tactics[0][12] == 0, tactics[
+    # both records swapped (field 6 of each 7-field record), the standalone spelling last
+    assert tactics[0][6] == 1 and tactics[0][13] == 1 and tactics[0][14] == 0, tactics[
         0
     ]
     with autotune(True):
