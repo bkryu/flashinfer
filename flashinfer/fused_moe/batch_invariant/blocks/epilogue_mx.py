@@ -20,6 +20,15 @@ two halves' trees, and the max of non-negative values is exact in every order) a
 shared scale. Codes: one 16-byte vector per thread per subtile into ``out [Tk, N_out]`` (uint8 e4m3 bytes); the scale: one
 byte into the 128x4 swizzled layout of ``(Tk, N_out)`` (``sf_offset_128x4_dev``), stored by the block's first half. Rows
 past the group's real end and blocks past ``N_out`` are not stored.
+
+The swapped decode body (:mod:`.swap_mxfp8`: the weights on the MMA's M side, the group's tokens a narrow N tile) runs
+the same term in the transposed orientation (:func:`swapped_epilogue_quant_loop`): thread = weight row = one output
+column of every token of the tile, so a block's 32 outputs of one token sit in 32 lanes -- the ungated chain's block is
+one warp, the gated chain's (its up lanes are the 8-column halves of two 16-row groups) spans two warps. The block amax
+is the same ``fmaxc`` tree over the same ``fabs`` leaves gathered across lanes by ``shfl.bfly`` and, for the gated chain, a
+shared-memory exchange between the two warps: the max of non-negative values is exact in every order and ``+0`` is its
+identity, so the gate lanes' leaves enter as ``+0`` and the bytes are the standalone quantizer's. Codes: one byte per
+(token, column) per lane; the scale byte by the block's first lane.
 """
 
 from __future__ import annotations
@@ -33,6 +42,7 @@ from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from ....batch_invariant.canon import _pairwise
+from ....batch_invariant.quantization.cvt_fp8 import cvt_f32x2_to_fp8x2
 from ....batch_invariant.quantization.blocks import (
     cvt_f32_to_ue8m0,
     pack_block_codes,
@@ -71,6 +81,22 @@ def xch_layout(epi_warpgroups: int):
 def xch_bytes(chain: GroupedChain, epi_warpgroups: int) -> int:
     return (
         4 * XCH_BUFFERS * epi_warpgroups * 128
+        if chain.out_fmt == OUT_FMT and chain.pair
+        else 0
+    )
+
+
+SWAP_XCH_WARPS = 4  # the swapped body's one epilogue warpgroup: the gated chain's block spans warps 2q / 2q + 1
+
+
+def swap_xch_layout(token_tile: int):
+    """The swapped body's half-block amax exchange of the gated chain: fp32 per (buffer, warp, token column of the tile)."""
+    return cute.make_layout((XCH_BUFFERS, SWAP_XCH_WARPS, token_tile))
+
+
+def swap_xch_bytes(chain: GroupedChain, token_tile: int) -> int:
+    return (
+        4 * XCH_BUFFERS * SWAP_XCH_WARPS * token_tile
         if chain.out_fmt == OUT_FMT and chain.pair
         else 0
     )
@@ -304,6 +330,225 @@ def grouped_epilogue_quant_loop(
                             (row0 + row_rel + sf_shift).to(Int64), blk, pcols
                         )
                     ] = sf_byte.to(Uint8)
+        with cute.arch.elect_one():
+            acc_pipeline.consumer_release(
+                acc_state
+            )  # TMEM buffer free for the next fold
+        acc_state.advance()
+
+
+@cute.jit
+def swapped_epilogue_quant_loop(
+    st,
+    chain: cutlass.Constexpr,
+    tidx: Int32,
+    tile_sched,
+    tCtAcc_base: cute.Tensor,
+    thr_mma,
+    mOut: cute.Tensor,
+    mSf: cute.Tensor,
+    Tk: Int32,
+    N: Int32,
+    epi_tile: cute.Tile,
+    acc_pipeline,
+    sX: cute.Tensor,
+    s_off: cute.Tensor,
+    s_off_pad: cute.Tensor,
+    weight_tile: cutlass.Constexpr = 128,
+):
+    """The fused requantization in the swapped body's transposed orientation: the accumulator tile is (weight rows,
+    tokens); thread ``t`` of the one epilogue warpgroup holds weight row ``t`` of the tile and every token column. Gated
+    chain: the gate accumulators come from lane ``+8`` (``shfl.sync.down``), the up lanes (row % 16 < 8) own output
+    column ``(row // 16) * 8 + row % 8`` of the tile's ``weight_tile / 2`` outputs, so a block of 32 output columns is
+    the 16 up lanes of warp ``2q`` and the 16 of warp ``2q + 1``: the block amax is the in-warp butterfly (xor 1, 2, 4
+    over the 8 consecutive up lanes, xor 16 over the two groups; the gate lanes' leaves ``+0``) combined with the partner
+    warp's through ``sX`` (:func:`swap_xch_layout`, one named barrier per subtile). Ungated chain: output column =
+    weight row, a block = one warp, the butterfly xor 1 .. 16. Then the quantizer class's term per (token, block): the
+    scale from the block amax, the code of this lane's output; token ``j`` of the tile is dense row ``row0 + j``, stored
+    iff ``j < rows_left`` (and the column exists); the scale byte at the padded position ``row0 + j + (off_pad[e] -
+    off[e])`` by the block's first lane. ``mOut [Tk', N_out]`` uint8 codes, ``mSf`` the flat 128x4 bytes of the padded
+    rows."""
+    pair = chain.pair
+    twin = bf16_twin(chain)
+    fp = CuteF32
+    rule, fmt = DEFAULT_RULE, MXFP8
+    d = elem_digit()
+    tiler_mn = cute.slice_(st.mma_tiler, (None, None, 0))
+    N_out = N // Int32(2) if cutlass.const_expr(pair) else N
+    nb = N_out // Int32(BLOCK)
+    pcols = ((nb + Int32(SF_COL_TILE - 1)) // Int32(SF_COL_TILE)) * Int32(SF_COL_TILE)
+    tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
+    copy_atom_t2r = get_tmem_load_op(
+        st.cta_tile_shape_mnk, st.c_layout, st.c_dtype, ACC_DTYPE, epi_tile, False
+    )
+    tAcc_epi = cute.flat_divide(tCtAcc, epi_tile)  # (EPI_M, EPI_N, SUB_M, SUB_N, STAGE)
+    tiled_copy_t2r = tcgen05.make_tmem_copy(
+        copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)]
+    )
+    thr_t2r = tiled_copy_t2r.get_slice(tidx)
+    tTR_tAcc_base = thr_t2r.partition_S(
+        tAcc_epi
+    )  # (T2R, T2R_M, T2R_N, SUB_M, SUB_N, STAGE)
+    idF = cute.make_identity_tensor(
+        (st.cta_tile_shape_mnk[0], st.cta_tile_shape_mnk[1], 1)
+    )  # the tile's own (weight row, token) coordinates
+    cF = cute.local_tile(idF, tiler_mn, (None, None, None))
+    tCcF = transform_partitioned_tensor_layout(thr_mma.partition_C(cF))
+    cF_epi = cute.flat_divide(tCcF, epi_tile)
+    tTR_cF = thr_t2r.partition_D(cF_epi)
+    frag = tTR_cF[(None, None, None, 0, 0, 0, 0, 0)]
+    offs = fragment_offsets(frag.layout)
+    nv = len(offs)
+    assert (
+        len({m for m, _ in offs}) == 1
+        and st.cta_tile_shape_mnk[0] == weight_tile == 128
+    ), (
+        "the 128-row TMEM layout: one weight row per thread",
+        offs,
+    )
+    assert nv % 2 == 0, offs
+    assert (weight_tile // (2 if pair else 1)) % BLOCK == 0, weight_tile
+    cols = [
+        n - offs[0][1] for _, n in offs
+    ]  # the register's token column inside the subtile
+    outs_per_tile = weight_tile // 2 if pair else weight_tile
+    blocks_per_tile = outs_per_tile // BLOCK
+    tTR_rAcc = cute.make_rmem_tensor(frag.shape, ACC_DTYPE)
+    tTR_cF = cute.group_modes(tTR_cF, 3, cute.rank(tTR_cF))
+    ys = cute.make_rmem_tensor(
+        cute.make_layout((nv,)), Float32
+    )  # the bf16-rounded chain values of this lane's column, widened
+    am = cute.make_rmem_tensor(
+        cute.make_layout((nv,)), Float32
+    )  # the block amax per token column
+    lane = cute.arch.lane_idx()
+    warp = (tidx % Int32(128)) // Int32(32)
+    partner = warp ^ Int32(1)
+    parity = Int32(0)
+    acc_state = pipeline.make_pipeline_state(
+        pipeline.PipelineUserType.Consumer, st.num_acc_stage
+    )
+    work_tile = tile_sched.initial_work_tile_info()
+    while work_tile.is_valid_tile:
+        row0, row_end, n_tile, e = (
+            work_tile.row0,
+            work_tile.row_end,
+            work_tile.n_tile,
+            work_tile.e,
+        )
+        tile_sched.advance_to_next_work()
+        work_tile = tile_sched.get_current_work()
+        rows_left = cutlass.min(row_end, Tk) - row0  # valid tokens of this tile
+        sf_shift = s_off_pad[e] - s_off[e]  # the scale bytes at the padded positions
+        tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_state.index)]
+        acc_pipeline.consumer_wait(acc_state)
+        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+        subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+        for s in cutlass.range_constexpr(subtile_cnt):
+            cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
+            crd0 = tTR_cF[(None, None, None, s)][(0, 0, 0)]
+            wrow = crd0[0]  # this thread's weight row in the tile
+            col0 = crd0[1] - Int32(offs[0][1])  # the subtile's first token column
+            n_glob = n_tile * Int32(weight_tile) + wrow
+            gate = None
+            if cutlass.const_expr(pair):
+                gate = [
+                    cute.arch.shuffle_sync_down(tTR_rAcc[v], offset=8)
+                    for v in range(nv)
+                ]
+                is_up = (wrow % Int32(2 * GROUP)) < Int32(GROUP)
+                out_loc = (wrow // Int32(2 * GROUP)) * Int32(GROUP) + wrow % Int32(
+                    GROUP
+                )
+                store_ok = is_up & (n_glob < N)
+            else:
+                out_loc = wrow
+                store_ok = n_glob < N
+            out_col = n_tile * Int32(outs_per_tile) + out_loc
+            blk = n_tile * Int32(blocks_per_tile) + out_loc // Int32(BLOCK)
+            leader = store_ok & (
+                (out_loc % Int32(BLOCK)) == Int32(0)
+            )  # the block's first column stores its scale byte
+            # the chain of every token column (rows past the group's end are finite rows of another group or the tail:
+            # computed, never stored, and a token column's reduction never mixes with another's), the block amax across
+            # the lanes
+            for v in cutlass.range_constexpr(nv):
+                yb = _chain_elem(
+                    twin, tTR_rAcc[v], gate[v] if cutlass.const_expr(pair) else None
+                )
+                yf = yb.to(Float32)
+                ys[v] = yf
+                leaf = leaf_value(fp, yf)
+                if cutlass.const_expr(pair):
+                    lf = Float32(0.0)
+                    if is_up:
+                        lf = leaf
+                    leaf = lf
+                    for m in (1, 2, 4, 16):
+                        leaf = d.combine(
+                            fp, leaf, cute.arch.shuffle_sync_bfly(leaf, offset=m)
+                        )
+                else:
+                    for m in (1, 2, 4, 8, 16):
+                        leaf = d.combine(
+                            fp, leaf, cute.arch.shuffle_sync_bfly(leaf, offset=m)
+                        )
+                am[v] = leaf
+            if cutlass.const_expr(pair):
+                if lane == Int32(0):
+                    for v in cutlass.range_constexpr(nv):
+                        sX[(parity, warp, Int32(cols[v]) + col0)] = am[v]
+                cute.arch.barrier(
+                    barrier_id=Int32(BAR_EPI_XCH), number_of_threads=128
+                )  # the four warps' halves are in
+                for v in cutlass.range_constexpr(nv):
+                    am[v] = d.combine(
+                        fp, am[v], sX[(parity, partner, Int32(cols[v]) + col0)]
+                    )
+                parity = Int32(1) - parity
+            # the quantizer class's term per (token, block): the scale from the block amax, this lane's code; two tokens
+            # per conversion
+            for q in cutlass.range_constexpr(0, nv, 2):
+                v0, v1 = q, q + 1
+                j0 = col0 + Int32(cols[v0])
+                j1 = col0 + Int32(cols[v1])
+                sf0, sfd0 = cvt_f32_to_ue8m0(
+                    scale_norm(fp, am[v0], fmt, rule), rule.round
+                )
+                sf1, sfd1 = cvt_f32_to_ue8m0(
+                    scale_norm(fp, am[v1], fmt, rule), rule.round
+                )
+                y0 = saturate(
+                    fp,
+                    quant_pre(fp, ys[v0], inv_scale(fp, sfd0, rule), rule),
+                    fmt,
+                    rule,
+                )
+                y1 = saturate(
+                    fp,
+                    quant_pre(fp, ys[v1], inv_scale(fp, sfd1, rule), rule),
+                    fmt,
+                    rule,
+                )
+                pr = cvt_f32x2_to_fp8x2(y0, y1, fmt.elem_fmt)
+                ok0 = store_ok & (j0 < rows_left)
+                ok1 = store_ok & (j1 < rows_left)
+                if ok0:
+                    mOut[(row0 + j0, out_col)] = (pr & 0xFF).to(Uint8)
+                if ok1:
+                    mOut[(row0 + j1, out_col)] = (pr >> 8).to(Uint8)
+                if leader & (j0 < rows_left):
+                    mSf[
+                        sf_offset_128x4_dev(
+                            (row0 + j0 + sf_shift).to(Int64), blk, pcols
+                        )
+                    ] = sf0.to(Uint8)
+                if leader & (j1 < rows_left):
+                    mSf[
+                        sf_offset_128x4_dev(
+                            (row0 + j1 + sf_shift).to(Int64), blk, pcols
+                        )
+                    ] = sf1.to(Uint8)
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(
                 acc_state

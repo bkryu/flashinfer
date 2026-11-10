@@ -152,17 +152,20 @@ def tiles_term(cfg: Knobs, rows: int) -> float:
     return expected_token_tiles(rows, cfg.tile_n) / max(1, math.ceil(rows / cfg.tile_n))
 
 
-def exposed_epilogue_cycles(cfg: Knobs, rows: int, nodes: int) -> float:
+def exposed_epilogue_cycles(
+    cfg: Knobs, rows: int, nodes: int, epi_warpgroups: int = _EPI_WARPGROUPS
+) -> float:
     """The chain work of a CTA's last tile, which no mainloop overlaps (the earlier tiles' epilogues run behind the next tile's
     mainloop through the accumulator stages): a thread's chains times the chain's node cycles. The grouped body computes a
-    row's outputs per thread, the tile's columns split between its epilogue warpgroups (the gated chain pairs two accumulator
-    columns per output); the swapped body computes a weight row's live token columns per thread, ``min(rows, tile)`` of them
-    (the chain of a dead column is skipped). At a few rows per expert this term separates the bodies: the grouped body's
-    epilogue is the tile's width wide whatever the live rows."""
+    row's outputs per thread, the tile's columns split between its epilogue warpgroups (``epi_warpgroups``: the bf16 classes'
+    two, the block-scaled classes' four; the gated chain pairs two accumulator columns per output); the swapped body computes a
+    weight row's live token columns per thread, ``min(rows, tile)`` of them (the chain of a dead column is skipped). At a few
+    rows per expert this term separates the bodies: the grouped body's epilogue is the tile's width wide whatever the live
+    rows."""
     if cfg.swap_ab:
         chains = min(rows, cfg.tile_n)
     else:
-        chains = cfg.tile_n / _EPI_WARPGROUPS
+        chains = cfg.tile_n / epi_warpgroups
     return chains * nodes * CHAIN_NODE_CYCLES
 
 

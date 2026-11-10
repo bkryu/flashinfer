@@ -11,8 +11,12 @@ SM100 / SM103 one 32: a dimension of the specification). It takes the layer's ca
 ``CutlassMxfp8Config`` / this config's ``prepare_activations`` produce it) and every routing input mode: ``FromLogits``
 runs the class's own routing kernel, ``PackedPrecomputed`` / ``UnpackedPrecomputed`` take the caller's expert ids and
 weights. The combine is the slot-order fp32 fold (``use_fused_finalize`` is ignored, ``do_finalize=True`` only), the
-tactics are the ranked grouped-GEMM records of the dense MX heuristic (any tactic gives the same bits), and an
-unsupported configuration raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+tactics are the ranked grouped-GEMM records of the dense MX heuristic over both record spaces -- the padded body's and the
+swapped decode body's (the weights on the MMA's M side, the group's tokens a narrow tile; `schedule_mxfp8`) -- any tactic
+gives the same bits, and the packing of the expanded rows follows the first picks (the dense packing when either is a
+swapped record, else the padded one: a placement decided by the token count, so the routing-and-plan launch takes the
+matching form). An unsupported configuration raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+instead of falling back.
 """
 
 from __future__ import annotations
@@ -209,11 +213,29 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
                 and T * k <= ROUTE_PLAN_MAX_SLOTS
                 and cfg.routing.num_experts <= MAX_E
             ):
-                # routing and the padded permutation plan in one launch (a placement: the same bits and integers)
-                ids, wts, counts, dest, src = route_plan(
-                    act.routing_logits, k, self._method, bias, scale, align=GROUP_ALIGN
-                )
-                plan = [counts, dest, src]
+                # routing and the permutation plan in one launch (a placement: the same bits and integers), in the form of
+                # the packing the ranked records run on at this token count
+                if self._packing(T, H) == "dense":
+                    ids, wts, counts, dest, src, dest_pad, pos_pad = route_plan(
+                        act.routing_logits,
+                        k,
+                        self._method,
+                        bias,
+                        scale,
+                        dual=True,
+                        pad_align=GROUP_ALIGN,
+                    )
+                    plan = [counts, dest, src, dest_pad, pos_pad]
+                else:
+                    ids, wts, counts, dest, src = route_plan(
+                        act.routing_logits,
+                        k,
+                        self._method,
+                        bias,
+                        scale,
+                        align=GROUP_ALIGN,
+                    )
+                    plan = [counts, dest, src]
             else:
                 ids, wts = route(act.routing_logits, k, self._method, bias, scale)
         else:
@@ -235,10 +257,12 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         return [x, sf, ids, wts, w.w1, w.w1_sf, w.w2, w.w2_sf, out] + plan
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
-    def _ranked(self, T: int) -> Tuple[list, list]:
+    def _ranked(self, T: int, H: Optional[int] = None) -> Tuple[list, list]:
+        """The ranked records of both GEMMs over both record spaces at ``T`` tokens (`schedule_mxfp8.ranked_mx`), trimmed to
+        the packing the first picks run on: on the padded packing the swapped records cannot run, so they leave the lists."""
         from .blocks.epilogue import GroupedChain
-        from .schedule import TOP_K, active_experts, rows_per_expert
-        from .schedule_mxfp8 import GEMM2_CHAIN, rank_grouped_mx
+        from .schedule import TOP_K
+        from .schedule_mxfp8 import packing_for, ranked_mx
 
         cfg = self.config
         E, k, I = (
@@ -246,30 +270,23 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
             cfg.routing.top_k,
             cfg.experts.intermediate_size,
         )
-        H = self._hidden
-        rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
+        H = H if H is not None else self._hidden
         a = self._activation()
         chain1 = GroupedChain(a.chain, a.act, "bf16", a.params)
-        n1 = 2 * I if a.gated else I
         sm_count, family = self._part if self._part is not None else (None, None)
         in_fmt = self._in_fmt or "mxfp8"
-        return (
-            rank_grouped_mx(
-                rows, n1, H, E, chain1, in_fmt, sm_count, family, TOP_K, n_active=n_act
-            ),
-            rank_grouped_mx(
-                rows,
-                H,
-                I,
-                E,
-                GEMM2_CHAIN,
-                in_fmt,
-                sm_count,
-                family,
-                TOP_K,
-                n_active=n_act,
-            ),
-        )
+        r1, r2 = ranked_mx(T, k, H, I, E, chain1, in_fmt, sm_count, family, TOP_K)
+        if packing_for(r1[0], r2[0]) == "padded":
+            r1 = [c for c in r1 if not c.swap_ab]
+            r2 = [c for c in r2 if not c.swap_ab]
+        return r1, r2
+
+    def _packing(self, T: int, H: int) -> str:
+        """The packing of the expanded rows at ``T`` tokens: the first picks' (`schedule_mxfp8.packing_for`)."""
+        from .schedule_mxfp8 import packing_for
+
+        r1, r2 = self._ranked(T, H)
+        return packing_for(r1[0], r2[0])
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
         self._require_built()
@@ -278,7 +295,10 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         return [_tactic(c1, c2) for c1 in r1 for c2 in r2]
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + ("moe.mxfp8-v1", self._in_fmt or "")
+        return super()._cache_key_extras() + (
+            "moe.mxfp8-v2",
+            self._in_fmt or "",
+        )  # v2: the tactic carries the swapped flag
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(
@@ -292,15 +312,18 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         from .api_mxfp8 import MoEWeightsMXFP8, fused_moe_mxfp8
 
         xq, xsf, ids, wts, w1, w1_sf, w2, w2_sf, out = inputs[:9]
-        plan = tuple(inputs[9:12]) if len(inputs) >= 12 else None
+        plan = tuple(inputs[9:]) if len(inputs) >= 12 else None
         self._hidden = int(xq.shape[1])
+        T = int(xq.shape[0])
         if tactic == -1 or tactic is None:
-            r1, r2 = self._ranked(int(xq.shape[0]))
+            r1, r2 = self._ranked(T)
             c1, c2 = r1[0], r2[0]
         else:
             c1, c2 = _configs_from_tactic(tuple(tactic))
         a = self._activation()
         w = MoEWeightsMXFP8(w1, w1_sf, w2, w2_sf, a.gated, a.act, a.params)
+        # the packing follows the first picks at this token count (the plan, when given, was built in its form); a tactic
+        # of the padded packing is a pair of dense records, one of the dense packing any pair
         fused_moe_mxfp8(
             (xq, xsf),
             ids,
@@ -311,5 +334,6 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
             config2=c2,
             in_fmt=self._in_fmt,
             plan=plan,
+            path=self._packing(T, self._hidden),
         )
         return out

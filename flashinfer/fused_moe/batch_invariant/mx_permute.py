@@ -40,10 +40,11 @@ def _sf_byte_offset(row: Int32, col: Int32, pcols: Int32) -> Int64:
 
 
 class ScatterMxKernel:
-    """``kernel(xq [T, B] u8, xsf [T * nb] u8 (linear), dest [Tk] i32, x_perm [Tk_pad, B] u8, sf_perm [sf_numel(Tk_pad, K)]
-    u8, Tk, B, nb, pcols)``: ``B`` bytes per row (``B % 16 == 0``), ``nb = K / 32`` scale bytes per row, ``pcols`` the
-    padded scale columns of the destination (a multiple of 4); ``dest[i]`` the padded row of expanded row ``i`` (token
-    ``i // k``). ``wpr`` warps per live row (a placement, ``permute.warps_per_row``: warp ``part`` of a row owns the
+    """``kernel(xq [T, B] u8, xsf [T * nb] u8 (linear), dest [Tk] i32, dest_sf [Tk] i32, x_perm [rows, B] u8, sf_perm
+    [sf_numel(sf_rows, K)] u8, Tk, B, nb, pcols)``: ``B`` bytes per row (``B % 16 == 0``), ``nb = K / 32`` scale bytes per
+    row, ``pcols`` the padded scale columns of the destination (a multiple of 4); ``dest[i]`` the destination row of
+    expanded row ``i`` (token ``i // k``), ``dest_sf[i]`` the row of its scale bytes (``dest`` itself in the padded
+    packing; the padded position of the dense row in the dense one). ``wpr`` warps per live row (a placement, ``permute.warps_per_row``: warp ``part`` of a row owns the
     32-vector slabs ``part, part + wpr, ...`` of the values and of the scale bytes); the padding rows of the 128-row atoms
     are never written (unspecified bytes the row-local MMA reads into rows no tile stores)."""
 
@@ -57,6 +58,7 @@ class ScatterMxKernel:
         mX: cute.Tensor,
         mSf: cute.Tensor,
         mDest: cute.Tensor,
+        mDestSf: cute.Tensor,
         mXp: cute.Tensor,
         mSfp: cute.Tensor,
         Tk: Int32,
@@ -65,7 +67,7 @@ class ScatterMxKernel:
         pcols: Int32,
         stream,
     ):
-        self.kernel(mX, mSf, mDest, mXp, mSfp, Tk, B, nb, pcols).launch(
+        self.kernel(mX, mSf, mDest, mDestSf, mXp, mSfp, Tk, B, nb, pcols).launch(
             grid=[cute.ceil_div(Tk * Int32(self.wpr), WARPS), 1, 1],
             block=[WARPS * LANES, 1, 1],
             stream=stream,
@@ -78,6 +80,7 @@ class ScatterMxKernel:
         mX: cute.Tensor,
         mSf: cute.Tensor,
         mDest: cute.Tensor,
+        mDestSf: cute.Tensor,
         mXp: cute.Tensor,
         mSfp: cute.Tensor,
         Tk: Int32,
@@ -96,6 +99,7 @@ class ScatterMxKernel:
         valid = i_raw < Tk
         i = cutlass.min(i_raw, Tk - Int32(1))
         p = mDest[i]
+        p_sf = mDestSf[i]
         t = i // Int32(self.k)
         # the values: 16-byte vectors, this warp's slabs of 32 (lanes stride inside a slab)
         atom = cute.make_copy_atom(
@@ -122,7 +126,7 @@ class ScatterMxKernel:
             if j < nb:
                 v = mSf[t.to(Int64) * nb.to(Int64) + j.to(Int64)]
             if valid & (j < pcols):
-                mSfp[_sf_byte_offset(p, j, pcols)] = v
+                mSfp[_sf_byte_offset(p_sf, j, pcols)] = v
         cute.arch.griddepcontrol_launch_dependents()
 
 
@@ -132,7 +136,8 @@ def scatter_mx_kernel_name(k: int, wpr: int = 1) -> str:
 
 @functools.cache
 def get_compiled_scatter_mx(k: int, wpr: int = 1) -> Any:
-    """``kernel(xq [T, B] u8, xsf [n_src] u8, src [Tk_pad] i32, x_perm [Tk_pad, B] u8, sf_perm [n_dst] u8, Tk_pad, B, nb, pcols)``."""
+    """``kernel(xq [T, B] u8, xsf [n_src] u8, dest [Tk] i32, dest_sf [Tk] i32, x_perm [rows, B] u8, sf_perm [n_dst] u8, Tk, B,
+    nb, pcols)``; ``wpr`` warps per row (``permute.warps_per_row(T k, B / 16, sms)``)."""
 
     def compile_fn():
         sym_t, sym_n, sym_p, sym_b = (
@@ -152,6 +157,9 @@ def get_compiled_scatter_mx(k: int, wpr: int = 1) -> Any:
         dest_fake = cute.runtime.make_fake_tensor(
             Int32, (sym_p,), (1,), assumed_align=4
         )
+        dest_sf_fake = cute.runtime.make_fake_tensor(
+            Int32, (sym_p,), (1,), assumed_align=4
+        )
         xp_fake = cute.runtime.make_fake_tensor(
             Uint8,
             (sym_n, sym_b),
@@ -167,6 +175,7 @@ def get_compiled_scatter_mx(k: int, wpr: int = 1) -> Any:
             x_fake,
             sf_fake,
             dest_fake,
+            dest_sf_fake,
             xp_fake,
             sfp_fake,
             Int32(128),
