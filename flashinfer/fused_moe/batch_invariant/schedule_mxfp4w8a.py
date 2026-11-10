@@ -41,8 +41,8 @@ from .schedule import (
 GEMM2_CHAIN = GroupedChain("plain", "silu", "bf16")
 #: The activation operand's format for the zero-fill term: e4m3 rows (the token box's bytes).
 ACT_FMT = "mxfp8"
-#: Nodes of the fused requantization's per-element term on top of the bf16 chain (the ``mxfp8.quant`` class's element chain:
-#: the scaled value and its e4m3 conversion), counted from its S-expression as `chain_nodes` counts the chain's.
+#: Nodes of the fused requantization's per-element term on top of the bf16 chain's output (the ``mxfp8.quant`` class's element
+#: chain: the block's inverse scale, the scaled value and its e4m3 conversion), the DAG count as `chain_nodes` counts the chain's.
 REQUANT_NODES = 3
 
 
