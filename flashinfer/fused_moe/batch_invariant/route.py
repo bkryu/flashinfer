@@ -92,6 +92,7 @@ class RouteKernel:
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()  # programmatic dependent launch: the logits may come from the previous kernel
+        pdl.trigger_after_wait()
         t_raw = bidx * WARPS + tidx // LANES
         valid = t_raw < T
         t = cutlass.min(

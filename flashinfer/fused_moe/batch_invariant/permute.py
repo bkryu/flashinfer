@@ -68,6 +68,7 @@ class HistogramKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         cute.arch.griddepcontrol_wait()
+        pdl.trigger_after_wait()
         smem = cutlass.utils.SmemAllocator()
         hist = smem.allocate_tensor(
             Int32, cute.make_layout((MAX_E,)), byte_alignment=16
@@ -127,6 +128,7 @@ class PositionKernel:
         warp = tidx // LANES
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
+        pdl.trigger_after_wait()
         smem = cutlass.utils.SmemAllocator()
         s_off = smem.allocate_tensor(
             Int32, cute.make_layout((MAX_E + 1,)), byte_alignment=16
@@ -228,6 +230,7 @@ class PlanKernel:
         warp = tidx // LANES
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
+        pdl.trigger_after_wait()
         smem = cutlass.utils.SmemAllocator()
         hist = smem.allocate_tensor(
             Int32, cute.make_layout((MAX_E,)), byte_alignment=16
@@ -364,6 +367,7 @@ class PlanBlocksKernel:
         warp = tidx // LANES
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
+        pdl.trigger_after_wait()
         smem = cutlass.utils.SmemAllocator()
         wcnt = smem.allocate_tensor(
             Int32, cute.make_layout((PLAN_WARPS * MAX_E,)), byte_alignment=16
@@ -467,6 +471,7 @@ class PlanFinishKernel:
         b, _, _ = cute.arch.block_idx()
         warp = tidx // LANES
         cute.arch.griddepcontrol_wait()
+        pdl.trigger_after_wait()
         smem = cutlass.utils.SmemAllocator()
         hist = smem.allocate_tensor(
             Int32, cute.make_layout((MAX_E,)), byte_alignment=16
@@ -624,6 +629,7 @@ class GatherKernel:
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
+        pdl.trigger_after_wait()
         g = bidx * WARPS + tidx // LANES
         p_raw = g // Int32(wpr)
         part = g % Int32(wpr)
