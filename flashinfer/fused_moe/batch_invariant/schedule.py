@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 from ...gemm.batch_invariant.generator import CLUSTERS, Knobs, knob_product
 
@@ -172,15 +172,20 @@ def tiles_term(cfg: Knobs, rows: int) -> float:
     return expected_token_tiles(rows, cfg.tile_n) / max(1, math.ceil(rows / cfg.tile_n))
 
 
-def exposed_epilogue_cycles(cfg: Knobs, rows: int, nodes: int) -> float:
+def exposed_epilogue_cycles(
+    cfg: Knobs, rows: int, nodes: int, pair: bool = False
+) -> float:
     """The chain work of a CTA's last tile, which no mainloop overlaps (the earlier tiles' epilogues run behind the next tile's
     mainloop through the accumulator stages): a thread's chains times the chain's node cycles. The grouped body computes a
     row's outputs per thread, the tile's columns split between its epilogue warpgroups (the gated chain pairs two accumulator
     columns per output); the swapped body computes a weight row's live token columns per thread, ``min(rows, tile)`` of them
     (the chain of a dead column is skipped). At a few rows per expert this term separates the bodies: the grouped body's
-    epilogue is the tile's width wide whatever the live rows."""
+    epilogue is the tile's width wide whatever the live rows. The 64-row swapped tile gives a thread two weight rows at a
+    quarter of the columns: its busiest thread holds half the chains (plain), a quarter when one of its rows is the gate."""
     if cfg.swap_ab:
-        chains = min(rows, cfg.tile_n)
+        chains = min(rows, cfg.tile_n) * cfg.tile_m / 128
+        if pair and cfg.tile_m < 128:
+            chains /= 2
     else:
         chains = cfg.tile_n / _EPI_WARPGROUPS
     return chains * nodes * CHAIN_NODE_CYCLES
@@ -191,17 +196,45 @@ def zero_fill_cycles(
 ) -> float:
     """The zero-fill of a CTA's token box rows past the group's rows over the K extent: the grouped body's token tile (its
     CTA rows; the box is multicast over the N-cluster, each CTA fills its share) less the live rows, the swapped body's
-    token tile less the live rows; at the family's fill rate (`ZERO_FILL_BYTES_PER_CLK`). Charged once per launch, not per
-    wave: a later wave's fill streams beside the other CTAs' loads; the first wave's is exposed."""
+    token box less the live rows; at the family's fill rate (`ZERO_FILL_BYTES_PER_CLK`), of which a swapped record's box
+    exposes only a share (`SWAPPED_FILL_EXPOSURE`: the box streams under the weight tile's stages). Charged once per launch,
+    not per wave: a later wave's fill streams beside the other CTAs' loads; the first wave's is exposed."""
     from ...gemm.batch_invariant.spec import ELEM_BITS_OF
 
     eb = ELEM_BITS_OF[in_fmt] / 8.0
+    rate = ZERO_FILL_BYTES_PER_CLK.get(family, ZERO_FILL_BYTES_PER_CLK["sm_107"])
     if cfg.swap_ab:
-        oob, share = max(0, cfg.tile_n - rows), 1.0
+        # the token box's fill streams largely under the weight tile's stages: the exposed share of its rate
+        oob, share, rate = max(0, cfg.tile_n - rows), 1.0, rate / SWAPPED_FILL_EXPOSURE
     else:
         oob, share = max(0, cfg.cta_tile_mn[0] - rows), float(cfg.cluster_n)
-    rate = ZERO_FILL_BYTES_PER_CLK.get(family, ZERO_FILL_BYTES_PER_CLK["sm_107"])
     return oob * K * eb / share / rate
+
+
+# The exposed share of a swapped record's token-box fill: the box streams largely under the weight tile's stages, so the wider box
+# costs only a share of its fill bytes at the family's fill rate (an empirical constant fitted on the token-tile ladder of the
+# 128-row records at one row per expert, one value for every family)
+SWAPPED_FILL_EXPOSURE = 0.4
+
+# The per-body fixed cost of a launch -- launch latency, prologue (barriers, TMEM, descriptors, the group tables), epilogue
+# tail -- in SM cycles: the K -> 0 intercept at one row per expert as the fixed-cost probe measures it on each part, side by
+# side for the two bodies (declared empirical, named by the probe; a launch's intercept, not a wave's: a further wave adds a
+# fraction of it); None until a part is measured, the term is then off. Body-level and shared across the formats; the
+# chain-specific part stays in `exposed_epilogue_cycles`.
+FIXED_CYCLES: Dict[Tuple[str, str], Optional[float]] = {
+    ("grouped", "sm_107"): 18300.0,
+    ("swapped", "sm_107"): 18300.0,
+    ("grouped", "sm_100"): None,
+    ("swapped", "sm_100"): None,
+    ("grouped", "sm_103"): None,
+    ("swapped", "sm_103"): None,
+}
+
+
+def fixed_cycles(cfg: Knobs, family: str) -> float:
+    """``FIXED_CYCLES[body, part]``: the body's per-launch floor; zero while the part's constant is unmeasured."""
+    c = FIXED_CYCLES.get(("swapped" if cfg.swap_ab else "grouped", family))
+    return 0.0 if c is None else c
 
 
 def raster_for(cfg: Knobs, rows: int) -> str:
@@ -269,6 +302,11 @@ def rank_grouped(
     space = dense + swapped
     guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
     nodes = chain_nodes(chain if not isinstance(chain, str) else chain)
+    from .blocks.epilogue import GroupedChain
+
+    pair = (
+        GroupedChain.legacy(chain, "bf16") if isinstance(chain, str) else chain
+    ).pair
 
     def key(i, c):
         canon = dataclasses.replace(c, raster_along="m")
@@ -279,8 +317,9 @@ def rank_grouped(
         # spill over their token tile under the load, the last tile's exposed epilogue chain, the token box's zero-fill
         est = (
             est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles(c, rows, nodes)
+            + exposed_epilogue_cycles(c, rows, nodes, pair)
             + zero_fill_cycles(c, rows, K, fam)
+            + fixed_cycles(c, fam)
         )
         # three significant digits: records the estimate cannot separate (at the HBM floor every token tile reads the same
         # weights) fall through to the structural raster and the enumeration order -- the grouped records before the swapped
