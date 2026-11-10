@@ -314,8 +314,28 @@ def test_fingerprint_dimensions_and_classes():
     assert s107 == spec_fingerprint_mxfp8(
         2048, 768, 8, 128, S.SOFTMAX_RENORM, "silu", (), True, "mxfp8_k64"
     )
+    # the routing terms the bf16 model serves are classes of this backend too (Llama4 = the top-1 TopKSigmoid term, its own
+    # class); a method the classes do not implement is refused
     with pytest.raises(ValueError):
-        fp(arch="sm_107", method=RoutingMethodType.Llama4)
+        fp(arch="sm_107", method=RoutingMethodType.MiniMax2)
+    assert fp(arch="sm_107", method=RoutingMethodType.TopKSigmoid) != s107
+    assert bi.fingerprint(
+        "fused_moe_mxfp8",
+        method=RoutingMethodType.Llama4,
+        H=2048,
+        I=768,
+        top_k=1,
+        num_experts=128,
+        arch="sm_107",
+    ) == bi.fingerprint(
+        "fused_moe_mxfp8",
+        method=RoutingMethodType.TopKSigmoid,
+        H=2048,
+        I=768,
+        top_k=1,
+        num_experts=128,
+        arch="sm_107",
+    )
     with pytest.raises(ValueError):
         fp(arch="sm_107", act="tanh")
     with pytest.raises(ValueError):
@@ -1919,7 +1939,26 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             _logits_pack((xq, xsf), logits),
             _weights(w1[:, :I].contiguous(), w2, ReLU2()),
         )
-    # an unimplemented routing method from logits is refused; the same layer takes pre-routed inputs
+    # MiniMax2 from logits is refused (another term); the same layer takes pre-routed inputs; Llama4 is the top-1 term
+    minimax = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E, top_k=1, method=RoutingMethodType.MiniMax2
+            ),
+            quant=_QUANT,
+            experts=ExpertConfig(intermediate_size=I),
+            backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+        ),
+        device=torch.device("cuda"),
+    )
+    with pytest.raises(BatchInvariantUnsupportedError):
+        minimax(_logits_pack((xq, xsf), logits), W)
+    ids = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
+    assert minimax(
+        _routed_pack((xq, xsf), ids, torch.ones(8, 1, device="cuda")), W
+    ).shape == (8, H)
+    # Llama4 routing (the top-1 of the logits with its sigmoid as the weight) is a routing term the bf16 model serves: the layer
+    # runs from logits, deterministically; at any other top_k the class refuses it (TopKSigmoid is that term)
     llama = MoELayer(
         MoEConfig(
             routing=RoutingConfig(
@@ -1931,12 +1970,23 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         ),
         device=torch.device("cuda"),
     )
-    with pytest.raises(BatchInvariantUnsupportedError):
-        llama(_logits_pack((xq, xsf), logits), W)
-    ids = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
-    assert llama(
-        _routed_pack((xq, xsf), ids, torch.ones(8, 1, device="cuda")), W
-    ).shape == (8, H)
+    out_l = llama(_logits_pack((xq, xsf), logits), W)
+    assert out_l.shape == (8, H) and torch.equal(
+        bits(out_l), bits(llama(_logits_pack((xq, xsf), logits), W))
+    )
+    with pytest.raises(errors) as excinfo:
+        MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(
+                    num_experts=E, top_k=2, method=RoutingMethodType.Llama4
+                ),
+                quant=_QUANT,
+                experts=ExpertConfig(intermediate_size=I),
+                backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+            ),
+            device=torch.device("cuda"),
+        )
+    assert "Llama4" in str(excinfo.value)
     # weights on the CPU cannot be quantized by the class
     with pytest.raises(TypeError):
         BatchInvariantFp8BlockConfig.prepare_weights(

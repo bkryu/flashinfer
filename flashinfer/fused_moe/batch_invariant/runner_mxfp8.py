@@ -26,6 +26,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from ...batch_invariant.support import check_device, unsupported
+from ...tllm_enums import RoutingMethodType
 from ..api import MoEActivationPack, MoEWeightPack, RoutingInputMode
 from ..runners import _validate_logits_inputs, _validate_prerouted_inputs
 from .runner import _configs_from_tactic, _tactic
@@ -88,6 +89,12 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         # group-limited routing (n_group / topk_group > 1) is refused only from logits (the class has no grouped routing
         # term); with pre-routed ids the group structure is irrelevant, the output is the ungrouped configuration's
         self._method = METHOD_OF_FLASHINFER.get(routing.method)
+        if routing.method is RoutingMethodType.Llama4 and routing.top_k != 1:
+            raise unsupported(
+                CLASS,
+                f"Llama4 routing with top_k {routing.top_k}",
+                "top_k = 1 (the method is the top-1 of the logits with its sigmoid as the weight; TopKSigmoid for other k)",
+            )
         if not cfg.finalize.do_finalize:
             raise unsupported(
                 CLASS,
