@@ -290,7 +290,10 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         from .schedule_fp8bs import fused_quant_default
 
         cfg = self.config
-        fused = fused_quant_default(T, cfg.routing.top_k, cfg.routing.num_experts)
+        block = getattr(self, "_block", QBLOCK)
+        fused = fused_quant_default(
+            T, cfg.routing.top_k, cfg.routing.num_experts, block
+        )
         r1, r2 = self._ranked(T, fused)
         return r1[0], r2[0], fused
 
@@ -303,7 +306,11 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         T = int(inputs[_X].shape[0])
         _, _, default_fused = self._default(T)
         out: List[Any] = []
-        for fused in (default_fused, not default_fused):
+        # both requantization spellings at the 128-wide class; the 32-wide class has the standalone pass only
+        spellings = (
+            (default_fused, not default_fused) if self._block == QBLOCK else (False,)
+        )
+        for fused in spellings:
             r1, r2 = self._ranked(T, fused)
             out += [_tactic_bs(c1, c2, fused) for c1 in r1 for c2 in r2]
         return out

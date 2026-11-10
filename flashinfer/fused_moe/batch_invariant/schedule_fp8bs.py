@@ -235,10 +235,11 @@ def rank_grouped_fp8bs(
     return out[:k]
 
 
-def fused_quant_default(T: int, k: int, E: int) -> bool:
+def fused_quant_default(T: int, k: int, E: int, block: int = QBLOCK) -> bool:
     """Whether the block-scale op requantizes GEMM1's output in the epilogue (the wide-tile records) or by the standalone quantizer
-    pass at this (T, k, E) by default: a placement rule on the rows per active expert, both spellings the same bits."""
-    return rows_per_expert(T, k, E) >= FUSED_QUANT_MIN_ROWS
+    pass at this (T, k, E) by default: a placement rule on the rows per active expert, both spellings the same bits. The 32-wide
+    class requantizes by the standalone pass only (the fused epilogue is the 128-wide class's)."""
+    return block == QBLOCK and rows_per_expert(T, k, E) >= FUSED_QUANT_MIN_ROWS
 
 
 def default_configs_fp8bs(
