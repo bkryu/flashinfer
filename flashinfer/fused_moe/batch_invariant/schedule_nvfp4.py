@@ -107,9 +107,8 @@ def chain_nodes_nvfp4(chain: W4A4Chain) -> int:
     s = Q.w4a4_row_scale(alg, alg.leaf("alpha", 0), alg.leaf("pts"))
     g, u = alg.leaf("g", 0, 0), alg.leaf("u", 0, 0)
     if chain.static_quant:
-        # the static class's GEMM1 per output: the fp32 gated value's nodes plus the output's share of the block's work (the amax
-        # tree, the scale and the encode scale once per 16 outputs) plus its own code's nodes -- each term counted once over its
-        # leaves (printing the block's codes re-expands the shared sub-terms 16-fold, which is not work)
+        # chain nodes are DAG nodes: the block's shared sub-terms (amax tree, scale, encode scale) are counted once and split
+        # over the block's outputs, never re-expanded per code
         gs = alg.leaf("gs2", 0)
         if chain.pair:
             pre = Q.glu_scaled_pre(alg, g, u, s, chain.act, chain.params)
