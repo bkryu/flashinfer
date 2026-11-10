@@ -243,7 +243,7 @@ def rank_grouped_mx(
             sm_count,
             in_fmt,
             nominal,
-            EPI_WARPGROUPS,
+            epi_warpgroups=EPI_WARPGROUPS,
         ) + stage_round_trip_cycles(c, K, in_fmt)
         return (
             float(f"{est:.3g}"),

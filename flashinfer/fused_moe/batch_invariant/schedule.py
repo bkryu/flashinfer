@@ -299,6 +299,7 @@ def record_cost(
     sm_count: Optional[int] = None,
     in_fmt: str = "bf16",
     nominal: bool = False,
+    *,
     epi_warpgroups: int = _EPI_WARPGROUPS,
     overrides: Optional[dict] = None,
 ) -> float:
@@ -307,7 +308,8 @@ def record_cost(
     (`estimate_overrides`, with a class's own ``overrides`` layered on top: its promotion counts and the like; the dense
     dispatcher's constants untouched), times the pair term and the swapped records' tiles term, plus the exposed epilogue
     chain (over the body's ``epi_warpgroups``) and the token box's exposed fill; in SM cycles (a launch's fixed cost is the
-    same for both bodies on every measured part, so it is no term)."""
+    same for both bodies on every measured part, so it is no term). The class-specific arguments are keyword-only: a class
+    that does not pass them gets the shared defaults."""
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import estimate_cycles
