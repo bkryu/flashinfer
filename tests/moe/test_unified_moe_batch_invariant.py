@@ -2539,7 +2539,6 @@ def test_grouped_gemms_with_the_plan_tables_equal_the_per_cta_scan():
     )
     from flashinfer.gemm.batch_invariant.generator import Knobs
 
-    g = torch.Generator(device="cuda").manual_seed(13)
     dense = Knobs((128, 128), (1, 1), False, True, "m", 1)
     swapped = Knobs((128, 8), (1, 1), False, True, "m", 1, swap_ab=True)
     for T, k, H, I, E in [
