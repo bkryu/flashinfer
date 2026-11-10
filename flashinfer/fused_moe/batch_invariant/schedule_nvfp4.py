@@ -208,20 +208,27 @@ def rank_grouped_nvfp4(
     the group's padded rows is excluded: the group scheduler's tiles never span groups) and the swapped records the swapped body
     accepts (``swap``: None ranks them with the rest, True keeps only them, False excludes them), ordered by the dense class's
     estimate at ``(M = rows, N = n_active * N, K)`` at the instruction class times the pair term and the swapped records' spill
-    factor, plus the last tile's exposed epilogue chain (this class's chain term over four epilogue warpgroups) and the token
-    box's zero-fill at the packed fp4 width, rounded to three significant digits; the grouped scheduler's structural raster first
+    factor, plus the last tile's exposed epilogue chain (this class's chain term over four epilogue warpgroups), the token
+    box's zero-fill at the packed fp4 width (a swapped record's at its exposed share) and the body's fixed cost per wave
+    (`schedule.fixed_cycles`, off until the part is measured), rounded to three significant digits; the grouped scheduler's structural raster first
     among twins, ties in the spaces' enumeration order (the grouped records before the swapped ones, the narrower token tile
     first). Each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the list: distinct
     records, at most ``k``, never empty for an implementable shape."""
     import dataclasses
 
-    from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
+    from ...gemm.batch_invariant.heuristic import (
+        PART_TABLE,
+        decode_sane,
+        estimate_cycles,
+    )
     from .blocks.compile_nvfp4 import (
         can_implement_grouped_nvfp4,
         can_implement_swapped_nvfp4,
     )
+    from .schedule import fixed_cycles
 
     fam = family or "sm_107"
+    sms = sm_count or PART_TABLE.get(fam, PART_TABLE["sm_107"]).sm_count
     dense_n = (n_active or E) * N
     m_fit = padded_rows(rows)
     dense = (
@@ -256,6 +263,7 @@ def rank_grouped_nvfp4(
             est * pair_term(c, rows) * tiles_term(c, rows)
             + exposed_epilogue_cycles_nvfp4(c, rows, nodes)
             + zero_fill_cycles(c, rows, K, fam, in_fmt)
+            + fixed_cycles(c, rows, n_active or E, N, fam, sms)
         )
         return (
             float(f"{est:.3g}"),

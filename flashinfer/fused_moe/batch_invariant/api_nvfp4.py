@@ -28,6 +28,7 @@ import torch
 from ...batch_invariant.quantization.nvfp4_schedule import padded_sf_cols, sf_numel
 from ...batch_invariant.support import BatchInvariantUnsupportedError, unsupported
 from ...gemm.batch_invariant.api import part_of, persistent_clusters, sm_count_of
+from .schedule import launch_tile_bound
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.schedule import chunks_for
 from ...gemm.batch_invariant.spec import NVFP4_FMTS
@@ -469,6 +470,10 @@ def grouped_gemm_nvfp4(
         )
     if rows == 0:
         return out
+    # the persistent grid clipped to the launch's tile bound (a placement: which cluster computes a tile, never the bits)
+    grid = min(
+        persistent_clusters(a4.device, config), launch_tile_bound(config, rows, E, N)
+    )
     if config.swap_ab:
         from .blocks import compile_nvfp4 as CN
 
@@ -485,7 +490,7 @@ def grouped_gemm_nvfp4(
                 alpha.reshape(-1),
                 a_pts.reshape(-1),
                 aux.reshape(-1),
-                persistent_clusters(a4.device, config),
+                grid,
             )
         else:
             kernel(
@@ -497,7 +502,7 @@ def grouped_gemm_nvfp4(
                 counts,
                 alpha.reshape(-1),
                 a_pts.reshape(-1),
-                persistent_clusters(a4.device, config),
+                grid,
             )
         return out
     kernel = get_compiled_grouped_nvfp4(config, chain, in_fmt, dense_a)
@@ -513,7 +518,7 @@ def grouped_gemm_nvfp4(
             alpha.reshape(-1),
             a_pts.reshape(-1),
             aux.reshape(-1),
-            persistent_clusters(a4.device, config),
+            grid,
         )
     else:
         kernel(
@@ -525,7 +530,7 @@ def grouped_gemm_nvfp4(
             counts,
             alpha.reshape(-1),
             a_pts.reshape(-1),
-            persistent_clusters(a4.device, config),
+            grid,
         )
     return out
 
