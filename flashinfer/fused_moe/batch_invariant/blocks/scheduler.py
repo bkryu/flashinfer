@@ -158,14 +158,18 @@ def build_group_tables_dual(
     loc_c = cute.make_rmem_tensor((PER_LANE,), Int32)
     loc_b = cute.make_rmem_tensor((PER_LANE,), Int32)
     loc_p = cute.make_rmem_tensor((PER_LANE,), Int32)
-    sum_c = Int32(0)
-    sum_b = Int32(0)
-    sum_p = Int32(0)
+    # the lane's counts first, all loads in flight together (as build_group_tables), then the three sums
     for i in cutlass.range_constexpr(PER_LANE):
         e = lane * PER_LANE + i
         c = Int32(0)
         if e < E:
             c = counts[e]
+        loc_c[i] = c
+    sum_c = Int32(0)
+    sum_b = Int32(0)
+    sum_p = Int32(0)
+    for i in cutlass.range_constexpr(PER_LANE):
+        c = loc_c[i]
         loc_c[i] = sum_c
         loc_b[i] = sum_b
         loc_p[i] = sum_p
