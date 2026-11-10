@@ -331,13 +331,13 @@ def test_fingerprint_dimensions_and_classes():
     assert bi.fingerprint("fused_moe_fp8bs", act="relu2", **dims) == bi.fingerprint(
         "fused_moe_fp8bs", act=ReLU2(), **dims
     )
-    # the routing terms the bf16 model serves are classes of this backend too (Llama4 = TopK with sigmoid weights); an unknown
-    # method is refused
+    # the routing terms the bf16 model serves are classes of this backend too (Llama4 = TopK with sigmoid weights); a method the
+    # classes do not implement is refused
     assert (
         bi.fingerprint("fused_moe_fp8bs", method=RoutingMethodType.Llama4, **dims) != fp
     )
     with pytest.raises(ValueError):
-        bi.fingerprint("fused_moe_fp8bs", method="NoSuchRouting", **dims)
+        bi.fingerprint("fused_moe_fp8bs", method=RoutingMethodType.MiniMax2, **dims)
     with pytest.raises(TypeError):
         bi.fingerprint("fused_moe_fp8bs", block=128, **dims)
     for cfg in ACTIVATIONS:
