@@ -97,24 +97,34 @@ def _temperature(
     return None, scale_value(T)
 
 
-def _check_logits(logits: torch.Tensor) -> int:
-    check_device(logits.device, CLASS, LSE_ROW_ARCHS)
-    if logits.dtype not in _DTYPE_STR:
+def check_input(
+    x: torch.Tensor,
+    name: str,
+    cls: str,
+    archs,
+    vocab_hint: str = (
+        f"every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it the row's alignment decides"
+    ),
+) -> int:
+    """The device, dtype, rank and vocabulary checks shared by the mode's sampling entries (the row class, the draw,
+    the support): ``BatchInvariantUnsupportedError`` naming ``cls`` on a miss; returns the vocabulary ``N``."""
+    check_device(x.device, cls, archs)
+    if x.dtype not in _DTYPE_STR:
+        raise unsupported(cls, f"{name} dtype {x.dtype}", f"bf16, f16 or fp32 {name}")
+    if x.dim() < 1:
         raise unsupported(
-            CLASS, f"logits dtype {logits.dtype}", "bf16, f16 or fp32 logits"
+            cls, f"a {x.dim()}-D input", f"{name} of shape (..., vocabulary)"
         )
-    if logits.dim() < 1:
-        raise unsupported(
-            CLASS, f"a {logits.dim()}-D input", "logits of shape (..., vocabulary)"
-        )
-    N = int(logits.shape[-1])
+    N = int(x.shape[-1])
     if not (0 < N < MAX_VOCAB):
         raise unsupported(
-            CLASS,
-            f"a vocabulary of {N}",
-            f"0 < vocabulary < 2^31 (every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it the row's alignment decides)",
+            cls, f"a vocabulary of {N}", f"0 < vocabulary < 2^31 ({vocab_hint})"
         )
     return N
+
+
+def _check_logits(logits: torch.Tensor) -> int:
+    return check_input(logits, "logits", CLASS, LSE_ROW_ARCHS)
 
 
 def _aligned_rows(x2: torch.Tensor, align: int) -> torch.Tensor:

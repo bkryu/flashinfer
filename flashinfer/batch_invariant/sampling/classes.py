@@ -3,7 +3,8 @@
 """The sampling classes' entries of the mode's registry (:data:`flashinfer.batch_invariant.CLASSES`): the class name and
 the fingerprint behind ``fingerprint("softmax", N=, dtype=, temperature=[, out_dtype=])``, ``fingerprint("log_softmax",
 ...)``, ``fingerprint("log_probs", ...)``, ``fingerprint("sampling_from_probs", N=, dtype=)`` and
-``fingerprint("sampling_from_logits", N=, dtype=)``.
+``fingerprint("sampling_from_logits", N=, dtype=)``, ``fingerprint("top_k_renorm_probs", N=, dtype=)``,
+``fingerprint("top_p_renorm_probs", N=, dtype=)`` and ``fingerprint("top_k_mask_logits", N=, dtype=)``.
 
 The first three APIs run one class, ``lse.row``, whose specification is a function of the vocabulary ``N`` (the two row
 trees), the input dtype (the output conversion of the probabilities; the leaves of a 16-bit input are its exact
@@ -63,6 +64,30 @@ def _draw_fingerprint(N: int, dtype, from_logits: bool = False) -> str:
     return spec_fingerprint(int(N), bool(from_logits), in_fmt)
 
 
+def _support_fingerprint(N: int, dtype, filters, from_logits: bool) -> str:
+    from .support_spec import spec_fingerprint
+
+    return spec_fingerprint(filters, int(N), bool(from_logits), _in_fmt(dtype))
+
+
+def _top_k_renorm_fingerprint(N: int, dtype) -> str:
+    from .support_spec import Filters
+
+    return _support_fingerprint(N, dtype, Filters(top_k=1), False)
+
+
+def _top_p_renorm_fingerprint(N: int, dtype) -> str:
+    from .support_spec import Filters
+
+    return _support_fingerprint(N, dtype, Filters(top_p=1.0), False)
+
+
+def _top_k_mask_fingerprint(N: int, dtype) -> str:
+    from .support_spec import Filters
+
+    return _support_fingerprint(N, dtype, Filters(top_k=1), True)
+
+
 def _draw_probs_fingerprint(N: int, dtype) -> str:
     return _draw_fingerprint(N, dtype, False)
 
@@ -89,4 +114,16 @@ def register(classes: Dict[str, Any], class_info: Any) -> None:
     )
     classes["sampling_from_logits"] = class_info(
         "sample.icdf.v1", ("N", "dtype"), _draw_logits_fingerprint
+    )
+    # the support class (support_api.py): the kept set under one filter per entry -- the fingerprint covers the filter
+    # set, the selection rules, the vocabulary (the sum tree the kept mass is read from) and the weight form; the dtype
+    # is the renormalised probabilities' output conversion (the masked logits convert nothing: a validated dimension)
+    classes["top_k_renorm_probs"] = class_info(
+        "support.row.v1", ("N", "dtype"), _top_k_renorm_fingerprint
+    )
+    classes["top_p_renorm_probs"] = class_info(
+        "support.row.v1", ("N", "dtype"), _top_p_renorm_fingerprint
+    )
+    classes["top_k_mask_logits"] = class_info(
+        "support.row.v1", ("N", "dtype"), _top_k_mask_fingerprint
     )

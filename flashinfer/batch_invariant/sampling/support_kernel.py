@@ -1,0 +1,2016 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""The ``support.row.v1`` kernel (``support_spec.py``): the row class's passes, the per-row thresholds by radix selection
+over the weights' bit patterns, and the kept set's mass, count and row outputs.
+
+Structure: the CTA's share of the row is staged in shared memory once -- by the loader's cp.async path when the config
+stages, otherwise through its predicated register loads (``draw_kernel._DrawLoader.stage_from_regs``) -- and every pass
+reads it from there: the trees through the ``lse.row`` loader and engine (the same plans, the same chains), the radix
+passes as compact dynamic loops over the tile's 32-bit words (eight bf16 or four fp32 elements per thread per iteration,
+lane-contiguous words). Each radix pass adds one to a 256-bin count histogram per candidate element (``red.shared.add.u32
+[bin], 1``: the hardware aggregates a warp's same-address increments; a non-candidate lane increments a dummy slot, so
+there is no branch) and, for top-p, the element's fixed-point mass ``trunc(mul(w, div(2^44, S)))`` split into
+32-bit-safe chunks (``red.shared.add.u32`` of each chunk into one of ``RM`` lane-spread replicas of the bin; the only
+shared atomics native on these parts are 32-bit -- 64-bit integer and fp64 adds are CAS loops). Integer sums in any
+order are exact. Every warp then scans the 256 bins from the top (8 per lane, an exact integer prefix over the lanes) to
+the bin where the running count (mass) reaches the goal and extends the prefix by that bin's digit (8 / 8 / 8 / 7 bits).
+A cluster's CTAs each histogram their share and read all the shares' bins through ``mapa`` + ``ld.shared::cluster``.
+
+**The early finish** (a placement of the same selection, bit-identical by construction): after the second pass the
+selected bin holds the candidates whose 16 top pattern bits are the prefix; when their cluster-wide count is at most
+``CAP`` the remaining two passes are replaced by one compaction sweep (the candidates' patterns appended to a small
+shared list, warp-aggregated) and an exact rank selection over the list (the ``rem_k``-th largest pattern, or the
+first pattern in descending order at which the running fixed-point mass reaches ``rem_m``) -- the same integer
+procedure the passes compute, on the same candidates. Otherwise the two passes run as before. The early finish pays
+on the mass selection (top-p: its passes carry the mass chunks) and not on the count selection, so the default
+applies it to the mass selection only (``early_finish="mass"``; ``"all"`` and ``""`` for the study).
+
+**The pass count by input kind** (``n_passes_for``): a bf16 probability widened to fp32 has 16 zero low pattern
+bits and an f16 one 13 (the widening is a shift), so after two (three) passes every remaining digit of every
+candidate is zero and the threshold pattern is the prefix shifted -- those inputs run two (three) passes. fp32
+inputs and the ``ex2`` weights of every logits input run four.
+
+The kept set is ``w >= threshold`` with the threshold the largest of the applied filters' (ties kept); the kept mass is
+the canonical sum tree over the kept weights (the others ``+0``), the count an integer sum, the log-probabilities
+``mul(add(z_j, neg(lg2(mass))), LN2)``.
+
+The kernel is built on the row kernel's plumbing (``kernel.py``: the peers, the tiled copies, the predicates) and the
+draw kernel's loader (``draw_kernel._DrawLoader``: the pad an absent element reads and the register-path staging); its
+own cache module (``SUPPORT_MODULE``), so an edit here never recompiles the row or the draw kernels.
+"""
+
+from __future__ import annotations
+
+import functools
+
+import cutlass
+import cutlass.cute as cute
+from cutlass import Boolean, Float32, Int32, Int64, Uint8
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+from .. import canon, jit
+from .cute_ext import CuteF32
+from .draw_kernel import INT_MAX, _DrawLoader, _imax, _imin, _ld_shared_cluster_i32
+from .kernel import (
+    NAN,
+    NEG_INF,
+    _CutePeers,
+    _map_shared_rank,
+    _predicate,
+    _select,
+    _tiled_copy,
+)
+from .schedule import BLOCK, LANES, SMEM_BUDGET, V, LSEConfig
+from .spec import (
+    inv_sum,
+    lg2,
+    logp,
+    max_reduction,
+    prob,
+    scale,
+    shifted,
+    sum_reduction,
+)
+from .support_spec import FIX_BITS, FIX_SCALE, Filters
+
+SUPPORT_MODULE = "batch_invariant_sampling_support"
+BINS = 256
+BINS_PER_LANE = BINS // LANES
+PASS_SHIFTS = (
+    23,
+    15,
+    7,
+    0,
+)  # the digit of pass p is bits [shift, shift + width) of the 31-bit pattern
+PASS_WIDTHS = (8, 8, 8, 7)
+INF_BITS = 0x7F800000
+I64_MASK = (1 << 32) - 1
+MASS_BITS = (
+    FIX_BITS + 1
+)  # a row's fixed-point masses sum below 2^45 (the tree sum's rounding slack included)
+RM = 4  # lane-spread replicas of every bin for the mass chunks (same-address adds serialise)
+WPT = 4  # 32-bit words a thread reads per sweep iteration
+#: The early finish: the candidates of the selected bin the compaction list holds (two per lane of a warp).
+CAP = 64
+EARLY_AFTER = (
+    2  # the passes before the early finish decides (the prefix then has 16 bits)
+)
+
+
+# ---- device helpers (bit moves, shared-memory integer adds, cluster reads) ------------------------------------------
+@dsl_user_op
+def _f32_bits(a: Float32, *, loc=None, ip=None) -> Int32:
+    """``mov.b32 r, f``: the bit pattern of an fp32 (no arithmetic)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _bitcast_i32_to_f32(a: Int32, *, loc=None, ip=None) -> Float32:
+    """``mov.b32 f, r``: the fp32 of a bit pattern (no arithmetic)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(a).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _red_inc_u32(addr: Int32, *, loc=None, ip=None) -> None:
+    """``red.shared.add.u32 [addr], 1`` (the hardware aggregates a warp's same-address increments)."""
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "red.shared.add.u32 [$0], 1;",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _red_add_u32(addr: Int32, v: Int32, *, loc=None, ip=None) -> None:
+    """``red.shared.add.u32 [addr], v``."""
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip)],
+        "red.shared.add.u32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _atom_add_u32(addr: Int32, v: Int32, *, loc=None, ip=None) -> Int32:
+    """``atom.shared.add.u32 d, [addr], v``: the old value (the compaction's slot base)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip)],
+            "atom.shared.add.u32 $0, [$1], $2;",
+            "=r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _popc(a: Int32, *, loc=None, ip=None) -> Int32:
+    """``popc.b32``: the number of set bits (a ballot's candidate count, a lane's rank within it). Inline asm, so the
+    MLIR stays free of the math dialect the IR pin forbids (``cute.arch.popc`` lowers to ``math.ctpop``)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(a).ir_value(loc=loc, ip=ip)],
+            "popc.b32 $0, $1;",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_shared_cluster_i64(addr: Int32, *, loc=None, ip=None) -> Int64:
+    """``ld.shared::cluster.b64``: one 64-bit word from a peer CTA's shared memory (bits move; no arithmetic)."""
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared::cluster.b64 $0, [$1];",
+            "=l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_rzi_s64_f32(a: Float32, *, loc=None, ip=None) -> Int64:
+    """``cvt.rzi.s64.f32``: the truncated fixed-point value (saturates at 2^63 - 1), the class's ``trunc``."""
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "cvt.rzi.s64.f32 $0, $1;",
+            "=l,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _f16_lo(w: Int32, *, loc=None, ip=None) -> Float32:
+    """The low fp16 half of a word, widened exactly (``cvt.f32.f16``)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(w).ir_value(loc=loc, ip=ip)],
+            "{\n.reg .b16 lo, hi;\nmov.b32 {lo, hi}, $1;\ncvt.f32.f16 $0, lo;\n}",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _f16_hi(w: Int32, *, loc=None, ip=None) -> Float32:
+    """The high fp16 half of a word, widened exactly."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(w).ir_value(loc=loc, ip=ip)],
+            "{\n.reg .b16 lo, hi;\nmov.b32 {lo, hi}, $1;\ncvt.f32.f16 $0, hi;\n}",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def _shfl_up_i64(v, d):
+    """``shfl.up`` of a 64-bit value by its halves."""
+    lo = cute.arch.shuffle_sync_up((v & Int64(I64_MASK)).to(Int32), offset=d)
+    hi = cute.arch.shuffle_sync_up((v >> 32).to(Int32), offset=d)
+    return (hi.to(Int64) << 32) | (lo.to(Int64) & Int64(I64_MASK))
+
+
+def _shfl_idx_i64(v, src):
+    """``shfl.idx`` of a 64-bit value by its halves."""
+    lo = cute.arch.shuffle_sync((v & Int64(I64_MASK)).to(Int32), offset=src)
+    hi = cute.arch.shuffle_sync((v >> 32).to(Int32), offset=src)
+    return (hi.to(Int64) << 32) | (lo.to(Int64) & Int64(I64_MASK))
+
+
+def _weight_bits(we):
+    """The 31-bit pattern of a non-negative weight (``+0`` and ``-0`` both 0)."""
+    return _f32_bits(we) & Int32(0x7FFFFFFF)
+
+
+def _smem_base(tensor) -> Int32:
+    """The shared-memory byte address of a tensor's first element."""
+    return Int32(tensor.iterator.toint())
+
+
+def chunking(N: int):
+    """The mass chunks: ``chunk_bits`` wide so that a slot's sum over at most ``N`` elements stays below 2^32, and enough
+    of them for the 45-bit masses."""
+    chunk_bits = min(16, 31 - (N - 1).bit_length())
+    assert chunk_bits >= 4, N
+    return chunk_bits, -(-MASS_BITS // chunk_bits)
+
+
+class _IntReducer:
+    """Exact integer reductions (min / add) of one value per thread over the lanes, the CTA's warps and the cluster's
+    CTAs."""
+
+    def __init__(
+        self, W, C, warp_id, lane_id, ibuf=None, icbuf=None, ibuf64=None, icbuf64=None
+    ):
+        self.W, self.C, self.warp_id, self.lane_id = W, C, warp_id, lane_id
+        self.ibuf, self.icbuf, self.ibuf64, self.icbuf64 = ibuf, icbuf, ibuf64, icbuf64
+        self.n_cluster = 0
+
+    def reduce64(self, v, peers):
+        """The exact 64-bit integer sum of one value per thread (lanes by shuffles of the halves, then the 64-bit
+        buffers)."""
+        for mask in (1, 2, 4, 8, 16):
+            lo = cute.arch.shuffle_sync_bfly(
+                (v & Int64(I64_MASK)).to(Int32), offset=mask
+            )
+            hi = cute.arch.shuffle_sync_bfly((v >> 32).to(Int32), offset=mask)
+            v = v + ((hi.to(Int64) << 32) | (lo.to(Int64) & Int64(I64_MASK)))
+        if self.W > 1:
+            cute.arch.barrier()
+            self.ibuf64[self.warp_id, self.lane_id] = v
+            cute.arch.barrier()
+            acc = self.ibuf64[0, self.lane_id]
+            for sid in range(1, self.W):
+                acc = acc + self.ibuf64[sid, self.lane_id]
+            v = acc
+        if self.C > 1:
+            if self.n_cluster:
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+            self.icbuf64[self.lane_id] = v
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            self.n_cluster += 1
+            peers.n_cluster_exchanges += 1
+            off = self.lane_id * 8
+            acc = _ld_shared_cluster_i64(
+                _map_shared_rank(self.icbuf64.iterator, Int32(0)) + off
+            )
+            for sid in range(1, self.C):
+                acc = acc + _ld_shared_cluster_i64(
+                    _map_shared_rank(self.icbuf64.iterator, Int32(sid)) + off
+                )
+            v = acc
+        return v
+
+    def reduce(self, v, op: str, peers):
+        """The exact 32-bit integer reduction (``"min"`` or ``"add"``) of one value per thread."""
+        comb = _imin if op == "min" else (lambda a, b: a + b)
+        for mask in (1, 2, 4, 8, 16):
+            v = comb(v, cute.arch.shuffle_sync_bfly(v, offset=mask))
+        if self.W > 1:
+            cute.arch.barrier()  # the previous reduction's readers are done
+            self.ibuf[self.warp_id, self.lane_id] = v
+            cute.arch.barrier()
+            acc = self.ibuf[0, self.lane_id]
+            for sid in range(1, self.W):
+                acc = comb(acc, self.ibuf[sid, self.lane_id])
+            v = acc
+        if self.C > 1:
+            if self.n_cluster:
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+            self.icbuf[self.lane_id] = v
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            self.n_cluster += 1
+            peers.n_cluster_exchanges += (
+                1  # so that ``peers.finish()`` holds the CTA for the peers' reads
+            )
+            off = self.lane_id * 4
+            acc = _ld_shared_cluster_i32(
+                _map_shared_rank(self.icbuf.iterator, Int32(0)) + off
+            )
+            for sid in range(1, self.C):
+                acc = comb(
+                    acc,
+                    _ld_shared_cluster_i32(
+                        _map_shared_rank(self.icbuf.iterator, Int32(sid)) + off
+                    ),
+                )
+            v = acc
+        return v
+
+
+class _Radix:
+    """What the radix passes need: the staged words, their count and global column origin, the histograms, and the
+    early finish's buffers: the candidate list (``cand``), its counter box (``cbox``), the rank-ordered masses and
+    patterns (``sq`` / ``sp``)."""
+
+    def __init__(
+        self,
+        words,
+        n_words,
+        col0,
+        N,
+        nm,
+        c,
+        hist,
+        mslot,
+        mred,
+        kind,
+        from_logits,
+        gcnt=None,
+        gmass=None,
+        cand=None,
+        cbox=None,
+        sq=None,
+        sp=None,
+    ):
+        self.words, self.n_words, self.col0, self.N, self.nm, self.c = (
+            words,
+            n_words,
+            col0,
+            N,
+            nm,
+            c,
+        )
+        self.hist, self.mslot, self.mred, self.kind, self.from_logits = (
+            hist,
+            mslot,
+            mred,
+            kind,
+            from_logits,
+        )
+        self.gcnt, self.gmass = gcnt, gmass
+        self.cand, self.cbox, self.sq, self.sp = cand, cbox, sq, sp
+
+
+def _kind(dtype) -> int:
+    """The staged words' element kind: 0 fp32, 1 bf16, 2 f16."""
+    if dtype.width == 32:
+        return 0
+    return 1 if dtype is cutlass.BFloat16 else 2
+
+
+def n_passes_for(kind: int, from_logits: bool) -> int:
+    """The radix passes that determine the threshold pattern: four for fp32 weights (fp32 inputs and the ``ex2`` weights
+    of every logits input), two for bf16 probabilities and three for f16 ones -- their fp32 patterns' low 16 / 13 bits
+    are zero (the widening is a shift; an f16 subnormal has at most 10 significant bits), so every remaining digit of
+    every candidate is zero and the pattern is the prefix shifted."""
+    if from_logits or kind == 0:
+        return 4
+    return 2 if kind == 1 else 3
+
+
+def _smem_layout(k):
+    """Byte sizes of the tile, the count histograms (two buffers, a dummy slot each), the mass slots, the reduced
+    masses and the early finish's buffers."""
+    n_share = k.cfg.blocks_per_cta(k.N) * BLOCK
+    tile = n_share * k.elem_bytes
+    hist = 2 * (BINS + 1) * 4 if (k.use_k or k.use_p) else 0
+    mslot = (BINS * RM + LANES) * k.n_chunks * 4 if k.use_p else 0
+    mred = 2 * BINS * 8 if k.use_p else 0
+    if k.C > 1:
+        hist += 2 * BINS * 4
+        mred += 2 * BINS * 8 if k.use_p else 0
+    ef = k.early_finish and (k.use_k or k.use_p) and k.n_passes > EARLY_AFTER
+    cand = (CAP + 1) * (4 + 8 + 4) + 2 * 4 if ef else 0
+    return n_share, tile, hist, mslot, mred, cand
+
+
+class SupportRowKernel:
+    """``support.row.v1`` for one Kp bucket: the input kind, the filter set (which of top-k / top-p / min-p are on, their
+    order), the temperature form, which row outputs are written (the mask, the renormalised log-probabilities, the
+    input-dtype output: renormalised probabilities or masked logits), and the selection's placement (``early_finish``);
+    ``study`` names an attribution form (``"noradix"``: the thresholds of top-k / top-p left at 0 -- NOT the class)."""
+
+    def __init__(
+        self,
+        dtype,
+        Kp: int,
+        cfg: LSEConfig,
+        from_logits: bool,
+        filters: Filters,
+        temp_rows: bool,
+        write_mask: bool,
+        write_logprobs: bool,
+        mask_vec: int = 1,
+        lp_vec: int = 1,
+        out_mode: str = "",
+        out_vec: int = 1,
+        early_finish: str = "mass",
+        study: str = "",
+    ):
+        N = Kp * BLOCK
+        cfg.validate(N)
+        assert cfg.rows_per_cta == 1, "the support kernel holds one row per CTA group"
+        assert not write_logprobs or from_logits
+        assert out_mode in ("", "probs", "masked") and (
+            out_mode != "masked" or from_logits
+        )
+        assert study in ("", "noradix") and early_finish in ("", "mass", "all")
+        self.out_mode, self.out_vec = out_mode, out_vec
+        self.early_finish, self.study = early_finish, study
+        self.dtype, self.N, self.Kp, self.cfg = dtype, N, Kp, cfg
+        self.from_logits, self.filters, self.temp_rows = from_logits, filters, temp_rows
+        self.write_mask, self.write_logprobs = write_mask, write_logprobs
+        self.mask_vec, self.lp_vec = mask_vec, lp_vec
+        self.use_k, self.use_p, self.use_m = (
+            filters.top_k is not None,
+            filters.top_p is not None,
+            filters.min_p is not None,
+        )
+        assert self.use_k or self.use_p or self.use_m
+        self.chunk_bits, self.n_chunks = chunking(N)
+        pl = cfg.placement(N)
+        self.plan_max = canon.plan(max_reduction(N, None), pl)
+        self.plan_sum = canon.plan(sum_reduction(N, None), pl)
+        self.W, self.C = self.plan_sum.units["warp"], self.plan_sum.units["cta"]
+        assert cfg.cluster == self.C and self.plan_sum.units["grid"] == 1
+        self.kpw = cfg.blocks_per_warp(N)
+        self.vec = cfg.vec_elems
+        self.num_threads = cfg.num_threads
+        self.n_entries = max(
+            (
+                len(self.plan_sum.keys_at(i))
+                for i, s in enumerate(self.plan_sum.steps)
+                if s.level == "warp"
+            ),
+            default=0,
+        )
+        self.n_entries_cta = max(
+            (
+                len(self.plan_sum.keys_at(i))
+                for i, s in enumerate(self.plan_sum.steps)
+                if s.level == "cta"
+            ),
+            default=0,
+        )
+        self.elem_bytes = dtype.width // 8
+        self.kind = _kind(dtype)
+        self.n_passes = n_passes_for(self.kind, from_logits)
+        _, tile, _, _, _, _ = _smem_layout(self)
+        assert tile <= SMEM_BUDGET, (
+            "the CTA's share of the row must fit the staging budget (use a cluster)"
+        )
+        if cfg.stage == "smem":
+            assert cfg.smem_stage_ok(N, self.elem_bytes)
+
+    def _tv_layout(self, vec):
+        """The thread-value layout of a tiled copy over one row with ``vec`` elements per thread."""
+        return cute.make_layout(
+            ((LANES, 1), (vec, V // vec, 1)), stride=((V, 1), (1, vec, V))
+        )
+
+    def _smem_bytes(self) -> int:
+        """The dynamic shared memory: the exchange and integer buffers, the staged tile, the histograms, the list."""
+        b = self.n_entries * self.W * LANES * 4 if self.W > 1 else 0
+        b += self.W * LANES * 4 if self.W > 1 else 0
+        if self.C > 1:
+            b += self.n_entries_cta * LANES * 4 + LANES * 4
+        _, tile, hist, mslot, mred, cand = _smem_layout(self)
+        return b + tile + hist + mslot + mred + cand + 256
+
+    @cute.jit
+    def __call__(
+        self,
+        mX: cute.Tensor,
+        mK: cute.Tensor,
+        mP: cute.Tensor,
+        mMinP: cute.Tensor,
+        mTemp: cute.Tensor,
+        mThr: cute.Tensor,
+        mCount: cute.Tensor,
+        mMass: cute.Tensor,
+        mS: cute.Tensor,
+        mMask: cute.Tensor,
+        mLp: cute.Tensor,
+        mOut: cute.Tensor,
+        c_const: Float32,
+        M: Int64,
+        N: Int32,
+        enable_pdl: cutlass.Constexpr[bool],
+        stream,
+    ):
+        k = self.kernel(
+            mX,
+            mK,
+            mP,
+            mMinP,
+            mTemp,
+            mThr,
+            mCount,
+            mMass,
+            mS,
+            mMask,
+            mLp,
+            mOut,
+            c_const,
+            M,
+            N,
+            enable_pdl,
+            self._tv_layout(self.vec),
+            self._tv_layout(self.mask_vec),
+            self._tv_layout(self.lp_vec),
+            self._tv_layout(self.out_vec),
+            (1, BLOCK),
+        )
+        if cutlass.const_expr(self.C > 1):
+            k.launch(
+                grid=[M * self.C, 1, 1],
+                block=[self.num_threads, 1, 1],
+                cluster=[self.C, 1, 1],
+                smem=self._smem_bytes(),
+                stream=stream,
+                use_pdl=enable_pdl,
+            )
+        else:
+            k.launch(
+                grid=[M, 1, 1],
+                block=[self.num_threads, 1, 1],
+                smem=self._smem_bytes(),
+                stream=stream,
+                use_pdl=enable_pdl,
+            )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mX: cute.Tensor,
+        mK: cute.Tensor,
+        mP: cute.Tensor,
+        mMinP: cute.Tensor,
+        mTemp: cute.Tensor,
+        mThr: cute.Tensor,
+        mCount: cute.Tensor,
+        mMass: cute.Tensor,
+        mS: cute.Tensor,
+        mMask: cute.Tensor,
+        mLp: cute.Tensor,
+        mOut: cute.Tensor,
+        c_const: Float32,
+        M: Int64,
+        N: Int32,
+        enable_pdl: cutlass.Constexpr[bool],
+        tv_layout: cute.Layout,
+        tv_mask: cute.Layout,
+        tv_lp: cute.Layout,
+        tv_out: cute.Layout,
+        tiler_mn: cute.Shape,
+    ):
+        fp = CuteF32
+        bidx, _, _ = cute.arch.block_idx()
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
+        W, C = self.W, self.C
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        if cutlass.const_expr(C > 1):
+            c_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            rg = bidx // C
+        else:
+            c_rank = Int32(0)
+            rg = bidx
+        w = warp_idx % W
+        t = lane_idx
+        tid = warp_idx * LANES + lane_idx
+        coords = {"lane": t, "warp": w, "cta": c_rank, "grid": 0}
+        row = rg.to(Int64)
+        row_c = _select(row < M, row, M - 1)
+
+        # ---- shared memory: the staged share, the exchange buffers, the histograms ------------------------------
+        smem = cutlass.utils.SmemAllocator()
+        xbuf = cbuf = ibuf = icbuf = None
+        n_share = self.cfg.blocks_per_cta(self.N) * BLOCK
+        smem_x = smem.allocate_tensor(
+            mX.element_type,
+            cute.make_ordered_layout((1, n_share), order=(1, 0)),
+            byte_alignment=16,
+        )
+        if cutlass.const_expr(W > 1):
+            xbuf = smem.allocate_tensor(
+                Float32,
+                cute.make_layout((1, self.n_entries, W, LANES)),
+                byte_alignment=16,
+            )
+            ibuf = smem.allocate_tensor(
+                Int32, cute.make_layout((W, LANES)), byte_alignment=16
+            )
+        if cutlass.const_expr(C > 1):
+            cbuf = smem.allocate_tensor(
+                Float32,
+                cute.make_layout((1, self.n_entries_cta, LANES)),
+                byte_alignment=16,
+            )
+            icbuf = smem.allocate_tensor(
+                Int32, cute.make_layout((LANES,)), byte_alignment=16
+            )
+        hist, mslot, mred, gcnt, gmass, cand, cbox, sq, sp = _alloc_hist(self, smem)
+
+        in_bits = self.vec * mX.element_type.width
+        thr_x, atom_x = _tiled_copy(mX, in_bits, tv_layout, tiler_mn, t)
+        thr_async = atom_async = None
+        if cutlass.const_expr(self.cfg.stage == "smem"):
+            atom_async = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(),
+                mX.element_type,
+                num_bits_per_copy=in_bits,
+            )
+            thr_async = cute.make_tiled_copy(atom_async, tv_layout, tiler_mn).get_slice(
+                t
+            )
+        idX = cute.make_identity_tensor(mX.shape)
+        if cutlass.const_expr(self.temp_rows):
+            c = scale(fp, mTemp[row_c])
+        else:
+            c = c_const
+        pad = NEG_INF if self.from_logits else 0.0
+        cta_base = c_rank * self.cfg.blocks_per_cta(self.N)
+        loader = _DrawLoader(
+            self,
+            self.plan_sum,
+            coords,
+            mX,
+            idX,
+            tiler_mn,
+            rg,
+            M,
+            N,
+            thr_x,
+            atom_x,
+            smem_x if self.cfg.stage == "smem" else None,
+            thr_async,
+            atom_async,
+            cta_base,
+            pad=pad,
+        )
+        if cutlass.const_expr(self.cfg.stage != "smem"):
+            loader.stage_from_regs(smem_x, cta_base)
+            cute.arch.barrier()
+        peers = _CutePeers(xbuf, Int32(0), w, lane_idx, cbuf, c_rank)
+        red = _IntReducer(W, C, w, lane_idx, ibuf, icbuf)
+
+        # ===== the weights: (max,) sum ==============================================================================
+        nm = Float32(0.0)
+        wmax = Float32(1.0)
+        if cutlass.const_expr(self.from_logits):
+            state, start = canon.init_state(self.plan_max, fp, loader.max_leaf)
+            m = canon.run(self.plan_max, state, start, peers, fp)
+            nm = fp.neg(m)
+            loader.nm, loader.c = nm, c
+            leaf = loader.sum_leaf
+        else:
+            leaf = loader.max_leaf
+            if cutlass.const_expr(self.use_m):
+                state, start = canon.init_state(self.plan_max, fp, loader.max_leaf)
+                wmax = canon.run(self.plan_max, state, start, peers, fp)
+        state, start = canon.init_state(self.plan_sum, fp, leaf)
+        S = canon.run(self.plan_sum, state, start, peers, fp)
+
+        # ===== the thresholds ======================================================================================
+        words = cute.make_tensor(
+            cute.recast_ptr(smem_x.iterator, dtype=Int32),
+            cute.make_layout((n_share * self.elem_bytes // 4,)),
+        )
+        rx = _Radix(
+            words,
+            Int32(n_share * self.elem_bytes // 4),
+            cta_base * BLOCK,
+            N,
+            nm,
+            c,
+            hist,
+            mslot,
+            mred,
+            self.kind,
+            self.from_logits,
+            gcnt,
+            gmass,
+            cand,
+            cbox,
+            sq,
+            sp,
+        )
+        thr_bits = Int32(0)
+        if cutlass.const_expr(self.use_k and self.study != "noradix"):
+            kk = mK[row_c]
+            sel_k = _radix_select(
+                self,
+                rx,
+                tid,
+                t,
+                False,
+                kk,
+                Int64(0),
+                Float32(0.0),
+                Int32(0),
+                peers,
+                red,
+            )
+            thr_bits = _select(
+                kk <= Int32(0), Int32(INF_BITS), _select(kk >= N, Int32(0), sel_k[0])
+            )
+        if cutlass.const_expr(self.use_p and self.study != "noradix"):
+            base = Int32(0)
+            Sp = S
+            if cutlass.const_expr(self.use_k and self.filters.order == "top_k_first"):
+                base = thr_bits
+                Sp = _masked_sum(self, leaf, peers, thr_bits)
+            scale_fix = fp.div(Float32(FIX_SCALE), Sp)
+            pv = mP[row_c]
+            target = _cvt_rzi_s64_f32(fp.mul(pv, Float32(FIX_SCALE)))
+            sel_p, tot_c, tot_m, min_pos = _radix_select(
+                self, rx, tid, t, True, Int32(0), target, scale_fix, base, peers, red
+            )
+            # p >= 1: the target is unreachable (the filter is off: every positive weight is kept)
+            use_radix = (tot_m >= target) & (tot_c > Int32(0)) & (pv < Float32(1.0))
+            fallback = _select(min_pos == Int32(INT_MAX), Int32(INF_BITS), min_pos)
+            thr_bits = _imax(thr_bits, _select(use_radix, sel_p, fallback))
+        if cutlass.const_expr(self.use_m):
+            thr_bits = _imax(thr_bits, _f32_bits(fp.mul(wmax, mMinP[row_c])))
+        thr = _bitcast_i32_to_f32(thr_bits)
+
+        # ===== the kept set: mass (the masked canonical tree) with the count, outputs ================================
+        mass, count_local = _masked_sum_count(self, loader, leaf, peers, thr_bits)
+        count = red.reduce(count_local, "add", peers)
+        if t == 0:
+            if w == 0:
+                if c_rank == 0:
+                    if row < M:
+                        mThr[row] = thr
+                        mCount[row] = count.to(Int64)
+                        mMass[row] = mass
+                        mS[row] = S
+        if cutlass.const_expr(
+            self.write_mask or self.write_logprobs or self.out_mode != ""
+        ):
+            nlg = Float32(0.0)
+            if cutlass.const_expr(self.write_logprobs):
+                nlg = fp.neg(lg2(fp, mass))
+            inv = Float32(0.0)
+            if cutlass.const_expr(self.out_mode == "probs"):
+                inv = inv_sum(fp, mass)  # lse.row's div(1, s) with the kept mass as s
+            _write_rows(
+                self,
+                loader,
+                leaf,
+                thr_bits,
+                idX,
+                mMask,
+                mLp,
+                mOut,
+                tv_mask,
+                tv_lp,
+                tv_out,
+                tiler_mn,
+                rg,
+                M,
+                N,
+                t,
+                nm,
+                c,
+                nlg,
+                inv,
+            )
+        peers.finish()
+        if enable_pdl:
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+# ---- trace-time helpers (plain Python: static loops, selects, no staged control flow) --------------------------------
+def _alloc_hist(k, smem):
+    """The count histograms (two buffers, a dummy slot each), the mass chunk slots, the per-bin masses (two buffers),
+    for a cluster the gathered cluster-wide bins (counts and masses, two buffers), and for the early finish the
+    candidate list, its counter box and the rank-ordered masses / patterns (each ``CAP`` + a dummy slot)."""
+    hist = mslot = mred = gcnt = gmass = cand = cbox = sq = sp = None
+    if k.use_k or k.use_p:
+        hist = smem.allocate_tensor(
+            Int32, cute.make_layout((2 * (BINS + 1),)), byte_alignment=16
+        )
+        if k.C > 1:
+            gcnt = smem.allocate_tensor(
+                Int32, cute.make_layout((2 * BINS,)), byte_alignment=16
+            )
+        if k.early_finish and k.n_passes > EARLY_AFTER:
+            cand = smem.allocate_tensor(
+                Int32, cute.make_layout((CAP + 1,)), byte_alignment=16
+            )
+            cbox = smem.allocate_tensor(
+                Int32, cute.make_layout((2,)), byte_alignment=16
+            )
+            sq = smem.allocate_tensor(
+                Int64, cute.make_layout((CAP + 1,)), byte_alignment=16
+            )
+            sp = smem.allocate_tensor(
+                Int32, cute.make_layout((CAP + 1,)), byte_alignment=16
+            )
+    if k.use_p:
+        mslot = smem.allocate_tensor(
+            Int32,
+            cute.make_layout(((BINS * RM + LANES) * k.n_chunks,)),
+            byte_alignment=16,
+        )
+        mred = smem.allocate_tensor(
+            Int64, cute.make_layout((2 * BINS,)), byte_alignment=16
+        )
+        if k.C > 1:
+            gmass = smem.allocate_tensor(
+                Int64, cute.make_layout((2 * BINS,)), byte_alignment=16
+            )
+    return hist, mslot, mred, gcnt, gmass, cand, cbox, sq, sp
+
+
+def _clear(tensor, start: int, size: int, tid, zero, n: int):
+    """Zero ``size`` entries of a shared tensor from ``start`` (a static range), ``n`` threads at a time."""
+    for i in range(-(-size // n)):
+        idx = tid + i * n
+        idx = _select(
+            idx < Int32(size), idx, Int32(size - 1)
+        )  # the tail: the last entry zeroed again, harmless
+        tensor[Int32(start) + idx] = zero
+
+
+def _staged_weight(wv, h: int, kind: int, from_logits: bool, nm, c):
+    """Element ``h`` of a staged word as the weight: the word itself (fp32), the bf16 halves widened by a shift, the f16
+    halves by ``cvt.f32.f16``; a logit through the class's ``ex2(shifted(x))``."""
+    if kind == 0:
+        x = _bitcast_i32_to_f32(wv)
+    elif kind == 1:
+        x = (
+            _bitcast_i32_to_f32(wv << 16)
+            if h == 0
+            else _bitcast_i32_to_f32(wv & Int32(-65536))
+        )
+    else:
+        x = _f16_lo(wv) if h == 0 else _f16_hi(wv)
+    if from_logits:
+        return CuteF32.ex2(shifted(CuteF32, x, nm, c))
+    return x
+
+
+@cute.jit
+def _radix_sweep(
+    words: cute.Tensor,
+    n_words: Int32,
+    col0: Int32,
+    N: Int32,
+    tid: Int32,
+    lane: Int32,
+    nm: Float32,
+    c: Float32,
+    scale_fix: Float32,
+    prefix: Int32,
+    base_bits: Int32,
+    cnt_base: Int32,
+    m_base: Int32,
+    p: cutlass.Constexpr[int],
+    shift: cutlass.Constexpr[int],
+    width: cutlass.Constexpr[int],
+    kind: cutlass.Constexpr[int],
+    from_logits: cutlass.Constexpr[bool],
+    by_mass: cutlass.Constexpr[bool],
+    n_chunks: cutlass.Constexpr[int],
+    chunk_bits: cutlass.Constexpr[int],
+    nthreads: cutlass.Constexpr[int],
+    n_iters: cutlass.Constexpr[int],
+    epw: cutlass.Constexpr[int],
+) -> Int32:
+    """One radix pass over the staged words: every candidate element adds one to its digit's bin (and its mass chunks);
+    the smallest candidate pattern (pass 0 of a mass selection) is returned. (No Python-object locals before the
+    runtime loop: the DSL carries every local through it.)"""
+    dmask = Int32((1 << width) - 1)
+    min_pos = Int32(INT_MAX)
+    rep = lane & Int32(RM - 1)
+    dummy_c = cnt_base + Int32(BINS * 4)
+    dummy_m = m_base + (Int32(BINS * RM * n_chunks) + lane * n_chunks) * 4
+    for it in range(n_iters):
+        for m in cutlass.range_constexpr(WPT):
+            idx = Int32(it * (nthreads * WPT) + m * nthreads) + tid
+            valid = idx < n_words
+            idxc = _select(valid, idx, n_words - 1)
+            wv = words[idxc]
+            for h in cutlass.range_constexpr(epw):
+                we = _staged_weight(wv, h, kind, from_logits, nm, c)
+                bits = _weight_bits(we)
+                g = col0 + idxc * epw + h
+                ok = valid & (g < N) & (bits >= base_bits)
+                if cutlass.const_expr(by_mass):
+                    ok = ok & (bits > Int32(0))
+                if cutlass.const_expr(p > 0):
+                    ok = ok & ((bits >> (shift + width)) == prefix)
+                digit = (bits >> shift) & dmask
+                _red_inc_u32(_select(ok, cnt_base + digit * 4, dummy_c))
+                if cutlass.const_expr(by_mass):
+                    q = _cvt_rzi_s64_f32(CuteF32.mul(we, scale_fix))
+                    slot = m_base + ((digit * RM + rep) * n_chunks) * 4
+                    for ch in cutlass.range_constexpr(n_chunks):
+                        part = (
+                            (q >> (ch * chunk_bits)) & Int64((1 << chunk_bits) - 1)
+                        ).to(Int32)
+                        _red_add_u32(
+                            _select(ok, slot + ch * 4, dummy_m + ch * 4),
+                            _select(ok, part, Int32(0)),
+                        )
+                    if cutlass.const_expr(p == 0):
+                        min_pos = _imin(min_pos, _select(ok, bits, Int32(INT_MAX)))
+    return min_pos
+
+
+def _reduce_mass(mslot, mred, buf, tid, n: int, n_chunks: int, chunk_bits: int):
+    """Every bin's chunk replicas summed into the 64-bit mass the scans read (an integer sum; order immaterial)."""
+    for i in range(max(1, BINS // n)):
+        bin_ = (tid + i * n) & Int32(
+            BINS - 1
+        )  # more threads than bins: the same value written twice, harmless
+        tot = Int64(0)
+        for ch in range(n_chunks):
+            parts = [mslot[(bin_ * RM + r) * n_chunks + ch] for r in range(RM)]
+            acc = parts[0]
+            for r in range(1, RM):
+                acc = acc + parts[r]
+            tot = tot + ((acc.to(Int64) & Int64(I64_MASK)) << (ch * chunk_bits))
+        mred[Int32(buf * BINS) + bin_] = tot
+
+
+def _scan_bins(hist, mred, gcnt, gmass, buf, lane, by_mass: bool, rem_k, rem_m, C: int):
+    """Every warp: the bins from the top, 8 per lane, with an exact integer prefix over the lanes. Returns ``(any, bin,
+    count above, mass above, total count, total mass, the selected bin's count)`` -- the first bin (from the top) with
+    elements whose running count (mass) reaches the remaining goal."""
+    cs, ms, bins = [], [], []
+    for i in range(BINS_PER_LANE):
+        b = Int32(BINS - 1 - i) - lane * BINS_PER_LANE
+        bins.append(b)
+        if C > 1:  # the cluster-wide bins, gathered into this CTA's smem
+            cnt = gcnt[Int32(buf * BINS) + b]
+            m = gmass[Int32(buf * BINS) + b] if by_mass else Int64(0)
+        else:
+            cnt = hist[Int32(buf * (BINS + 1)) + b]
+            m = mred[Int32(buf * BINS) + b] if by_mass else Int64(0)
+        cs.append(cnt)
+        ms.append(m)
+    tc = cs[0]
+    tm = ms[0]
+    for i in range(1, BINS_PER_LANE):
+        tc = tc + cs[i]
+        tm = tm + ms[i]
+    inc_c, inc_m = tc, tm
+    for d in (1, 2, 4, 8, 16):
+        oc = cute.arch.shuffle_sync_up(inc_c, offset=d)
+        inc_c = _select(lane >= Int32(d), inc_c + oc, inc_c)
+        if by_mass:
+            om = _shfl_up_i64(inc_m, d)
+            inc_m = _select(lane >= Int32(d), inc_m + om, inc_m)
+    cum_c = inc_c - tc
+    cum_m = inc_m - tm
+    tot_c = cute.arch.shuffle_sync(inc_c, offset=LANES - 1)
+    tot_m = _shfl_idx_i64(inc_m, LANES - 1) if by_mass else Int64(0)
+    found = Boolean(False)
+    sel = Int32(0)
+    sel_c = Int32(0)
+    ab_c = Int32(0)
+    ab_m = Int64(0)
+    for i in range(BINS_PER_LANE):
+        nc = cum_c + cs[i]
+        nmv = cum_m + ms[i]
+        cond = (nmv >= rem_m) if by_mass else (nc >= rem_k)
+        hit = _select(found, Boolean(False), (cs[i] > Int32(0)) & cond)
+        sel = _select(hit, bins[i], sel)
+        sel_c = _select(hit, cs[i], sel_c)
+        ab_c = _select(hit, cum_c, ab_c)
+        ab_m = _select(hit, cum_m, ab_m)
+        found = found | hit
+        cum_c = nc
+        cum_m = nmv
+    hit_lane = _select(found, lane, Int32(LANES))
+    for mask in (1, 2, 4, 8, 16):
+        hit_lane = _imin(hit_lane, cute.arch.shuffle_sync_bfly(hit_lane, offset=mask))
+    anyhit = hit_lane < Int32(LANES)
+    src = _select(anyhit, hit_lane, Int32(0))
+    sel = cute.arch.shuffle_sync(sel, offset=src)
+    sel_c = cute.arch.shuffle_sync(sel_c, offset=src)
+    ab_c = cute.arch.shuffle_sync(ab_c, offset=src)
+    if by_mass:
+        ab_m = _shfl_idx_i64(ab_m, src)
+    return anyhit, sel, ab_c, ab_m, tot_c, tot_m, sel_c
+
+
+def _cluster_reduce(
+    hist, mred, gcnt, gmass, buf, tid, by_mass: bool, C: int, n: int, c_rank
+):
+    """The cluster-wide bins in two rounds: (1) every CTA publishes its bins and CTA ``r`` sums bins ``[r * 256 / C,
+    (r + 1) * 256 / C)`` over the peers (one remote load per peer per bin, issued back to back) into its ``gcnt`` /
+    ``gmass`` of this buffer; (2) a barrier publishes those, and every CTA gathers all 256 reduced bins from their owners
+    into its own ``gcnt`` / ``gmass`` -- one remote load per thread per array. Two cluster round trips per pass; the scans
+    then read local shared memory. (The caller accounts the two exchanges to the peers.)"""
+    per = BINS // C  # bins each CTA owns
+    # round 1: publish, then the owner sums its bins over the peers (a thread per owned bin; the result parks in
+    # gcnt / gmass at the owned bin's index, this buffer -- only the owner writes those entries before the second barrier)
+    cute.arch.cluster_arrive()
+    cute.arch.cluster_wait()
+    hb = [
+        _map_shared_rank(hist.iterator, Int32(sid)) + Int32(buf * (BINS + 1) * 4)
+        for sid in range(C)
+    ]
+    mb = (
+        [
+            _map_shared_rank(mred.iterator, Int32(sid)) + Int32(buf * BINS * 8)
+            for sid in range(C)
+        ]
+        if by_mass
+        else None
+    )
+    for i in range(max(1, per // n)):
+        j = (tid + i * n) & Int32(per - 1)  # C and BINS are powers of two
+        b = c_rank * per + j
+        parts = [_ld_shared_cluster_i32(hb[sid] + b * 4) for sid in range(C)]
+        acc = parts[0]
+        for sid in range(1, C):
+            acc = acc + parts[sid]
+        gcnt[Int32(buf * BINS) + b] = acc
+        if by_mass:
+            mparts = [_ld_shared_cluster_i64(mb[sid] + b * 8) for sid in range(C)]
+            macc = mparts[0]
+            for sid in range(1, C):
+                macc = macc + mparts[sid]
+            gmass[Int32(buf * BINS) + b] = macc
+    # round 2: publish the owned sums, gather every owner's bins
+    cute.arch.cluster_arrive()
+    cute.arch.cluster_wait()
+    gb = [
+        _map_shared_rank(gcnt.iterator, Int32(sid)) + Int32(buf * BINS * 4)
+        for sid in range(C)
+    ]
+    gm = (
+        [
+            _map_shared_rank(gmass.iterator, Int32(sid)) + Int32(buf * BINS * 8)
+            for sid in range(C)
+        ]
+        if by_mass
+        else None
+    )
+    for i in range(max(1, BINS // n)):
+        b = (tid + i * n) & Int32(BINS - 1)
+        owner = (
+            b // per
+        )  # every thread fetches bin b from its owner: one load per array
+        base_c = gb[0]
+        for sid in range(1, C):
+            base_c = _select(owner == Int32(sid), gb[sid], base_c)
+        cnt = _ld_shared_cluster_i32(base_c + b * 4)
+        if by_mass:
+            base_m = gm[0]
+            for sid in range(1, C):
+                base_m = _select(owner == Int32(sid), gm[sid], base_m)
+            mv = _ld_shared_cluster_i64(base_m + b * 8)
+        gcnt[Int32(buf * BINS) + b] = (
+            cnt  # (our own bins come back through mapa to our own smem)
+        )
+        if by_mass:
+            gmass[Int32(buf * BINS) + b] = mv
+    cute.arch.barrier()
+
+
+def _pass(
+    p: int,
+    words,
+    n_words,
+    col0,
+    N,
+    tid,
+    lane,
+    nm,
+    c,
+    scale_fix,
+    base_bits,
+    prefix,
+    rem_k,
+    rem_m,
+    hist,
+    mslot,
+    mred,
+    gcnt,
+    gmass,
+    hbase,
+    mbase,
+    c_rank,
+    C: int,
+    n: int,
+    n_iters: int,
+    n_chunks: int,
+    chunk_bits: int,
+    kind: int,
+    from_logits: bool,
+    by_mass: bool,
+):
+    """One radix pass: clear, sweep, (reduce the masses,) the cluster reduction, the scan. Returns ``(prefix, rem_k,
+    rem_m, the sweep's smallest candidate pattern, total count, total mass, the selected bin's count)``."""
+    shift, width = PASS_SHIFTS[p], PASS_WIDTHS[p]
+    buf = p % 2
+    _clear(hist, buf * (BINS + 1), BINS + 1, tid, Int32(0), n)
+    if by_mass:
+        _clear(mslot, 0, (BINS * RM + LANES) * n_chunks, tid, Int32(0), n)
+    cute.arch.barrier()
+    mp = _radix_sweep(
+        words,
+        n_words,
+        col0,
+        N,
+        tid,
+        lane,
+        nm,
+        c,
+        scale_fix,
+        prefix,
+        base_bits,
+        hbase + Int32(buf * (BINS + 1) * 4),
+        mbase,
+        p,
+        shift,
+        width,
+        kind,
+        from_logits,
+        by_mass,
+        n_chunks,
+        chunk_bits,
+        n,
+        n_iters,
+        1 if kind == 0 else 2,
+    )
+    cute.arch.barrier()
+    if by_mass:
+        _reduce_mass(mslot, mred, buf, tid, n, n_chunks, chunk_bits)
+        cute.arch.barrier()
+    if C > 1:
+        _cluster_reduce(hist, mred, gcnt, gmass, buf, tid, by_mass, C, n, c_rank)
+    anyhit, sel, ab_c, ab_m, tot_c, tot_m, sel_c = _scan_bins(
+        hist, mred, gcnt, gmass, buf, lane, by_mass, rem_k, rem_m, C
+    )
+    prefix = (prefix << width) | _select(anyhit, sel, Int32(0))
+    rem_k = _select(anyhit, rem_k - ab_c, rem_k)
+    if by_mass:
+        rem_m = _select(anyhit, rem_m - ab_m, rem_m)
+    return prefix, rem_k, rem_m, mp, tot_c, tot_m, _select(anyhit, sel_c, Int32(0))
+
+
+@cute.jit
+def _compact_sweep(
+    words: cute.Tensor,
+    n_words: Int32,
+    col0: Int32,
+    N: Int32,
+    tid: Int32,
+    lane: Int32,
+    nm: Float32,
+    c: Float32,
+    prefix: Int32,
+    base_bits: Int32,
+    cand: cute.Tensor,
+    cnt_addr: Int32,
+    shift: cutlass.Constexpr[int],
+    kind: cutlass.Constexpr[int],
+    from_logits: cutlass.Constexpr[bool],
+    by_mass: cutlass.Constexpr[bool],
+    nthreads: cutlass.Constexpr[int],
+    n_iters: cutlass.Constexpr[int],
+    epw: cutlass.Constexpr[int],
+):
+    """The early finish's compaction: the patterns of the selected bin's candidates (``bits >> shift == prefix``, the
+    same candidates the pass counted) appended to ``cand`` -- warp-aggregated: a word batch with candidates reserves
+    its slots with one ``atom.shared.add`` by lane 0, the lanes' ranks within the ballot place them; a candidate past
+    the list's capacity goes to the dummy slot ``CAP`` (the caller takes this path only when the count fits)."""
+    lane_lt = (Int32(1) << lane) - Int32(1)
+    for it in range(n_iters):
+        for m in cutlass.range_constexpr(WPT):
+            idx = Int32(it * (nthreads * WPT) + m * nthreads) + tid
+            valid = idx < n_words
+            idxc = _select(valid, idx, n_words - 1)
+            wv = words[idxc]
+            for h in cutlass.range_constexpr(epw):
+                we = _staged_weight(wv, h, kind, from_logits, nm, c)
+                bits = _weight_bits(we)
+                g = col0 + idxc * epw + h
+                ok = valid & (g < N) & (bits >= base_bits) & ((bits >> shift) == prefix)
+                if cutlass.const_expr(by_mass):
+                    ok = ok & (bits > Int32(0))
+                ballot = cute.arch.vote_ballot_sync(ok)
+                n_w = _popc(ballot)
+                if n_w > Int32(0):
+                    old = Int32(0)
+                    if lane == Int32(0):
+                        old = _atom_add_u32(cnt_addr, n_w)
+                    base = cute.arch.shuffle_sync(old, offset=0)
+                    slot = base + _popc(ballot & lane_lt)
+                    slot = _select(ok & (slot < Int32(CAP)), slot, Int32(CAP))
+                    cand[slot] = bits
+
+
+@cute.jit
+def _select_small(
+    cand: cute.Tensor,
+    sq: cute.Tensor,
+    sp: cute.Tensor,
+    n_all: Int32,
+    lane: Int32,
+    warp: Int32,
+    rem_k: Int32,
+    rem_m: Int64,
+    scale_fix: Float32,
+    by_mass: cutlass.Constexpr[bool],
+) -> Int32:
+    """The exact selection over the compacted candidates (at most ``CAP``, two per lane): every candidate's rank in
+    descending pattern order (ties by list position), then the ``rem_k``-th largest pattern, or -- the masses written in
+    rank order, an exact 64-bit prefix over the lanes -- the first pattern in rank order at which the running mass
+    reaches ``rem_m`` (the first candidate when ``rem_m`` is 0, as the bin scan selects the first non-empty bin).
+    Every warp computes the same value from the same list; no candidate (``n_all == 0``) gives 0."""
+    i0 = lane
+    i1 = lane + Int32(LANES)
+    v0 = i0 < n_all
+    v1 = i1 < n_all
+    p0 = cand[_select(v0, i0, Int32(CAP))]
+    p1 = cand[_select(v1, i1, Int32(CAP))]
+    r0 = Int32(0)
+    r1 = Int32(0)
+    for j in cutlass.range_constexpr(CAP):
+        vj = Int32(j) < n_all
+        pj = cand[_select(vj, Int32(j), Int32(CAP))]
+        r0 = r0 + _select(
+            vj & ((pj > p0) | ((pj == p0) & (Int32(j) < i0))), Int32(1), Int32(0)
+        )
+        r1 = r1 + _select(
+            vj & ((pj > p1) | ((pj == p1) & (Int32(j) < i1))), Int32(1), Int32(0)
+        )
+    if cutlass.const_expr(by_mass):
+        # the masses of the candidates (the same op on the same bits as the passes), in rank order
+        q0 = _cvt_rzi_s64_f32(CuteF32.mul(_bitcast_i32_to_f32(p0), scale_fix))
+        q1 = _cvt_rzi_s64_f32(CuteF32.mul(_bitcast_i32_to_f32(p1), scale_fix))
+        if warp == Int32(0):
+            sq[_select(v0, r0, Int32(CAP))] = _select(v0, q0, Int64(0))
+            sp[_select(v0, r0, Int32(CAP))] = _select(v0, p0, Int32(0))
+            sq[_select(v1, r1, Int32(CAP))] = _select(v1, q1, Int64(0))
+            sp[_select(v1, r1, Int32(CAP))] = _select(v1, p1, Int32(0))
+        cute.arch.barrier()
+        a0 = _select(v0, sq[i0], Int64(0))
+        a1 = _select(v1, sq[i1], Int64(0))
+        inc0 = a0
+        for d in cutlass.range_constexpr(5):
+            o = _shfl_up_i64(inc0, 1 << d)
+            inc0 = _select(lane >= Int32(1 << d), inc0 + o, inc0)
+        tot0 = _shfl_idx_i64(inc0, LANES - 1)
+        inc1 = a1
+        for d in cutlass.range_constexpr(5):
+            o = _shfl_up_i64(inc1, 1 << d)
+            inc1 = _select(lane >= Int32(1 << d), inc1 + o, inc1)
+        inc1 = inc1 + tot0
+        hit0 = v0 & (inc0 >= rem_m) & ((inc0 - a0 < rem_m) | (i0 == Int32(0)))
+        hit1 = v1 & (inc1 >= rem_m) & (inc1 - a1 < rem_m)
+        res = _select(hit0, sp[i0], _select(hit1, sp[i1], Int32(0)))
+        cute.arch.barrier()  # the next writer of sq / sp (the other filter's early finish) waits for every reader
+    else:
+        hit0 = v0 & (r0 == rem_k - Int32(1))
+        hit1 = v1 & (r1 == rem_k - Int32(1))
+        res = _select(hit0, p0, _select(hit1, p1, Int32(0)))
+    for mask in cutlass.range_constexpr(5):
+        res = _imax(res, cute.arch.shuffle_sync_bfly(res, offset=1 << mask))
+    return res
+
+
+@cute.jit
+def _passes_tail(
+    words: cute.Tensor,
+    n_words: Int32,
+    col0: Int32,
+    N: Int32,
+    tid: Int32,
+    lane: Int32,
+    nm: Float32,
+    c: Float32,
+    scale_fix: Float32,
+    base_bits: Int32,
+    prefix: Int32,
+    rem_k: Int32,
+    rem_m: Int64,
+    hist: cute.Tensor,
+    mslot: cute.Tensor,
+    mred: cute.Tensor,
+    gcnt: cute.Tensor,
+    gmass: cute.Tensor,
+    hbase: Int32,
+    mbase: Int32,
+    c_rank: Int32,
+    C: cutlass.Constexpr[int],
+    nthreads: cutlass.Constexpr[int],
+    n_iters: cutlass.Constexpr[int],
+    n_chunks: cutlass.Constexpr[int],
+    chunk_bits: cutlass.Constexpr[int],
+    kind: cutlass.Constexpr[int],
+    from_logits: cutlass.Constexpr[bool],
+    by_mass: cutlass.Constexpr[bool],
+    n_pass: cutlass.Constexpr[int],
+) -> Int32:
+    """The remaining radix passes (the early finish's other branch): the passes the plain form runs; the pattern is the
+    final prefix shifted by the last pass's digit position."""
+    for p in cutlass.range_constexpr(EARLY_AFTER, n_pass):
+        prefix, rem_k, rem_m, _, _, _, _ = _pass(
+            p,
+            words,
+            n_words,
+            col0,
+            N,
+            tid,
+            lane,
+            nm,
+            c,
+            scale_fix,
+            base_bits,
+            prefix,
+            rem_k,
+            rem_m,
+            hist,
+            mslot,
+            mred,
+            gcnt,
+            gmass,
+            hbase,
+            mbase,
+            c_rank,
+            C,
+            nthreads,
+            n_iters,
+            n_chunks,
+            chunk_bits,
+            kind,
+            from_logits,
+            by_mass,
+        )
+    return prefix << PASS_SHIFTS[n_pass - 1]
+
+
+@cute.jit
+def _finish_small(
+    words: cute.Tensor,
+    n_words: Int32,
+    col0: Int32,
+    N: Int32,
+    tid: Int32,
+    lane: Int32,
+    warp: Int32,
+    nm: Float32,
+    c: Float32,
+    scale_fix: Float32,
+    base_bits: Int32,
+    prefix: Int32,
+    rem_k: Int32,
+    rem_m: Int64,
+    cand: cute.Tensor,
+    cbox: cute.Tensor,
+    sq: cute.Tensor,
+    sp: cute.Tensor,
+    c_rank: Int32,
+    C: cutlass.Constexpr[int],
+    nthreads: cutlass.Constexpr[int],
+    n_iters: cutlass.Constexpr[int],
+    kind: cutlass.Constexpr[int],
+    from_logits: cutlass.Constexpr[bool],
+    by_mass: cutlass.Constexpr[bool],
+) -> Int32:
+    """The early finish: compact the selected bin's candidates (every CTA its share; a cluster's CTAs append the peers'
+    lists through ``mapa``, so every CTA selects over the same set), then the exact rank selection over the list."""
+    if tid == Int32(0):
+        cbox[0] = Int32(0)
+    cute.arch.barrier()
+    _compact_sweep(
+        words,
+        n_words,
+        col0,
+        N,
+        tid,
+        lane,
+        nm,
+        c,
+        prefix,
+        base_bits,
+        cand,
+        _smem_base(cbox),
+        PASS_SHIFTS[EARLY_AFTER - 1],
+        kind,
+        from_logits,
+        by_mass,
+        nthreads,
+        n_iters,
+        1 if kind == 0 else 2,
+    )
+    cute.arch.barrier()
+    n_all = cbox[0]
+    if cutlass.const_expr(C > 1):
+        cute.arch.cluster_arrive()
+        cute.arch.cluster_wait()
+        off = n_all
+        for sid in cutlass.range_constexpr(C):
+            cnt_s = _ld_shared_cluster_i32(_map_shared_rank(cbox.iterator, Int32(sid)))
+            cnt_s = _select(Int32(sid) == c_rank, Int32(0), cnt_s)
+            base_s = _map_shared_rank(cand.iterator, Int32(sid))
+            if warp == Int32(0):
+                for s in cutlass.range_constexpr(CAP // LANES):
+                    j = lane + Int32(s * LANES)
+                    ok = j < cnt_s
+                    v = _ld_shared_cluster_i32(base_s + _select(ok, j, Int32(0)) * 4)
+                    dst = off + j
+                    cand[_select(ok & (dst < Int32(CAP)), dst, Int32(CAP))] = v
+            off = off + cnt_s
+        n_all = off
+        cute.arch.barrier()
+    n_all = _imin(n_all, Int32(CAP))
+    res = _select_small(
+        cand, sq, sp, n_all, lane, warp, rem_k, rem_m, scale_fix, by_mass
+    )
+    return res
+
+
+@cute.jit
+def _select_tail(
+    small: Boolean,
+    words: cute.Tensor,
+    n_words: Int32,
+    col0: Int32,
+    N: Int32,
+    tid: Int32,
+    lane: Int32,
+    warp: Int32,
+    nm: Float32,
+    c: Float32,
+    scale_fix: Float32,
+    base_bits: Int32,
+    prefix: Int32,
+    rem_k: Int32,
+    rem_m: Int64,
+    hist: cute.Tensor,
+    mslot: cute.Tensor,
+    mred: cute.Tensor,
+    gcnt: cute.Tensor,
+    gmass: cute.Tensor,
+    cand: cute.Tensor,
+    cbox: cute.Tensor,
+    sq: cute.Tensor,
+    sp: cute.Tensor,
+    hbase: Int32,
+    mbase: Int32,
+    c_rank: Int32,
+    C: cutlass.Constexpr[int],
+    nthreads: cutlass.Constexpr[int],
+    n_iters: cutlass.Constexpr[int],
+    n_chunks: cutlass.Constexpr[int],
+    chunk_bits: cutlass.Constexpr[int],
+    kind: cutlass.Constexpr[int],
+    from_logits: cutlass.Constexpr[bool],
+    by_mass: cutlass.Constexpr[bool],
+    n_pass: cutlass.Constexpr[int],
+) -> Int32:
+    """After the first two passes: the early finish when the selected bin's candidates fit the list (``small``, a
+    cluster-uniform value), else the remaining passes."""
+    result = Int32(0)
+    if small:
+        result = _finish_small(
+            words,
+            n_words,
+            col0,
+            N,
+            tid,
+            lane,
+            warp,
+            nm,
+            c,
+            scale_fix,
+            base_bits,
+            prefix,
+            rem_k,
+            rem_m,
+            cand,
+            cbox,
+            sq,
+            sp,
+            c_rank,
+            C,
+            nthreads,
+            n_iters,
+            kind,
+            from_logits,
+            by_mass,
+        )
+    else:
+        result = _passes_tail(
+            words,
+            n_words,
+            col0,
+            N,
+            tid,
+            lane,
+            nm,
+            c,
+            scale_fix,
+            base_bits,
+            prefix,
+            rem_k,
+            rem_m,
+            hist,
+            mslot,
+            mred,
+            gcnt,
+            gmass,
+            hbase,
+            mbase,
+            c_rank,
+            C,
+            nthreads,
+            n_iters,
+            n_chunks,
+            chunk_bits,
+            kind,
+            from_logits,
+            by_mass,
+            n_pass,
+        )
+    return result
+
+
+def _radix_select(
+    k, rx, tid, lane, by_mass, goal_k, goal_m, scale_fix, base_bits, peers, red
+):
+    """The threshold pattern among the candidates (present, pattern ``>= base_bits``; for the mass goal also positive):
+    the ``goal_k``-th largest pattern, or the largest pattern whose upward-closed fixed-point mass reaches ``goal_m``.
+    Returns ``(pattern, candidate count, candidate mass, smallest candidate pattern)`` -- the last three from the first
+    pass (INT_MAX when there is no candidate), for the mass goal's fallback. The pass count is the input kind's
+    (``n_passes_for``: the pattern is the final prefix shifted); with the early finish (the policy ``k.early_finish``:
+    the mass selection, every selection, or none) the passes after the second are replaced by the compaction and the
+    rank selection when the selected bin's candidates fit the list."""
+    n_pass = k.n_passes
+    use_ef = (
+        bool(k.early_finish)
+        and (k.early_finish == "all" or by_mass)
+        and n_pass > EARLY_AFTER
+    )
+    C = k.C
+    n = k.num_threads
+    n_iters = -(-(k.cfg.blocks_per_cta(k.N) * BLOCK * k.elem_bytes // 4) // (n * WPT))
+    hbase = _smem_base(rx.hist)
+    mbase = _smem_base(rx.mslot) if by_mass else Int32(0)
+    c_rank = peers.cta_rank
+    # the tensors the jit tail takes (never dereferenced when unused: gated by their constexpr flags)
+    mslot = rx.mslot if by_mass else rx.hist
+    mred = rx.mred if by_mass else rx.hist
+    gcnt = rx.gcnt if C > 1 else rx.hist
+    gmass = rx.gmass if (C > 1 and by_mass) else rx.hist
+    prefix = Int32(0)
+    rem_k, rem_m = goal_k, goal_m
+    tot_c0, tot_m0 = Int32(0), Int64(0)
+    min_pos = Int32(INT_MAX)
+    sel_c = Int32(0)
+    for p in range(EARLY_AFTER if use_ef else n_pass):
+        prefix, rem_k, rem_m, mp, tot_c, tot_m, sel_c = _pass(
+            p,
+            rx.words,
+            rx.n_words,
+            rx.col0,
+            rx.N,
+            tid,
+            lane,
+            rx.nm,
+            rx.c,
+            scale_fix,
+            base_bits,
+            prefix,
+            rem_k,
+            rem_m,
+            rx.hist,
+            mslot,
+            mred,
+            gcnt,
+            gmass,
+            hbase,
+            mbase,
+            c_rank,
+            C,
+            n,
+            n_iters,
+            k.n_chunks,
+            k.chunk_bits,
+            rx.kind,
+            rx.from_logits,
+            by_mass,
+        )
+        if C > 1:
+            peers.n_cluster_exchanges += 2
+        if p == 0:
+            tot_c0, tot_m0 = tot_c, tot_m
+            if by_mass:
+                min_pos = mp
+    if use_ef:
+        small = sel_c <= Int32(
+            CAP
+        )  # cluster-uniform: every CTA scanned the same reduced bins
+        prefix = _select_tail(
+            small,
+            rx.words,
+            rx.n_words,
+            rx.col0,
+            rx.N,
+            tid,
+            lane,
+            peers.warp_id,
+            rx.nm,
+            rx.c,
+            scale_fix,
+            base_bits,
+            prefix,
+            rem_k,
+            rem_m,
+            rx.hist,
+            mslot,
+            mred,
+            gcnt,
+            gmass,
+            rx.cand,
+            rx.cbox,
+            rx.sq,
+            rx.sp,
+            hbase,
+            mbase,
+            c_rank,
+            C,
+            n,
+            n_iters,
+            k.n_chunks,
+            k.chunk_bits,
+            rx.kind,
+            rx.from_logits,
+            by_mass,
+            n_pass,
+        )
+        if C > 1:
+            peers.n_cluster_exchanges += 1
+    else:
+        prefix = prefix << PASS_SHIFTS[n_pass - 1]
+    if by_mass:
+        min_pos = red.reduce(min_pos, "min", peers)
+    return prefix, tot_c0, tot_m0, min_pos
+
+
+def _masked_sum(k, leaf, peers, thr_bits):
+    """The canonical sum tree over the weights with pattern ``>= thr_bits`` (the others ``+0``)."""
+    fp = CuteF32
+
+    def masked_leaf(key):
+        we = leaf(key)
+        return _select(_weight_bits(we) >= thr_bits, we, Float32(0.0))
+
+    state, start = canon.init_state(k.plan_sum, fp, masked_leaf)
+    return canon.run(k.plan_sum, state, start, peers, fp)
+
+
+def _masked_sum_count(k, loader, leaf, peers, thr_bits):
+    """The kept mass (the masked canonical tree) and this thread's kept count, from one sweep: the leaf closure counts
+    the present elements it keeps while the engine's fold reads it."""
+    fp = CuteF32
+    plan = k.plan_sum
+    ri_block, ri_elem = plan.reg_index("block"), plan.reg_index("elem")
+    cnt = [Int32(0)]
+
+    def masked_leaf(key):
+        we = leaf(key)
+        keep = _weight_bits(we) >= thr_bits
+        kk = key[ri_block] if ri_block is not None else 0
+        present = loader.block(kk)[0][key[ri_elem] // k.vec, 0, 0]
+        cnt[0] = cnt[0] + _select(present & keep, Int32(1), Int32(0))
+        return _select(keep, we, Float32(0.0))
+
+    state, start = canon.init_state(plan, fp, masked_leaf)
+    mass = canon.run(plan, state, start, peers, fp)
+    return mass, cnt[0]
+
+
+def _write_rows(
+    k,
+    loader,
+    leaf,
+    thr_bits,
+    idX,
+    mMask,
+    mLp,
+    mOut,
+    tv_mask,
+    tv_lp,
+    tv_out,
+    tiler_mn,
+    rg,
+    M,
+    N,
+    t,
+    nm,
+    c,
+    nlg,
+    inv,
+):
+    """The row outputs of this thread's blocks: the mask, the renormalised log-probabilities, and the input-dtype
+    output -- the renormalised probabilities ``cvt(mul(w_j, div(1, mass)))`` (``lse.row``'s ``prob`` chain with the kept
+    mass; ``+0`` outside the kept set) or the masked logits (the input, ``-inf`` outside the kept set)."""
+    fp = CuteF32
+    plan = k.plan_sum
+    ri = plan.reg_index("block")
+    if k.write_mask:
+        thr_m, atom_m = _tiled_copy(mMask, k.mask_vec * 8, tv_mask, tiler_mn, t)
+    if k.write_logprobs:
+        thr_l, atom_l = _tiled_copy(mLp, k.lp_vec * 32, tv_lp, tiler_mn, t)
+    if k.out_mode:
+        thr_o, atom_o = _tiled_copy(
+            mOut, k.out_vec * mOut.element_type.width, tv_out, tiler_mn, t
+        )
+    for kk in range(k.kpw):
+        kg = loader.k_global(kk)
+        cY = cute.local_tile(idX, tiler_mn, (rg, kg))
+        if k.write_mask:
+            gM = thr_m.partition_S(cute.local_tile(mMask, tiler_mn, (rg, kg)))
+            fm = cute.make_fragment_like(gM)
+            pm = _predicate(thr_m.partition_S(cY), M, N)
+        if k.write_logprobs:
+            gL = thr_l.partition_S(cute.local_tile(mLp, tiler_mn, (rg, kg)))
+            fl = cute.make_fragment_like(gL)
+            pl = _predicate(thr_l.partition_S(cY), M, N)
+        if k.out_mode:
+            gO = thr_o.partition_S(cute.local_tile(mOut, tiler_mn, (rg, kg)))
+            fo = cute.make_fragment_like(gO)
+            po = _predicate(thr_o.partition_S(cY), M, N)
+        for e in range(V):
+            key = (
+                tuple(kk if i == ri else e for i in range(plan.n_reg))
+                if ri is not None
+                else (e,)
+            )
+            we = leaf(key)
+            keep = _weight_bits(we) >= thr_bits
+            if k.write_mask:
+                fm[e] = _select(keep, Uint8(1), Uint8(0))
+            if k.write_logprobs:
+                lp = logp(fp, shifted(fp, loader.x(kk, e), nm, c), nlg)
+                fl[e] = _select(keep, lp, Float32(NAN))
+            if k.out_mode == "probs":
+                fo[e] = _select(keep, prob(fp, we, inv), Float32(0.0)).to(
+                    mOut.element_type
+                )
+            elif k.out_mode == "masked":
+                fo[e] = _select(keep, loader.x(kk, e), Float32(NEG_INF)).to(
+                    mOut.element_type
+                )
+        if k.write_mask:
+            cute.copy(atom_m, fm, gM, pred=pm)
+        if k.write_logprobs:
+            cute.copy(atom_l, fl, gL, pred=pl)
+        if k.out_mode:
+            cute.copy(atom_o, fo, gO, pred=po)
+
+
+def kernel_name(
+    dtype_str: str,
+    Kp: int,
+    cfg: LSEConfig,
+    from_logits: bool,
+    filters: Filters,
+    temp_rows: bool,
+    write_mask: bool,
+    write_logprobs: bool,
+    mask_vec: int,
+    lp_vec: int,
+    enable_pdl: bool,
+    out_mode: str = "",
+    out_vec: int = 1,
+    early_finish: str = "mass",
+    study: str = "",
+) -> str:
+    """The cache object's name: one per (dtype, Kp bucket, config, input kind, filter set, temperature form, outputs,
+    pdl, the selection's placement)."""
+    return jit.sanitize_symbol_name(
+        f"support_{'logits' if from_logits else 'probs'}_{filters.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}_"
+        f"{'trow' if temp_rows else 'tconst'}{f'_mask{mask_vec}' if write_mask else ''}"
+        f"{f'_lp{lp_vec}' if write_logprobs else ''}{f'_{out_mode}{out_vec}' if out_mode else ''}"
+        f"_pdl{int(enable_pdl)}{f'_ef{early_finish}' if early_finish else ''}{f'_{study}' if study else ''}"
+    )
+
+
+def get_compiled_kernel(
+    dtype_str: str,
+    N: int,
+    cfg: LSEConfig,
+    from_logits: bool,
+    filters: Filters,
+    temp_rows: bool,
+    write_mask: bool,
+    write_logprobs: bool,
+    mask_vec: int,
+    lp_vec: int,
+    enable_pdl: bool,
+    out_mode: str = "",
+    out_vec: int = 1,
+    early_finish: str = "mass",
+    study: str = "",
+):
+    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, filter set,
+    temperature form, outputs, pdl, placement); ``N``, ``M`` and the row strides are runtime arguments."""
+    from .schedule import padded_blocks
+
+    return _compile_bucket(
+        dtype_str,
+        padded_blocks(N),
+        cfg,
+        from_logits,
+        filters,
+        temp_rows,
+        write_mask,
+        write_logprobs,
+        mask_vec,
+        lp_vec,
+        enable_pdl,
+        out_mode,
+        out_vec,
+        early_finish,
+        study,
+    )
+
+
+@functools.cache
+def _compile_bucket(
+    dtype_str,
+    Kp,
+    cfg,
+    from_logits,
+    filters,
+    temp_rows,
+    write_mask,
+    write_logprobs,
+    mask_vec,
+    lp_vec,
+    enable_pdl,
+    out_mode,
+    out_vec,
+    early_finish,
+    study,
+):
+    """Compile, or load from the cache, the kernel of one Kp bucket and specialisation."""
+    from ..fp_interface.cute import get_cutlass_dtype
+
+    dtype = get_cutlass_dtype(dtype_str)
+    name = kernel_name(
+        dtype_str,
+        Kp,
+        cfg,
+        from_logits,
+        filters,
+        temp_rows,
+        write_mask,
+        write_logprobs,
+        mask_vec,
+        lp_vec,
+        enable_pdl,
+        out_mode,
+        out_vec,
+        early_finish,
+        study,
+    )
+
+    def compile_fn():
+        obj = SupportRowKernel(
+            dtype,
+            Kp,
+            cfg,
+            from_logits,
+            filters,
+            temp_rows,
+            write_mask,
+            write_logprobs,
+            mask_vec,
+            lp_vec,
+            out_mode,
+            out_vec,
+            early_finish,
+            study,
+        )
+        sym_m, sym_n = cute.sym_int(64), cute.sym_int(32)
+
+        def rows(dt, vec, shape):
+            return cute.runtime.make_fake_tensor(
+                dt,
+                shape,
+                (cute.sym_int64(divisibility=vec), 1),
+                assumed_align=max(vec * (dt.width // 8), 1),
+            )
+
+        def vector(dt, align):
+            # every per-row vector has its own size symbol: the FFI entry then checks ndim / dtype only, so the unused
+            # ones may be small dummies
+            return cute.runtime.make_fake_tensor(
+                dt, (cute.sym_int(32),), (1,), assumed_align=align
+            )
+
+        x = rows(dtype, cfg.vec_elems, (sym_m, sym_n))
+        dummy2 = (cute.sym_int(64), cute.sym_int(32))
+        mask = rows(Uint8, mask_vec, (sym_m, sym_n) if write_mask else dummy2)
+        lp = rows(Float32, lp_vec, (sym_m, sym_n) if write_logprobs else dummy2)
+        out = rows(dtype, out_vec, (sym_m, sym_n) if out_mode else dummy2)
+        args = (
+            x,
+            vector(Int32, 4),
+            vector(Float32, 4),
+            vector(Float32, 4),
+            vector(Float32, 4),
+            vector(Float32, 4),
+            vector(Int64, 8),
+            vector(Float32, 4),
+            vector(Float32, 4),
+            mask,
+            lp,
+            out,
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return cute.compile(
+            obj,
+            *args,
+            Float32(1.0),
+            Int64(1),
+            Int32(1),
+            enable_pdl,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return jit.build_and_load(SUPPORT_MODULE, name, compile_fn)

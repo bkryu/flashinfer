@@ -3,7 +3,9 @@
 """The batch-invariant sampling classes: the row log-sum-exp class ``lse.row`` behind
 ``flashinfer.sampling.softmax(..., batch_invariant=True)`` and ``flashinfer.sampling.log_probs`` (``api``), and the
 inverse-CDF draw ``sample.icdf.v1`` behind ``sampling_from_probs(..., batch_invariant=True)`` /
-``sampling_from_logits(..., batch_invariant=True)`` (``draw_api``) on the request-keyed stream (``stream``). Light imports
+``sampling_from_logits(..., batch_invariant=True)`` (``draw_api``) on the request-keyed stream (``stream``), and the
+support class ``support.row.v1`` behind ``top_k_renorm_probs`` / ``top_p_renorm_probs`` / ``top_k_mask_logits(...,
+batch_invariant=True)`` (``support_api``). Light imports
 only: the CuTe-DSL kernel modules are imported on first use.
 
 The kernels' compiled-object cache modules are registered here (the kernel modules are their roots: an edit to a kernel
@@ -25,4 +27,11 @@ _jit.MODULE_ROOTS.setdefault(
         "batch_invariant/sampling/draw_kernel.py",
         "batch_invariant/sampling/stream_kernel.py",
     ),
+)
+# the support kernel of support.row.v1 (the kept set under top-k / top-p / min-p): its own module, so an edit to it never
+# recompiles the row or the draw kernels (it imports the row kernel's plumbing and the draw kernel's loader, so an edit
+# to either recompiles it too)
+_jit.MODULE_ROOTS.setdefault(
+    "batch_invariant_sampling_support",
+    ("batch_invariant/sampling/support_kernel.py",),
 )
