@@ -249,8 +249,8 @@ class BatchInvariantMoeMxfp4w8aRunner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        self._validate_pack_contract(act)
         self._require_built()
+        self._validate_pack_contract(act)
         from .api import route, route_plan
         from .api_mxfp4w8a import MoEWeightsMXFP4W8A, check_shape_mxfp4w8a
 

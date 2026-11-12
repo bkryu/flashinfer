@@ -260,8 +260,8 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        self._validate_pack_contract(act)
         self._require_built()
+        self._validate_pack_contract(act)
         from .api import route
         from .api_nvfp4 import route_plan_dual
         from .api_nvfp4 import MoEWeightsNVFP4, check_shape_nvfp4
