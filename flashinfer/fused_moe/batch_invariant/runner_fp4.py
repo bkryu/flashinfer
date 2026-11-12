@@ -119,10 +119,13 @@ class BatchInvariantFp4Runner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._require_built()
+        self._validate_pack_contract(act)
         return self.impl.pack_inputs(act, weights)
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
+        self._require_built()
         return self.impl.get_valid_tactics(inputs, profile)
 
     def _cache_key_extras(self) -> tuple:
@@ -136,6 +139,7 @@ class BatchInvariantFp4Runner(MoERunner):
         do_preparation: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        self._require_built()
         return self.impl.forward(
             inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
         )
