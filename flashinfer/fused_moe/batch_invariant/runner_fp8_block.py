@@ -13,7 +13,7 @@ raises the mode's error naming the pairs served, as the config's ``prepare_weigh
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple, Type
+from typing import Any, List, Optional, Tuple, Type
 
 import torch
 
@@ -25,6 +25,8 @@ from ..api import (
     GeGLUTanh,
     Identity,
     MoEConfig,
+    MoEWeightPack,
+    MoEActivationPack,
     PowLU,
     QuantConfig,
     QuantFormat,
@@ -99,15 +101,40 @@ class BatchInvariantFp8BlockRunner(MoERunner):
             return BatchInvariantMxfp8Runner
         return None
 
-    def __new__(cls, config: MoEConfig, device: Any) -> "BatchInvariantFp8BlockRunner":
+    def __new__(
+        cls, config: Optional[MoEConfig] = None, device: Any = None
+    ) -> "BatchInvariantFp8BlockRunner":
         # the backend's class constructs the pair's runner; a pair without one is refused here (the layer never asks:
-        # it admits the declared pairs only)
-        if cls is BatchInvariantFp8BlockRunner:
+        # it admits the declared pairs only); without a config (the registry's contract tests) a bare instance of the class
+        if cls is BatchInvariantFp8BlockRunner and config is not None:
             impl = cls.implementation(config.quant.pair)
             if impl is None:
                 raise unsupported_pair(config.quant)
             cls = impl
         return super().__new__(cls)
+
+    # the runners' lifecycle and pack-contract rules on the backend's class itself: a served pair constructs its
+    # implementation runner, which overrides these; a bare instance of this class serves no pair
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        self._validate_pack_contract(act)
+        raise unsupported_pair(self.config.quant)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        raise unsupported_pair(self.config.quant)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        raise unsupported_pair(self.config.quant)
 
     def __init__(self, config: MoEConfig, device: Any) -> None:
         super().__init__()
