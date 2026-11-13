@@ -259,16 +259,26 @@ class GroupedBlockScaledTma:
         ) * st.atom_thr_size
 
 
+def xch_smem_bytes(layout) -> int:
+    """Bytes of an fp32 shared-memory exchange buffer with ``layout`` (a chain's ``smem_layout``; None: no buffer)."""
+    return 0 if layout is None else 4 * cute.cosize(layout)
+
+
 def grouped_plan(
-    plan_cls, knobs: Knobs, own_bytes: Callable, umma_addr_max: Optional[int] = None
+    plan_cls,
+    knobs: Knobs,
+    own_bytes: Callable,
+    umma_addr_max: Optional[int] = None,
+    k_blocks: Optional[int] = None,
 ):
     """The block-scaled plan with the grouped bodies' own stage rule: the operand ring (A, B, SFA, SFB per stage) fills the
     CTA's shared memory after the barrier reserve and the body's own buffers (``own_bytes(st)``: the group tables, the
     epilogue staging buffers), under the dense plan's A-ring cap. The dense plan's output stages are not reserved (the
     grouped epilogue stores from its own staging buffers). ``umma_addr_max``: the operand rings a UMMA reads (A and B,
     behind the barriers and the body's own buffers) end below this many bytes of the CTA's shared memory (the plan's
-    ``UMMA_SMEM_ADDR_MAX`` on the sm_100 instruction plans: their descriptors' address window). A placement: the ring depth
-    moves no bits."""
+    ``UMMA_SMEM_ADDR_MAX`` on the sm_100 instruction plans: their descriptors' address window). ``k_blocks``: the
+    instruction K steps per stage (the swapped body's two-atom stage; None: the format's one swizzle atom of K). A
+    placement: the ring depth moves no bits."""
 
     class _Plan(plan_cls):
         def _stages(self):
@@ -309,7 +319,7 @@ def grouped_plan(
             )
             return num_ab, NUM_C_STAGE_MIN
 
-    return _Plan(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR)
+    return _Plan(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR, k_blocks=k_blocks)
 
 
 @dataclass(frozen=True)
@@ -385,11 +395,13 @@ class BlockScaledOperands:
         own_bytes: Callable,
         body: str,
         umma_addr_max: Optional[int] = None,
+        k_blocks: Optional[int] = None,
     ):
         """The block-scaled plan with the grouped bodies' stage rule (:func:`grouped_plan`); ``own_bytes(st)`` the body's own
-        shared storage beyond the barriers, ``umma_addr_max`` the UMMA descriptors' address window the swapped body's A ring
-        must end inside (``None``: the plan's A-ring cap alone)."""
-        return grouped_plan(self.plan_cls, knobs, own_bytes, umma_addr_max)
+        shared storage beyond the barriers, ``umma_addr_max`` the UMMA descriptors' address window the bodies' A ring must
+        end inside (``None``: the plan's A-ring cap alone), ``k_blocks`` the instruction K steps per stage (None: the
+        format's)."""
+        return grouped_plan(self.plan_cls, knobs, own_bytes, umma_addr_max, k_blocks)
 
     def view_elems(self, t: cute.Tensor) -> cute.Tensor:
         """The API's operand as the element tensor the TMA reads: the byte-packed 4-bit operand viewed as fp4 of the logical

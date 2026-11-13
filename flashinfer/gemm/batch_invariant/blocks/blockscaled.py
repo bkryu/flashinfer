@@ -131,7 +131,7 @@ class BlockScaledPlan:
     S2T_BROADCAST = False  # the smem -> TMEM scale-factor copy's source partition (see s2t_copy_and_partition)
     # the M-side operand ring (A) placed above this many bytes of the CTA's shared memory reads wrong data on the sm_100
     # instruction plans of this part (observed; the B and scale-factor rings above it compute the class): the grouped
-    # planners keep the A and B rings below it (`fused_moe/batch_invariant/blocks/blockscaled_kernel.py::plan_with_room`);
+    # planners keep the A and B rings below it (`fused_moe/batch_invariant/blocks/operands.py::grouped_plan`);
     # None: the whole shared memory
     UMMA_SMEM_ADDR_MAX: Optional[int] = A_RING_MAX_BYTES
 

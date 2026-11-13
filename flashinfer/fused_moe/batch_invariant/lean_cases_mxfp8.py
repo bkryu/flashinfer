@@ -127,7 +127,7 @@ def render() -> str:
         "(a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat), GEMM.tileResultMX8 c₁ S₁ p a b kb nblk = GEMM.tileResultMX8 c₂ S₂ q a b kb nblk := "
         "GEMM.space_invariantMX8 moeMxfp8Space"
     )
-    # the swapped record space (the swapped decode body, `blocks/swap_mxfp8.py`): the three token tiles, members of both dense MX
+    # the swapped record space (the unified swapped body, `blocks/swap.py`): the three token tiles, members of both dense MX
     # classes' predicates, disjoint from the grouped space; the union is one guarantee space on both classes
     sw = swapped_space()
     L.append(

@@ -206,6 +206,11 @@ class GroupedEpilogueBlock:
     def static_quant(self) -> bool:
         return False
 
+    @property
+    def needs_aux(self) -> bool:
+        """Whether the chain reads the per-expert auxiliary scales (the static NVFP4 class's chains)."""
+        return False
+
     def tile_scale(self, fp, mAlpha, mSa, mAux, e):
         return None
 

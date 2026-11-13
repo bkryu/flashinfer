@@ -319,13 +319,14 @@ def grouped_gemm_mxfp8(
     the padded positions (``sf_numel(sf_rows, K)`` bytes, ``sf_rows`` the padded rows incl. the tail; derived from the
     buffer when not given), the output's rows ``a``'s; the fused requantization's scales land at the padded positions. The
     record selects the body: a dense record runs the padded body (on either packing), a swapped record (``config.swap_ab``:
-    128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap_mxfp8`) the swapped body on
-    the dense packing (``a`` carries at least the token tile's rows past the live rows: ``DENSE_TAIL``)."""
-    from .blocks.compile_mxfp8 import (
+    128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap`) the swapped body on
+    the dense packing (``a`` carries at least the token tile's rows past the live rows: ``DENSE_TAIL``). Both bodies are the
+    unified grouped bodies (:mod:`.blocks.kernel` / :mod:`.blocks.swap`) on the block-scaled operand block at the MX
+    chain's instruction class."""
+    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
+    from .schedule_mxfp8 import (
         can_implement_grouped_mxfp8,
         can_implement_swapped_mxfp8,
-        get_compiled_grouped_mxfp8,
-        get_compiled_swapped_mxfp8,
         swap_k_block_arg,
     )
 
@@ -389,7 +390,7 @@ def grouped_gemm_mxfp8(
             raise ValueError(
                 f"grouped_gemm_mxfp8: swapped record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt}, k_block={kb or 'default'})"
             )
-        kernel_of = lambda: get_compiled_swapped_mxfp8(config, chain, in_fmt, kb)  # noqa: E731
+        kernel_of = lambda: get_compiled_swapped(config, chain, k_block=kb)  # noqa: E731
 
         def args(*outs):
             return (
@@ -407,7 +408,9 @@ def grouped_gemm_mxfp8(
             raise ValueError(
                 f"grouped_gemm_mxfp8: record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
             )
-        kernel_of = lambda: get_compiled_grouped_mxfp8(config, chain, in_fmt, dense_a)  # noqa: E731
+        kernel_of = lambda: get_compiled_grouped(  # noqa: E731
+            config, chain, packing="dense" if dense_a else "padded"
+        )
 
         def args(*outs):
             return (
@@ -417,6 +420,7 @@ def grouped_gemm_mxfp8(
                 w_sf,
                 *outs,
                 counts,
+                sf_rows,
                 grid_of(),
             )
 

@@ -4,8 +4,8 @@
 64-row tile streamed by TMA with the expert as the batch coordinate) and the group's tokens on the N side as a **narrow
 token tile** (8, 16 or 32 rows: the swapped records of :mod:`..schedule`; ``kind::f8f6f4`` takes 16 or 32), read as a TMA
 box from the dense permuted activations at the group's row (``x_perm`` for GEMM1, the dense intermediate for GEMM2) -- the
-same dense rows the grouped body reads, so no second packing. One body for the bf16, the fp8 per-tensor and the NVFP4
-classes, as :mod:`.kernel`: the operand block (:mod:`.operands`, keyed by the chain's operand format) and the epilogue
+same dense rows the grouped body reads, so no second packing. One body for the bf16, the fp8 per-tensor, the NVFP4 and
+the MXFP8 classes, as :mod:`.kernel`: the operand block (:mod:`.operands`, keyed by the chain's operand format) and the epilogue
 block (the chain) are resolved at trace time. Rows past the group's end (the next group's rows or the buffer's tail) are
 computed and never stored: the MMA is token-local on N. One TMA pipeline carries the weight tile and the token box of one
 k-tile per stage, two swizzle atoms of K per stage (the grouped records' step), the dense ``mma_loop`` folds them, and the
@@ -38,7 +38,9 @@ int32; for a chain with scale operands ``alpha (E,)``, ``sa (1,)``, ``si (1,)`` 
 (:meth:`SwappedGroupedGemm.with_scales`); for the block-scaled chains ``sfa`` the flat scale factors of the rows at the padded
 positions, ``sfw`` the experts' scale buffers, ``alpha (E,)``, ``pts`` (the per-token scales at the padded positions, a
 multiple of 128 entries) and the static class's ``out_sf`` / ``aux`` (:meth:`SwappedGroupedGemm.block_scaled` /
-:meth:`SwappedGroupedGemm.block_scaled_static`).
+:meth:`SwappedGroupedGemm.block_scaled_static`); the MX chains carry no further operand
+(:meth:`SwappedGroupedGemm.block_scaled_plain`; the fused requantization's codes and scale bytes through
+:meth:`SwappedGroupedGemm.block_scaled_quant`, the stage two atoms of K wide when the class's rule says so).
 The gather form (``gather=True``, :meth:`SwappedGroupedGemm.gathered`): the token tile's rows gathered by the TMA's gather4
 mode from the unpermuted ``x (T, K)`` through the plan's ``src`` (row ``p`` reads ``x[src[p] // k_div]``; rows past the
 group's end repeat its last row and are never stored), one swizzle atom of K per stage (the gather4 box is the atom): GEMM1
@@ -73,7 +75,7 @@ from ....gemm.batch_invariant.blocks.blockscaled import s2t_copy_and_partition
 from ....gemm.batch_invariant.blocks.mainloop import mma_loop
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE, BAR_TMEM_ALLOC
 from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs
-from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS
+from ....gemm.batch_invariant.spec import MMA_K_OF, SF_ATOM_KBLOCKS
 from .. import spec_nvfp4 as Q
 from .epilogue import (
     BAR_EPI_JOIN,
@@ -88,6 +90,7 @@ from .operands import (
     PipelineCpAsyncUmma,
     operands_for,
     swap_sf_producer_loop,
+    xch_smem_bytes,
 )
 from .scheduler import (
     MAX_E,
@@ -200,7 +203,12 @@ class SwappedGroupedGemm:
         knobs: Knobs,
         chain: Union[str, GroupedEpilogueBlock],
         gather: bool = False,
+        *,
+        k_block: int = 0,
     ):
+        """``k_block``: K elements per smem stage of a block-scaled chain's body (0: the format's one swizzle atom of K; a
+        multiple of the instruction's K step: several atoms, the MXFP8 classes' two-atom decode stage), a placement of the
+        same fold."""
         if isinstance(chain, str):
             chain = GroupedChain.legacy(chain, "bf16")
         assert isinstance(chain, GroupedEpilogueBlock), chain
@@ -218,6 +226,10 @@ class SwappedGroupedGemm:
         )
         self.knobs, self.chain, self.gather = knobs, chain, gather
         self.token_tile, self.weight_tile = knobs.tile_n, knobs.tile_m
+        assert k_block == 0 or (
+            self.operands.block_scaled and k_block % MMA_K_OF[self.in_fmt] == 0
+        ), ("the k-block is the block-scaled bodies' whole instruction steps", k_block)
+        self.k_block = k_block
         # the warp roles: the epilogue warpgroup, (the block-scaled formats' scale-factor warp,) the MMA warp, the TMA warp
         bs = self.operands.block_scaled
         self.sf_warp = len(EPILOGUE_WARPS) if bs else None
@@ -327,6 +339,66 @@ class SwappedGroupedGemm:
         )
 
     @cute.jit
+    def block_scaled_plain(
+        self,
+        rows: cute.Tensor,
+        sfa: cute.Tensor,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The block-scaled chains without further operands (the MX classes): ``rows`` the dense rows, ``sfa`` their scale
+        factors at the padded positions, ``w`` / ``sfw`` the experts and their scale buffers."""
+        assert self.operands.block_scaled and not self.chain.operands
+        assert not self.chain.quant, self.chain
+        self._launch(
+            rows,
+            w,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            None,
+            Int32(1),
+            sfa=sfa,
+            sfw=sfw,
+        )
+
+    @cute.jit
+    def block_scaled_quant(
+        self,
+        rows: cute.Tensor,
+        sfa: cute.Tensor,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        out_sf: cute.Tensor,
+        counts: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The block-scaled chains without further operands whose epilogue quantizes (the MXFP8 classes' fused
+        requantization): ``out`` the codes of the dense rows, ``out_sf`` the flat 128x4 scale bytes at the padded positions."""
+        assert self.operands.block_scaled and not self.chain.operands
+        assert self.chain.quant, self.chain
+        self._launch(
+            rows,
+            w,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            None,
+            Int32(1),
+            sfa=sfa,
+            sfw=sfw,
+            out_sf=out_sf,
+        )
+
+    @cute.jit
     def block_scaled_static(
         self,
         rows: cute.Tensor,
@@ -391,6 +463,7 @@ class SwappedGroupedGemm:
         # the gather form's slab is one swizzle atom of K wide (the gather4 box is the atom): it keeps the format's default stage
         body = "gather" if self.gather else "swapped"
         sfw_t = None
+        self.xch_layout = self.chain.smem_layout(1, token_tile=self.token_tile)
         if cutlass.const_expr(ops.block_scaled):
             rows = ops.view_elems(
                 rows
@@ -398,16 +471,21 @@ class SwappedGroupedGemm:
             w = ops.view_elems(w)  # (N, K, E): the MMA's A operand (M = N, K, L = E)
             sfw_t = ops.sf_view_experts(sfw, w.shape[0], w.shape[1], w.shape[2])
             # the block-scaled plan takes the swapped record itself (its knob rule admits the narrow token tiles with the
-            # swapped flag); the A ring (the weights) ends inside the sm_100 instructions' descriptor window
+            # swapped flag); the A ring (the weights) ends inside the sm_100 instructions' descriptor window; the stage holds
+            # ``k_block`` elements of K when given (the two-atom stage), the format's atom otherwise
             st = ops.plan(
                 self.knobs,
-                lambda st: ops.table_bytes,
+                lambda st: ops.table_bytes + xch_smem_bytes(self.xch_layout),
                 body,
                 ops.plan_cls.UMMA_SMEM_ADDR_MAX,
+                k_blocks=(self.k_block // MMA_K_OF[self.in_fmt])
+                if self.k_block
+                else None,
             )
             self.block = st.block
             assert self.block.in_fmt == self.in_fmt, (self.block.in_fmt, self.in_fmt)
         else:
+            assert self.xch_layout is None, self.chain
             # the weights are the plan's A operand, the token rows its B operand
             st = ops.plan(plan_knobs_of(self.knobs), w, rows, ops.table_bytes, body)
             self.block = ops.mainloop(body)
@@ -746,6 +824,15 @@ class SwappedGroupedGemm:
                 layout=sfb_smem_layout_staged,
                 byte_alignment=128,
             )
+        sX = None
+        if cutlass.const_expr(self.xch_layout is not None):
+            # a quantising chain's exchange buffer (the fused requantization's half-block amax between the two warps of a block);
+            # the layout is built here (a layout built at plan time belongs to the host region)
+            sX = smem.allocate_tensor(
+                element_type=cutlass.Float32,
+                layout=self.chain.smem_layout(1, token_tile=tn),
+                byte_alignment=16,
+            )
         gW_mkl = cute.local_tile(
             mW_mkl, cute.slice_(st.mma_tiler, (None, 0, None)), (None, None, None)
         )  # (bM, bK, RestM, RestK, RestL)
@@ -929,27 +1016,50 @@ class SwappedGroupedGemm:
                 s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
             )
             cute.arch.griddepcontrol_wait()  # the output rows were the predecessor chain's reads
-            swapped_epilogue_loop(
-                st,
-                self.chain,
-                tidx,
-                tile_sched,
-                tCtAcc_base,
-                thr_mma,
-                mOut,
-                Tk,
-                N,
-                epi_tile,
-                acc_pipeline,
-                mAlpha=mAlpha,
-                mSa=mSa,
-                mSi=mSi,
-                mPts=mPts,
-                mAux=mAux,
-                mOutSf=mOutSf,
-                s_off=s_off,
-                s_off_pad=s_off_pad,
-            )
+            quant_loop = self.chain.swapped_loop()
+            if cutlass.const_expr(quant_loop is not None):
+                # a quantising chain's own epilogue in the transposed orientation (the MXFP8 classes' fused requantization:
+                # the codes of the dense rows, the scale bytes at the padded positions)
+                quant_loop(
+                    st,
+                    self.chain,
+                    tidx,
+                    tile_sched,
+                    tCtAcc_base,
+                    thr_mma,
+                    mOut,
+                    mOutSf,
+                    Tk,
+                    N,
+                    epi_tile,
+                    acc_pipeline,
+                    sX,
+                    s_off,
+                    s_off_pad,
+                    wt,
+                )
+            else:
+                swapped_epilogue_loop(
+                    st,
+                    self.chain,
+                    tidx,
+                    tile_sched,
+                    tCtAcc_base,
+                    thr_mma,
+                    mOut,
+                    Tk,
+                    N,
+                    epi_tile,
+                    acc_pipeline,
+                    mAlpha=mAlpha,
+                    mSa=mSa,
+                    mSi=mSi,
+                    mPts=mPts,
+                    mAux=mAux,
+                    mOutSf=mOutSf,
+                    s_off=s_off,
+                    s_off_pad=s_off_pad,
+                )
             tmem.relinquish_alloc_permit()
             # the allocator warp alone frees the columns: the epilogue warpgroup's warps join here after their last TMEM loads
             # (the block-scaled body's allocation was issued in the prologue's own region: the column count is given explicitly)

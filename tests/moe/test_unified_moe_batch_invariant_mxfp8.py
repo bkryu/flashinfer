@@ -422,17 +422,19 @@ def test_shape_rules_and_padded_bound():
 def test_swapped_k_block_is_a_shape_rule():
     """The swapped body's k-block (K elements per smem stage) is a function of the class and K alone: two atoms of K when
     they divide K, else the one-atom default (`swap_k_block`), spelled into the kernel name with the default as 0
-    (`swap_k_block_arg`: one object per k-block), accepted by the body iff it divides K; the padded body and the dense
-    class keep the default (`Knobs.k_block` does not exist in this tree: the record space is untouched)."""
-    from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp8 import (
+    (`swap_k_block_arg`: one object per k-block, the shared compile wrapper's ``_kb`` suffix), accepted by the body iff it
+    divides K; the grouped body and the dense class keep the default (`Knobs.k_block` does not exist in this tree: the
+    record space is untouched)."""
+    from flashinfer.fused_moe.batch_invariant.blocks.compile import swapped_kernel_name
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
         SWAP_K_BLOCKS,
         can_implement_swapped_mxfp8,
         swap_k_block,
         swap_k_block_arg,
-        swapped_kernel_name,
+        swapped_knobs_mx,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
-    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
 
     assert SWAP_K_BLOCKS == (128, 256)
     for fmt in ("mxfp8", "mxfp8_k64"):
@@ -446,9 +448,10 @@ def test_swapped_k_block_is_a_shape_rule():
         )
         cfg = swapped_knobs_mx()[0]
         f32 = GroupedChain("plain", "silu", "f32")
-        assert swapped_kernel_name(cfg, f32, fmt, 256).endswith(
+        mx = MxChain.of(f32, fmt)
+        assert swapped_kernel_name(cfg, mx, k_block=256).endswith(
             "_kb256"
-        ) and not swapped_kernel_name(cfg, f32, fmt, 0).endswith("_kb256")
+        ) and not swapped_kernel_name(cfg, mx).endswith("_kb256")
         assert can_implement_swapped_mxfp8(cfg, 256, 2048, 8, f32, fmt, 256)
         assert not can_implement_swapped_mxfp8(cfg, 256, 640, 8, f32, fmt, 256), (
             "a k-block that does not divide K is refused"
@@ -456,6 +459,124 @@ def test_swapped_k_block_is_a_shape_rule():
         assert not can_implement_swapped_mxfp8(cfg, 256, 2048, 8, f32, fmt, 512), (
             "four atoms are not admitted"
         )
+
+
+def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch):
+    """The MX chains run the backend's swapped body (:mod:`blocks.swap`), which reads the plan's group counts under the
+    chain's trigger rule (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own wait, the body's own
+    wait before the tables is the margin) and whose builder asserts the shipped placement is one of them; the gather form
+    belongs to the bf16 classes; a k-block is whole instruction steps of the class."""
+    from flashinfer.fused_moe.batch_invariant import pdl
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        GEMM2_CHAIN,
+        swapped_knobs_mx,
+    )
+
+    cfg = swapped_knobs_mx()[0]
+    assert pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS
+    for fmt in ("mxfp8", "mxfp8_k64"):
+        ch = MxChain("glu", "silu", "mxfp8", (), fmt)
+        SwappedGroupedGemm(cfg, ch)
+        assert SwappedGroupedGemm(cfg, ch, k_block=256).k_block == 256
+        with pytest.raises(AssertionError):
+            SwappedGroupedGemm(cfg, ch, k_block=48)
+        with pytest.raises(AssertionError):
+            SwappedGroupedGemm(cfg, ch, gather=True)
+    monkeypatch.setattr(pdl, "TRIGGER", "early")
+    with pytest.raises(AssertionError):
+        SwappedGroupedGemm(cfg, GEMM2_CHAIN)
+
+
+def test_mx_classes_run_on_the_unified_bodies():
+    """The MXFP8 classes have no body of their own: the backend's grouped and swapped bodies (:mod:`blocks.kernel`,
+    :mod:`blocks.swap`) take the MX chain through the block-scaled operand block (e4m3 elements, UE8M0 scales per 32
+    elements, four epilogue warpgroups, the 128-row scale atom as the group alignment, both packings) and the fused
+    requantization through the epilogue block's hooks (its own loops, its exchange buffer for the gated chain only); the
+    compiled objects carry the instruction class, the packing and the k-block in their names; the shared acceptance runs at
+    the chain's class; one JIT module (``batch_invariant_moe``) holds the kernels and the MX scatter, with no MX-specific
+    body in its source closure."""
+    from flashinfer.batch_invariant import jit
+    from flashinfer.fused_moe.batch_invariant.blocks import compile as C
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import (
+        MxChain,
+        grouped_epilogue_quant_loop,
+        swap_xch_bytes,
+        swapped_epilogue_quant_loop,
+        xch_bytes,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.kernel import GroupedBlockGemm
+    from flashinfer.fused_moe.batch_invariant.blocks.operands import (
+        BlockScaledOperands,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import (
+        SwappedGroupedGemm,
+        is_swapped_record,
+        swapped_knobs,
+    )
+    from flashinfer.fused_moe.batch_invariant.mx_permute import MODULE as SCATTER_MODULE
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        GEMM2_CHAIN,
+        swapped_knobs_mx,
+    )
+    from flashinfer.gemm.batch_invariant.blocks.operands import IN_DT
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    dense = Knobs((128, 128), (1, 1), False, True, "m", 1)
+    quant, plain = MxChain("glu", "silu", "mxfp8"), GEMM2_CHAIN
+    assert quant.quant and not plain.quant
+    assert quant.operands == () and not quant.needs_aux and not quant.per_row_scale
+    assert quant.grouped_loop() is grouped_epilogue_quant_loop
+    assert quant.swapped_loop() is swapped_epilogue_quant_loop
+    assert plain.grouped_loop() is None and plain.swapped_loop() is None
+    # the exchange buffer: the gated fused requantization's alone (an ungated block is one thread's / one warp's)
+    assert xch_bytes(quant, 4) > 0 and swap_xch_bytes(quant, 16) > 0
+    assert (
+        xch_bytes(plain, 4) == 0 and xch_bytes(MxChain("act", "relu2", "mxfp8"), 4) == 0
+    )
+    for fmt in ("mxfp8", "mxfp8_k64"):
+        for packing in ("padded", "dense"):
+            body = GroupedBlockGemm(dense, quant.at(fmt), packing=packing)
+            ops = body.operands
+            assert ops == BlockScaledOperands(fmt, packing) and ops.block_scaled
+            assert (ops.sf_vec, ops.elem_bits, ops.group_align) == (32, 8, 128)
+            assert ops.dtype is IN_DT[fmt] and body.epi_warpgroups == 4
+            assert ops.dense_a == (packing == "dense")
+        assert swapped_knobs(fmt) == swapped_knobs_mx()
+        sw = swapped_knobs_mx()[0]
+        assert is_swapped_record(sw, fmt)
+        s = SwappedGroupedGemm(sw, plain.at(fmt), k_block=256)
+        assert s.operands.block_scaled and s.k_block == 256 and s.sf_warp == 4
+        assert C.can_implement_grouped_blockscaled(dense, 256, 2048, 8, quant, fmt)
+        assert C.can_implement_swapped_blockscaled(sw, 256, 2048, 8, quant, fmt)
+        assert not C.can_implement_grouped_blockscaled(dense, 256, 2064, 8, quant, fmt)
+    # a bf16 chain names no instruction class: the shared wrapper takes the MX chain (the MX dispatcher converts)
+    assert not C.can_implement_grouped_blockscaled(
+        dense, 256, 2048, 8, GroupedChain("plain", "silu", "bf16"), "mxfp8"
+    )
+    assert C.kernel_name(dense, quant.at("mxfp8_k64"), packing="dense").startswith(
+        "grouped_mxfp8k64_densea_swiglu_mxfp8_"
+    )
+    assert C.kernel_name(dense, quant, packing="padded").startswith(
+        "grouped_mxfp8_swiglu_mxfp8_"
+    )
+    name = C.swapped_kernel_name(
+        swapped_knobs_mx()[1], plain.at("mxfp8_k64"), k_block=256
+    )
+    assert name.startswith("swapped_mxfp8k64_plain_bf16_") and name.endswith("_kb256")
+    assert C.MODULE == SCATTER_MODULE == "batch_invariant_moe"
+    assert "batch_invariant_moe_mxfp8" not in jit.MODULE_ROOTS
+    srcs = jit.relative_sources("batch_invariant_moe")
+    gone = ("blockscaled_kernel.py", "swap_mxfp8.py", "compile_mxfp8.py")
+    assert not any(os.path.basename(src) in gone for src in srcs), srcs
+    for src in (
+        "fused_moe/batch_invariant/mx_permute.py",
+        "fused_moe/batch_invariant/blocks/epilogue_mx.py",
+        "fused_moe/batch_invariant/blocks/operands.py",
+    ):
+        assert src in srcs, srcs
 
 
 @pytest.mark.parametrize(
@@ -1373,12 +1494,12 @@ def test_every_record_computes_the_class_at_long_k_on_every_instruction_class_of
         grouped_gemm_mxfp8,
         mx_class_of,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp8 import (
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
         can_implement_grouped_mxfp8,
         can_implement_swapped_mxfp8,
+        swapped_knobs_mx,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
-    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
     from flashinfer.gemm.batch_invariant.generator import Knobs
     import flashinfer
 
@@ -1514,14 +1635,14 @@ def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
         mx_class_of,
         sf_numel,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp8 import (
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
         SWAP_K_BLOCKS,
         can_implement_grouped_mxfp8,
         can_implement_swapped_mxfp8,
+        swapped_knobs_mx,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
-    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
     import flashinfer
 

@@ -9,7 +9,7 @@ and the instruction class the operands run on (``in_fmt``: ``mxfp8`` on SM100 / 
 block's key). The non-quantising chains run the shared epilogue loops through ``elem`` (the bf16 chain's term: the UE8M0
 block scales are operands of the instruction, so the accumulators are dequantised and the chain has no scale); the
 quantising chain runs the loops below (``grouped_loop`` / ``swapped_loop``) with its half-block amax exchange buffer
-(``smem_layout``).
+(``smem_layout``); both unified bodies (:mod:`.kernel`, :mod:`.swap`) call the hooks.
 
 The term is the standalone quantizer's, applied to the same values: the chain's output rounded to bf16 (the class's
 intermediate), widened exactly to fp32; the block amax of 32 consecutive output columns by the quantizer's canonical pairwise
@@ -29,7 +29,7 @@ shared scale. Codes: one 16-byte vector per thread per subtile into ``out [Tk, N
 byte into the 128x4 swizzled layout of ``(Tk, N_out)`` (``sf_offset_128x4_dev``), stored by the block's first half. Rows
 past the group's real end and blocks past ``N_out`` are not stored.
 
-The swapped decode body (:mod:`.swap_mxfp8`: the weights on the MMA's M side, the group's tokens a narrow N tile) runs
+The swapped body (:mod:`.swap`: the weights on the MMA's M side, the group's tokens a narrow N tile) runs
 the same term in the transposed orientation (:func:`swapped_epilogue_quant_loop`): thread = weight row = one output
 column of every token of the tile, so a block's 32 outputs of one token sit in 32 lanes -- the ungated chain's block is
 one warp, the gated chain's (its up lanes are the 8-column halves of two 16-row groups) spans two warps. The block amax
@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -92,10 +92,8 @@ OUT_FMT = "mxfp8"  # the out_fmt of the fused requantization: e4m3 codes + UE8M0
 MX_OUT_FMTS = ("bf16", "f16", "f32", OUT_FMT)  # the MXFP8 classes' output formats
 VEC_BYTES = 16
 XCH_BUFFERS = 2  # the half-block amax exchange of the gated chain, double-buffered by block parity (one barrier per block)
-BAR_EPI_XCH = 8  # named barrier ids BAR_EPI_XCH + warpgroup pair (the staged store uses BAR_EPI_STAGE + warpgroup)
-BAR_EPI_JOIN = (
-    3  # every epilogue warpgroup once, after its last TMEM load, before the TMEM free
-)
+BAR_EPI_XCH = 8  # named barrier ids BAR_EPI_XCH + warpgroup pair (the staged store uses BAR_EPI_STAGE + warpgroup, the
+# TMEM join BAR_EPI_JOIN: `.epilogue`)
 
 
 # The accumulator a dead lane or dead token column computes its (never stored) chain on: a normal operand through the chain's
@@ -183,10 +181,14 @@ class MxChain(GroupedEpilogueBlock):
         """The same chain on another instruction class."""
         return dataclasses.replace(self, in_fmt=in_fmt)
 
+    def at(self, in_fmt: str) -> "MxChain":
+        """The same chain on another instruction class (the block-scaled chains' shared spelling)."""
+        return self.with_class(in_fmt)
+
     @staticmethod
-    def of(chain: Union[GroupedChain, "MxChain"], in_fmt: str) -> "MxChain":
+    def of(chain: GroupedEpilogueBlock, in_fmt: str) -> "MxChain":
         """The MX chain at ``in_fmt`` of a bf16 chain object (its kind, activation, output format and parameters) or of an MX
-        chain (its class replaced)."""
+        chain (its class replaced); any other epilogue block is refused."""
         if isinstance(chain, MxChain):
             return chain.with_class(in_fmt)
         assert isinstance(chain, GroupedChain), chain
