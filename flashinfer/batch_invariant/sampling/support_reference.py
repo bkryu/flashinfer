@@ -65,6 +65,17 @@ def top_p_threshold(w: torch.Tensor, p: float, S: float) -> float:
     return _as_f32(thr)
 
 
+def _combine(thr: float, t: float) -> float:
+    """The effective threshold of two filters: the larger of the two in the kernel's order -- the integer maximum of the
+    31-bit patterns -- so a NaN threshold (``mul(w_max, min_p)`` with an infinite maximum and ``min_p = 0``) orders above
+    every weight and nothing is kept; the row is invalid either way (its mass is not a positive finite number)."""
+    if t != t:
+        return t
+    if thr != thr:
+        return thr
+    return t if t > thr else thr
+
+
 def support_row(
     w: torch.Tensor, N: int, f: Filters, w_max: Optional[float] = None
 ) -> Dict[str, object]:
@@ -91,7 +102,7 @@ def support_row(
         keep &= w >= thr
     if f.min_p is not None:
         wm = row_max(w) if w_max is None else w_max
-        thr = max(thr, fp32.mul(wm, f.min_p))
+        thr = _combine(thr, fp32.mul(wm, f.min_p))
         keep &= w >= thr
     mass = row_sum(torch.where(keep, w, torch.zeros_like(w)), N)
     return {

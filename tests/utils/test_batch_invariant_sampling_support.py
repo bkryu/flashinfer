@@ -1,7 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The support class ``support.row.v1`` behind ``flashinfer.sampling.top_k_renorm_probs`` / ``top_p_renorm_probs`` /
-``top_k_mask_logits(..., batch_invariant=True)`` and ``sampling_support``.
+"""The support class ``support.row.v1``: ``sampling_support`` and its internal renormalisation entries (the operators
+``top_k_renorm_probs`` / ``top_p_renorm_probs`` / ``top_k_mask_logits`` carry no ``batch_invariant`` flag in this
+release; the class is the selection stage for the truncated samplers).
 
 Device-free: the pinned fingerprints; the exact model's declared properties (top-k an upward-closed cut with ties, top-p
 reaching its fixed-point target minimally, the two orders, min-p on the row maximum, the exact fixed point, the
@@ -10,17 +11,16 @@ three kernels (only the declared forms). On a device of the class's architecture
 effective threshold, the kept count, the kept mass and the row sum equal the exact model bit for bit for probability
 and logits inputs, every filter set and both orders, across the configuration space (single-CTA, cluster, staged) and
 the dispatcher's picks; the special parameter values and ties; batch invariance (a row alone, a permutation, a
-sub-batch); the renormalised probabilities and masked logits bit for bit and the public entries equal to the class's
-entry; SM-count independence where the picks differ; determinism, graph replay and PDL; the default path untouched;
-views and empty batches."""
+sub-batch); the renormalised probabilities and masked logits bit for bit and the internal entries equal to the class's
+entry; SM-count independence where the picks differ; determinism, graph replay and PDL; views and empty batches."""
 
 import os
 
 import pytest
 import torch
 
-import flashinfer
 from flashinfer import batch_invariant as bi
+from flashinfer.batch_invariant.sampling import classes as CL
 from flashinfer.batch_invariant.sampling import schedule as C
 from flashinfer.batch_invariant.sampling import sterm as term
 from flashinfer.batch_invariant.sampling import support_reference as SR
@@ -216,27 +216,19 @@ def _row(N=1000, seed=0):
 
 # ------------------------------------------------------------------------------------------------ device-free
 def test_fingerprints_are_pinned():
-    """The receipts: the class's fingerprints for the three entries at N = 1000 in bf16 (the filter set, the selection
-    rules, the vocabulary's sum tree, the weight form and the output format are hashed); the dimensions move them."""
-    assert bi.class_name("top_k_renorm_probs") == "support.row.v1"
-    assert bi.class_name("top_p_renorm_probs") == "support.row.v1"
-    assert bi.class_name("top_k_mask_logits") == "support.row.v1"
-    assert (
-        bi.fingerprint("top_k_renorm_probs", N=1000, dtype="bf16")
-        == "support-row-4a26c16577a204b6"
-    )
-    assert (
-        bi.fingerprint("top_p_renorm_probs", N=1000, dtype="bf16")
-        == "support-row-475956ca58f276bb"
-    )
-    assert (
-        bi.fingerprint("top_k_mask_logits", N=1000, dtype="bf16")
-        == "support-row-5b80a40dba511dd7"
-    )
+    """The receipts: the class's fingerprints of the three renormalisation forms at N = 1000 in bf16 (the filter set,
+    the selection rules, the vocabulary's sum tree, the weight form and the output format are hashed); the dimensions
+    move them. The class has no registry entry of its own (the operators' flag is deferred): the truncated samplers'
+    entries name it."""
     f = SS.spec_fingerprint
-    assert f(Filters(top_k=1), 1000, False, "bf16") == bi.fingerprint(
-        "top_k_renorm_probs", N=1000, dtype="bf16"
+    assert f(Filters(top_k=1), 1000, False, "bf16") == "support-row-4a26c16577a204b6"
+    assert f(Filters(top_p=1.0), 1000, False, "bf16") == "support-row-475956ca58f276bb"
+    assert f(Filters(top_k=1), 1000, True, "bf16") == "support-row-5b80a40dba511dd7"
+    assert CL._support_fingerprint(1000, torch.bfloat16, Filters(top_k=1), False) == f(
+        Filters(top_k=1), 1000, False, "bf16"
     )
+    for op in ("top_k_renorm_probs", "top_p_renorm_probs", "top_k_mask_logits"):
+        assert op not in bi.CLASSES
     assert f(Filters(top_k=1), 1000) == f(
         Filters(top_k=7), 1000
     )  # the parameter values are inputs, not dimensions
@@ -250,10 +242,8 @@ def test_fingerprints_are_pinned():
         Filters(top_k=1), 1000, False, "bf16"
     )
     assert "ties-kept" in SS.SELECT_RULE and "trunc(p*2^44)" in SS.SELECT_RULE
-    with pytest.raises(TypeError):
-        bi.fingerprint("top_k_renorm_probs", N=1000)
     with pytest.raises(ValueError):
-        bi.fingerprint("top_k_renorm_probs", N=1000, dtype="f64")
+        CL._support_fingerprint(1000, "f64", Filters(top_k=1), False)
 
 
 @pytest.mark.parametrize("k", [0, 1, 2, 3, 17, 500, 999, 1000, 5000])
@@ -411,11 +401,11 @@ def test_dispatcher_picks_are_members_of_the_space():
 def test_unsupported_inputs_raise_before_any_kernel():
     x = torch.rand(4, 64, dtype=torch.bfloat16)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="support.row"):
-        flashinfer.sampling.top_k_renorm_probs(x, 5, batch_invariant=True)
+        top_k_renorm_probs_batch_invariant(x, 5)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="support.row"):
-        flashinfer.sampling.top_p_renorm_probs(x, 0.5, batch_invariant=True)
+        top_p_renorm_probs_batch_invariant(x, 0.5)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="support.row"):
-        flashinfer.sampling.top_k_mask_logits(x, 5, batch_invariant=True)
+        top_k_mask_logits_batch_invariant(x, 5)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="support.row"):
         sampling_support(x.double(), top_k=5)
     assert (
@@ -829,10 +819,10 @@ def test_big_vocabulary():
 @needs_device
 @pytest.mark.parametrize("dtype", DT, ids=["f32", "bf16"])
 @pytest.mark.parametrize("N", [1000, 32768])
-def test_renormalised_outputs_and_public_entries(dtype, N):
+def test_renormalised_outputs_and_internal_entries(dtype, N):
     """The renormalised probabilities (``lse.row``'s prob chain over the kept mass, in the input dtype, +0 outside the
     kept set) and the masked logits are the model's bit for bit, for probabilities and logits, across configs; the
-    public entries under the flag return the class's tensors (with scalar and per-row parameters)."""
+    internal renormalisation entries return the class's tensors (with scalar and per-row parameters)."""
     M = 12
     w = weights(M, N, dtype)
     for fset in ("k", "p", "kpm"):
@@ -870,26 +860,16 @@ def test_renormalised_outputs_and_public_entries(dtype, N):
         )
     kw, _ = params("k", M, N, seed=2)
     want = sampling_support(w, top_k=kw["top_k"], return_probs=True).probs
-    assert _eq_nan(
-        flashinfer.sampling.top_k_renorm_probs(w, kw["top_k"], batch_invariant=True),
-        want,
-    )
     assert _eq_nan(top_k_renorm_probs_batch_invariant(w, kw["top_k"]), want)
     assert _eq_nan(
-        flashinfer.sampling.top_k_renorm_probs(w, 7, batch_invariant=True),
+        top_k_renorm_probs_batch_invariant(w, 7),
         sampling_support(w, top_k=7, return_probs=True).probs,
     )
     kw, _ = params("p", M, N, seed=2)
     want = sampling_support(w, top_p=kw["top_p"], return_probs=True).probs
-    assert _eq_nan(
-        flashinfer.sampling.top_p_renorm_probs(w, kw["top_p"], batch_invariant=True),
-        want,
-    )
     assert _eq_nan(top_p_renorm_probs_batch_invariant(w, kw["top_p"]), want)
     assert _eq_nan(
-        flashinfer.sampling.top_p_renorm_probs(
-            w, 0.9, is_deterministic=True, batch_invariant=True
-        ),
+        top_p_renorm_probs_batch_invariant(w, 0.9),
         sampling_support(w, top_p=0.9, return_probs=True).probs,
     )
     x = tied_logits(M, N, dtype, seed=4)
@@ -897,17 +877,11 @@ def test_renormalised_outputs_and_public_entries(dtype, N):
     want = sampling_support(
         x, top_k=kw["top_k"], from_logits=True, return_masked_logits=True
     ).masked_logits
-    assert torch.equal(
-        flashinfer.sampling.top_k_mask_logits(x, kw["top_k"], batch_invariant=True),
-        want,
-    )
     assert torch.equal(top_k_mask_logits_batch_invariant(x, kw["top_k"]), want)
     # the renormalised rows sum to one within the output rounding; the masked logits keep the kept values
-    pr = flashinfer.sampling.top_k_renorm_probs(
-        w[3:4], 20, batch_invariant=True
-    ).float()
+    pr = top_k_renorm_probs_batch_invariant(w[3:4], 20).float()
     assert abs(float(pr.sum()) - 1.0) < (2e-2 if dtype == torch.bfloat16 else 1e-4)
-    ml = flashinfer.sampling.top_k_mask_logits(x, 5, batch_invariant=True)
+    ml = top_k_mask_logits_batch_invariant(x, 5)
     keep = torch.isfinite(ml)
     assert torch.equal(ml[keep], x[keep]) and bool((keep.sum(1) >= 5).all())
 
@@ -1064,53 +1038,6 @@ def test_determinism_graph_replay_and_pdl():
 
 
 @needs_device
-def test_default_path_is_the_operator_kernel(monkeypatch):
-    """Without the flag the three entries call the operator's registered kernels, byte for byte."""
-    N, M = 1000, 6
-    w = weights(M, N, torch.float32, seed=8)
-    x = tied_logits(M, N, torch.float32, seed=8)
-    seen = []
-    import flashinfer.sampling as fs
-
-    module = fs.get_sampling_module()
-    real_k, real_p, real_m = (
-        module.top_k_renorm_probs,
-        module.top_p_renorm_probs,
-        module.top_k_mask_logits,
-    )
-
-    def wrap(name, fn):
-        def w_(*a, **k):
-            seen.append(name)
-            return fn(*a, **k)
-
-        return w_
-
-    monkeypatch.setattr(module, "top_k_renorm_probs", wrap("k", real_k))
-    monkeypatch.setattr(module, "top_p_renorm_probs", wrap("p", real_p))
-    monkeypatch.setattr(module, "top_k_mask_logits", wrap("m", real_m))
-    ok = flashinfer.sampling.top_k_renorm_probs(w, 20)
-    op = flashinfer.sampling.top_p_renorm_probs(w, 0.8)
-    om = flashinfer.sampling.top_k_mask_logits(x, 20)
-    assert seen == ["k", "p", "m"]
-    assert torch.equal(
-        ok,
-        real_k(
-            w,
-            *fs._to_tensor_scalar_tuple(20),
-            fs._get_row_states_buffer("top_k_renorm_probs_row_states", w.device),
-            is_deterministic=False,
-        ),
-    )
-    assert om.shape == x.shape and op.shape == w.shape
-    seen.clear()
-    flashinfer.sampling.top_k_renorm_probs(w, 20, batch_invariant=True)
-    flashinfer.sampling.top_p_renorm_probs(w, 0.8, batch_invariant=True)
-    flashinfer.sampling.top_k_mask_logits(x, 20, batch_invariant=True)
-    assert seen == []  # the flag never reaches the operator's kernels
-
-
-@needs_device
 def test_shapes_views_and_empty_batches():
     """3-D inputs give outputs of the leading shape; a strided view is accepted (copied first); M = 0 launches
     nothing; the 2-D entries match their row-wise results."""
@@ -1135,14 +1062,12 @@ def test_shapes_views_and_empty_batches():
     rv = sampling_support(wide[:, :N], return_probs=True, **kw)
     assert torch.equal(rv.mask, flat.mask) and _eq_nan(rv.probs, flat.probs)
     x = tied_logits(6, N, torch.bfloat16, seed=2)
-    ml = flashinfer.sampling.top_k_mask_logits(x.view(2, 3, N), 5, batch_invariant=True)
+    ml = top_k_mask_logits_batch_invariant(x.view(2, 3, N), 5)
     assert ml.shape == (2, 3, N) and torch.equal(
-        ml.view(6, N), flashinfer.sampling.top_k_mask_logits(x, 5, batch_invariant=True)
+        ml.view(6, N), top_k_mask_logits_batch_invariant(x, 5)
     )
     e = sampling_support(w[:0], top_k=5, return_probs=True)
     assert (
         e.threshold.shape == (0,) and e.mask.shape == (0, N) and e.probs.shape == (0, N)
     )
-    assert flashinfer.sampling.top_k_renorm_probs(
-        w[:0], 5, batch_invariant=True
-    ).shape == (0, N)
+    assert top_k_renorm_probs_batch_invariant(w[:0], 5).shape == (0, N)

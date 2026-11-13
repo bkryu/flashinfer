@@ -5,9 +5,10 @@
 :func:`sampling_support` is the class's entry: the kept set of every row under top-k / top-p / min-p (ties kept) with its
 effective threshold, count and mass, and on request the renormalised probabilities (``lse.row``'s ``prob`` chain with the
 kept mass), the masked logits or the renormalised log-probabilities. :func:`top_k_renorm_probs_batch_invariant`,
-:func:`top_p_renorm_probs_batch_invariant` and :func:`top_k_mask_logits_batch_invariant` are what
-``flashinfer.sampling.top_k_renorm_probs`` / ``top_p_renorm_probs`` / ``top_k_mask_logits`` run under
-``batch_invariant=True``: one call of :func:`sampling_support` each.
+:func:`top_p_renorm_probs_batch_invariant` and :func:`top_k_mask_logits_batch_invariant` are the class's forms of
+``flashinfer.sampling.top_k_renorm_probs`` / ``top_p_renorm_probs`` / ``top_k_mask_logits`` -- one call of
+:func:`sampling_support` each; internal entries: the operators carry no ``batch_invariant`` flag in this release
+(their ``is_deterministic=True`` kernels serve them; exposing the class there is deferred).
 
 Every unsupported input raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
@@ -283,7 +284,8 @@ def top_k_renorm_probs_batch_invariant(
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
 ) -> torch.Tensor:
-    """``flashinfer.sampling.top_k_renorm_probs(probs, top_k, batch_invariant=True)``: ``probs`` renormalised over the
+    """The class's ``top_k_renorm_probs`` (an internal entry; not exposed on the operator in this release): ``probs``
+    renormalised over the
     top-k kept set of the class ``support.row.v1`` -- the k-th largest weight is the cut, ties at it are kept (the count
     may exceed ``k``), ``k <= 0`` keeps nothing (a row of ``+0``), ``k >= N`` everything -- as ``cvt(mul(p_j, div(1,
     mass)))`` with the kept mass the canonical tree over the kept weights (``lse.row``'s ``prob`` chain), ``+0`` outside
@@ -307,7 +309,8 @@ def top_p_renorm_probs_batch_invariant(
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
 ) -> torch.Tensor:
-    """``flashinfer.sampling.top_p_renorm_probs(probs, top_p, batch_invariant=True)``: ``probs`` renormalised over the
+    """The class's ``top_p_renorm_probs`` (an internal entry; not exposed on the operator in this release): ``probs``
+    renormalised over the
     top-p kept set of the class ``support.row.v1`` -- the smallest upward-closed set of weights whose declared
     fixed-point mass (``trunc(mul(p_j, div(2^44, S)))``, an exact integer sum) reaches ``trunc(mul(p, 2^44))``, ties at
     the cut kept, every positive weight when ``p >= 1`` or when the positive mass does not reach the target, zero
@@ -332,7 +335,8 @@ def top_k_mask_logits_batch_invariant(
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
 ) -> torch.Tensor:
-    """``flashinfer.sampling.top_k_mask_logits(logits, top_k, batch_invariant=True)``: ``logits`` with ``-inf`` outside
+    """The class's ``top_k_mask_logits`` (an internal entry; not exposed on the operator in this release): ``logits``
+    with ``-inf`` outside
     the top-k kept set of the class ``support.row.v1`` over the ``lse.row`` weights ``e_j = ex2((x_j - m) log2(e))`` of
     the row (the k-th largest weight is the cut, ties kept; the logits' own values are untouched inside the set), in the
     input dtype (bf16 / f16 / fp32)."""

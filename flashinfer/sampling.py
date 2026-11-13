@@ -1516,10 +1516,20 @@ def top_p_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
+    *,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-p (nucleus) sampling from probabilities.
     This operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
+
+    With ``batch_invariant=True`` the kept set is the batch-invariant class ``support.row.v1`` and the draw over
+    it the class ``sample.icdf.v1`` (``flashinfer/batch_invariant/README.md``): the kept set is the smallest
+    upward-closed set of weights whose declared fixed-point mass reaches ``top_p`` of the row's canonical sum (ties
+    at the cut kept), the token the inverse CDF over the canonical sum tree of the kept weights at the fp32 uniform
+    of a request-keyed stream -- the row's key is ``(seed, offset)`` and the token is a function of the row's
+    values, ``top_p``, its seed and its offset alone, never of its slot in the batch, the batch size or the
+    configuration. The receipt is ``flashinfer.batch_invariant.fingerprint("top_p_sampling_from_probs", N=, dtype=)``.
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
@@ -1580,6 +1590,16 @@ def top_p_sampling_from_probs(
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
         after the renormalization step.  Defaults to ``False``.
+    batch_invariant : bool
+        ``False`` (default): the operator's kernel above, unchanged. ``True``: the batch-invariant classes (bf16 / f16 / fp32 probabilities or unnormalised weights ``>= 0``
+        of shape ``(..., vocabulary)``; ``top_p`` a float or an fp32 tensor of one value or one per row; ``seed`` / ``offset`` one key per output row -- int64 / uint64
+        tensors of length ``batch_size``, or a scalar, a length-one tensor or the pair reserved from ``generator``
+        for a single row (a key shared by several rows raises ``ValueError``); SM100 / SM103 / SM107): the token is
+        drawn from the kept set's renormalised distribution at the row's key, ``-1`` (and ``valid`` False) for a row whose kept
+        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row) or whose
+        index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
+        construction). Anything the classes do not cover raises
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 
     Returns
     -------
@@ -1625,6 +1645,14 @@ def top_p_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
+    if batch_invariant:
+        from .batch_invariant.sampling.draw_support_api import (
+            top_p_sampling_from_probs_batch_invariant,
+        )
+
+        return top_p_sampling_from_probs_batch_invariant(
+            probs, top_p, indices, generator, seed, offset, return_valid
+        )
     return get_sampling_module().top_p_sampling_from_probs(
         probs,
         indices,
@@ -1648,10 +1676,20 @@ def top_k_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
+    *,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-k sampling from probabilities.
     This operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
+
+    With ``batch_invariant=True`` the kept set is the batch-invariant class ``support.row.v1`` and the draw over
+    it the class ``sample.icdf.v1`` (``flashinfer/batch_invariant/README.md``): the threshold is the k-th largest
+    weight (an exact radix selection over the weights' bit patterns, ties at the cut kept), the token the inverse
+    CDF over the canonical sum tree of the kept weights at the fp32 uniform of a request-keyed stream -- the row's
+    key is ``(seed, offset)`` and the token is a function of the row's values, ``top_k``, its seed and its offset
+    alone, never of its slot in the batch, the batch size or the configuration. The receipt is
+    ``flashinfer.batch_invariant.fingerprint("top_k_sampling_from_probs", N=, dtype=)``.
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
@@ -1712,6 +1750,16 @@ def top_k_sampling_from_probs(
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
         after the renormalization step.  Defaults to ``False``.
+    batch_invariant : bool
+        ``False`` (default): the operator's kernel above, unchanged. ``True``: the batch-invariant classes (bf16 / f16 / fp32 probabilities or unnormalised weights ``>= 0``
+        of shape ``(..., vocabulary)``; ``top_k`` an int or an int32 / int64 tensor of one value or one per row; ``seed`` / ``offset`` one key per output row -- int64 / uint64
+        tensors of length ``batch_size``, or a scalar, a length-one tensor or the pair reserved from ``generator``
+        for a single row (a key shared by several rows raises ``ValueError``); SM100 / SM103 / SM107): the token is
+        drawn from the kept set's renormalised distribution at the row's key, ``-1`` (and ``valid`` False) for a row whose kept
+        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row) or whose
+        index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
+        construction). Anything the classes do not cover raises
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 
     Returns
     -------
@@ -1756,6 +1804,14 @@ def top_k_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
+    if batch_invariant:
+        from .batch_invariant.sampling.draw_support_api import (
+            top_k_sampling_from_probs_batch_invariant,
+        )
+
+        return top_k_sampling_from_probs_batch_invariant(
+            probs, top_k, indices, generator, seed, offset, return_valid
+        )
     return get_sampling_module().top_k_sampling_from_probs(
         probs,
         indices,
@@ -1779,8 +1835,18 @@ def min_p_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
+    *,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities.
+
+    With ``batch_invariant=True`` the kept set is the batch-invariant class ``support.row.v1`` and the draw over
+    it the class ``sample.icdf.v1`` (``flashinfer/batch_invariant/README.md``): the kept set is
+    ``{j : p_j >= mul(p_max, min_p)}`` with ``p_max`` the row's ``max`` tree, the token the inverse CDF over the
+    canonical sum tree of the kept weights at the fp32 uniform of a request-keyed stream -- the row's key is
+    ``(seed, offset)`` and the token is a function of the row's values, ``min_p``, its seed and its offset alone,
+    never of its slot in the batch, the batch size or the configuration. The receipt is
+    ``flashinfer.batch_invariant.fingerprint("min_p_sampling_from_probs", N=, dtype=)``.
 
     this operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
@@ -1844,6 +1910,16 @@ def min_p_sampling_from_probs(
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
         after the renormalization step.  Defaults to ``False``.
+    batch_invariant : bool
+        ``False`` (default): the operator's kernel above, unchanged. ``True``: the batch-invariant classes (bf16 / f16 / fp32 probabilities or unnormalised weights ``>= 0``
+        of shape ``(..., vocabulary)``; ``min_p`` a float or an fp32 tensor of one value or one per row; ``seed`` / ``offset`` one key per output row -- int64 / uint64
+        tensors of length ``batch_size``, or a scalar, a length-one tensor or the pair reserved from ``generator``
+        for a single row (a key shared by several rows raises ``ValueError``); SM100 / SM103 / SM107): the token is
+        drawn from the kept set's renormalised distribution at the row's key, ``-1`` (and ``valid`` False) for a row whose kept
+        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row) or whose
+        index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
+        construction). Anything the classes do not cover raises
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 
     Returns
     -------
@@ -1883,6 +1959,14 @@ def min_p_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
+    if batch_invariant:
+        from .batch_invariant.sampling.draw_support_api import (
+            min_p_sampling_from_probs_batch_invariant,
+        )
+
+        return min_p_sampling_from_probs_batch_invariant(
+            probs, min_p, indices, generator, seed, offset, return_valid
+        )
     return get_sampling_module().min_p_sampling_from_probs(
         probs,
         indices,
@@ -2028,8 +2112,20 @@ def top_k_top_p_sampling_from_logits(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     top_k_max: Optional[int] = None,
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits.
+
+    With ``batch_invariant=True`` the kept set is the batch-invariant class ``support.row.v1`` over the ``lse.row``
+    weights ``e_j = ex2((x_j - m) log2(e))`` of the row and the draw over it the class ``sample.icdf.v1``
+    (``flashinfer/batch_invariant/README.md``), without materialising the probabilities: the top-k cut then the
+    top-p cut on the kept mass (``filter_apply_order="top_k_first"``) or both cuts on the whole row (``"joint"``),
+    ties kept, one kernel either way; the token the inverse CDF over the canonical sum tree of the kept weights at
+    the fp32 uniform of a request-keyed stream -- the row's key is ``(seed, offset)`` and the token is a function
+    of the row's values, the two parameters, its seed and its offset alone, never of its slot in the batch, the
+    batch size or the configuration. The receipt is
+    ``flashinfer.batch_invariant.fingerprint("top_k_top_p_sampling_from_logits", N=, dtype=[, filter_apply_order=])``.
 
     this operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
@@ -2103,6 +2199,16 @@ def top_k_top_p_sampling_from_logits(
         ``"top_k_first"``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
         where rows above it (including "no top-k" rows) sample with ``top_k = top_k_max``.
         Otherwise ignored. Default is ``None``.
+    batch_invariant : bool
+        ``False`` (default): the operator's kernel above, unchanged. ``True``: the batch-invariant classes (bf16 / f16 / fp32 logits
+        of shape ``(..., vocabulary)``; ``top_k`` / ``top_p`` scalars or tensors of one value or one per row, both orders; ``seed`` / ``offset`` one key per output row -- int64 / uint64
+        tensors of length ``batch_size``, or a scalar, a length-one tensor or the pair reserved from ``generator``
+        for a single row (a key shared by several rows raises ``ValueError``); SM100 / SM103 / SM107): the token is
+        drawn from the kept set's renormalised distribution at the row's key, ``-1`` (the row invalid) for a row whose kept
+        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row) or whose
+        index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
+        construction), and so is ``top_k_max`` (one kernel, no fast path). Anything the classes do not cover raises
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 
     Returns
     -------
@@ -2147,6 +2253,24 @@ def top_k_top_p_sampling_from_logits(
     top_k_mask_logits
     top_p_sampling_from_probs
     """
+    if batch_invariant:
+        if check_nan:
+            if torch.any(torch.isnan(logits)):
+                raise ValueError("Input logits contains NaN.")
+        from .batch_invariant.sampling.draw_support_api import (
+            top_k_top_p_sampling_from_logits_batch_invariant,
+        )
+
+        return top_k_top_p_sampling_from_logits_batch_invariant(
+            logits,
+            top_k,
+            top_p,
+            indices,
+            filter_apply_order,
+            generator,
+            seed,
+            offset,
+        )
     if filter_apply_order == "top_k_first":
         if _top_k_first_fast_path_applicable(logits, top_k, indices, top_k_max):
             return _top_k_first_fast_path(
@@ -2207,8 +2331,19 @@ def top_k_top_p_sampling_from_probs(
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
     top_k_max: Optional[int] = None,
+    *,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities.
+
+    With ``batch_invariant=True`` the kept set is the batch-invariant class ``support.row.v1`` and the draw over
+    it the class ``sample.icdf.v1`` (``flashinfer/batch_invariant/README.md``): the top-k cut then the top-p cut
+    on the kept mass (``filter_apply_order="top_k_first"``) or both cuts on the whole row (``"joint"``), ties
+    kept, one kernel either way; the token the inverse CDF over the canonical sum tree of the kept weights at the
+    fp32 uniform of a request-keyed stream -- the row's key is ``(seed, offset)`` and the token is a function of
+    the row's values, the two parameters, its seed and its offset alone, never of its slot in the batch, the batch
+    size or the configuration. The receipt is
+    ``flashinfer.batch_invariant.fingerprint("top_k_top_p_sampling_from_probs", N=, dtype=[, filter_apply_order=])``.
 
     this operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
@@ -2286,6 +2421,16 @@ def top_k_top_p_sampling_from_probs(
         ``"top_k_first"``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
         where rows above it (including "no top-k" rows) sample with ``top_k = top_k_max``.
         Otherwise ignored. Default is ``None``.
+    batch_invariant : bool
+        ``False`` (default): the operator's kernel above, unchanged. ``True``: the batch-invariant classes (bf16 / f16 / fp32 probabilities or unnormalised weights ``>= 0``
+        of shape ``(..., vocabulary)``; ``top_k`` / ``top_p`` scalars or tensors of one value or one per row, both orders; ``seed`` / ``offset`` one key per output row -- int64 / uint64
+        tensors of length ``batch_size``, or a scalar, a length-one tensor or the pair reserved from ``generator``
+        for a single row (a key shared by several rows raises ``ValueError``); SM100 / SM103 / SM107): the token is
+        drawn from the kept set's renormalised distribution at the row's key, ``-1`` (and ``valid`` False) for a row whose kept
+        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row) or whose
+        index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
+        construction), and so is ``top_k_max`` (one kernel, no fast path). Anything the classes do not cover raises
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 
     Returns
     -------
@@ -2329,6 +2474,25 @@ def top_k_top_p_sampling_from_probs(
     top_p_renorm_probs
     top_k_mask_logits
     """
+    if batch_invariant:
+        if check_nan:
+            if torch.any(torch.isnan(probs)):
+                raise ValueError("Input probs contains NaN.")
+        from .batch_invariant.sampling.draw_support_api import (
+            top_k_top_p_sampling_from_probs_batch_invariant,
+        )
+
+        return top_k_top_p_sampling_from_probs_batch_invariant(
+            probs,
+            top_k,
+            top_p,
+            indices,
+            filter_apply_order,
+            generator,
+            seed,
+            offset,
+            return_valid,
+        )
     if filter_apply_order == "top_k_first":
         if _top_k_first_fast_path_applicable(probs, top_k, indices, top_k_max):
             return _top_k_first_fast_path(
@@ -2381,19 +2545,10 @@ def top_p_renorm_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
     is_deterministic: bool = False,
-    *,
-    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-p thresholding.
 
     Uses AIR Top-P algorithm (radix-based) for efficient threshold finding.
-
-    With ``batch_invariant=True`` the kept set and the renormalisation are the batch-invariant class
-    ``support.row.v1`` (``flashinfer/batch_invariant/README.md``): the threshold is the largest weight whose
-    upward-closed set's declared fixed-point mass reaches ``p`` of the row's canonical sum, ties at the cut are
-    kept, and the kept weights are renormalised by the canonical tree over them (``lse.row``'s ``prob`` chain), so
-    a row's output depends on its own values and ``p`` alone -- never on its slot, the batch size or the
-    configuration. The fingerprint is ``flashinfer.batch_invariant.fingerprint("top_p_renorm_probs", N=, dtype=)``.
 
     Parameters
     ----------
@@ -2409,17 +2564,6 @@ def top_p_renorm_probs(
     is_deterministic: bool
         If True, use deterministic integer accumulation for reproducible results. This will affect performance.
         Default is False.
-    batch_invariant : bool
-        ``False`` (default): the operator's kernel above, unchanged. ``True``: the batch-invariant class
-        ``support.row.v1`` (bf16 / f16 / fp32 probabilities or unnormalised weights ``>= 0`` of shape
-        ``(..., vocabulary)``, the output in the input dtype; ``top_p`` a scalar or a per-row tensor; SM100 /
-        SM103 / SM107): the kept set is the smallest upward-closed set whose fixed-point mass
-        ``sum trunc(mul(p_j, div(2^44, S)))`` reaches ``trunc(mul(p, 2^44))``, ties at the cut kept, every positive
-        weight when ``p >= 1`` or the positive mass does not reach the target, zero weights never; the kept weights
-        are renormalised as ``cvt(mul(p_j, div(1, mass)))`` with ``mass`` the canonical tree over them, ``+0``
-        outside the set. ``is_deterministic`` is ignored (the class is deterministic by construction). Anything
-        the class does not cover raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
-        instead of falling back.
 
     Returns
     -------
@@ -2460,12 +2604,6 @@ def top_p_renorm_probs(
     sampling_from_probs
     top_k_renorm_probs
     """
-    if batch_invariant:
-        from .batch_invariant.sampling.support_api import (
-            top_p_renorm_probs_batch_invariant,
-        )
-
-        return top_p_renorm_probs_batch_invariant(probs, top_p)
     batch_size = probs.size(0)
     vocab_size = probs.size(1)
     # Workspace size for AIR Top-P radix algorithm.
@@ -2496,17 +2634,8 @@ def top_k_renorm_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     is_deterministic: bool = False,
-    *,
-    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-k thresholding.
-
-    With ``batch_invariant=True`` the kept set and the renormalisation are the batch-invariant class
-    ``support.row.v1`` (``flashinfer/batch_invariant/README.md``): the threshold is the k-th largest weight (an
-    exact radix selection over the weights' bit patterns), ties at the cut are kept, and the kept weights are
-    renormalised by the canonical tree over them (``lse.row``'s ``prob`` chain), so a row's output depends on its
-    own values and ``k`` alone -- never on its slot, the batch size or the configuration. The fingerprint is
-    ``flashinfer.batch_invariant.fingerprint("top_k_renorm_probs", N=, dtype=)``.
 
     Parameters
     ----------
@@ -2526,16 +2655,6 @@ def top_k_renorm_probs(
         order). Useful when replicas (e.g. tensor-parallel ranks) must compute
         identical outputs from identical inputs. Slightly affects performance.
         Default is False.
-    batch_invariant : bool
-        ``False`` (default): the operator's kernel above, unchanged. ``True``: the batch-invariant class
-        ``support.row.v1`` (bf16 / f16 / fp32 probabilities or unnormalised weights ``>= 0`` of shape
-        ``(..., vocabulary)``, the output in the input dtype; ``top_k`` a scalar or a per-row tensor; SM100 /
-        SM103 / SM107): the k-th largest weight is the cut and ties at it are kept (the kept count may exceed
-        ``k``), ``k <= 0`` keeps nothing (a row of ``+0``), ``k >= N`` everything; the kept weights are
-        renormalised as ``cvt(mul(p_j, div(1, mass)))`` with ``mass`` the canonical tree over them, ``+0`` outside
-        the set (an all-zero row renormalises to NaN: the declared ``div(1, +0)``). ``is_deterministic`` is
-        ignored (the class is deterministic by construction). Anything the class does not cover raises
-        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 
     Returns
     -------
@@ -2578,12 +2697,6 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    if batch_invariant:
-        from .batch_invariant.sampling.support_api import (
-            top_k_renorm_probs_batch_invariant,
-        )
-
-        return top_k_renorm_probs_batch_invariant(probs, top_k)
     row_states_buffer = _get_row_states_buffer(
         "top_k_renorm_probs_row_states", probs.device
     )
@@ -2601,19 +2714,9 @@ top_k_renorm_prob = top_k_renorm_probs
 
 @flashinfer_api(trace=top_k_mask_logits_trace)
 def top_k_mask_logits(
-    logits: torch.Tensor,
-    top_k: Union[torch.Tensor, int],
-    *,
-    batch_invariant: bool = False,
+    logits: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
     r"""Fused GPU kernel for masking logits by top-k thresholding.
-
-    With ``batch_invariant=True`` the kept set is the batch-invariant class ``support.row.v1``
-    (``flashinfer/batch_invariant/README.md``) over the ``lse.row`` weights ``e_j = ex2((x_j - m) log2(e))`` of the
-    row: the threshold is the k-th largest weight (an exact radix selection over the weights' bit patterns), ties
-    at the cut are kept, the kept logits are returned as they are and the rest as ``-inf``, so a row's output
-    depends on its own values and ``k`` alone -- never on its slot, the batch size or the configuration. The
-    fingerprint is ``flashinfer.batch_invariant.fingerprint("top_k_mask_logits", N=, dtype=)``.
 
     Parameters
     ----------
@@ -2626,13 +2729,6 @@ def top_k_mask_logits(
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
         We keep the top-k logits, set the rest to negative infinity.
-    batch_invariant : bool
-        ``False`` (default): the operator's kernel above, unchanged. ``True``: the batch-invariant class
-        ``support.row.v1`` (bf16 / f16 / fp32 logits of shape ``(..., vocabulary)``, the output in the input dtype;
-        ``top_k`` a scalar or a per-row tensor; SM100 / SM103 / SM107): the k-th largest weight is the cut and ties
-        at it are kept (the kept count may exceed ``k``), ``k <= 0`` keeps nothing (a row of ``-inf``), ``k >= N``
-        everything. Anything the class does not cover raises
-        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 
     Returns
     -------
@@ -2671,12 +2767,6 @@ def top_k_mask_logits(
     top_k_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    if batch_invariant:
-        from .batch_invariant.sampling.support_api import (
-            top_k_mask_logits_batch_invariant,
-        )
-
-        return top_k_mask_logits_batch_invariant(logits, top_k)
     row_states_buffer = _get_row_states_buffer(
         "top_k_mask_logits_row_states", logits.device
     )

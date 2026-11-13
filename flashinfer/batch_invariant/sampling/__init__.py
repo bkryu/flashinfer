@@ -4,8 +4,11 @@
 ``flashinfer.sampling.softmax(..., batch_invariant=True)`` and ``flashinfer.sampling.log_probs`` (``api``), and the
 inverse-CDF draw ``sample.icdf.v1`` behind ``sampling_from_probs(..., batch_invariant=True)`` /
 ``sampling_from_logits(..., batch_invariant=True)`` (``draw_api``) on the request-keyed stream (``stream``), and the
-support class ``support.row.v1`` behind ``top_k_renorm_probs`` / ``top_p_renorm_probs`` / ``top_k_mask_logits(...,
-batch_invariant=True)`` (``support_api``). Light imports
+support class ``support.row.v1`` (``support_api``: the kept set of a row under top-k / top-p / min-p filters; its
+renormalisation entries are internal in this release) with the truncated draw over it behind
+``top_k_sampling_from_probs`` / ``top_p_sampling_from_probs`` / ``min_p_sampling_from_probs`` /
+``top_k_top_p_sampling_from_probs`` / ``top_k_top_p_sampling_from_logits(..., batch_invariant=True)``
+(``draw_support_api``). Light imports
 only: the CuTe-DSL kernel modules are imported on first use.
 
 The kernels' compiled-object cache modules are registered here (the kernel modules are their roots: an edit to a kernel
@@ -34,4 +37,10 @@ _jit.MODULE_ROOTS.setdefault(
 _jit.MODULE_ROOTS.setdefault(
     "batch_invariant_sampling_support",
     ("batch_invariant/sampling/support_kernel.py",),
+)
+# the truncated draw (the support's thresholds, then the draw over the kept weights): its own module; it imports both
+# kernels' plumbing, so an edit to either of them recompiles it too, and an edit here recompiles nothing else
+_jit.MODULE_ROOTS.setdefault(
+    "batch_invariant_sampling_draw_support",
+    ("batch_invariant/sampling/draw_support_kernel.py",),
 )

@@ -163,3 +163,64 @@ def draw_reference(
         "S": torch.tensor(out["S"], dtype=torch.float64).to(torch.float32),
         "t": torch.tensor(out["t"], dtype=torch.float64).to(torch.float32),
     }
+
+
+def draw_support_reference(
+    x: torch.Tensor,
+    seeds: Sequence[int],
+    offsets: Sequence[int],
+    filters,
+    from_logits: bool = False,
+    temperature=None,
+    draw: int = 0,
+    rows: Optional[Sequence[int]] = None,
+) -> Dict[str, torch.Tensor]:
+    """The truncated draw's exact model: ``support.row.v1`` per row (``filters[r]``, a :class:`support_spec.Filters`), then
+    the draw over the kept weights (the others ``+0``): ``{"samples" int64 (-1 where invalid), "valid" bool, "mass" (the
+    masked canonical tree), "threshold", "u", "logprobs"}`` (the renormalised log-probability of the drawn token for
+    logits, ``mul(add(z, neg(lg2(mass))), LN2)``; NaN when invalid), each over ``rows`` (every row by default)."""
+    from .mufu_device import lg2_device
+    from .spec import LN2_F32
+    from .support_reference import support_row
+
+    x = x.detach().cpu()
+    M, N = x.shape
+    rows = list(range(M)) if rows is None else list(rows)
+    xf = x.to(torch.float32)
+    cs = _scales(temperature, M) if from_logits else None
+    out: Dict[str, list] = {
+        k: [] for k in ("samples", "valid", "mass", "threshold", "u", "logprobs")
+    }
+    for r in rows:
+        if from_logits:
+            m = row_max(xf[r])
+            z = torch.mul(
+                torch.add(xf[r], torch.tensor(fp32.neg(m), dtype=torch.float32)),
+                torch.tensor(cs[r], dtype=torch.float32),
+            )
+            w = ex2_device(z)
+            res = support_row(w, N, filters[r], w_max=1.0)
+        else:
+            w = xf[r]
+            res = support_row(w, N, filters[r])
+        wk = torch.where(res["mask"], w, torch.zeros_like(w))
+        words = stream.words(int(seeds[r]), int(offsets[r]), draw)
+        u = stream.uniform32(words[0])
+        tok, ok, mass, _ = draw_row(wk, N, u)
+        lp = float("nan")
+        if from_logits and ok:
+            lg2m = float(lg2_device(torch.tensor([mass], dtype=torch.float32))[0])
+            lp = fp32.mul(fp32.add(float(z[tok]), fp32.neg(lg2m)), LN2_F32)
+        out["samples"].append(tok)
+        out["valid"].append(ok)
+        out["mass"].append(mass)
+        out["threshold"].append(res["threshold"])
+        out["u"].append(u)
+        out["logprobs"].append(lp)
+    ret = {
+        "samples": torch.tensor(out["samples"], dtype=torch.int64),
+        "valid": torch.tensor(out["valid"], dtype=torch.bool),
+    }
+    for k in ("mass", "threshold", "u", "logprobs"):
+        ret[k] = torch.tensor(out[k], dtype=torch.float64).to(torch.float32)
+    return ret
