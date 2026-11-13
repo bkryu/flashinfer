@@ -368,7 +368,7 @@ def compile_grouped_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
         body = GroupedBlockGemm(cfg, chain, packing=packing)
-        if _is_block_scaled(chain):
+        if _is_block_scaled(chain) or _is_promoted(chain):
             if isinstance(chain, (MxChain, Mxfp4Chain)) or _is_promoted(chain):
                 # the MX chains (MXFP8, MXFP4) and the block-scale fp8 chains: no operand beyond the output (the quantising chain
                 # writes its scales as a second output); the W4A4 unscaled oracle keeps ``block_scaled`` (alpha / pts unread)
@@ -557,7 +557,7 @@ def compile_swapped_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
         body = SwappedGroupedGemm(cfg, chain, gather=gather, k_block=k_block)
-        if _is_block_scaled(chain):
+        if _is_block_scaled(chain) or _is_promoted(chain):
             if isinstance(chain, (MxChain, Mxfp4Chain)) or _is_promoted(chain):
                 # the MX and the block-scale fp8 chains' entries; the W4A4 unscaled oracle keeps ``block_scaled`` (alpha / pts unread)
                 if chain.quant:
