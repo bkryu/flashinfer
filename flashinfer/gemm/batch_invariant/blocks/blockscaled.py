@@ -124,11 +124,14 @@ class BlockScaledPlan:
     SF_VEC = SF_VEC["mxfp8"]  # elements per block scale
     INST_K = 32  # the instruction's K
     TMEM_COLS = TMEM_COLS  # the TMEM budget planned against
+    #: the sm_100 instructions' shared-memory descriptors address the first 256 KB of the CTA's shared memory: every operand
+    #: ring a UMMA reads ends below it (the grouped bodies' plan rule; the sm_107 plan lifts it)
+    UMMA_SMEM_ADDR_MAX: Optional[int] = 1 << 18
     TMEM_ALLOC_ARCH = TMEM_ARCH  # the allocator's architecture: "sm_100" allows powers of two to 512, "sm_107" also the whole 576
     S2T_BROADCAST = False  # the smem -> TMEM scale-factor copy's source partition (see s2t_copy_and_partition)
     # the M-side operand ring (A) placed above this many bytes of the CTA's shared memory reads wrong data on the sm_100
     # instruction plans of this part (observed; the B and scale-factor rings above it compute the class): the grouped
-    # planners keep the A and B rings below it (`fused_moe/batch_invariant/blocks/blockscaled_kernel.py::plan_with_room`);
+    # planners keep the A and B rings below it (`fused_moe/batch_invariant/blocks/operands.py::grouped_plan`);
     # None: the whole shared memory
     UMMA_SMEM_ADDR_MAX: Optional[int] = A_RING_MAX_BYTES
 
@@ -384,6 +387,9 @@ class BlockScaledPlanSM107(BlockScaledPlan):
 
     IN_FMT = "mxfp8_k64"
     INST_K = 64
+    UMMA_SMEM_ADDR_MAX = (
+        None  # the sm_107 instructions address the part's whole shared memory
+    )
     TMEM_COLS = TMEM_COLS_SM107
     TMEM_ALLOC_ARCH = (
         "sm_107"  # the allocator accepts the non-power-of-two 576 on sm_107 only

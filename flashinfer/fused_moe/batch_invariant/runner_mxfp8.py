@@ -20,7 +20,7 @@ the routing-and-plan launch takes the matching form). An unsupported configurati
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -89,7 +89,9 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         T, H = x.shape
         if sf.dtype not in (torch.uint8, torch.float8_e8m0fnu):
             raise unsupported(
-                self.CLASS, f"hidden_states_scale {sf.dtype}", "uint8 or UE8M0 scale bytes"
+                self.CLASS,
+                f"hidden_states_scale {sf.dtype}",
+                "uint8 or UE8M0 scale bytes",
             )
         if H % BLOCK:
             raise unsupported(self.CLASS, f"hidden size {H}", self.ROW_RULE)
@@ -138,7 +140,11 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         from .blocks.epilogue_mx import MxChain
 
         return MxChain(
-            "glu" if a.gated else "act", a.act, "bf16", a.params, self._in_fmt or "mxfp8"
+            "glu" if a.gated else "act",
+            a.act,
+            "bf16",
+            a.params,
+            self._in_fmt or "mxfp8",
         )
 
     def _chain2(self):

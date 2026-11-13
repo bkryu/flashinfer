@@ -69,6 +69,7 @@ from .api import (
     BatchInvariantBf16Config,
     BatchInvariantFp8BlockConfig,
     BatchInvariantFp8PerTensorConfig,
+    BatchInvariantFp4Config,
     FrostLowLatencyConfig,
     MoEActivationPack,
     MoEConfig,
@@ -132,6 +133,7 @@ from .backends.frost_low_latency.runner import FrostLowLatencyRunner
 from .batch_invariant.runner import BatchInvariantMoeRunner
 from .batch_invariant.runner_fp8 import BatchInvariantFp8PerTensorRunner
 from .batch_invariant.runner_fp8_block import BatchInvariantFp8BlockRunner
+from .batch_invariant.runner_fp4 import BatchInvariantFp4Runner
 from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
@@ -182,6 +184,7 @@ _RunnerT = Union[
     B12xNvfp4Runner,
     B12xW4A16Runner,
     BatchInvariantFp8BlockRunner,
+    BatchInvariantFp4Runner,
 ]
 
 # Map backend-config class -> runner class
@@ -232,6 +235,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     B12xW4A16Config: B12xW4A16Runner,
     BatchInvariantFp8PerTensorConfig: BatchInvariantFp8PerTensorRunner,
     BatchInvariantFp8BlockConfig: BatchInvariantFp8BlockRunner,
+    BatchInvariantFp4Config: BatchInvariantFp4Runner,
 }
 
 

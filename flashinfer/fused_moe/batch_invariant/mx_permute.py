@@ -24,7 +24,7 @@ from cutlass import Int32, Int64, Uint8
 
 from ...batch_invariant import jit
 
-MODULE = "batch_invariant_moe_mxfp8"
+MODULE = "batch_invariant_moe"  # the MoE kernels' one module (the scatter shares the bodies' cache key)
 WARPS = 4
 LANES = 32
 VEC_BYTES = 16

@@ -419,17 +419,19 @@ def test_shape_rules_and_padded_bound():
 def test_swapped_k_block_is_a_shape_rule():
     """The swapped body's k-block (K elements per smem stage) is a function of the class and K alone: two atoms of K when
     they divide K, else the one-atom default (`swap_k_block`), spelled into the kernel name with the default as 0
-    (`swap_k_block_arg`: one object per k-block), accepted by the body iff it divides K; the padded body and the dense
-    class keep the default (`Knobs.k_block` does not exist in this tree: the record space is untouched)."""
-    from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp8 import (
+    (`swap_k_block_arg`: one object per k-block, the shared compile wrapper's ``_kb`` suffix), accepted by the body iff it
+    divides K; the grouped body and the dense class keep the default (`Knobs.k_block` does not exist in this tree: the
+    record space is untouched)."""
+    from flashinfer.fused_moe.batch_invariant.blocks.compile import swapped_kernel_name
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
         SWAP_K_BLOCKS,
         can_implement_swapped_mxfp8,
         swap_k_block,
         swap_k_block_arg,
-        swapped_kernel_name,
+        swapped_knobs_mx,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
-    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
 
     assert SWAP_K_BLOCKS == (128, 256)
     for fmt in ("mxfp8", "mxfp8_k64"):
@@ -443,9 +445,10 @@ def test_swapped_k_block_is_a_shape_rule():
         )
         cfg = swapped_knobs_mx()[0]
         f32 = GroupedChain("plain", "silu", "f32")
-        assert swapped_kernel_name(cfg, f32, fmt, 256).endswith(
+        mx = MxChain.of(f32, fmt)
+        assert swapped_kernel_name(cfg, mx, k_block=256).endswith(
             "_kb256"
-        ) and not swapped_kernel_name(cfg, f32, fmt, 0).endswith("_kb256")
+        ) and not swapped_kernel_name(cfg, mx).endswith("_kb256")
         assert can_implement_swapped_mxfp8(cfg, 256, 2048, 8, f32, fmt, 256)
         assert not can_implement_swapped_mxfp8(cfg, 256, 640, 8, f32, fmt, 256), (
             "a k-block that does not divide K is refused"
@@ -453,6 +456,124 @@ def test_swapped_k_block_is_a_shape_rule():
         assert not can_implement_swapped_mxfp8(cfg, 256, 2048, 8, f32, fmt, 512), (
             "four atoms are not admitted"
         )
+
+
+def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch):
+    """The MX chains run the backend's swapped body (:mod:`blocks.swap`), which reads the plan's group counts under the
+    chain's trigger rule (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own wait, the body's own
+    wait before the tables is the margin) and whose builder asserts the shipped placement is one of them; the gather form
+    belongs to the bf16 classes; a k-block is whole instruction steps of the class."""
+    from flashinfer.fused_moe.batch_invariant import pdl
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        GEMM2_CHAIN,
+        swapped_knobs_mx,
+    )
+
+    cfg = swapped_knobs_mx()[0]
+    assert pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS
+    for fmt in ("mxfp8", "mxfp8_k64"):
+        ch = MxChain("glu", "silu", "mxfp8", (), fmt)
+        SwappedGroupedGemm(cfg, ch)
+        assert SwappedGroupedGemm(cfg, ch, k_block=256).k_block == 256
+        with pytest.raises(AssertionError):
+            SwappedGroupedGemm(cfg, ch, k_block=48)
+        with pytest.raises(AssertionError):
+            SwappedGroupedGemm(cfg, ch, gather=True)
+    monkeypatch.setattr(pdl, "TRIGGER", "early")
+    with pytest.raises(AssertionError):
+        SwappedGroupedGemm(cfg, GEMM2_CHAIN)
+
+
+def test_mx_classes_run_on_the_unified_bodies():
+    """The MXFP8 classes have no body of their own: the backend's grouped and swapped bodies (:mod:`blocks.kernel`,
+    :mod:`blocks.swap`) take the MX chain through the block-scaled operand block (e4m3 elements, UE8M0 scales per 32
+    elements, four epilogue warpgroups, the 128-row scale atom as the group alignment, both packings) and the fused
+    requantization through the epilogue block's hooks (its own loops, its exchange buffer for the gated chain only); the
+    compiled objects carry the instruction class, the packing and the k-block in their names; the shared acceptance runs at
+    the chain's class; one JIT module (``batch_invariant_moe``) holds the kernels and the MX scatter, with no MX-specific
+    body in its source closure."""
+    from flashinfer.batch_invariant import jit
+    from flashinfer.fused_moe.batch_invariant.blocks import compile as C
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import (
+        MxChain,
+        grouped_epilogue_quant_loop,
+        swap_xch_bytes,
+        swapped_epilogue_quant_loop,
+        xch_bytes,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.kernel import GroupedBlockGemm
+    from flashinfer.fused_moe.batch_invariant.blocks.operands import (
+        BlockScaledOperands,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import (
+        SwappedGroupedGemm,
+        is_swapped_record,
+        swapped_knobs,
+    )
+    from flashinfer.fused_moe.batch_invariant.mx_permute import MODULE as SCATTER_MODULE
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        GEMM2_CHAIN,
+        swapped_knobs_mx,
+    )
+    from flashinfer.gemm.batch_invariant.blocks.operands import IN_DT
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    dense = Knobs((128, 128), (1, 1), False, True, "m", 1)
+    quant, plain = MxChain("glu", "silu", "mxfp8"), GEMM2_CHAIN
+    assert quant.quant and not plain.quant
+    assert quant.operands == () and not quant.needs_aux and not quant.per_row_scale
+    assert quant.grouped_loop() is grouped_epilogue_quant_loop
+    assert quant.swapped_loop() is swapped_epilogue_quant_loop
+    assert plain.grouped_loop() is None and plain.swapped_loop() is None
+    # the exchange buffer: the gated fused requantization's alone (an ungated block is one thread's / one warp's)
+    assert xch_bytes(quant, 4) > 0 and swap_xch_bytes(quant, 16) > 0
+    assert (
+        xch_bytes(plain, 4) == 0 and xch_bytes(MxChain("act", "relu2", "mxfp8"), 4) == 0
+    )
+    for fmt in ("mxfp8", "mxfp8_k64"):
+        for packing in ("padded", "dense"):
+            body = GroupedBlockGemm(dense, quant.at(fmt), packing=packing)
+            ops = body.operands
+            assert ops == BlockScaledOperands(fmt, packing) and ops.block_scaled
+            assert (ops.sf_vec, ops.elem_bits, ops.group_align) == (32, 8, 128)
+            assert ops.dtype is IN_DT[fmt] and body.epi_warpgroups == 4
+            assert ops.dense_a == (packing == "dense")
+        assert swapped_knobs(fmt) == swapped_knobs_mx()
+        sw = swapped_knobs_mx()[0]
+        assert is_swapped_record(sw, fmt)
+        s = SwappedGroupedGemm(sw, plain.at(fmt), k_block=256)
+        assert s.operands.block_scaled and s.k_block == 256 and s.sf_warp == 4
+        assert C.can_implement_grouped_blockscaled(dense, 256, 2048, 8, quant, fmt)
+        assert C.can_implement_swapped_blockscaled(sw, 256, 2048, 8, quant, fmt)
+        assert not C.can_implement_grouped_blockscaled(dense, 256, 2064, 8, quant, fmt)
+    # a bf16 chain names no instruction class: the shared wrapper takes the MX chain (the MX dispatcher converts)
+    assert not C.can_implement_grouped_blockscaled(
+        dense, 256, 2048, 8, GroupedChain("plain", "silu", "bf16"), "mxfp8"
+    )
+    assert C.kernel_name(dense, quant.at("mxfp8_k64"), packing="dense").startswith(
+        "grouped_mxfp8k64_densea_swiglu_mxfp8_"
+    )
+    assert C.kernel_name(dense, quant, packing="padded").startswith(
+        "grouped_mxfp8_swiglu_mxfp8_"
+    )
+    name = C.swapped_kernel_name(
+        swapped_knobs_mx()[1], plain.at("mxfp8_k64"), k_block=256
+    )
+    assert name.startswith("swapped_mxfp8k64_plain_bf16_") and name.endswith("_kb256")
+    assert C.MODULE == SCATTER_MODULE == "batch_invariant_moe"
+    assert "batch_invariant_moe_mxfp8" not in jit.MODULE_ROOTS
+    srcs = jit.relative_sources("batch_invariant_moe")
+    gone = ("blockscaled_kernel.py", "swap_mxfp8.py", "compile_mxfp8.py")
+    assert not any(os.path.basename(src) in gone for src in srcs), srcs
+    for src in (
+        "fused_moe/batch_invariant/mx_permute.py",
+        "fused_moe/batch_invariant/blocks/epilogue_mx.py",
+        "fused_moe/batch_invariant/blocks/operands.py",
+    ):
+        assert src in srcs, srcs
 
 
 @pytest.mark.parametrize(
@@ -1370,12 +1491,12 @@ def test_every_record_computes_the_class_at_long_k_on_every_instruction_class_of
         grouped_gemm_mxfp8,
         mx_class_of,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp8 import (
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
         can_implement_grouped_mxfp8,
         can_implement_swapped_mxfp8,
+        swapped_knobs_mx,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
-    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
     from flashinfer.gemm.batch_invariant.generator import Knobs
     import flashinfer
 
@@ -1511,14 +1632,14 @@ def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
         mx_class_of,
         sf_numel,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.compile_mxfp8 import (
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
         SWAP_K_BLOCKS,
         can_implement_grouped_mxfp8,
         can_implement_swapped_mxfp8,
+        swapped_knobs_mx,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
-    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
     import flashinfer
 
@@ -1946,7 +2067,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             MoELayer(sharded, device=torch.device("cuda"))
         assert "expert parallelism" in str(excinfo.value), shard
         # the class's own refusal fires first and names the shard (the shared assertion stands behind it)
-        with pytest.raises(BatchInvariantUnsupportedError, match="expert-parallel shards"):
+        with pytest.raises(
+            BatchInvariantUnsupportedError, match="expert-parallel shards"
+        ):
             BatchInvariantMxfp8Runner(sharded, torch.device("cuda"))._check_support()
     layer = _layer(k, E, I)
     x, logits, w1, w2 = _problem(8, k, H, I, E, seed=9)
@@ -2020,19 +2143,28 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert out_l.shape == (8, H) and torch.equal(
         bits(out_l), bits(llama(_logits_pack((xq, xsf), logits), W))
     )
-    with pytest.raises(errors) as excinfo:
-        MoELayer(
-            MoEConfig(
-                routing=RoutingConfig(
-                    num_experts=E, top_k=2, method=RoutingMethodType.Llama4
-                ),
-                quant=_QUANT,
-                experts=ExpertConfig(intermediate_size=I),
-                backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+    # a routing term the from-logits mode has no class for (Llama4 at top_k > 1) is refused at the from-logits call, not at
+    # construction (the shared runner's rule: a layer that only receives pre-routed ids builds under any RoutingConfig)
+    llama2 = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E, top_k=2, method=RoutingMethodType.Llama4
             ),
-            device=torch.device("cuda"),
-        )
+            quant=_QUANT,
+            experts=ExpertConfig(intermediate_size=I),
+            backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+        ),
+        device=torch.device("cuda"),
+    )
+    with pytest.raises(errors) as excinfo:
+        llama2(_logits_pack((xq, xsf), logits), W)
     assert "Llama4" in str(excinfo.value)
+    ids2 = torch.stack(
+        [torch.zeros(8, dtype=torch.int32), torch.ones(8, dtype=torch.int32)], 1
+    ).cuda()
+    assert llama2(
+        _routed_pack((xq, xsf), ids2, torch.full((8, 2), 0.5, device="cuda")), W
+    ).shape == (8, H)
     # weights on the CPU cannot be quantized by the class
     with pytest.raises(TypeError):
         BatchInvariantFp8BlockConfig.prepare_weights(
@@ -2046,3 +2178,355 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # zero tokens
     out = layer(_logits_pack((xq[:0], xsf[:0]), logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
+
+
+# ----------------------------------------------------------------------------- the shared runner's and entries' rules
+
+
+def test_ranking_is_memoised_per_token_count():
+    """The dispatcher's ranking (`schedule_mxfp8.rank_grouped_mx`) is memoised on its arguments: a forward without a tactic pays
+    the ranking once per token count; a bf16 chain object is taken at the instruction class (the same key as its MX chain), a
+    chain at another class is another key."""
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        _rank_grouped_mx,
+        rank_grouped_mx,
+    )
+
+    _rank_grouped_mx.cache_clear()
+    chain = MxChain("glu", "silu", "bf16", (), "mxfp8_k64")
+    args = (1536, 2048, 128, chain, "mxfp8_k64", 212, "sm_107", 3, False, 8)
+    a = rank_grouped_mx(1, *args)
+    assert a == rank_grouped_mx(1, *args)
+    info = _rank_grouped_mx.cache_info()
+    assert (info.hits, info.misses) == (1, 1)
+    rank_grouped_mx(2, *args)
+    assert _rank_grouped_mx.cache_info().misses == 2
+    bf16 = GroupedChain("glu", "silu", "bf16")
+    assert rank_grouped_mx(1, 1536, 2048, 128, bf16, *args[4:]) == a
+    assert _rank_grouped_mx.cache_info().hits == 2
+    rank_grouped_mx(1, 1536, 2048, 128, bf16, "mxfp8", *args[5:])
+    assert _rank_grouped_mx.cache_info().misses == 3
+    assert all(c.swap_ab or c.tile_n in (64, 128, 192, 256) for c in a) and a
+
+
+def test_grouped_gemm_shape_rules_are_host_errors():
+    """The grouped MX GEMM entry checks the chain's shape rules on the host before any record or kernel is consulted: K in whole
+    scale blocks, N at the weight-row rule, whole gate / up column pairs for a paired chain, an output width a multiple of the
+    output format's row (a whole scale block for the fused requantization), a 16-byte-aligned output base. Device-free: the
+    rules raise before the instruction class is looked up on a device."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import (
+        MoEWeightsMXFP8,
+        grouped_gemm_mxfp8,
+        sf_numel,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    cfg = Knobs((128, 128), (1, 1), False, True, "m", 1)
+    plain = GroupedChain("plain", "silu", "bf16")
+
+    def operands(Tk, N, K, E=4):
+        a = torch.zeros(Tk, K, dtype=torch.float8_e4m3fn)
+        w = torch.zeros(E, N, K, dtype=torch.float8_e4m3fn)
+        Kb = (
+            -(-K // 32) * 32
+        )  # scale buffers of a valid size: the operand rule is the one under test
+        a_sf = torch.zeros(sf_numel(Tk, Kb), dtype=torch.uint8)
+        w_sf = torch.zeros(E, sf_numel(-(-N // 8) * 8, Kb), dtype=torch.uint8)
+        cnt = torch.full((E,), Tk // E, dtype=torch.int32)
+        return a, a_sf, w, w_sf, cnt
+
+    with pytest.raises(ValueError, match="K a multiple of 32"):
+        grouped_gemm_mxfp8(*operands(128, 64, 48), cfg, plain, "mxfp8_k64")
+    with pytest.raises(ValueError, match="N of 8"):
+        grouped_gemm_mxfp8(*operands(128, 20, 64), cfg, plain, "mxfp8_k64")
+    W = MoEWeightsMXFP8.__new__(MoEWeightsMXFP8)
+    W.gated, W.act, W.params = True, "silu", ()
+    with pytest.raises(ValueError, match="whole gate / up column pairs"):
+        grouped_gemm_mxfp8(*operands(128, 24, 64), cfg, W.chain1, "mxfp8_k64")
+    with pytest.raises(ValueError, match="output width of 16 mxfp8"):
+        grouped_gemm_mxfp8(*operands(128, 32, 64), cfg, W.chain1_quant, "mxfp8_k64")
+    with pytest.raises(ValueError, match="a multiple of the 128-row scale-factor atom"):
+        grouped_gemm_mxfp8(*operands(96, 64, 64), cfg, plain, "mxfp8_k64")
+    a, a_sf, w, w_sf, cnt = operands(128, 64, 64)
+    buf = torch.empty(128, 64 + 8, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="16-byte-aligned"):
+        grouped_gemm_mxfp8(
+            a, a_sf, w, w_sf, cnt, cfg, plain, "mxfp8_k64", out=buf[:, 4:68]
+        )
+    with pytest.raises(ValueError, match="allocates its two outputs"):
+        grouped_gemm_mxfp8(
+            a, a_sf, w, w_sf, cnt, cfg, W.chain1_quant, "mxfp8_k64", out=buf[:, :64]
+        )
+
+
+@needs_device
+def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
+    """A pre-routed expert id outside ``[0, E)`` (``-1``, ``E``, ``2^30``: a framework's dropped slot) is dropped by the MXFP8 op
+    as by the bf16 one: the plan does not count it (``dest -1``), the scatter and the two GEMMs never touch it, and the combine
+    folds the remaining slots in slot order with the term ``+0`` in its place, so the output equals the class's composition on
+    the same rows with those slots at a valid id and weight ``+0``; a token whose slots are all dropped gives a zero row; the
+    other tokens keep their bits. Both packings (the dense packing of the swapped records, the padded packing) and both plan
+    forms (the one-launch plan below ``PLAN_MULTI_MIN_N`` expanded rows and the two-launch form above it). With every slot
+    dropped the GEMMs launch without a tile and the output is all zero rows, on the dense and the swapped records."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.api import PLAN_MULTI_MIN_N, permute_plan
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import default_configs_mx
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    k, H, I, E = 8, 256, 128, 64
+    bad = (-1, E, 1 << 30)
+    a = activation_of(_SWIGLU)
+    for T in (96, PLAN_MULTI_MIN_N // k + 3):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=21, adversarial=True)
+        xq, xsf = _quant(x)
+        W, layer = _weights(w1, w2), _layer(k, E, I)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids_bad = ids.clone()
+        rows = torch.randperm(T, generator=torch.Generator().manual_seed(T))[: T // 4]
+        for j, t in enumerate(rows.tolist()):
+            ids_bad[t, j % k] = bad[j % 3]
+            ids_bad[t, (j + 3) % k] = bad[(j + 1) % 3]
+        ids_bad[rows[0]] = torch.tensor(
+            [bad[i % 3] for i in range(k)], dtype=torch.int32
+        )
+        dropped = (ids_bad < 0) | (ids_bad >= E)
+        n_valid = int((~dropped).sum())
+        for form in (
+            {},
+            dict(align=F.GROUP_ALIGN),
+            dict(dual=True, pad_align=F.GROUP_ALIGN),
+        ):
+            counts, dest, src, *_ = permute_plan(ids_bad.cuda(), E, **form)
+            assert int(counts.sum()) == n_valid, form
+            assert torch.equal(dest.cpu().view(-1) < 0, dropped.view(-1)), form
+            assert torch.all(src[src >= 0].unique().numel() == n_valid), form
+        out = layer(_routed_pack((xq, xsf), ids_bad.cuda(), wts.cuda()), W)
+        ids_ref = torch.where(dropped, torch.zeros_like(ids), ids)
+        wts_ref = torch.where(dropped, torch.zeros_like(wts), wts)
+        ref = _reference_ffn(xq, xsf, ids_ref.cuda(), wts_ref.cuda(), w1, w2, a)
+        assert torch.equal(bits(out.cpu()), bits(ref)), T
+        assert torch.all(out[rows[0]] == 0)
+        Wq = F.MoEWeightsMXFP8.from_view(W.get_view(KEY))
+        for path in ("padded", "dense"):
+            sm, fam = F._part(xq.device)
+            c1, c2 = default_configs_mx(
+                T,
+                k,
+                H,
+                I,
+                E,
+                Wq.chain1,
+                F.mx_class_of(xq.device),
+                sm,
+                fam,
+                swap=None if path == "dense" else False,
+            )
+            out_api = F.fused_moe_mxfp8(
+                (xq, xsf),
+                ids_bad.cuda(),
+                wts.cuda(),
+                Wq,
+                config1=c1,
+                config2=c2,
+                path=path,
+            )
+            assert torch.equal(bits(out_api), bits(out)), (T, path)
+        whole = (~dropped.any(dim=1)).cuda()
+        ref_whole = layer(_routed_pack((xq, xsf), ids.cuda(), wts.cuda()), W)
+        assert torch.equal(bits(out[whole]), bits(ref_whole[whole]))
+    # every slot dropped: zero counts, the GEMMs launch without a tile, the zero row of every token, on both record kinds
+    T, k, E = 37, 4, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=44)
+    xq, xsf = _quant(x)
+    Wq = F.MoEWeightsMXFP8.from_view(_weights(w1, w2).get_view(KEY))
+    ids_none = torch.full((T, k), -1, dtype=torch.int32, device="cuda")
+    wts_any = torch.rand(T, k, device="cuda")
+    out, im = F.fused_moe_mxfp8(
+        (xq, xsf), ids_none, wts_any, Wq, return_intermediates=True
+    )
+    torch.cuda.synchronize()
+    assert torch.all(out == 0) and int(im["counts"].sum()) == 0
+    assert torch.all(im["dest"] == -1)
+    sm, fam = F._part(xq.device)
+    for swap in (False, True):
+        c1, c2 = default_configs_mx(
+            T, k, H, I, E, Wq.chain1, F.mx_class_of(xq.device), sm, fam, swap=swap
+        )
+        assert c1.swap_ab == swap and c2.swap_ab == swap
+        out2 = F.fused_moe_mxfp8(
+            (xq, xsf), ids_none, wts_any, Wq, config1=c1, config2=c2
+        )
+        torch.cuda.synchronize()
+        assert torch.all(out2 == 0), swap
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "act",
+    [SwiGLU(), SwiGLU(alpha=1.702, beta=1.0, limit=7.0), ReLU2()],
+    ids=["swiglu", "swiglu_oai", "relu2"],
+)
+def test_nan_activations_stay_in_their_rows(act):
+    """An e4m3 NaN in a token's quantized row gives that token the composition's bits -- the NaN mask and the finite values
+    (the requantization's block amax and saturation follow the device's non-NaN max / min rule the quantizer class states, so
+    a NaN accumulator row leaves the chain as finite codes; what the kernel writes is what the composition writes) -- and
+    leaves every other token's bits unchanged, the tokens sharing its experts included: a row's fold, its block amax and its
+    requantization never read another row."""
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    a = activation_of(act)
+    T, k, H, I, E = 40, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(
+        T, k, H, I, E, seed=77, gated=a.gated, adversarial=True
+    )
+    xq, xsf = _quant(x)
+    xq = xq.clone()
+    W, layer = _weights(w1, w2, act), _layer(k, E, I, act)
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    clean = layer(_routed_pack((xq, xsf), ids, wts), W)
+    rows = (3, 17, 39)
+    xb = xq.view(torch.uint8)
+    for r in rows:
+        xb[r, (r * 7) % H] = 0x7F  # the e4m3 NaN byte
+    out = layer(_routed_pack((xq, xsf), ids, wts), W)
+    ref = _reference_ffn(xq, xsf, ids, wts, w1, w2, a)
+    nan_out, nan_ref = torch.isnan(out.cpu()), torch.isnan(ref)
+    assert torch.equal(nan_out, nan_ref)
+    assert torch.equal(bits(out.cpu())[~nan_out], bits(ref)[~nan_out])
+    for r in rows:  # the NaN moved its own row (the composition says where)
+        assert not torch.equal(bits(out[r]), bits(clean[r])), r
+    others = torch.tensor([t not in rows for t in range(T)], device="cuda")
+    assert torch.equal(bits(out[others]), bits(clean[others]))
+    assert not nan_out[others.cpu()].any()
+
+
+@needs_device
+def test_pre_routed_layers_build_under_any_routing_term():
+    """A routing term the from-logits mode has no class for (``DeepSeekV3`` with more groups than the kernels hold, ``Llama4``
+    with ``top_k > 1``) does not refuse the layer at construction: the pre-routed modes never consult it, so the layer runs
+    pre-routed (unpacked and packed) with the bits of the plain layer on the same ids and weights, and refuses from logits with
+    the term's limit (the shared runner's rule)."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    k, H, I, E = 6, 512, 256, 64
+    x, logits, w1, w2 = _problem(16, k, H, I, E, seed=13, adversarial=True)
+    xq, xsf = _quant(x)
+    W = _weights(w1, w2)
+    for routing, what, kk in (
+        (
+            RoutingConfig(
+                num_experts=E,
+                top_k=k,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=32,
+                topk_group=4,
+                routed_scaling_factor=1.0,
+            ),
+            "n_group",
+            k,
+        ),
+        (
+            RoutingConfig(num_experts=E, top_k=2, method=RoutingMethodType.Llama4),
+            "Llama4",
+            2,
+        ),
+    ):
+        layer = MoELayer(
+            MoEConfig(
+                routing=routing,
+                quant=_QUANT,
+                experts=ExpertConfig(intermediate_size=I),
+                backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+                execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=16),
+            ),
+            device=torch.device("cuda"),
+        )
+        plain = _layer(kk, E, I, tune_max=16)
+        ids, weights = _reference_route(logits, kk, RoutingMethodType.Renormalize)
+        ids, weights = ids.cuda(), weights.cuda()
+        for packed in (False, True):
+            assert torch.equal(
+                bits(layer(_routed_pack((xq, xsf), ids, weights, packed=packed), W)),
+                bits(plain(_routed_pack((xq, xsf), ids, weights, packed=packed), W)),
+            ), (what, packed)
+        with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+            layer(_logits_pack((xq, xsf), logits), W)
+        assert what in str(excinfo.value), what
+
+
+@needs_device
+def test_packed_weights_round_in_the_combine_kernel():
+    """The packed pre-routed mode's f32 weights enter the fold as their bf16 rounding (the packed word's value), rounded by
+    the combine kernel: the bits equal the unpacked mode on the host-rounded weights, and differ from the unpacked mode on
+    the unrounded f32 weights where the rounding moves a weight."""
+    k, H, I, E = 4, 512, 256, 32
+    x, logits, w1, w2 = _problem(24, k, H, I, E, seed=21, adversarial=True)
+    xq, xsf = _quant(x)
+    W = _weights(w1, w2)
+    layer = _layer(k, E, I)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda().float()
+    packed = layer(_routed_pack((xq, xsf), ids, weights, packed=True), W)
+    rounded = layer(_routed_pack((xq, xsf), ids, weights.to(torch.bfloat16).float()), W)
+    assert torch.equal(bits(packed), bits(rounded))
+    assert torch.equal(
+        bits(
+            layer(
+                _routed_pack((xq, xsf), ids, weights.to(torch.bfloat16), packed=True), W
+            )
+        ),
+        bits(packed),
+    )
+    assert not torch.equal(weights, weights.to(torch.bfloat16).float())
+
+
+@needs_device
+def test_routing_constants_are_read_from_the_cache_under_graph_capture():
+    """The route kernels' absent bias and unit scale are cached device constants (``api._const``): a call under CUDA graph
+    capture reads the cached tensor when it exists (no fill node in the graph), a default first met inside a capture is a
+    fill of that capture and is never cached, and a captured from-logits decode call of the MXFP8 layer replays the eager
+    call's bits with no fill launch among its kernels."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from flashinfer.fused_moe.batch_invariant import api
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    k, H, I, E = 8, 512, 256, 64
+    x, logits, w1, w2 = _problem(4, k, H, I, E, seed=31, adversarial=True)
+    xq, xsf = _quant(x)
+    W, layer = _weights(w1, w2), _layer(k, E, I, tune_max=4)
+    pack = _logits_pack((xq, xsf), logits)
+    eager = bits(layer(pack, W))  # the constants of this expert count are now cached
+    b0, s0 = api._const(dev, E, 0.0), api._const(dev, 1, 1.0)
+    assert api._const(dev, E, 0.0) is b0 and api._const(dev, 1, 1.0) is s0
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        layer(pack, W)
+        torch.cuda.current_stream().synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            assert api._const(dev, E, 0.0) is b0 and api._const(dev, 1, 1.0) is s0
+            inside = api._const(
+                dev, 3 * E, 0.0
+            )  # first met inside the capture: a fill of this capture alone
+            out = layer(pack, W)
+    torch.cuda.synchronize()
+    assert api._const(dev, 3 * E, 0.0) is not inside
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), eager)
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        graph.replay()
+        torch.cuda.synchronize()
+    names = [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    fills = [n for n in names if "Fill" in n or "fill" in n]
+    assert len(fills) == 1, (
+        names
+    )  # the one constant first met inside the capture, none for the cached bias and scale
+    assert torch.equal(bits(out), eager)

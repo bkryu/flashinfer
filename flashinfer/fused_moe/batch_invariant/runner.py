@@ -629,7 +629,9 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         n = na + 2 + self.N_WEIGHT_TENSORS
         xs, ids, wts = inputs[:na], inputs[na], inputs[na + 1]
         tensors, out = inputs[na + 2 : n], inputs[n]
-        plan = tuple(inputs[n + 1 :]) or None  # the plan's tensors, in the form the class packed them
+        plan = (
+            tuple(inputs[n + 1 :]) or None
+        )  # the plan's tensors, in the form the class packed them
         self._hidden = int(xs[0].shape[1])
         if tactic == -1 or tactic is None:
             c1, c2 = self._pick(int(xs[0].shape[0]))

@@ -62,14 +62,17 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "attention/batch_invariant/swaps/compile.py",
         "attention/batch_invariant/fixup.py",
     ),
-    # the MoE kernels of the bf16 and the fp8 per-tensor classes: the grouped and the swapped GEMM bodies (one source for
-    # both operand formats, composing the dense GEMM blocks: they are in its closure), the routing, permutation and
-    # combine kernels; the MoE API, dispatchers and runners stay outside
+    # the MoE kernels of the bf16, the fp8 per-tensor, the NVFP4 and the MXFP8 classes: the grouped and the swapped GEMM
+    # bodies (one source for every operand format, composing the dense and the block-scaled GEMM blocks: they are in its
+    # closure), the routing, permutation, combine, fp4 scatter and MX scatter kernels; the MoE API, dispatchers and runners
+    # stay outside
     "batch_invariant_moe": (
         "fused_moe/batch_invariant/blocks/compile.py",
         "fused_moe/batch_invariant/route.py",
         "fused_moe/batch_invariant/route_plan.py",
         "fused_moe/batch_invariant/permute.py",
+        "fused_moe/batch_invariant/permute_nvfp4.py",
+        "fused_moe/batch_invariant/mx_permute.py",
         "fused_moe/batch_invariant/combine.py",
     ),
     # the block-scale fp8 kernels (the DeepSeek-style class behind gemm_fp8_nt_groupwise): their own module
@@ -79,11 +82,9 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     # the block-scale fp8 MoE kernels (the DeepSeek-style class): the grouped block-scale GEMM (which composes the dense
     # block-scale body: in its closure), the standalone block quantizer and the block-scale gather; their own module
     "batch_invariant_moe_fp8bs": ("fused_moe/batch_invariant/blocks/fp8bs_compile.py",),
-    # the MXFP8 MoE kernels: the grouped block-scaled GEMM (which composes the block-scaled dense blocks and the grouped
-    # epilogue / scheduler) and the scatter kernel; the routing, permutation and combine kernels are the bf16 module's
-    "batch_invariant_moe_mxfp8": (
-        "fused_moe/batch_invariant/blocks/compile_mxfp8.py",
-        "fused_moe/batch_invariant/mx_permute.py",
+    # the NVFP4 MoE classes' row-mapped per-token quantization (the quantizer class's kernel with a destination row map)
+    "batch_invariant_moe_nvfp4_quant": (
+        "fused_moe/batch_invariant/blocks/quant_nvfp4.py",
     ),
 }
 
@@ -123,10 +124,6 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
         "gemm/batch_invariant/heuristic.py",
     ),
     "batch_invariant_moe_fp8bs": (
-        "gemm/batch_invariant/schedule.py",
-        "gemm/batch_invariant/heuristic.py",
-    ),
-    "batch_invariant_moe_mxfp8": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),
