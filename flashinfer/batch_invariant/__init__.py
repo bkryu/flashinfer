@@ -301,6 +301,64 @@ def _moe_fp8_fingerprint(
     return spec_fingerprint_fp8(H, I, top_k, num_experts, rm, name, params, gated)
 
 
+def _moe_nvfp4_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    arch=None,
+    intermediate: str = "per_token",
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The NVFP4 (W4A4) MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the NVFP4 x NVFP4 pair): the
+    dimensions of :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars
+    and gating) under the same bounds; ``arch`` (an architecture family, a compute capability or a device; the current CUDA
+    device by default) selects the instruction class of each expert weight shape (the sm_107 K = 128 step on SM107 for the
+    unsplit shapes, the K = 64 step elsewhere): the architecture is a dimension of the class; ``intermediate`` the
+    intermediate's quantization class (``per_token`` / ``static``)."""
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import ALIGN_NVFP4
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import (
+        expert_classes,
+        spec_fingerprint_nvfp4,
+    )
+
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % ALIGN_NVFP4:
+            raise ValueError(
+                f"fingerprint('fused_moe_nvfp4'): {dim} {value} must be a positive multiple of {ALIGN_NVFP4} "
+                "(the class's packed fp4 row alignment: whole scale-factor column groups)"
+            )
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_nvfp4",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
+    family = _mx_family(arch, "fused_moe_nvfp4")
+    return spec_fingerprint_nvfp4(
+        H,
+        I,
+        top_k,
+        num_experts,
+        rm,
+        name,
+        params,
+        gated,
+        expert_classes(H, I, family, bool(gated)),
+        intermediate=intermediate,
+    )
+
+
 def _megamoe_bf16_fingerprint(
     hidden: int,
     intermediate: int,
@@ -424,14 +482,31 @@ CLASSES: Dict[str, ClassInfo] = {
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint
-    ),
-    # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
+    ),  # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
     "fused_moe_fp8": ClassInfo(
         "moe.e4m3",
         ("H", "I", "top_k", "num_experts"),
         _moe_fp8_fingerprint,
         ("method", "act", "params", "gated", "n_group", "topk_group"),
+    ),
+    # the unified MoE layer with `BatchInvariantFp4Config` (the NVFP4 x NVFP4 pair: NVFP4 experts, per-token NVFP4
+    # activations): the dimensions of the bf16 MoE classes plus the architecture (the instruction class of each expert
+    # weight shape)
+    "fused_moe_nvfp4": ClassInfo(
+        "moe.nvfp4",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_nvfp4_fingerprint,
+        (
+            "method",
+            "act",
+            "params",
+            "gated",
+            "arch",
+            "intermediate",
+            "n_group",
+            "topk_group",
+        ),
     ),
     # the unified MoE layer with `BatchInvariantFp8BlockConfig` under `QuantConfig(MXFP8, MXFP8)` (the fp8-block backend
     # groups the fp8 formats with block scales under one key, the pair selecting the classes): the bf16 classes' dimensions
