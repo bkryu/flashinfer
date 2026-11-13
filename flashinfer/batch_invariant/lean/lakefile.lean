@@ -34,3 +34,6 @@ lean_exe moemxfp8conformance where
 
 lean_exe moenvfp4conformance where
   root := `MoENvfp4Main
+
+lean_exe moemxfp4conformance where
+  root := `MoEMxfp4Main

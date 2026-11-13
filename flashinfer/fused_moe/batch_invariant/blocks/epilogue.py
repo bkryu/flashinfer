@@ -78,7 +78,7 @@ from ....batch_invariant.quantization.cvt_fp8 import (
     cvt_f32x8_to_e2m1x8,
 )
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
-from ....gemm.batch_invariant.spec import NVFP4_FMTS
+from ....gemm.batch_invariant.spec import MXFP4_FMTS, NVFP4_FMTS
 from .. import spec_nvfp4 as Q
 from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS, act_elem, glu_elem
 from ..spec_fp8 import act_quant_pre, glu_quant_pre, scaled_out_elem, w8a8_alpha
@@ -197,6 +197,12 @@ class GroupedEpilogueBlock:
     @property
     def paired_cvt(self) -> bool:
         return False
+
+    @property
+    def dead_lane_select(self) -> bool:
+        """Whether the grouped epilogue replaces a dead row's accumulators by a constant after the TMEM load (the bf16 and fp8
+        chains: the division's slow path on garbage operands); the W4A4 chains leave the dead lanes as they are."""
+        return True
 
     @property
     def per_row_scale(self) -> bool:
@@ -415,6 +421,10 @@ class W4A4Chain(GroupedChain):
         return self.out_fmt == "nvfp4" or self.scale == "w4a4s"
 
     @property
+    def dead_lane_select(self) -> bool:
+        return False
+
+    @property
     def per_row_scale(self) -> bool:
         return self.scale == "w4a4"
 
@@ -470,6 +480,33 @@ class W4A4Chain(GroupedChain):
             super().describe()
         )  # the output format names the static class's GEMM1 (`..._nvfp4`)
         return base if self.scale == "none" else f"{self.scale}_{base}"
+
+
+@dataclass(frozen=True)
+class Mxfp4Chain(GroupedChain):
+    """A grouped chain of the MXFP4 classes (``moe.mxfp4.<act>``: MXFP4 experts x MXFP4 activations, the e8m0 block scales of
+    both operands applied inside the instruction, no global scale): the bf16 class's chain on the raw accumulators of the
+    dense MX class -- GEMM1's gated / ungated activation to bf16 (the intermediate the ``mxfp4.quant`` class then quantizes
+    per row), GEMM2's plain conversion -- on the instruction class ``in_fmt`` (a key of the block-scaled plans; the kernel
+    name carries it, ``describe()`` does not). The chain declares no further operand; ``describe()`` keys the kernel cache
+    apart from the bf16 class's chains."""
+
+    in_fmt: str = "mxfp4"
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.in_fmt in MXFP4_FMTS, self
+
+    def at(self, in_fmt: str) -> "Mxfp4Chain":
+        """The same chain on another instruction class."""
+        return dataclasses.replace(self, in_fmt=in_fmt)
+
+    def describe(self) -> str:
+        return "mxfp4_" + super().describe()
+
+
+#: GEMM2 of the MXFP4 classes: the accumulator converted to bf16 (the dense MX class's chain at a unit alpha).
+MXFP4_GEMM2_CHAIN = Mxfp4Chain("plain", "silu", "bf16", ())
 
 
 def static_block_plan(offs: List[Tuple[int, int]], pair: bool) -> List[List[int]]:
@@ -913,10 +950,11 @@ def grouped_epilogue_loop(
                     m: (crd0[0] - Int32(offs[0][0]) + Int32(m)) < rows_left
                     for m in rows_in_frag
                 }
-                for v in cutlass.range_constexpr(nv):
-                    tTR_rAcc[v] = select_f32(
-                        live[offs[v][0]], tTR_rAcc[v], Float32(1.0)
-                    )
+                if cutlass.const_expr(chain.dead_lane_select):
+                    for v in cutlass.range_constexpr(nv):
+                        tTR_rAcc[v] = select_f32(
+                            live[offs[v][0]], tTR_rAcc[v], Float32(1.0)
+                        )
                 # the row's scale once per distinct row of the fragment: the tile's constant, or for a per-row chain
                 # s = mul(alpha_e, pts[row]) at the row's padded position (a row past the group's end reads a valid entry and
                 # stores nothing)

@@ -310,8 +310,10 @@ class MoEWeightsNVFP4:
         return GEMM2_STATIC_CHAIN if self.static else GEMM2_CHAIN
 
     def view(self) -> Dict[str, object]:
-        """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for this backend."""
+        """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for this backend (``quant`` names the pair:
+        the fp4 backend's pairs share the view key)."""
         return {
+            "quant": "nvfp4",
             "gemm1_weights": self.w1,
             "gemm1_weights_scale": self.w1_sf,
             "gemm1_alpha": self.w1_alpha,

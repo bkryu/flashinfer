@@ -350,7 +350,7 @@ class SwappedGroupedGemm:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        """The block-scaled chains without further operands (the MX classes): ``rows`` the dense rows, ``sfa`` their scale
+        """The block-scaled chains without further operands (the MX classes, MXFP8 and MXFP4): ``rows`` the dense rows, ``sfa`` their scale
         factors at the padded positions, ``w`` / ``sfw`` the experts and their scale buffers."""
         assert self.operands.block_scaled and not self.chain.operands
         assert not self.chain.quant, self.chain
