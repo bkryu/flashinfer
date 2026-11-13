@@ -19,3 +19,5 @@ import BIKernels.SupportRow
 import BIKernels.SamplingCases
 import BIKernels.MoE
 import BIKernels.MoECases
+import BIKernels.MegaMoE
+import BIKernels.MegaMoECases
