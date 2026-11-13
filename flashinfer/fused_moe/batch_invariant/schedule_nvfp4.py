@@ -10,7 +10,7 @@ with nominal constants, no measured tables) at the dense shape whose tiles, M ta
 launch's: ``M`` = the rows of one active expert, ``N`` = the active experts' weight rows side by side (every group's tiles
 count, and the weights are read once per group). Two record spaces are ranked together, as the bf16 classes' dispatcher
 ranks them: the grouped records (the dense records at swizzle 1: no in-cluster split, no operand swap, no B-reuse tile, no
-in-CTA chunk fold) and the swapped records (:mod:`.blocks.swap_nvfp4`: the weights on the MMA's M side, 128 rows per CTA, the
+in-CTA chunk fold) and the swapped records (:mod:`.blocks.swap`: the weights on the MMA's M side, 128 rows per CTA, the
 group's tokens a narrow N tile of 8 / 16 / 32 rows), which the dense model prices as a swapped decode record. The grouped
 launch's own terms on the dense estimate are the bf16 dispatcher's: the pair term (the cluster tile's dummy share), the
 swapped records' spill factor (the Poisson expectation of token tiles per active expert), the last tile's exposed epilogue
@@ -30,11 +30,11 @@ from ...gemm.batch_invariant.generator import (
     CLUSTERS,
     TILES_M_BLOCKSCALED,
     TILES_N_BLOCKSCALED,
-    TILES_N_NARROW,
     Knobs,
     knob_product,
 )
-from .blocks.epilogue_nvfp4 import W4A4Chain
+from .blocks.epilogue import W4A4Chain
+from .blocks.swap import swapped_knobs
 from .schedule import (  # noqa: F401  (re-exported)
     TOP_K,
     active_experts,
@@ -46,7 +46,7 @@ from .schedule import (  # noqa: F401  (re-exported)
     zero_fill_cycles,
 )
 
-#: Epilogue warpgroups of the grouped block-scaled body (:data:`.blocks.kernel_nvfp4.EPI_WARPGROUPS_NVFP4`): the exposed
+#: Epilogue warpgroups of the grouped block-scaled body (:data:`.blocks.operands.EPI_WARPGROUPS_BLOCKSCALED`): the exposed
 #: epilogue term splits a tile's chains between them.
 
 GROUP_ALIGN = (
@@ -70,13 +70,10 @@ def grouped_knobs_blockscaled(clusters=None) -> List[Knobs]:
 
 
 def swapped_knobs_blockscaled() -> List[Knobs]:
-    """The swapped decode space of the grouped block-scaled classes (:mod:`.blocks.swap_nvfp4`): the dense class's swapped 1-CTA
+    """The swapped decode space of the grouped block-scaled classes (:mod:`.blocks.swap`): the dense class's swapped 1-CTA
     records at the narrow token tiles (128 weight rows x 8 / 16 / 32 tokens), one per tile, no cluster, swizzle 1. Disjoint from
     the grouped space; the body reads the dense packing."""
-    return [
-        Knobs((128, tn), (1, 1), False, True, "m", 1, swap_ab=True)
-        for tn in TILES_N_NARROW
-    ]
+    return swapped_knobs("nvfp4")
 
 
 #: The average rows per active expert fill at most three quarters of the swapped token tile (an empirical margin).
@@ -110,9 +107,22 @@ def chain_nodes_nvfp4(chain: W4A4Chain) -> int:
         # the block's DAG (the fp32 values, the amax tree, the scale, the codes) sized once and split over its outputs
         gs = alg.leaf("gs2", 0)
         if chain.pair:
-            vals = [Q.glu_scaled_pre(alg, alg.leaf("g", 0, j), alg.leaf("u", 0, j), s, chain.act, chain.params) for j in range(Q.NVFP4_BLOCK)]
+            vals = [
+                Q.glu_scaled_pre(
+                    alg,
+                    alg.leaf("g", 0, j),
+                    alg.leaf("u", 0, j),
+                    s,
+                    chain.act,
+                    chain.params,
+                )
+                for j in range(Q.NVFP4_BLOCK)
+            ]
         else:
-            vals = [Q.act_scaled_pre(alg, alg.leaf("u", 0, j), s, chain.act, chain.params) for j in range(Q.NVFP4_BLOCK)]
+            vals = [
+                Q.act_scaled_pre(alg, alg.leaf("u", 0, j), s, chain.act, chain.params)
+                for j in range(Q.NVFP4_BLOCK)
+            ]
         sf_d, codes = Q.static_block(alg, vals, gs)
         return -(-_dag_size([sf_d, *codes]) // Q.NVFP4_BLOCK)
     if chain.pair:
@@ -157,7 +167,9 @@ def all_valid_configs_nvfp4(
 ) -> List[Knobs]:
     """The configuration space the grouped guarantee is claimed over, for an expert weight shape, a chain and an
     instruction class."""
-    from .blocks.compile_nvfp4 import can_implement_grouped_nvfp4
+    from .blocks.compile import (
+        can_implement_grouped_blockscaled as can_implement_grouped_nvfp4,
+    )
 
     return [
         k
@@ -171,7 +183,9 @@ def all_valid_configs_nvfp4_swapped(
 ) -> List[Knobs]:
     """The swapped decode records the swapped body accepts for an expert weight shape, a chain and an instruction class (the
     dense packing); the guarantee is claimed over this space and the grouped space together."""
-    from .blocks.compile_nvfp4 import can_implement_swapped_nvfp4
+    from .blocks.compile import (
+        can_implement_swapped_blockscaled as can_implement_swapped_nvfp4,
+    )
 
     return [
         k
@@ -213,9 +227,11 @@ def rank_grouped_nvfp4(
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import decode_sane
-    from .blocks.compile_nvfp4 import (
-        can_implement_grouped_nvfp4,
-        can_implement_swapped_nvfp4,
+    from .blocks.compile import (
+        can_implement_grouped_blockscaled as can_implement_grouped_nvfp4,
+    )
+    from .blocks.compile import (
+        can_implement_swapped_blockscaled as can_implement_swapped_nvfp4,
     )
     from .schedule import record_cost
 

@@ -93,12 +93,17 @@ def w4a4_static_gemm1_cpu(
     else:
         rows, N = acc.shape
         vv = acc.view(rows, N // 16, 2, 8)
-        u, g = vv[:, :, 0, :].reshape(rows, N // 2), vv[:, :, 1, :].reshape(rows, N // 2)
+        u, g = (
+            vv[:, :, 0, :].reshape(rows, N // 2),
+            vv[:, :, 1, :].reshape(rows, N // 2),
+        )
         v = Q.glu_scaled_pre(TorchF32, g, u, s, act, params)
     rows, I = v.shape
     nb = I // Q.NVFP4_BLOCK
     vb = v.view(rows, nb, Q.NVFP4_BLOCK)
-    amax = QF32.fabs(vb).amax(dim=-1)  # the canonical tree's value (the max of non-negatives)
+    amax = QF32.fabs(vb).amax(
+        dim=-1
+    )  # the canonical tree's value (the max of non-negatives)
     sf_d, inv = Q.nvfp4_block_chain(QF32, amax, _f32(gs_rows).view(-1, 1))
     q = Q.nvfp4_quant_elem(QF32, vb, inv.unsqueeze(-1))  # e2m1 values
     return pack_e2m1(e2m1_codes(q).view(rows, I)), e4m3_bytes(sf_d)
@@ -109,4 +114,6 @@ def w4a4_static_gemm2_cpu(
 ) -> torch.Tensor:
     """The static class's GEMM2: ``cvt_bf16(mul(acc, mul(alpha2_e(row), inv2_e(row))))`` (``inv2_e = div(1, gs2_e)`` as the host
     formed it)."""
-    return Q.scaled_out_elem(TorchF32, _f32(acc), _row_scale(alpha_rows, inv2_rows), "bf16")
+    return Q.scaled_out_elem(
+        TorchF32, _f32(acc), _row_scale(alpha_rows, inv2_rows), "bf16"
+    )

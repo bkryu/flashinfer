@@ -29,8 +29,6 @@ import functools
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint32
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .. import canon, jit
 from .blocks import (

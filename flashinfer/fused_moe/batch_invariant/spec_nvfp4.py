@@ -110,7 +110,11 @@ def glu_scaled_pre(
 
 
 def act_scaled_pre(
-    fp: Any, acc: Any, s: Any, act: str = "relu2", params: Sequence[Optional[float]] = ()
+    fp: Any,
+    acc: Any,
+    s: Any,
+    act: str = "relu2",
+    params: Sequence[Optional[float]] = (),
 ) -> Any:
     """The fp32 ungated value of the W4A4 chain before any rounding: ``act(mul(acc, s))``."""
     assert not tuple(params), (act, params)
@@ -210,14 +214,18 @@ class MoENvfp4Spec(S.MoESpec):
 
     def row_scale(self, which: int, r: int = 0) -> Term:
         if which == 2 and self.intermediate == "static":
-            return w4a4_row_scale(self.alg, self.alpha(2, r), static_inv2(self.alg, self.gs2(r)))
+            return w4a4_row_scale(
+                self.alg, self.alpha(2, r), static_inv2(self.alg, self.gs2(r))
+            )
         return w4a4_row_scale(self.alg, self.alpha(which, r), self.pts(which, r))
 
     def gemm1_pre(self, r: int = 0, j: int = 0) -> Term:
         """The fp32 GEMM1 value of column ``j`` before any rounding (the static class quantizes it in place)."""
         s = self.row_scale(1, r)
         if not self.gated:
-            return act_scaled_pre(self.alg, self.acc("u", r, j), s, self.act, self.params)
+            return act_scaled_pre(
+                self.alg, self.acc("u", r, j), s, self.act, self.params
+            )
         return glu_scaled_pre(
             self.alg, self.acc("g", r, j), self.acc("u", r, j), s, self.act, self.params
         )
@@ -253,7 +261,9 @@ class MoENvfp4Spec(S.MoESpec):
 
     @property
     def name(self) -> str:
-        return f"{CLASS}.{self.act}" + (".static" if self.intermediate == "static" else "")
+        return f"{CLASS}.{self.act}" + (
+            ".static" if self.intermediate == "static" else ""
+        )
 
 
 def spec_fingerprint_nvfp4(
@@ -279,7 +289,9 @@ def spec_fingerprint_nvfp4(
         spec_fingerprint as quant_fingerprint,
     )
 
-    s = MoENvfp4Spec(H, I, k, E, method, act, params, gated, fp4_class, intermediate=intermediate)
+    s = MoENvfp4Spec(
+        H, I, k, E, method, act, params, gated, fp4_class, intermediate=intermediate
+    )
     if intermediate == "static":
         blk = s.gemm1_block(0, 0)
         quant = [

@@ -156,7 +156,21 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
 
         return activation_of(self.config.activation)
 
+    def _check_experts(self) -> None:
+        """The class's rule on the expert range: the EP form is not part of this backend, so a shard is refused in the
+        class's terms (before the layer's generic shard check)."""
+        experts, routing = self.config.experts, self.config.routing
+        if experts.local_expert_offset or (
+            experts.local_num_experts not in (None, 0, routing.num_experts)
+        ):
+            raise unsupported(
+                CLASS,
+                "expert-parallel shards (local_expert_offset / local_num_experts)",
+                "the full expert set (the class's EP form is not part of this backend)",
+            )
+
     def _check_support(self) -> None:
+        self._check_experts()
         super()._check_support()
         from .api_nvfp4 import check_shape_nvfp4
 
@@ -176,14 +190,6 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
                 CLASS,
                 "fused shared experts",
                 "num_fused_shared_experts = 0 (a shared expert is one more routed slot)",
-            )
-        if experts.local_expert_offset or (
-            experts.local_num_experts not in (None, 0, routing.num_experts)
-        ):
-            raise unsupported(
-                CLASS,
-                "expert-parallel shards (local_expert_offset / local_num_experts)",
-                "the full expert set (the class's EP form is not part of this backend)",
             )
         # the shape rule on the dimensions the config fixes (H enters at the first call, with the full rule)
         check_shape_nvfp4(
@@ -437,7 +443,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int, H: int) -> Tuple[list, list]:
         from .api_nvfp4 import GEMM2_CHAIN, GEMM2_STATIC_CHAIN
-        from .blocks.epilogue_nvfp4 import W4A4Chain
+        from .blocks.epilogue import W4A4Chain
         from .schedule_nvfp4 import (
             TOP_K,
             active_experts,

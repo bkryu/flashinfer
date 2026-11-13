@@ -142,7 +142,7 @@ def groupedBlockScaledOK (cfg : GEMM.Config) : Bool :=
 theorem grouped_blockscaled_in_dense (cfg : GEMM.Config) (h : groupedBlockScaledOK cfg = true) : GEMM.ConfigOKNvfp4 cfg = true :=
   (Bool.and_eq_true _ _).mp h |>.1
 
-/-- The swapped decode space of the grouped block-scaled classes (`blocks/swap_nvfp4.py`): the dense class's swapped 1-CTA
+/-- The swapped decode space of the grouped block-scaled classes (`blocks/swap.py`): the dense class's swapped 1-CTA
 records at a narrow token tile (128 weight rows x 8 / 16 / 32 tokens), no cluster, swizzle 1, no in-cluster split. The
 block-scaled step is symmetric in its operands, so each is a placement of the class (the dense class's swapped decode
 records). Disjoint from `groupedBlockScaledOK` (`swapAb`). -/

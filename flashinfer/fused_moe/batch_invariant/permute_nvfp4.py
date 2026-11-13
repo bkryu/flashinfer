@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The NVFP4 MoE classes' row moves (cache module ``batch_invariant_moe_nvfp4``): the scatter of the per-token quantized
+"""The NVFP4 MoE classes' row moves (cache module ``batch_invariant_moe``, with the bodies): the scatter of the per-token quantized
 activations into the grouped layout (the packed fp4 rows to their dense destinations, the 128x4 swizzled scale factors and
 the per-token scales to the padded positions), and the re-tiling of the intermediate's scale factors and row scales from the
 dense rows to the padded positions. Byte moves only: no arithmetic, a placement of the class's bytes.
@@ -22,7 +22,7 @@ from cutlass import Float32, Int32, Int64, Uint8, Uint32
 from ...batch_invariant import jit
 from .permute import LANES, WARPS
 
-MODULE = "batch_invariant_moe_nvfp4"
+MODULE = "batch_invariant_moe"
 SF_COL_TILE = 4  # scale columns per contiguous 4-byte group of the 128x4 layout
 # blocks past which the scatter kernels' warps stride over the rows: the block launch rate, not the bytes, bounds a
 # one-row-per-warp grid at the large batches
@@ -258,7 +258,9 @@ def get_compiled_scatter_fp4(
             cute.sym_int(32, divisibility=16),
         )
         sym_s = (
-            cute.sym_int(32) if sf_src == "linear" else cute.sym_int(32, divisibility=512)
+            cute.sym_int(32)
+            if sf_src == "linear"
+            else cute.sym_int(32, divisibility=512)
         )
         sym_sp, sym_pp = (
             cute.sym_int(32, divisibility=512),

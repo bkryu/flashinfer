@@ -34,7 +34,7 @@ from ...gemm.batch_invariant.schedule import chunks_for
 from ...gemm.batch_invariant.spec import NVFP4_FMTS
 from . import spec as S
 from .api import interleave_fc1, permute_plan, route  # noqa: F401  (route re-exported for the class's callers)
-from .blocks.epilogue_nvfp4 import W4A4Chain
+from .blocks.epilogue import W4A4Chain
 from .spec_nvfp4 import (
     CLASS,
     E2M1_MAX,
@@ -105,6 +105,27 @@ def check_shape_nvfp4(
             "the expert weight shapes",
             "unsplit expert weights (the dense class would K-split this shape)",
         )
+
+
+def _scale_vector(t, name: str, E: int, device: torch.device) -> torch.Tensor:
+    """A per-expert vector of ``E`` multipliers as a contiguous fp32 ``[E]`` on ``device``: finite, positive, normal values
+    (their reciprocals are factors of the class's chains, so a zero, subnormal, infinite or NaN entry is refused here instead
+    of reaching the kernels as an infinite or NaN scale); a tensor of ``E`` elements of any shape is reshaped, a one-element
+    tensor broadcast to the experts."""
+    v = torch.as_tensor(t, dtype=torch.float32, device=device)
+    if v.numel() == 1:
+        v = v.reshape(1).expand(E)
+    if v.numel() != E:
+        raise ValueError(
+            f"{CLASS}: {name} must hold one fp32 multiplier per expert ({E}), got shape {tuple(v.shape)}"
+        )
+    v = v.reshape(E).contiguous()
+    tiny = torch.finfo(torch.float32).tiny
+    if not bool(torch.isfinite(v).all()) or not bool((v >= tiny).all()):
+        raise ValueError(
+            f"{CLASS}: {name} must be finite positive normal fp32 multipliers (at least {tiny:.4g})"
+        )
+    return v
 
 
 def fp4_global_scale(w: torch.Tensor) -> torch.Tensor:
@@ -195,15 +216,21 @@ class MoEWeightsNVFP4:
         check_shape_nvfp4(H, I, E, gated=gated)
         w1i = fc1.contiguous() if (interleaved or not gated) else interleave_fc1(fc1)
         fc2 = fc2.contiguous()
+        if global_scales is not None:
+            # the caller's per-tensor global scales: one finite positive normal multiplier per expert and GEMM
+            global_scales = (
+                _scale_vector(global_scales[0], "global_scales[0]", E, w1i.device),
+                _scale_vector(global_scales[1], "global_scales[1]", E, w1i.device),
+            )
         w1s, sf1s, a1s, w2s, sf2s, a2s = [], [], [], [], [], []
         for e in range(E):
             gs1 = (
-                global_scales[0][e].reshape(1).float()
+                global_scales[0][e].reshape(1)
                 if global_scales is not None
                 else fp4_global_scale(w1i[e])
             )
             gs2 = (
-                global_scales[1][e].reshape(1).float()
+                global_scales[1][e].reshape(1)
                 if global_scales is not None
                 else fp4_global_scale(fc2[e])
             )
@@ -222,16 +249,10 @@ class MoEWeightsNVFP4:
             gs_inter = (
                 torch.ones(E, dtype=torch.float32, device=w1i.device)
                 if intermediate_scales is None
-                else intermediate_scales.to(device=w1i.device, dtype=torch.float32)
-                .reshape(E)
-                .contiguous()
-            )
-            if not (
-                bool((gs_inter > 0).all()) and bool(torch.isfinite(gs_inter).all())
-            ):
-                raise ValueError(
-                    "the static intermediate scales are positive finite multipliers [E]"
+                else _scale_vector(
+                    intermediate_scales, "intermediate_scales", E, w1i.device
                 )
+            )
             inv_inter = torch.reciprocal(
                 gs_inter
             ).contiguous()  # div.rn: the quantizer's correctly rounded reciprocal
@@ -359,33 +380,36 @@ def grouped_gemm_nvfp4(
     (``a_pts`` of the padded row count), ``out [rows]`` dense. ``w4 [E, N, K/2]`` uint8, ``w_sf [E, sf_bytes(N, K)]``,
     ``alpha [E]`` f32. ``chain``: the W4A4 GEMM1 / GEMM2 chains or the unscaled oracle (``scale == "none"``: ``alpha`` and
     ``pts`` ignored). The record selects the body: a dense record runs the padded body on either packing, a swapped record
-    (``config.swap_ab``: 128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap_nvfp4`) runs
+    (``config.swap_ab``: 128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap`) runs
     the swapped decode body on the dense packing (``a4`` carries at least the token tile's rows past the live rows: the op's
     ``DENSE_TAIL``). The persistent grid is a launch argument: the device's co-resident cluster capacity for the record. The
     static class: GEMM1 with ``chain.out_fmt == "nvfp4"`` writes the packed codes to ``out`` (uint8 ``[rows, N_out/2]``) and the
     scale bytes to ``out_sf`` (the flat 128x4 buffer of the (padded) rows) with ``aux = gs2 [E]``; GEMM2 with ``chain.scale ==
     "w4a4s"`` takes ``aux = inv2 [E]`` (``a_pts`` unread)."""
-    from .blocks.compile_nvfp4 import (
-        can_implement_grouped_nvfp4,
-        can_implement_swapped_nvfp4,
-        get_compiled_grouped_nvfp4,
-        get_compiled_swapped_nvfp4,
+    from .blocks.compile import (
+        can_implement_grouped_blockscaled,
+        can_implement_swapped_blockscaled,
+        get_compiled_grouped,
+        get_compiled_swapped,
     )
 
-    if (
-        a4.dtype != torch.uint8
-        or w4.dtype != torch.uint8
-        or a4.dim() != 2
-        or w4.dim() != 3
-    ):
-        raise TypeError(
-            "grouped_gemm_nvfp4 takes packed-fp4 uint8 a4 [rows, K/2] and w4 [E, N, K/2]"
-        )
-    rows, Kh = a4.shape
-    E, N, Kh2 = w4.shape
+    from .api import _check_grouped_chain, _check_grouped_operands, _grouped_out
+
+    # the shared operand rules at the packed fp4 formats' alignment (16-byte rows of codes: whole scale-factor column groups);
+    # the weight rows N in whole 8-row units (the 16-bit output's rows), the expert count under the group tables' bound
+    rows, Kh, E, N, _ = _check_grouped_operands(
+        "grouped_gemm_nvfp4",
+        a4,
+        w4,
+        counts,
+        a4.shape[0] if a4.dim() == 2 else None,
+        None,
+        torch.uint8,
+        ALIGN_NVFP4 // 2,
+        "packed fp4 uint8",
+        n_align=8,
+    )
     K = 2 * Kh
-    if Kh != Kh2 or not a4.is_contiguous() or not w4.is_contiguous():
-        raise ValueError("grouped_gemm_nvfp4: contiguous operands of one K")
     rows_sf = a_pts.numel()
     if dense_a:
         if rows_sf % GROUP_ALIGN or rows_sf < rows - DENSE_TAIL:
@@ -396,12 +420,6 @@ def grouped_gemm_nvfp4(
         raise ValueError(
             "grouped_gemm_nvfp4: the padded rows are a multiple of the 128-row scale-factor atom"
         )
-    if (
-        counts.dtype != torch.int32
-        or tuple(counts.shape) != (E,)
-        or not counts.is_contiguous()
-    ):
-        raise ValueError("grouped_gemm_nvfp4: counts must be a contiguous int32 [E]")
     if a_sf.dtype != torch.uint8 or a_sf.numel() < sf_numel(rows_sf, K):
         raise ValueError(
             "grouped_gemm_nvfp4: a_sf must hold the 128x4 swizzled scales of the (padded) rows"
@@ -425,15 +443,17 @@ def grouped_gemm_nvfp4(
             raise ValueError(
                 "grouped_gemm_nvfp4: the swapped decode body reads the dense packing (dense_a=True)"
             )
-        if not can_implement_swapped_nvfp4(config, N, K, E, chain, in_fmt):
+        if not can_implement_swapped_blockscaled(config, N, K, E, chain, in_fmt):
             raise ValueError(
                 f"grouped_gemm_nvfp4: swapped record {config.describe()} does not implement ({N}, {K}, {E}, {chain}, {in_fmt})"
             )
-    elif not can_implement_grouped_nvfp4(config, N, K, E, chain, in_fmt):
+    elif not can_implement_grouped_blockscaled(config, N, K, E, chain, in_fmt):
         raise ValueError(
             f"grouped_gemm_nvfp4: record {config.describe()} does not implement ({N}, {K}, {E}, {chain}, {in_fmt})"
         )
-    n_out = N // 2 if chain.pair else N
+    # the chain's shape rules on the host before any record is consulted: whole gate / up pairs, the output width in whole
+    # 16-byte rows of the output format (whole scale blocks for the packed codes)
+    n_out = _check_grouped_chain("grouped_gemm_nvfp4", N, chain)
     static = chain.needs_aux
     if chain.static_quant:
         n_out //= 2  # the packed codes: two per byte
@@ -459,15 +479,7 @@ def grouped_gemm_nvfp4(
             )  # GEMM2 of the static class: the scale-byte operand is unread
     if out is None:
         out = torch.zeros(rows, n_out, dtype=out_dtype, device=a4.device)
-    if (
-        tuple(out.shape) != (rows, n_out)
-        or out.dtype != out_dtype
-        or out.stride(1) != 1
-        or out.stride(0) % 8
-    ):
-        raise ValueError(
-            "grouped_gemm_nvfp4: out must be a 16-byte-aligned row-major [rows, n_out] of the chain's dtype"
-        )
+    out = _grouped_out("grouped_gemm_nvfp4", out, rows, n_out, out_dtype, a4.device)
     if rows == 0:
         return out
     # the persistent grid clipped to the launch's tile bound (a placement: which cluster computes a tile, never the bits)
@@ -475,9 +487,7 @@ def grouped_gemm_nvfp4(
         persistent_clusters(a4.device, config), launch_tile_bound(config, rows, E, N)
     )
     if config.swap_ab:
-        from .blocks import compile_nvfp4 as CN
-
-        kernel = get_compiled_swapped_nvfp4(config, chain, in_fmt, CN.SWAP_VARIANT)
+        kernel = get_compiled_swapped(config, chain.at(in_fmt))
         if static:
             kernel(
                 a4.unsqueeze(-1),
@@ -487,9 +497,9 @@ def grouped_gemm_nvfp4(
                 out,
                 out_sf.reshape(-1),
                 counts,
-                alpha.reshape(-1),
-                a_pts.reshape(-1),
-                aux.reshape(-1),
+                alpha.reshape(-1).contiguous(),
+                a_pts.reshape(-1).contiguous(),
+                aux.reshape(-1).contiguous(),
                 grid,
             )
         else:
@@ -500,12 +510,14 @@ def grouped_gemm_nvfp4(
                 w_sf.reshape(-1),
                 out,
                 counts,
-                alpha.reshape(-1),
-                a_pts.reshape(-1),
+                alpha.reshape(-1).contiguous(),
+                a_pts.reshape(-1).contiguous(),
                 grid,
             )
         return out
-    kernel = get_compiled_grouped_nvfp4(config, chain, in_fmt, dense_a)
+    kernel = get_compiled_grouped(
+        config, chain.at(in_fmt), packing="dense" if dense_a else "padded"
+    )
     if static:
         kernel(
             a4.unsqueeze(-1),
@@ -515,9 +527,9 @@ def grouped_gemm_nvfp4(
             out,
             out_sf.reshape(-1),
             counts,
-            alpha.reshape(-1),
-            a_pts.reshape(-1),
-            aux.reshape(-1),
+            alpha.reshape(-1).contiguous(),
+            a_pts.reshape(-1).contiguous(),
+            aux.reshape(-1).contiguous(),
             grid,
         )
     else:
@@ -528,8 +540,8 @@ def grouped_gemm_nvfp4(
             w_sf.reshape(-1),
             out,
             counts,
-            alpha.reshape(-1),
-            a_pts.reshape(-1),
+            alpha.reshape(-1).contiguous(),
+            a_pts.reshape(-1).contiguous(),
             grid,
         )
     return out
@@ -995,9 +1007,9 @@ def fused_moe_nvfp4(
             aux=w.inv2 if static else None,
         )
         if T:
-            get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count), round_scales)(
-                y, dest, scales, out, T, H
-            )
+            get_compiled_combine(
+                k, "bf16", "bf16", warps_per_token(T, H, sm_count), round_scales
+            )(y, dest, scales, out, T, H)
         if return_intermediates:
             return out, dict(
                 counts=counts,
@@ -1127,9 +1139,9 @@ def fused_moe_nvfp4(
             in2,
         )
     if T:
-        get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count), round_scales)(
-            y, dest, scales, out, T, H
-        )
+        get_compiled_combine(
+            k, "bf16", "bf16", warps_per_token(T, H, sm_count), round_scales
+        )(y, dest, scales, out, T, H)
     if return_intermediates:
         return out, dict(
             counts=counts,

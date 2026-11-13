@@ -62,21 +62,16 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "attention/batch_invariant/swaps/compile.py",
         "attention/batch_invariant/fixup.py",
     ),
-    # the MoE kernels of the bf16 and the fp8 per-tensor classes: the grouped and the swapped GEMM bodies (one source for
-    # both operand formats, composing the dense GEMM blocks: they are in its closure), the routing, permutation and
-    # combine kernels; the MoE API, dispatchers and runners stay outside
+    # the MoE kernels of the bf16, the fp8 per-tensor and the NVFP4 classes: the grouped and the swapped GEMM bodies (one
+    # source for every operand format, composing the dense and the block-scaled GEMM blocks: they are in its closure), the
+    # routing, permutation, combine and fp4 scatter kernels; the MoE API, dispatchers and runners stay outside
     "batch_invariant_moe": (
         "fused_moe/batch_invariant/blocks/compile.py",
         "fused_moe/batch_invariant/route.py",
         "fused_moe/batch_invariant/route_plan.py",
         "fused_moe/batch_invariant/permute.py",
-        "fused_moe/batch_invariant/combine.py",
-    ),
-    # the NVFP4 MoE kernels: the grouped block-scaled GEMM (composing the block-scaled dense blocks) and the fp4 scatter
-    # kernels; the routing, plan and combine kernels stay in the bf16 module
-    "batch_invariant_moe_nvfp4": (
-        "fused_moe/batch_invariant/blocks/compile_nvfp4.py",
         "fused_moe/batch_invariant/permute_nvfp4.py",
+        "fused_moe/batch_invariant/combine.py",
     ),
     # the NVFP4 MoE classes' row-mapped per-token quantization (the quantizer class's kernel with a destination row map)
     "batch_invariant_moe_nvfp4_quant": (
@@ -112,10 +107,6 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
     ),
     # the grouped kernels compose the dense GEMM blocks, whose closure reaches the GEMM dispatcher files
     "batch_invariant_moe": (
-        "gemm/batch_invariant/schedule.py",
-        "gemm/batch_invariant/heuristic.py",
-    ),
-    "batch_invariant_moe_nvfp4": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),

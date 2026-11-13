@@ -97,7 +97,7 @@ is the same launch parameter as the dense one's. The NVFP4 MoE classes' dispatch
 dense 4-bit class's instruction class with `M =` the rows of one active expert rounded up to the 128-row scale-factor atom (the
 grouped kernel computes whole atoms per group), and keeps only the records whose M tile fits that padded group: a taller
 tile computes padding the dense estimate does not price. At few rows per active expert the ranking is led by the swapped
-decode body (`fused_moe/batch_invariant/blocks/swap_nvfp4.py`: the weights on the MMA's M side, the group's tokens a narrow
+decode body (`fused_moe/batch_invariant/blocks/swap.py`: the weights on the MMA's M side, the group's tokens a narrow
 N tile of 8 / 16 / 32 rows read from the dense packing, their scale factors gathered from the padded positions), chosen by a
 structural rule -- the narrowest swapped tile when the rows per active expert fill it to at most three quarters, the padded body
 otherwise -- so the

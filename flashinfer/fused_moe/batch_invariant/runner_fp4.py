@@ -106,6 +106,8 @@ class BatchInvariantFp4Runner(MoERunner):
     def _check_support(self) -> None:
         if self._impl is None:
             raise unsupported_pair(self.config.quant)
+        # the pair's own shard refusal first (the class's terms), then the layer's generic rules, then the pair's
+        self._impl._check_experts()
         super()._check_support()
         self._impl.check_support()
 

@@ -3527,6 +3527,16 @@ def _fp4_pair(quant: Optional["QuantConfig"]) -> Tuple[QuantFormat, QuantFormat]
     return quant.pair
 
 
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records as ranked members of the dispatcher's space follow Prims-TS (the open counterpart of TRTLLM-Gen's MoE
+# GEMMs: its swap-AB low-latency templates and tile-N ladder) and TRTLLM-Gen's fp4 decode tactics; the static-intermediate
+# class (GEMM1's epilogue quantizing the fp32 gated value per 16-column block with a per-expert static scale) follows the
+# fp4-intermediate recipe of the CuTe-DSL, TRTLLM-Gen, CUTLASS and Frost backends, with every op correctly rounded; the
+# dense packing of the expanded rows with the scale factors at the padded atom positions and the token tile's scale rows
+# gathered by one cp.async warp follow CuTe-DSL's gathered-operand pipeline; the PDL wait / trigger placement and the
+# launch's tile bound on the persistent grid follow Prims-TS and TRTLLM-Gen; the routing, permutation, combine and the
+# ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same bits, placed as those
+# kernels place theirs.
 @dataclass(frozen=True)
 class BatchInvariantFp4Config:
     """The batch-invariant fp4 MoE backend of the unified layer: one backend for the 4-bit-weight quantization pairs, grouped

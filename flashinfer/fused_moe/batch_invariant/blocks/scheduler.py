@@ -175,7 +175,9 @@ def build_group_tables_dual(
         loc_p[i] = sum_p
         sum_c = sum_c + c
         sum_b = sum_b + (c + Int32(cluster_rows - 1)) // Int32(cluster_rows)
-        sum_p = sum_p + ((c + Int32(pad_align - 1)) // Int32(pad_align)) * Int32(pad_align)
+        sum_p = sum_p + ((c + Int32(pad_align - 1)) // Int32(pad_align)) * Int32(
+            pad_align
+        )
     inc_c = sum_c
     inc_b = sum_b
     inc_p = sum_p

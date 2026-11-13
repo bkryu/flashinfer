@@ -852,11 +852,10 @@ def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
         GEMM2_CHAIN,
         grouped_gemm_nvfp4,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.compile_nvfp4 import (
-        can_implement_swapped_nvfp4,
+    from flashinfer.fused_moe.batch_invariant.blocks.compile import (
+        can_implement_swapped_blockscaled as can_implement_swapped_nvfp4,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GROUP
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_nvfp4 import W4A4Chain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GROUP, W4A4Chain
     from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
         swapped_knobs_blockscaled,
     )
@@ -2053,31 +2052,6 @@ def test_linear_scale_unit_pack_equals_swizzled_pack_with_ones():
 
 
 @needs_device
-def test_swapped_body_placement_variants_give_the_bits(monkeypatch):
-    """The swapped decode body's placement variants (the shipped one-pass group tables on the scale-factor warp with the TMEM
-    allocation issued first, the legacy two-scan allocator-warp prologue, the L2 cache hints) compute the same bits at every
-    token tile."""
-    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import fused_moe_nvfp4
-    from flashinfer.fused_moe.batch_invariant.blocks import compile_nvfp4 as CN
-    from flashinfer.fused_moe.batch_invariant.blocks.swap_nvfp4 import VARIANTS
-    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
-        swapped_knobs_blockscaled,
-    )
-
-    T, k, H, I, E = 37, 4, 512, 256, 16
-    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=25)
-    W = _weights_of(_weights(w1, w2))
-    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
-    ids, wts = ids.cuda(), wts.cuda()
-    ref = bits(fused_moe_nvfp4(x, ids, wts, W, swap=False))
-    for c in swapped_knobs_blockscaled():
-        for variant in ("",) + VARIANTS + ("+".join(VARIANTS),):
-            monkeypatch.setattr(CN, "SWAP_VARIANT", variant)
-            out = fused_moe_nvfp4(x, ids, wts, W, config1=c, config2=c)
-            assert torch.equal(bits(out), ref), (c.tile_n, variant)
-
-
-@needs_device
 def test_every_record_computes_the_class_at_long_k_on_every_instruction_class_of_the_part():
     """At a K long enough for every CTA to cycle its whole operand ring (16 k-tiles per output tile), every swapped record and
     the deepest-ring padded records compute the class on every instruction class the part runs (on SM107 the K = 64 class
@@ -2173,7 +2147,7 @@ def _static_ladder(T, k, H, I, E, act, seed, gs_pow2=True):
         fused_moe_nvfp4,
         grouped_gemm_nvfp4,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_nvfp4 import W4A4Chain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import W4A4Chain
     from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
         rank_grouped_nvfp4,
         rows_per_expert,

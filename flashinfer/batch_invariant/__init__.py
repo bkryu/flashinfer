@@ -312,47 +312,38 @@ def _moe_nvfp4_fingerprint(
     gated: Optional[bool] = None,
     arch=None,
     intermediate: str = "per_token",
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
 ) -> str:
-    """The NVFP4 (W4A4) MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the NVFP4 x NVFP4 pair): ``method``
-    and ``act`` as for ``fused_moe``; ``arch`` (an architecture family, a compute capability or a device; the current CUDA
+    """The NVFP4 (W4A4) MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the NVFP4 x NVFP4 pair): the
+    dimensions of :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars
+    and gating) under the same bounds; ``arch`` (an architecture family, a compute capability or a device; the current CUDA
     device by default) selects the instruction class of each expert weight shape (the sm_107 K = 128 step on SM107 for the
-    unsplit shapes, the K = 64 step elsewhere): the architecture is a dimension of the class."""
-    from flashinfer.fused_moe.batch_invariant import spec
+    unsplit shapes, the K = 64 step elsewhere): the architecture is a dimension of the class; ``intermediate`` the
+    intermediate's quantization class (``per_token`` / ``static``)."""
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import ALIGN_NVFP4
     from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import (
         expert_classes,
         spec_fingerprint_nvfp4,
     )
-    from flashinfer.tllm_enums import RoutingMethodType
 
-    if isinstance(method, str) and method in RoutingMethodType.__members__:
-        method = RoutingMethodType[method]
-    if isinstance(method, RoutingMethodType):
-        if method not in spec.METHOD_OF_FLASHINFER:
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % ALIGN_NVFP4:
             raise ValueError(
-                f"the batch-invariant MoE classes do not implement routing method {method!r}"
+                f"fingerprint('fused_moe_nvfp4'): {dim} {value} must be a positive multiple of {ALIGN_NVFP4} "
+                "(the class's packed fp4 row alignment: whole scale-factor column groups)"
             )
-        rm = spec.METHOD_OF_FLASHINFER[method]
-    elif isinstance(method, str):
-        rm = spec.METHODS[method]
-    elif isinstance(method, spec.RoutingMethod):
-        rm = method
-    else:
-        raise TypeError(
-            f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
-        )
-    if not isinstance(act, str):
-        a = spec.activation_of(act)
-        name, params, gated = a.act, a.params, a.gated
-    elif act == "swiglu":
-        name, gated = "silu", True
-    elif act == "relu2":
-        name, gated = "relu2", False
-    elif act in spec.ACTS or act in spec.UNGATED_ACTS:
-        name = act
-        if gated is None:
-            gated = act in spec.ACTS
-    else:
-        raise ValueError(f"no MoE chain named {act!r}")
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_nvfp4",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
     family = _mx_family(arch, "fused_moe_nvfp4")
     return spec_fingerprint_nvfp4(
         H,
@@ -457,7 +448,16 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.nvfp4",
         ("H", "I", "top_k", "num_experts"),
         _moe_nvfp4_fingerprint,
-        ("method", "act", "params", "gated", "arch", "intermediate"),
+        (
+            "method",
+            "act",
+            "params",
+            "gated",
+            "arch",
+            "intermediate",
+            "n_group",
+            "topk_group",
+        ),
     ),
 }
 
