@@ -44,6 +44,7 @@ from ....gemm.batch_invariant.blocks.operands import (
     MBAR_RESERVE_BYTES,
 )
 from ....gemm.batch_invariant.generator import Knobs
+from ....batch_invariant.quantization.layout import SF_COL_TILE
 from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS, SF_ATOM_ROWS
 from .epilogue import (
     GroupedChain,
@@ -52,7 +53,13 @@ from .epilogue import (
     staging_bytes,
     staging_layout,
 )
-from .scheduler import MAX_E, GroupScheduler, build_group_tables, warp_roles
+from .scheduler import (
+    MAX_E,
+    GroupScheduler,
+    build_group_tables,
+    build_group_tables_dual,
+    warp_roles,
+)
 
 #: The MX classes the grouped body serves: the SM100 / SM103 instruction (K = 32) and the SM107 one (K = 64).
 MX_FMTS = ("mxfp8", "mxfp8_k64")
@@ -68,7 +75,7 @@ from .epilogue_mx import (  # noqa: E402
 
 EPI_WARPGROUPS_MX = 4
 EPILOGUE_WARPS, MMA_WARP, TMA_WARP, THREADS = warp_roles(EPI_WARPGROUPS_MX)
-TABLE_BYTES = 2 * (MAX_E + 1) * 4  # the two group tables
+TABLE_BYTES = (MAX_E + 1) * 4  # one group table
 
 
 def sf_view_experts(sf: cute.Tensor, rows, k, E, vec: int, sf_dtype):
@@ -179,13 +186,34 @@ def ring_bytes(st) -> int:
     )
 
 
-def plan_with_room(plan_cls, knobs: Knobs, own_bytes):
+def umma_ring_bytes(st) -> int:
+    """Shared memory of the M-side operand ring a UMMA reads (A, all stages: the first ring behind the barriers and the kernel's
+    own buffers in every grouped body), the ring the plans' address bound applies to."""
+    return cute.size_in_bytes(st.a_dtype, st.a_smem_layout_staged)
+
+
+def plan_with_room(
+    plan_cls,
+    knobs: Knobs,
+    own_bytes,
+    umma_addr_max: Optional[int] = None,
+    k_blocks: Optional[int] = None,
+):
     """The block-scaled plan whose operand ring leaves room for the grouped kernel's own shared memory (the group tables,
     the epilogue staging buffers): built once; if the ring plus ``own_bytes(st)`` plus the barrier reserve overflows the
-    CTA's shared memory, rebuilt with the budget shortened by the overflow (one stage fewer). A placement: the ring depth
-    moves no bits."""
-    st = plan_cls(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR)
+    CTA's shared memory, rebuilt with the budget shortened by the overflow (one stage fewer). ``umma_addr_max``: the
+    M-side operand ring a UMMA reads (A, first behind the barriers and the kernel's own buffers) ends below this many bytes of
+    the CTA's shared memory -- the plan's ``UMMA_SMEM_ADDR_MAX``, the bound above which the M-side operand ring (A) reads
+    wrong data on the sm_100 instruction plans of this part; the B and scale-factor rings above it compute the class (the
+    long-K test over every record is the guard). ``k_blocks``: the plan's K steps per stage (the swapped body's two-atom
+    stage; default the format's). A placement: the ring depth moves no bits."""
+    st = plan_cls(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR, k_blocks=k_blocks)
     over = ring_bytes(st) + own_bytes(st) + MBAR_RESERVE_BYTES - st.smem_capacity
+    if umma_addr_max is not None:
+        over = max(
+            over,
+            umma_ring_bytes(st) + own_bytes(st) + MBAR_RESERVE_BYTES - umma_addr_max,
+        )
     if over <= 0:
         return st
     cut = over
@@ -201,8 +229,16 @@ def plan_with_room(plan_cls, knobs: Knobs, own_bytes):
                 finally:
                     self.smem_capacity += cut
 
-        st2 = _Plan(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR)
-        if ring_bytes(st2) + own_bytes(st2) + MBAR_RESERVE_BYTES <= st2.smem_capacity:
+        st2 = _Plan(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR, k_blocks=k_blocks)
+        fits = (
+            ring_bytes(st2) + own_bytes(st2) + MBAR_RESERVE_BYTES <= st2.smem_capacity
+        )
+        if umma_addr_max is not None:
+            fits = fits and (
+                umma_ring_bytes(st2) + own_bytes(st2) + MBAR_RESERVE_BYTES
+                <= umma_addr_max
+            )
+        if fits:
             return st2
         cut += 1024
     raise AssertionError(
@@ -216,10 +252,25 @@ class GroupedBlockScaledGemmMX:
     persistent grid (``max_active_clusters``, in clusters) is a dynamic launch argument: which cluster computes a tile,
     never the bits."""
 
-    def __init__(self, knobs: Knobs, chain: GroupedChain, in_fmt: str = "mxfp8"):
+    def __init__(
+        self,
+        knobs: Knobs,
+        chain: GroupedChain,
+        in_fmt: str = "mxfp8",
+        dense_a: bool = False,
+    ):
+        """``dense_a``: the A rows densely packed (group offsets at align 1; the TMA box of a tile starts at the group's
+        row), the scale factors at the padded positions (one 128x4 atom per (expert, 128-row tile): the swapped decode
+        body's packing, :mod:`.swap_mxfp8`), the output's rows the A rows; the stale rows of a partial tile (the next
+        group's rows) are never stored. Default: the padded packing."""
         assert isinstance(chain, GroupedChain), chain
         assert in_fmt in MX_FMTS, in_fmt
-        self.knobs, self.chain, self.in_fmt = knobs, chain, in_fmt
+        self.knobs, self.chain, self.in_fmt, self.dense_a = (
+            knobs,
+            chain,
+            in_fmt,
+            dense_a,
+        )
         self.plan_cls = PLANS[in_fmt]
         self.cluster_shape_mn = knobs.cluster_shape_mn
 
@@ -263,23 +314,33 @@ class GroupedBlockScaledGemmMX:
             a.element_type,
             b.element_type,
         )
-        sfa_t = sf_view(sfa, a.shape[0], a.shape[1], 1, pc.SF_VEC, pc.SF_DT)
+        sf_rows = a.shape[0]  # the padded packing: A's rows
+        if self.dense_a:
+            # the dense packing: the scale rows (the padded positions plus the tail) from the buffer itself
+            sf_rows = sfa.shape[0] // (
+                cute.ceil_div(a.shape[1] // pc.SF_VEC, SF_COL_TILE) * SF_COL_TILE
+            )
+        sfa_t = sf_view(sfa, sf_rows, a.shape[1], 1, pc.SF_VEC, pc.SF_DT)
         sfb_t = sf_view_experts(
             sfb, b.shape[0], b.shape[1], b.shape[2], pc.SF_VEC, pc.SF_DT
         )
         # the accumulator-side "C" of the plan is fp32 row-major: it only sizes the epilogue tile; the ring leaves room
         # for the group tables and the epilogue staging buffers
         self.staged = staged_store(self.chain.out_fmt)
+        tables = (3 if self.dense_a else 2) * TABLE_BYTES
         st = plan_with_room(
             self.plan_cls,
             self.knobs,
-            lambda st: TABLE_BYTES
-            + (
-                staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_MX)
-                if self.staged
-                else 0
-            )
-            + xch_bytes(self.chain, EPI_WARPGROUPS_MX),
+            lambda st: (
+                tables
+                + (
+                    staging_bytes(out.element_type, st.epi_tile, EPI_WARPGROUPS_MX)
+                    if self.staged
+                    else 0
+                )
+                + xch_bytes(self.chain, EPI_WARPGROUPS_MX)
+            ),
+            self.plan_cls.UMMA_SMEM_ADDR_MAX,
         )
         self.st = st
         self.c_smem_layout_staged = (
@@ -429,6 +490,12 @@ class GroupedBlockScaledGemmMX:
         )
         s_off = storage.group_off.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_pre = storage.group_pre.get_tensor(cute.make_layout((MAX_E + 1,)))
+        s_off_pad = None
+        if cutlass.const_expr(self.dense_a):
+            # the padded (atom-aligned) group offsets: the scale-factor positions of the dense rows
+            s_off_pad = smem.allocate_tensor(
+                Int32, cute.make_layout((MAX_E + 1,)), byte_alignment=16
+            )
         cluster_rows = st.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
         # programmatic dependent launch: the prologue above (descriptor prefetch, barrier and pipeline setup, the TMEM
         # allocator) reads nothing of the predecessor's, so it overlaps the predecessor's tail; every thread waits here,
@@ -437,7 +504,16 @@ class GroupedBlockScaledGemmMX:
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == EPILOGUE_WARPS[0]:
-            build_group_tables(counts, E, cluster_rows, s_off, s_pre, GROUP_ALIGN)
+            if cutlass.const_expr(self.dense_a):
+                # one pass for both tables: the dense group offsets (the A rows, the output) and the padded
+                # scale-factor positions
+                build_group_tables_dual(
+                    counts, E, cluster_rows, s_off, s_pre, s_off_pad, GROUP_ALIGN
+                )
+            else:
+                build_group_tables(
+                    counts, E, cluster_rows, s_off, s_pre, GROUP_ALIGN
+                )  # padded group offsets (atom-aligned)
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         # --- operand staging: smem rings (A, B swizzled; SFA, SFB plain), multicast masks, the B / SFB partitions
@@ -601,6 +677,8 @@ class GroupedBlockScaledGemmMX:
                 a_full_mcast_mask,
                 b_full_mcast_mask,
                 sfb_full_mcast_mask,
+                s_off,
+                s_off_pad,
             )
         if warp_idx == MMA_WARP:
             tmem.wait_for_alloc()
@@ -684,6 +762,8 @@ class GroupedBlockScaledGemmMX:
                     mma_m_in_cluster,
                     EPI_WARPGROUPS_MX,
                     sX,
+                    s_off,
+                    s_off_pad,
                     cta_v=mma_tile_coord_v,
                 )
             else:
@@ -736,12 +816,15 @@ def grouped_blockscaled_producer_loop(
     a_mcast_mask,
     b_mcast_mask,
     sfb_mcast_mask,
+    s_off=None,
+    s_off_pad=None,
 ):
     """The block-scaled producer with per-tile coordinates: A and SFA are re-partitioned from the group-offset view
-    (``row0`` a multiple of 128: a whole scale-factor atom, so the swizzled SFA box is addressed exactly), B and SFB are
-    the dense partitions indexed by the expert as the batch coordinate. k-tiles ascending, one ring slot holds A, B, SFA
-    and SFB of a k-tile. A 64-wide N tile reads half of a 128-row SFB atom (tile n -> atom n // 2); the 192-wide tile's
-    addressing lives in the SFB coordinate tensor."""
+    (``row0`` a multiple of 128: a whole scale-factor atom, so the swizzled SFA box is addressed exactly; the dense
+    packing's SFA box at the group's padded position ``row0 + off_pad[e] - off[e]``), B and SFB are the dense partitions
+    indexed by the expert as the batch coordinate. k-tiles ascending, one ring slot holds A, B, SFA and SFB of a k-tile.
+    A 64-wide N tile reads half of a 128-row SFB atom (tile n -> atom n // 2); the 192-wide tile's addressing lives in
+    the SFB coordinate tensor."""
     tn = st.cta_tile_shape_mnk[1]
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
@@ -758,7 +841,12 @@ def grouped_blockscaled_producer_loop(
             cute.group_modes(tCgA, 0, 3),
         )
         tAgA_slice = tAgA[(None, mma_m_in_cluster, None, 0)]
-        real_sfa = cute.domain_offset((work_tile.row0, 0, 0), mSFA_mkl)
+        row0_sf = work_tile.row0
+        if cutlass.const_expr(s_off_pad is not None):
+            row0_sf = work_tile.row0 + (
+                s_off_pad[work_tile.e] - s_off[work_tile.e]
+            )  # dense A: the tile's padded (atom-aligned) position
+        real_sfa = cute.domain_offset((row0_sf, 0, 0), mSFA_mkl)
         gSFA = cute.local_tile(
             real_sfa, cute.slice_(st.mma_tiler, (None, 0, None)), (None, None, None)
         )

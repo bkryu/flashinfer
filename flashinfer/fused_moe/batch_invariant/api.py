@@ -202,7 +202,8 @@ def grouped_gemm(
     the weights on the MMA's M side, :mod:`.blocks.swap_bf16`) the swapped body on the same dense rows -- a placement, the
     same bits. ``Tk`` (default: the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the
     swapped body's last token box then stays inside the buffer instead of being zero-filled past it). The persistent grid is a
-    launch argument: the device's co-resident cluster capacity for the record's cluster size."""
+    launch argument: the device's co-resident cluster capacity for the record's cluster size, clipped to the launch's static
+    tile bound (`schedule.launch_tile_bound`), or ``grid`` as given."""
     from .blocks.compile import get_compiled_grouped, get_compiled_swapped
     from .schedule import launch_tile_bound
 

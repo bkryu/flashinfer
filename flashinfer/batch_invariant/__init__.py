@@ -261,10 +261,12 @@ def _moe_fp8bs_fingerprint(
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
     deepseek_fp8_block_size: int = 128,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
 ) -> str:
     """The block-scale fp8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8BlockConfig`` under
     ``QuantConfig(DeepSeekFp8, DeepSeekFp8)``: the dimensions of ``fused_moe`` (``method`` / ``act`` / ``params`` / ``gated``
-    as there) and the scale block size (``deepseek_fp8_block_size``: 128 for ``moe.e4m3bs.<act>``, 32 for
+    / ``n_group`` / ``topk_group`` as there) and the scale block size (``deepseek_fp8_block_size``: 128 for ``moe.e4m3bs.<act>``, 32 for
     ``moe.e4m3bs32.<act>``, a dimension of the class); the block scales, like the operands, are inputs."""
     from flashinfer.fused_moe.batch_invariant import spec
     from flashinfer.fused_moe.batch_invariant.spec_fp8bs import (
@@ -273,6 +275,12 @@ def _moe_fp8bs_fingerprint(
     )
 
     rm, name, params, gated = _moe_dims(spec, method, act, params, gated)
+    if (n_group or 0) > 1 or (topk_group or 0) > 1:
+        if rm is not spec.SIGMOID_BIAS_RENORM_SCALED:
+            raise ValueError(
+                "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
+            )
+        rm = rm.with_groups(int(n_group or 0), int(topk_group or 0))
     return spec_fingerprint_fp8bs(
         H,
         I,
@@ -366,7 +374,15 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.e4m3bs",
         ("H", "I", "top_k", "num_experts"),
         _moe_fp8bs_fingerprint,
-        ("method", "act", "params", "gated", "deepseek_fp8_block_size"),
+        (
+            "method",
+            "act",
+            "params",
+            "gated",
+            "deepseek_fp8_block_size",
+            "n_group",
+            "topk_group",
+        ),
     ),
     # the unified MoE layer with `BatchInvariantFp8BlockConfig` under `QuantConfig(MXFP8, MXFP8)` (the fp8-block backend
     # groups the fp8 formats with block scales under one key, the pair selecting the classes: this entry and the

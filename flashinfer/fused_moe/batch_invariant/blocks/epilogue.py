@@ -467,11 +467,14 @@ def grouped_epilogue_loop(
                 # the chain, in fp32, per element (pair)
                 for v in cutlass.range_constexpr(nv):
                     if cutlass.const_expr(is_out[v]):
-                        tTR_rC[v] = _chain_elem(
-                            chain,
-                            tTR_rAcc[v],
-                            tTR_rAcc[partner[v]] if cutlass.const_expr(pair) else None,
-                        )
+                        if live[offs[v][0]]:
+                            tTR_rC[v] = _chain_elem(
+                                chain,
+                                tTR_rAcc[v],
+                                tTR_rAcc[partner[v]]
+                                if cutlass.const_expr(pair)
+                                else None,
+                            )
                 if cutlass.const_expr(staged):
                     # registers -> this warpgroup's staging buffer (the TMEM load's thread layout); the rows of a skipped warp
                     # (all past the group's end) stay stale and are predicated off below

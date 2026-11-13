@@ -126,6 +126,11 @@ class BlockScaledPlan:
     TMEM_COLS = TMEM_COLS  # the TMEM budget planned against
     TMEM_ALLOC_ARCH = TMEM_ARCH  # the allocator's architecture: "sm_100" allows powers of two to 512, "sm_107" also the whole 576
     S2T_BROADCAST = False  # the smem -> TMEM scale-factor copy's source partition (see s2t_copy_and_partition)
+    # the M-side operand ring (A) placed above this many bytes of the CTA's shared memory reads wrong data on the sm_100
+    # instruction plans of this part (observed; the B and scale-factor rings above it compute the class): the grouped
+    # planners keep the A and B rings below it (`fused_moe/batch_invariant/blocks/blockscaled_kernel.py::plan_with_room`);
+    # None: the whole shared memory
+    UMMA_SMEM_ADDR_MAX: Optional[int] = A_RING_MAX_BYTES
 
     def make_tiled_mma(
         self, cta_group, tile_mn, breuse: bool = False, b_collector=None
@@ -172,16 +177,25 @@ class BlockScaledPlan:
     def tmem_alloc_cols(self, need: int) -> int:
         return max(32, _pow2ceil(need))
 
-    def __init__(self, knobs: Knobs, c_dtype, c_layout, chunks: int = 1):
+    def __init__(
+        self,
+        knobs: Knobs,
+        c_dtype,
+        c_layout,
+        chunks: int = 1,
+        k_blocks: Optional[int] = None,
+    ):
         """``chunks``: the class's chunk count; with ``knobs.cta_chunks`` the CTA folds all of them (``self.cta_chunks``) and
-        the TMEM holds the running sum next to the accumulator stages (``sum_stage``)."""
+        the TMEM holds the running sum next to the accumulator stages (``sum_stage``). ``k_blocks``: the instruction K steps
+        per smem stage (the lowering's inner radix; default the format's one 128-byte atom of K) -- a placement of the same
+        fold (the grouped swapped decode body stages two atoms)."""
         assert knobs.well_formed(self.IN_FMT) and knobs.use_tma_store, knobs
         self.knobs = knobs
         self.chunks = chunks
         self.cta_chunks = (
             chunks if (knobs.cta_chunks and chunks > 1) else 1
         )  # chunks folded inside the CTA (1: none)
-        self.block = MainloopBlock(self.IN_FMT)
+        self.block = MainloopBlock(self.IN_FMT, inner_steps=k_blocks)
         self.a_dtype, self.b_dtype = self.A_DT, self.B_DT
         self.sf_dtype, self.sf_vec = self.SF_DT, self.SF_VEC
         self.c_dtype, self.c_layout = c_dtype, c_layout
@@ -375,6 +389,7 @@ class BlockScaledPlanSM107(BlockScaledPlan):
         "sm_107"  # the allocator accepts the non-power-of-two 576 on sm_107 only
     )
     S2T_BROADCAST = True
+    UMMA_SMEM_ADDR_MAX = None  # the sm_107 instruction plans compute the class with rings anywhere in the part's shared memory (observed)
 
     def make_tiled_mma(
         self, cta_group, tile_mn, breuse: bool = False, b_collector=None

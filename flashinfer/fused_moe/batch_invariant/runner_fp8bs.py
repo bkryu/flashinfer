@@ -23,7 +23,13 @@ import torch
 from ...batch_invariant.support import check_device, unsupported
 from ..api import MoEActivationPack, MoEWeightPack, RoutingInputMode
 from ..runners import _validate_logits_inputs, _validate_prerouted_inputs
-from .runner import _TACTIC_FIELDS, MOE_BF16_ARCHS, _configs_from_tactic, _tactic
+from .runner import (
+    _TACTIC_FIELDS,
+    MOE_BF16_ARCHS,
+    _configs_from_tactic,
+    _tactic,
+    routing_term,
+)
 from .runner_fp8_block import PAIR_DEEPSEEK_FP8, BatchInvariantFp8BlockRunner
 from .spec_fp8bs import BLOCK as QBLOCK
 from .spec_fp8bs import CLASS, CLASS_OF
@@ -64,8 +70,6 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
     # ---- support ---------------------------------------------------------------------------------------------------
     def _check_support(self) -> None:
         super()._check_support()
-        from .spec import METHOD_OF_FLASHINFER
-
         cfg = self.config
         check_device(self.device, CLASS, MOE_FP8BS_ARCHS)
         try:
@@ -98,17 +102,10 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
             raise unsupported(
                 CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
             )
-        if routing.n_group not in (None, 0, 1) or routing.topk_group not in (
-            None,
-            0,
-            1,
-        ):
-            raise unsupported(
-                CLASS, "group-limited routing (n_group > 1)", "n_group in (None, 0, 1)"
-            )
-        # the fp8-block base runner derives no routing method: the class's own (the logits mode consults it); expert-parallel
-        # shards are refused by name in super()._check_support() (the backend's `supports_expert_parallelism = False`)
-        self._method = METHOD_OF_FLASHINFER.get(routing.method)
+        # the routing term (the bf16 backend's methods, DeepSeekV3's expert groups under their shape rule, the Llama4 top-1 rule):
+        # the shared derivation; expert-parallel shards are refused by name in super()._check_support() (the backend's
+        # `supports_expert_parallelism = False`)
+        self._method, self._grouped_other = routing_term(routing, CLASS)
         if not cfg.finalize.do_finalize:
             raise unsupported(
                 CLASS,
@@ -192,11 +189,19 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
+            # the group-limited selection is a term of the DeepSeekV3 method; with another method the groups have no
+            # meaning in this module (with pre-routed ids the group structure never enters the computation)
+            if self._grouped_other:
+                raise unsupported(
+                    CLASS,
+                    f"expert groups (n_group / topk_group) with {cfg.routing.method!r} from logits",
+                    "the groups with DeepSeekV3, or pre-routed ids",
+                )
             if self._method is None:
                 raise unsupported(
                     CLASS,
                     f"routing method {cfg.routing.method!r} from logits",
-                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm or DeepSeekV3 with n_group <= 1",
+                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm, TopK, Llama4, TopKSigmoid or DeepSeekV3",
                 )
             bias = act.routing_bias
             if (bias is not None) != self._method.bias:
