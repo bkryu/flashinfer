@@ -2305,7 +2305,7 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
             counts, dest, src, *_ = permute_plan(ids_bad.cuda(), E, **form)
             assert int(counts.sum()) == n_valid, form
             assert torch.equal(dest.cpu().view(-1) < 0, dropped.view(-1)), form
-            assert torch.all(src[src >= 0].unique().numel() == n_valid), form
+            assert src[src >= 0].unique().numel() == n_valid, form
         out = layer(_routed_pack((xq, xsf), ids_bad.cuda(), wts.cuda()), W)
         ids_ref = torch.where(dropped, torch.zeros_like(ids), ids)
         wts_ref = torch.where(dropped, torch.zeros_like(wts), wts)
