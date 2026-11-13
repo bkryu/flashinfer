@@ -25,7 +25,6 @@ import torch
 
 from ...autotuner import TuningConfig
 from ...batch_invariant.support import check_device, unsupported
-from ...tllm_enums import RoutingMethodType
 
 from ..api import (
     GELU,
@@ -45,7 +44,7 @@ from ..api import (
     SwiGLUStep,
 )
 from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
-from .runner import MOE_BF16_ARCHS
+from .runner import MOE_BF16_ARCHS, routing_term
 from .spec_nvfp4 import CLASS
 
 #: The compute capabilities the classes are stated for (the dense 4-bit GEMM class's parts).
@@ -160,7 +159,6 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
     def _check_support(self) -> None:
         super()._check_support()
         from .api_nvfp4 import check_shape_nvfp4
-        from .spec import MAX_GROUPS, METHOD_OF_FLASHINFER
 
         cfg = self.config
         check_device(self.device, CLASS, MOE_NVFP4_ARCHS)
@@ -191,40 +189,7 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         check_shape_nvfp4(
             None, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
         )
-        self._method = METHOD_OF_FLASHINFER.get(routing.method)
-        self._grouped_other = False
-        if self._method is not None:
-            # the routing terms of the bf16 model (the shared routing kernels): the group-limited selection is a term of the
-            # DeepSeekV3 method with the groups as parameters (its shape rule as the bf16 runner's); Llama4 is the top-1 with
-            # its sigmoid as the weight (TopKSigmoid for other k). The pre-routed modes never consult the method.
-            grouped = (routing.n_group or 0) > 1 or (routing.topk_group or 0) > 1
-            if grouped and routing.method is RoutingMethodType.DeepSeekV3:
-                n_group, topk_group = (
-                    int(routing.n_group or 0),
-                    int(routing.topk_group or 0),
-                )
-                E = routing.num_experts
-                if not (
-                    1 <= topk_group <= n_group <= MAX_GROUPS
-                    and E % n_group == 0
-                    and E // n_group >= 2
-                    and routing.top_k <= topk_group * (E // n_group)
-                ):
-                    raise unsupported(
-                        CLASS,
-                        f"n_group {n_group}, topk_group {topk_group} over {E} experts for top_k {routing.top_k}",
-                        f"1 <= topk_group <= n_group <= {MAX_GROUPS}, n_group dividing num_experts into groups of at "
-                        "least two experts, top_k <= topk_group * (num_experts / n_group)",
-                    )
-                self._method = self._method.with_groups(n_group, topk_group)
-            elif grouped:
-                self._grouped_other = True
-            if routing.method is RoutingMethodType.Llama4 and routing.top_k != 1:
-                raise unsupported(
-                    CLASS,
-                    f"Llama4 routing with top_k {routing.top_k}",
-                    "top_k = 1 (the method is the top-1 of the logits with its sigmoid as the weight; TopKSigmoid for other k)",
-                )
+        self._method, self._grouped_other = routing_term(routing, CLASS)
         if not cfg.finalize.do_finalize:
             raise unsupported(
                 CLASS,
