@@ -1441,24 +1441,31 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                 device=torch.device("cuda"),
             )
         assert what in str(excinfo.value) or "moe.e4m3bs" in str(excinfo.value), what
-    # the group shape rule of the DeepSeekV3 term is checked at construction (the shared routing_term)
+    # the group shape rule of the DeepSeekV3 term is refused at the from-logits call, not at construction (the shared runner's
+    # rule: the pre-routed modes never consult the term, so a pre-routed layer builds under any RoutingConfig)
     for n_group, topk_group, kk in ((3, 1, k), (64, 4, k), (8, 9, k), (8, 1, 9)):
-        with pytest.raises(errors) as excinfo:
-            MoELayer(
-                MoEConfig(
-                    routing=RoutingConfig(
-                        num_experts=E,
-                        top_k=kk,
-                        method=RoutingMethodType.DeepSeekV3,
-                        n_group=n_group,
-                        topk_group=topk_group,
-                        routed_scaling_factor=1.0,
-                    ),
-                    quant=QUANT,
-                    experts=experts,
-                    backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+        grouped_layer = MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(
+                    num_experts=E,
+                    top_k=kk,
+                    method=RoutingMethodType.DeepSeekV3,
+                    n_group=n_group,
+                    topk_group=topk_group,
+                    routed_scaling_factor=1.0,
                 ),
-                device=torch.device("cuda"),
+                quant=QUANT,
+                experts=experts,
+                backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+            ),
+            device=torch.device("cuda"),
+        )
+        x_g, logits_g, w1_g, w2_g = _problem(8, kk, H, I, E, seed=9)
+        xq_g, sx_g = _xq(x_g)
+        with pytest.raises(errors) as excinfo:
+            grouped_layer(
+                _logits_pack(xq_g, sx_g, logits_g, torch.zeros(E, device="cuda")),
+                _weights(w1_g, w2_g),
             )
         assert "n_group" in str(excinfo.value) or "top_k" in str(excinfo.value), (
             n_group,
@@ -1483,7 +1490,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             MoELayer(sharded, device=torch.device("cuda"))
         assert "expert parallelism" in str(excinfo.value), shard
         # the class's own refusal fires first and names the shard (the shared assertion stands behind it)
-        with pytest.raises(bi.BatchInvariantUnsupportedError, match="expert-parallel shards"):
+        with pytest.raises(
+            bi.BatchInvariantUnsupportedError, match="expert-parallel shards"
+        ):
             BatchInvariantDeepSeekFp8Runner(
                 sharded, torch.device("cuda")
             )._check_support()
