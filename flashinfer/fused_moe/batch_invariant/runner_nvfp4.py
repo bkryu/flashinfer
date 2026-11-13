@@ -106,17 +106,18 @@ def _configs_from_tactic_nvfp4(t: tuple):
     return one(t[:7]), one(t[7:14])
 
 
-class BatchInvariantMoeNvfp4Runner(MoERunner):
-    """The unified layer's runner for the batch-invariant NVFP4 (W4A4) MoE classes."""
+class _Fp4PairRunner(MoERunner):
+    """What the fp4 backend's pair implementations share: the backend's key, the routing modes, the output format, the layer's
+    activation classes, the construction (the routed scale constant, the part, the intermediate's class field), the class's
+    shard refusal and the shape helpers. ``CLASS`` names the pair's registry class for its refusals."""
 
-    # the fp4 backend's key (``runner_fp4.BACKEND_KEY``): the pair implementations share the weight view and the records
+    CLASS: str = CLASS
     backend_key = "batch_invariant_fp4"
     supported_routing_modes = (
         RoutingInputMode.FromLogits,
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     )
-    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     supported_output_formats = (QuantFormat.BF16,)
     supported_activation_classes = (
         SwiGLU,
@@ -131,8 +132,6 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         ReLU,
         SiLU,
     )
-    # the per-token scale of a pre-quantized pack is consumed (the class's own ``pts``)
-    supports_per_token_scale = True
     supports_expert_parallelism = False
 
     def __init__(self, config, device) -> None:
@@ -164,43 +163,9 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             experts.local_num_experts not in (None, 0, routing.num_experts)
         ):
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 "expert-parallel shards (local_expert_offset / local_num_experts)",
                 "the full expert set (the class's EP form is not part of this backend)",
-            )
-
-    def _check_support(self) -> None:
-        self._check_experts()
-        super()._check_support()
-        from .api_nvfp4 import check_shape_nvfp4
-
-        cfg = self.config
-        check_device(self.device, CLASS, MOE_NVFP4_ARCHS)
-        try:
-            a = self._activation()
-        except ValueError as e:
-            raise unsupported(
-                CLASS,
-                f"activation {cfg.activation!r}",
-                "one of the layer's typed activations",
-            ) from e
-        experts, routing = cfg.experts, cfg.routing
-        if experts.num_fused_shared_experts:
-            raise unsupported(
-                CLASS,
-                "fused shared experts",
-                "num_fused_shared_experts = 0 (a shared expert is one more routed slot)",
-            )
-        # the shape rule on the dimensions the config fixes (H enters at the first call, with the full rule)
-        check_shape_nvfp4(
-            None, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
-        )
-        self._method, self._grouped_other = routing_term(routing, CLASS)
-        if not cfg.finalize.do_finalize:
-            raise unsupported(
-                CLASS,
-                "do_finalize=False",
-                "do_finalize=True (the slot-order combine is part of the class)",
             )
 
     def _build(self) -> None:
@@ -237,6 +202,69 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         return s
 
     # ---- inputs ----------------------------------------------------------------------------------------------------
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        x = act.hidden_states_q
+        if x.ndim != 2:
+            return False
+        if x.dtype == torch.bfloat16:
+            return x.shape[1] % 32 == 0
+        return x.dtype == torch.uint8 and (2 * x.shape[1]) % 32 == 0
+
+    @staticmethod
+    def _hidden_of(x: torch.Tensor) -> int:
+        return int(x.shape[1]) if x.dtype == torch.bfloat16 else 2 * int(x.shape[1])
+
+    def _ranked(self, T: int, H: int) -> Tuple[list, list]:
+        """The dispatcher's ranked records of the two GEMMs at ``T`` tokens (the pair's)."""
+        raise NotImplementedError
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
+        self._require_built()
+        r1, r2 = self._ranked(int(inputs[_X].shape[0]), self._hidden_of(inputs[_X]))
+        return [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
+
+
+class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
+    """The unified layer's runner for the batch-invariant NVFP4 (W4A4) MoE classes."""
+
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    supports_per_token_scale = True
+
+    def _check_support(self) -> None:
+        self._check_experts()
+        super()._check_support()
+        from .api_nvfp4 import check_shape_nvfp4
+
+        cfg = self.config
+        check_device(self.device, CLASS, MOE_NVFP4_ARCHS)
+        try:
+            a = self._activation()
+        except ValueError as e:
+            raise unsupported(
+                CLASS,
+                f"activation {cfg.activation!r}",
+                "one of the layer's typed activations",
+            ) from e
+        experts, routing = cfg.experts, cfg.routing
+        if experts.num_fused_shared_experts:
+            raise unsupported(
+                CLASS,
+                "fused shared experts",
+                "num_fused_shared_experts = 0 (a shared expert is one more routed slot)",
+            )
+        # the shape rule on the dimensions the config fixes (H enters at the first call, with the full rule)
+        check_shape_nvfp4(
+            None, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
+        )
+        self._method, self._grouped_other = routing_term(routing, CLASS)
+        if not cfg.finalize.do_finalize:
+            raise unsupported(
+                CLASS,
+                "do_finalize=False",
+                "do_finalize=True (the slot-order combine is part of the class)",
+            )
+
+    # ---- inputs ----------------------------------------------------------------------------------------------------
     def _validate_pack_contract(self, act: MoEActivationPack) -> None:
         """The routing mode must be one of the three; a pack's ``per_token_scale`` is consumed in every configuration (the
         class is per-token by construction: no tactic depends on the scale's presence), so ``QuantConfig.per_token_scale``
@@ -246,14 +274,6 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support routing_input_mode={act.routing_input_mode!r}; supported: {names}."
             )
-
-    def _accepts_shape(self, act: MoEActivationPack) -> bool:
-        x = act.hidden_states_q
-        if x.ndim != 2:
-            return False
-        if x.dtype == torch.bfloat16:
-            return x.shape[1] % 32 == 0
-        return x.dtype == torch.uint8 and (2 * x.shape[1]) % 32 == 0
 
     def _activation_scales(
         self, act: MoEActivationPack, T: int, H: int
@@ -305,6 +325,8 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
             pts = pts.to(torch.float32).contiguous()
         return sf_flat, pts
 
+    # the fp4 backend's key (``runner_fp4.BACKEND_KEY``): the pair implementations share the weight view and the records
+    # the per-token scale of a pre-quantized pack is consumed (the class's own ``pts``)
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
@@ -328,7 +350,14 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
         T = x.shape[0]
         H = x.shape[1] if x.dtype == torch.bfloat16 else 2 * x.shape[1]
         k, E = cfg.routing.top_k, cfg.routing.num_experts
-        w = MoEWeightsNVFP4.from_view(weights.get_view(self.backend_key))
+        view = weights.get_view(self.backend_key)
+        if view.get("quant", "nvfp4") != "nvfp4":
+            raise unsupported(
+                CLASS,
+                "weights prepared for another pair of the fp4 backend",
+                "weights from BatchInvariantFp4Config.prepare_weights(..., quant=QuantConfig(weight=NVFP4, activation=NVFP4))",
+            )
+        w = MoEWeightsNVFP4.from_view(view)
         if (
             w.hidden_size != H
             or w.num_experts != E
@@ -480,15 +509,6 @@ class BatchInvariantMoeNvfp4Runner(MoERunner):
                 rows, H, I, E, chain2, in2, sm_count, family, TOP_K, n_active=n_act
             ),
         )
-
-    @staticmethod
-    def _hidden_of(x: torch.Tensor) -> int:
-        return int(x.shape[1]) if x.dtype == torch.bfloat16 else 2 * int(x.shape[1])
-
-    def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
-        self._require_built()
-        r1, r2 = self._ranked(int(inputs[_X].shape[0]), self._hidden_of(inputs[_X]))
-        return [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
 
     def _cache_key_extras(self) -> tuple:
         return super()._cache_key_extras() + ("moe.nvfp4-v3", self._intermediate)

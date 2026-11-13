@@ -327,6 +327,34 @@ class SwappedGroupedGemm:
         )
 
     @cute.jit
+    def block_scaled_plain(
+        self,
+        rows: cute.Tensor,
+        sfa: cute.Tensor,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The block-scaled chains without further operands (the MXFP4 classes): ``rows`` the dense rows, ``sfa`` their scale
+        factors at the padded positions, ``w`` / ``sfw`` the experts and their scale buffers."""
+        assert self.operands.block_scaled and not self.chain.operands
+        self._launch(
+            rows,
+            w,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            None,
+            Int32(1),
+            sfa=sfa,
+            sfw=sfw,
+        )
+
+    @cute.jit
     def block_scaled_static(
         self,
         rows: cute.Tensor,

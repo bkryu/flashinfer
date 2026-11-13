@@ -359,6 +359,53 @@ def _moe_nvfp4_fingerprint(
     )
 
 
+def _moe_mxfp4_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    arch=None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The MXFP4 MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the MXFP4 x MXFP4 pair: UE8M0 block scales
+    on both operands, no global or per-token scale): the dimensions of :func:`_moe_class_terms` under the same bounds;
+    ``arch`` (an architecture family, a compute capability or a device; the current CUDA device by default) selects the
+    instruction class of the expert GEMMs (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere): the architecture is
+    a dimension of the class."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp4 import ALIGN_MXFP4
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp4 import (
+        expert_classes_mx,
+        spec_fingerprint_mxfp4,
+    )
+
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % ALIGN_MXFP4:
+            raise ValueError(
+                f"fingerprint('fused_moe_mxfp4'): {dim} {value} must be a positive multiple of {ALIGN_MXFP4} "
+                "(the class's packed fp4 row alignment: whole scale blocks)"
+            )
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_mxfp4",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
+    family = _mx_family(arch, "fused_moe_mxfp4")
+    return spec_fingerprint_mxfp4(
+        H, I, top_k, num_experts, rm, name, params, gated, expert_classes_mx(family)
+    )
+
+
 def _megamoe_bf16_fingerprint(
     hidden: int,
     intermediate: int,
@@ -458,6 +505,14 @@ CLASSES: Dict[str, ClassInfo] = {
             "n_group",
             "topk_group",
         ),
+    ),
+    # the MXFP4 x MXFP4 pair of the same backend (UE8M0 block scales on both operands: no global or per-token scale, no
+    # static-intermediate class)
+    "fused_moe_mxfp4": ClassInfo(
+        "moe.mxfp4",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_mxfp4_fingerprint,
+        ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
     ),
 }
 

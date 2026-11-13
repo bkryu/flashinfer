@@ -32,6 +32,7 @@ from .epilogue import (
     OUT_FMTS_W4A4,
     GroupedChain,
     GroupedEpilogueBlock,
+    Mxfp4Chain,
     W4A4Chain,
 )
 from .kernel import CHAINS, GROUP_ALIGN, GroupedBlockGemm
@@ -274,6 +275,20 @@ def compile_grouped_fn(
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
         body = GroupedBlockGemm(cfg, chain, packing=packing)
         if _is_block_scaled(chain):
+            if not chain.operands:
+                return cute.compile(
+                    body.block_scaled_plain,
+                    f["a"],
+                    f["b"],
+                    f["sfa"],
+                    f["sfb"],
+                    f["out"],
+                    f["counts"],
+                    Int32(GROUP_ALIGN),
+                    grid,
+                    stream_fake,
+                    options="--enable-tvm-ffi",
+                )
             if chain.needs_aux:
                 return cute.compile(
                     body.block_scaled_static,
@@ -422,6 +437,19 @@ def compile_swapped_fn(
         grid = GRID_PLACEHOLDER
         body = SwappedGroupedGemm(cfg, chain, gather=gather)
         if _is_block_scaled(chain):
+            if not chain.operands:
+                return cute.compile(
+                    body.block_scaled_plain,
+                    f["rows"],
+                    f["sfa"],
+                    f["b"],
+                    f["sfb"],
+                    f["out"],
+                    f["counts"],
+                    grid,
+                    stream_fake,
+                    options="--enable-tvm-ffi",
+                )
             if chain.needs_aux:
                 return cute.compile(
                     body.block_scaled_static,
@@ -506,20 +534,23 @@ def get_compiled_swapped(
 # ----------------------------------------------------------------------------- the block-scaled classes' entries
 
 
+BLOCKSCALED_CHAINS = (W4A4Chain, Mxfp4Chain)
+
+
 def can_implement_grouped_blockscaled(
-    knobs: Knobs, N: int, K: int, E: int, chain: W4A4Chain, in_fmt: str
+    knobs: Knobs, N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str
 ) -> bool:
     """:func:`can_implement_grouped` at the chain's instruction class ``in_fmt`` (the block-scaled classes name the class per
-    expert weight shape)."""
-    return isinstance(chain, W4A4Chain) and can_implement_grouped(
+    expert weight shape, or per part)."""
+    return isinstance(chain, BLOCKSCALED_CHAINS) and can_implement_grouped(
         knobs, N, K, E, chain.at(in_fmt)
     )
 
 
 def can_implement_swapped_blockscaled(
-    knobs: Knobs, N: int, K: int, E: int, chain: W4A4Chain, in_fmt: str
+    knobs: Knobs, N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str
 ) -> bool:
     """:func:`can_implement_swapped` at the chain's instruction class."""
-    return isinstance(chain, W4A4Chain) and can_implement_swapped(
+    return isinstance(chain, BLOCKSCALED_CHAINS) and can_implement_swapped(
         knobs, N, K, E, chain.at(in_fmt)
     )

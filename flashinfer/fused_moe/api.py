@@ -3541,13 +3541,16 @@ def _fp4_pair(quant: Optional["QuantConfig"]) -> Tuple[QuantFormat, QuantFormat]
 class BatchInvariantFp4Config:
     """The batch-invariant fp4 MoE backend of the unified layer: one backend for the 4-bit-weight quantization pairs, grouped
     as :class:`TrtllmFp4Config` groups them, ``QuantConfig(weight=..., activation=...)`` selecting the pair (``quant=None``
-    in ``prepare_weights`` / ``prepare_activations`` is NVFP4 x NVFP4). The pairs served: NVFP4 x NVFP4, the W4A4 classes
-    ``moe.nvfp4.<act>`` of the mode documented in ``flashinfer/batch_invariant/README.md`` (NVFP4 experts with one
-    per-tensor global scale per expert and GEMM, per-token NVFP4 activations; one class per typed activation and parameter
-    set, as the bf16 backend), on SM100 / SM103 / SM107. MXFP4 x MXFP8 arrives with the mixed MoE PR; a pair the backend
-    does not serve is skipped by the layer's candidate filter and refused by ``prepare_weights`` / ``prepare_activations``
-    and by the runner with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming the served pairs.
-    The kernel classes keep their registry names (``fingerprint("fused_moe_nvfp4", ...)``).
+    in ``prepare_weights`` / ``prepare_activations`` is NVFP4 x NVFP4). The pairs served, on SM100 / SM103 / SM107, one class
+    per typed activation and parameter set as the bf16 backend, documented in ``flashinfer/batch_invariant/README.md``:
+    NVFP4 x NVFP4, the W4A4 classes ``moe.nvfp4.<act>`` (NVFP4 experts with one per-tensor global scale per expert and GEMM,
+    per-token NVFP4 activations), and MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>`` (MXFP4 experts and MXFP4 activations,
+    one UE8M0 scale per 32 elements on both operands, no global and no per-token scale). MXFP4 x MXFP8 arrives with the mixed
+    MoE PR; a pair the backend does not serve is skipped by the layer's candidate filter and refused by ``prepare_weights`` /
+    ``prepare_activations`` and by the runner with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming
+    the served pairs. The kernel classes keep their registry names (``fingerprint("fused_moe_nvfp4", ...)``,
+    ``fingerprint("fused_moe_mxfp4", ...)``); the weight view carries its pair, and a pack prepared for one pair is refused by a
+    layer configured for the other.
 
     The guarantee, the routing input modes, the finalize contract and the error contract are the bf16 backend's
     (:class:`BatchInvariantBf16Config`): a token's output bits depend on its own row, its ``top_k`` experts and routing weights
@@ -3576,6 +3579,17 @@ class BatchInvariantFp4Config:
     ``prepare_weights(..., intermediate="static", intermediate_scales=[E] f32 multipliers)``, default ones (the open backends'
     unified-layer value, FlashInfer's ``fc2_input_scale`` convention); the weight view carries the class, and a pack prepared for
     the other class is refused.
+
+    MXFP4 x MXFP4 (the proofs are the ``MoEMxfp4`` Lean module): the input row quantized by the mode's MXFP4 quantizer
+    (``mxfp4.quant``), GEMM1 as the dense MXFP4 GEMM class per expert with the bf16 class's chain on the raw accumulators (the
+    block scales are applied inside the instruction), the bf16 intermediate quantized by the same class, GEMM2 with
+    ``cvt_bf16(acc)``, the slot-order combine; the instruction class is the part's (the sm_107 K = 128 step on SM107), so the
+    architecture is a dimension of ``fingerprint("fused_moe_mxfp4", ...)``. Weights: the canonical bf16 layouts above,
+    quantized per expert by the MXFP4 quantizer (128x4 swizzled UE8M0 scales), ``H`` and ``I`` multiples of 32. Activations:
+    bf16 rows as given, or packed fp4 ``uint8 [num_tokens, H / 2]`` with ``hidden_states_scale`` (the 128x4 swizzled scales of
+    ``mxfp4_quantize(..., batch_invariant=True)`` or the linear ``[num_tokens, H / 32]`` layout) and no ``per_token_scale``
+    (``QuantConfig(per_token_scale=True)`` is refused for this pair). ``intermediate`` and ``intermediate_scales`` are the NVFP4
+    pair's and are refused for MXFP4.
     """
 
     intermediate: str = "per_token"
@@ -3609,7 +3623,8 @@ class BatchInvariantFp4Config:
         ``SwiGLU()``). NVFP4 x NVFP4: every expert quantized to NVFP4 with its own per-tensor global scale (the gate / up
         rows interleaved first for a gated activation), the 128x4 swizzled block scales and the alphas
         (``1 / global scale``); ``intermediate`` / ``intermediate_scales`` select the static-intermediate class and its
-        per-expert scales (see the class docstring)."""
+        per-expert scales (see the class docstring). MXFP4 x MXFP4: every expert quantized to MXFP4 (one UE8M0 scale per 32
+        elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of this pair."""
         from .batch_invariant.spec import activation_of
 
         pair = _fp4_pair(quant)
@@ -3628,16 +3643,39 @@ class BatchInvariantFp4Config:
                 intermediate=intermediate,
                 intermediate_scales=intermediate_scales,
             ).view()
+        if pair == (QuantFormat.MXFP4, QuantFormat.MXFP4):
+            from ..batch_invariant.support import unsupported
+            from .batch_invariant.api_mxfp4 import MoEWeightsMXFP4
+            from .batch_invariant.spec_mxfp4 import CLASS as MX_CLASS
+
+            if intermediate != "per_token" or intermediate_scales is not None:
+                raise unsupported(
+                    MX_CLASS,
+                    f"intermediate={intermediate!r} with intermediate scales"
+                    if intermediate_scales is not None
+                    else f"intermediate={intermediate!r}",
+                    "the intermediate quantized per 32-element block by the class itself (the static class is the NVFP4 pair's)",
+                )
+            return MoEWeightsMXFP4.prepare(
+                w1.to(torch.bfloat16),
+                w2.to(torch.bfloat16),
+                gated=chain.gated,
+                act=chain.act,
+                params=chain.params,
+            ).view()
         raise AssertionError(f"unreachable: {pair!r} passed _fp4_pair")
 
     @staticmethod
     def prepare_activations(
         hidden_states: torch.Tensor, *, quant: Optional["QuantConfig"] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """The activation pack of the pair ``quant`` selects (``None``: NVFP4 x NVFP4). NVFP4 x NVFP4: bf16 activations as
-        given (no scale): the class's per-token quantization is part of the op."""
+        """The activation pack of the pair ``quant`` selects (``None``: NVFP4 x NVFP4). Both pairs: bf16 activations as
+        given (no scale): the class's quantization (per token for NVFP4, per 32-element block for MXFP4) is part of the op."""
         pair = _fp4_pair(quant)
-        if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+        if pair in (
+            (QuantFormat.NVFP4, QuantFormat.NVFP4),
+            (QuantFormat.MXFP4, QuantFormat.MXFP4),
+        ):
             return hidden_states.to(torch.bfloat16).contiguous(), None
         raise AssertionError(f"unreachable: {pair!r} passed _fp4_pair")
 

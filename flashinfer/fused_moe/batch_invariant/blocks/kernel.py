@@ -173,6 +173,35 @@ class GroupedBlockGemm:
         )
 
     @cute.jit
+    def block_scaled_plain(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        sfa: cute.Tensor,
+        sfb: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        rows_sf: Int32,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The entry of the block-scaled chains without further operands (the MXFP4 classes: the e8m0 scales of both operands
+        are applied inside the instruction, no global or per-row scale): ``rows_sf`` the rows of the A operand's scale-factor
+        buffer (the padded row count of the dense packing)."""
+        assert self.operands.block_scaled and not self.chain.operands, self.chain
+        self._launch(
+            a,
+            b,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            sfa=sfa,
+            sfb=sfb,
+            rows_sf=rows_sf,
+        )
+
+    @cute.jit
     def block_scaled_static(
         self,
         a: cute.Tensor,
