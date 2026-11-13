@@ -305,8 +305,9 @@ def compile_grouped_fn(
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
         body = GroupedBlockGemm(cfg, chain, packing=packing)
         if _is_block_scaled(chain):
-            if not chain.operands:
-                # the MX chains: no further operand; the quantising chain writes its scale bytes as a second output
+            if isinstance(chain, MxChain):
+                # the MX chains: no operand beyond the output (the quantising chain writes its scale bytes as a second
+                # output); the W4A4 unscaled oracle keeps the ``block_scaled`` entry and leaves its alpha / pts unread
                 if chain.quant:
                     return cute.compile(
                         body.block_scaled_quant,
@@ -490,7 +491,8 @@ def compile_swapped_fn(
         grid = GRID_PLACEHOLDER
         body = SwappedGroupedGemm(cfg, chain, gather=gather, k_block=k_block)
         if _is_block_scaled(chain):
-            if not chain.operands:
+            if isinstance(chain, MxChain):
+                # the MX chains' entries; the W4A4 unscaled oracle keeps ``block_scaled`` (alpha / pts unread)
                 if chain.quant:
                     return cute.compile(
                         body.block_scaled_quant,

@@ -60,6 +60,10 @@ needs_device = pytest.mark.skipif(
 
 _SWIGLU = SwiGLU()
 _NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+# a pre-quantized pack with the class's per-token scales needs the layer's opt-in (the shared pack contract)
+_NVFP4_PTS = QuantConfig(
+    weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4, per_token_scale=True
+)
 KEY = BatchInvariantFp4Runner.backend_key
 # the activations the suites cover (every typed activation of the layer, the parameterised ones once more with scalars that
 # move every branch): the bf16 backend's list, each its own class of this backend too
@@ -1052,12 +1056,24 @@ def test_both_packings_and_the_prequantized_pack_forms_give_the_bits():
     assert torch.equal(bits(out_s), bits(out)) and torch.equal(bits(out_n), bits(out))
     with pytest.raises(ValueError):
         fused_moe_nvfp4(x, ids, weights, W, path="padded", swap=True)
-    # the pre-quantized packs: the class's own quantization in both scale layouts
+    # the pre-quantized packs: the class's own quantization in both scale layouts (a pack with per-token scales on a layer
+    # configured for them; the layer's shared contract refuses the scale otherwise)
     x4, sf, pts = _quantized(x)
-    out_q = layer(
-        _routed_pack(x4, ids, weights)._replace(hidden_states_scale=sf)
-        if False
-        else MoEActivationPack(
+    with pytest.raises(ValueError, match="per_token_scale"):
+        layer(
+            MoEActivationPack(
+                x4,
+                sf,
+                topk_ids=ids,
+                topk_weights=weights,
+                routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+                per_token_scale=pts,
+            ),
+            W_pack,
+        )
+    layer_pts = _layer(k, E, I, quant=_NVFP4_PTS)
+    out_q = layer_pts(
+        MoEActivationPack(
             x4,
             sf,
             topk_ids=ids,
@@ -1069,7 +1085,7 @@ def test_both_packings_and_the_prequantized_pack_forms_give_the_bits():
     )
     assert torch.equal(bits(out_q), bits(out))
     sf_lin = unswizzle_sf_128x4(sf.cpu(), T, H).cuda().view(torch.float8_e4m3fn)
-    out_l = layer(
+    out_l = layer_pts(
         MoEActivationPack(
             x4,
             sf_lin,
