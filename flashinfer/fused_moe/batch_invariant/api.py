@@ -229,8 +229,13 @@ def _check_grouped_operands(
         or K % align
         or N % n_align
     ):
+        rule = (
+            f"N and K multiples of {align}"
+            if n_align == align
+            else f"K a multiple of {align}, N of {n_align}"
+        )
         raise ValueError(
-            f"{name}: K-contiguous, 16-byte-aligned operands of one K (K a multiple of {align}, N of {n_align}) "
+            f"{name}: K-contiguous, 16-byte-aligned operands of one K ({rule}) "
             f"(a {tuple(a.shape)} strides {tuple(a.stride())}, w {tuple(w.shape)} strides {tuple(w.stride())})"
         )
     if (
