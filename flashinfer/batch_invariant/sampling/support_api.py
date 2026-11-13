@@ -136,6 +136,7 @@ def sampling_support(
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
     early_finish: str = "mass",
+    count_list: Optional[bool] = None,
 ) -> Support:
     """The kept set of every row of ``x`` (probabilities / unnormalised weights ``>= 0``, or logits with ``from_logits``)
     under top-k (the k-th largest weight, ties kept; ``k <= 0`` keeps nothing, ``k >= N`` everything), top-p (the
@@ -245,6 +246,7 @@ def sampling_support(
             out_mode,
             out_vec,
             early_finish,
+            count_list=count_list,
         )
         kernel(
             x2,

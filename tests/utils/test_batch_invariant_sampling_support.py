@@ -971,7 +971,15 @@ def test_early_finish_is_a_placement():
                             c = sampling_support(
                                 x, **kw
                             )  # the default policy (the mass selection only)
-                            assert same(a, b) and same(c, b), (
+                            d = sampling_support(
+                                x, count_list=False, **kw
+                            )  # the count selection's passes over the words
+                            e = sampling_support(
+                                x, count_list=True, **kw
+                            )  # the list mode on every kernel (the rule picks it for some)
+                            assert (
+                                same(a, b) and same(c, b) and same(d, b) and same(e, b)
+                            ), (
                                 dtype,
                                 N,
                                 cfg.describe(),

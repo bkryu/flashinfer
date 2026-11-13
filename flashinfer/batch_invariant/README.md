@@ -270,7 +270,12 @@ the top by every warp with an exact integer prefix, a cluster's CTAs reducing th
 probability's fp32 pattern has 16 zero low bits and an f16 one 13, so two / three passes determine its threshold (fp32
 inputs and the `ex2` weights of logits take four), and for the mass selection an early finish replaces the last passes by
 one compaction sweep and an exact rank selection when the selected bin holds at most 64 candidates (a placement pinned
-against the plain passes) -- then the kept mass as the canonical tree over the kept weights and the row outputs. Every
+against the plain passes); with both filters in the `top_k_first` order the top-p candidates are the top-k kept set, so
+they are compacted once and selected by rank whenever they fit the list (about `k` of them), the mass passes running
+only when they do not; and for the four-pass kernels at the 128 KB shares the count selection's own passes after the
+first run on a gathered list of the selected bin's candidates (CTA-local, no cluster reduction) whenever those fit it
+(`count_list`, a placement pinned both ways) -- then the kept mass as the canonical tree over the kept weights and the
+row outputs. Every
 number the kernel compares or sums is an integer or a declared `.rn` / `cvt.rzi` result, so the kept set and the threshold
 are bit-identical in every member of the row class's space at one row per CTA; its dispatcher
 (`sampling/support_schedule.py`) is a closed form of `(N, M, elem_bytes, sm_count)` fitted on regret sweeps of that space on

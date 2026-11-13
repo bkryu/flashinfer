@@ -49,13 +49,16 @@ from .support_kernel import (
     _cvt_rzi_s64_f32,
     _f32_bits,
     _IntReducer,
+    _kept_shortcut,
     _kind,
     _masked_sum,
     _Radix,
     _radix_select,
+    _radix_select_kept,
     _smem_layout,
     _weight_bits,
     chunking,
+    count_list_default,
     n_passes_for,
 )
 from .support_spec import FIX_SCALE, Filters
@@ -124,6 +127,9 @@ class DrawSupportKernel:
         self.elem_bytes = dtype.width // 8
         self.kind = _kind(dtype)
         self.n_passes = n_passes_for(self.kind, from_logits)
+        self.count_list = count_list_default(
+            self.n_passes, cfg.blocks_per_cta(N) * BLOCK * self.elem_bytes
+        )
         _, tile, _, _, _, _ = _smem_layout(self)
         assert tile <= SMEM_BUDGET, (
             "the CTA's share of the row must fit the staging budget (use a cluster)"
@@ -300,7 +306,9 @@ class DrawSupportKernel:
             rcbuf = smem.allocate_tensor(
                 Int32, cute.make_layout((LANES,)), byte_alignment=16
             )
-        hist, mslot, mred, gcnt, gmass, cand, cbox, sq, sp = _alloc_hist(self, smem)
+        hist, mslot, mred, gcnt, gmass, cand, cbox, sq, sp, lst = _alloc_hist(
+            self, smem
+        )
 
         in_bits = self.vec * mX.element_type.width
         thr_x, atom_x = _tiled_copy(mX, in_bits, tv_layout, tiler_mn, t)
@@ -339,9 +347,13 @@ class DrawSupportKernel:
             cta_base,
             pad=pad,
         )
+        # the tile is staged here, before anything reads it: the radix sweeps read the words directly, and with no row-sum
+        # tree before them (the top_k_first order, top-k alone) no leaf read would have triggered the cp.async staging
         if cutlass.const_expr(self.cfg.stage != "smem"):
             loader.stage_from_regs(smem_x, cta_base)
-            cute.arch.barrier()
+        else:
+            loader._stage_all()
+        cute.arch.barrier()
         peers = _DrawPeers(xbuf, Int32(0), w, lane_idx, cbuf, c_rank, ibuf, icbuf, W, C)
         red = _IntReducer(W, C, w, lane_idx, rbuf, rcbuf)
 
@@ -381,9 +393,14 @@ class DrawSupportKernel:
             cbox,
             sq,
             sp,
+            lst,
         )
-        state, start = canon.init_state(self.plan_sum, fp, leaf)
-        S = canon.run(self.plan_sum, state, start, peers, fp)
+        # the row sum is read by a top-p selection over the whole row only (the joint order, or no top-k); with the
+        # top_k_first shortcut the top-p base is the top-k kept mass (the masked tree below)
+        S = Float32(1.0)
+        if cutlass.const_expr(self.use_p and not _kept_shortcut(self)):
+            state, start = canon.init_state(self.plan_sum, fp, leaf)
+            S = canon.run(self.plan_sum, state, start, peers, fp)
 
         # ===== the uniform: the row's key at the draw's block, word 0 ==============================================
         key = request_key(mSeed[row_c], mOff[row_c])
@@ -480,9 +497,14 @@ def _exact_draw(
         scale_fix = fp.div(Float32(FIX_SCALE), Sp)
         pv = mP[row_c]
         target = _cvt_rzi_s64_f32(fp.mul(pv, Float32(FIX_SCALE)))
-        sel_p, tot_c, tot_m, min_pos = _radix_select(
-            k, rx, tid, t, True, Int32(0), target, scale_fix, base, peers, red
-        )
+        if cutlass.const_expr(_kept_shortcut(k)):
+            sel_p, tot_c, tot_m, min_pos = _radix_select_kept(
+                k, rx, tid, t, base, target, scale_fix, peers, red
+            )
+        else:
+            sel_p, tot_c, tot_m, min_pos = _radix_select(
+                k, rx, tid, t, True, Int32(0), target, scale_fix, base, peers, red
+            )
         # p >= 1: the target is unreachable (the filter is off: every positive weight is kept)
         use_radix = (tot_m >= target) & (tot_c > Int32(0)) & (pv < Float32(1.0))
         fallback = _select(min_pos == Int32(INT_MAX), Int32(INF_BITS), min_pos)
