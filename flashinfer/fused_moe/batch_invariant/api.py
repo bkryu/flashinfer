@@ -201,11 +201,17 @@ def _check_grouped_operands(
     dtype: torch.dtype,
     align: int,
     kind: str,
+    *,
+    k_align: Optional[int] = None,
+    n_align: Optional[int] = None,
 ) -> Tuple[int, int, int, int, int]:
     """The grouped GEMM entries' shared operand rules (``(R, K, E, N, Tk)``): ``a [R, K]`` and ``w [E, N, K]`` of the
-    class's operand ``dtype``, K-contiguous and 16-byte-aligned (``align`` elements; N and K multiples of it), one K, at
-    most ``MAX_E`` experts,
-    ``Tk`` in ``[0, R]`` (the rows of ``out`` by default, else of ``a``), ``counts`` a contiguous int32 ``[E]``."""
+    class's operand ``dtype``, K-contiguous and 16-byte-aligned (``align`` elements; N and K multiples of it, or of the
+    class's own ``k_align`` / ``n_align`` -- a block-scaled class takes K in whole scale blocks and N at its weight-row
+    rule), one K, at most ``MAX_E`` experts, ``Tk`` in ``[0, R]`` (the rows of ``out`` by default, else of ``a``),
+    ``counts`` a contiguous int32 ``[E]``."""
+    k_align = align if k_align is None else k_align
+    n_align = align if n_align is None else n_align
     if a.dtype != dtype or w.dtype != dtype or a.dim() != 2 or w.dim() != 3:
         raise TypeError(f"{name} takes {kind} a [Tk, K] and w [E, N, K]")
     R, K = a.shape
@@ -223,11 +229,16 @@ def _check_grouped_operands(
         or w.stride(1) != K
         or a.stride(0) % align
         or w.stride(0) % align
-        or K % align
-        or N % align
+        or K % k_align
+        or N % n_align
     ):
+        rule = (
+            f"N and K multiples of {align}"
+            if k_align == n_align == align
+            else f"K a multiple of {k_align}, N of {n_align}"
+        )
         raise ValueError(
-            f"{name}: K-contiguous, 16-byte-aligned operands of one K (N and K multiples of {align}) "
+            f"{name}: K-contiguous, 16-byte-aligned operands of one K ({rule}) "
             f"(a {tuple(a.shape)} strides {tuple(a.stride())}, w {tuple(w.shape)} strides {tuple(w.stride())})"
         )
     if (
@@ -764,18 +775,42 @@ def swapped_pads(config1: Knobs, config2: Knobs) -> Tuple[int, int]:
     )
 
 
+def padded_rows_bound(T: int, k: int, E: int, align: int) -> int:
+    """An upper bound of the padded expanded row count ``sum_e roundup(counts[e], align)`` from the static sizes alone (no
+    device read, so CUDA-graph safe): every active expert pads at most ``align - 1`` rows."""
+    n = T * k
+    if n == 0:
+        return 0
+    return -(-(n + (align - 1) * min(E, n)) // align) * align
+
+
 def permute_plan(
-    experts: torch.Tensor, E: int
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    experts: torch.Tensor,
+    E: int,
+    *,
+    align: int = 1,
+    dual: bool = False,
+    pad_align: int = 128,
+) -> Tuple[torch.Tensor, ...]:
     """``(counts [E] int32, dest [T, k] int32, src [Tk] int32)``: the deterministic permutation of the expanded rows,
     grouped by expert in expert order and, inside a group, in token-slot order (a function of the routing alone). An id
     outside ``[0, E)`` is a dropped slot: ``counts`` excludes it, its ``dest`` is ``-1`` and ``src`` holds ``-1`` past
-    the valid rows."""
+    the valid rows. ``align > 1``: the group offsets rounded up to ``align`` rows (the block-scaled classes' padded
+    packing; ``src`` of ``padded_rows_bound`` rows with ``-1`` in every padding slot). ``dual`` (with ``align = 1``):
+    ``(..., dest_pad [T, k] int32, pos_pad [Tk] int32)`` follow -- the positions with the groups padded to ``pad_align``
+    rows and the padded position of every dense row (the block-scaled classes' dense packing: the rows dense, the scale
+    factors at the padded positions). The same integers as ``route_plan``'s forms."""
     from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
 
     if not 1 <= E <= MAX_E:
         raise ValueError(
             f"permute_plan: E {E} must lie in [1, {MAX_E}] (the plan kernel's expert tables)"
+        )
+    if align < 1 or align & (align - 1):
+        raise ValueError(f"permute_plan: align {align} must be a power of two")
+    if dual and (align > 1 or pad_align < 2):
+        raise ValueError(
+            "permute_plan: the dual form takes align 1 and a padded alignment above 1"
         )
     T, k = experts.shape
     if not 1 <= k <= S.MAX_TOP_K:
@@ -788,19 +823,29 @@ def permute_plan(
     n = T * k
     dev = experts.device
     dest = torch.empty(n, dtype=torch.int32, device=dev)
-    src = torch.empty(n, dtype=torch.int32, device=dev)
-    counts = torch.empty(E, dtype=torch.int32, device=dev)
-    if n == 0:
-        counts.zero_()
-        return counts, dest.view(T, k), src
-    if n >= PLAN_MULTI_MIN_N:
-        nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
-        hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
-        get_compiled_plan_multi(1, False, 128)(
-            flat, counts, dest, src, dest, dest, hist_blk, n, E, nb
+    if align > 1:
+        src = torch.full(
+            (padded_rows_bound(T, k, E, align),), -1, dtype=torch.int32, device=dev
         )
     else:
-        get_compiled_plan(1, False)(flat, counts, dest, src, dest, dest, n, E)
+        src = torch.empty(n, dtype=torch.int32, device=dev)
+    counts = torch.empty(E, dtype=torch.int32, device=dev)
+    dest_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
+    pos_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
+    if n == 0:
+        counts.zero_()
+    elif n >= PLAN_MULTI_MIN_N:
+        nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
+        hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
+        get_compiled_plan_multi(align, dual, pad_align)(
+            flat, counts, dest, src, dest_pad, pos_pad, hist_blk, n, E, nb
+        )
+    else:
+        get_compiled_plan(align, dual, pad_align)(
+            flat, counts, dest, src, dest_pad, pos_pad, n, E
+        )
+    if dual:
+        return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
     return counts, dest.view(T, k), src
 
 

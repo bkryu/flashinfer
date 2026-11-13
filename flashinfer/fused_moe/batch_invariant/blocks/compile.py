@@ -32,9 +32,10 @@ from .swap import SwappedGroupedGemm, is_swapped_record, swapped_knobs  # noqa: 
 MODULE = "batch_invariant_moe"
 GRID_PLACEHOLDER = 1  # the compile-time value of the grid argument: a dynamic Int32 of the kernel, never compiled in
 #: The output dtypes by format: the dense GEMM's, plus the e4m3 output stored as bytes (the chain's paired conversion fills
-#: byte registers); the output alignment of every format is the dense GEMM's (16-byte rows).
-OUT_DT_OF = dict(OUT_DT, e4m3=cutlass.Uint8)
-OUT_ALIGN_OF = ALIGN
+#: byte registers) and the MX fused requantization's e4m3 codes (``mxfp8``: the block scales are its second output); the
+#: output alignment of every format is the dense GEMM's (16-byte rows), the requantised output's a whole scale block.
+OUT_DT_OF = dict(OUT_DT, e4m3=cutlass.Uint8, mxfp8=cutlass.Uint8)
+OUT_ALIGN_OF = dict(ALIGN, mxfp8=32)
 
 ChainLike = Union[str, GroupedEpilogueBlock]
 

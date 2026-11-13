@@ -1,7 +1,15 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The MXFP8 class's fused requantization: the grouped GEMM1 epilogue that writes the ``mxfp8.quant`` class's codes and block
-scales of the bf16-rounded chain output instead of the bf16 output itself (the fused requantization).
+"""The epilogue block of the MXFP8 classes (:class:`MxChain`) and its fused requantization: the grouped GEMM1 epilogue that
+writes the ``mxfp8.quant`` class's codes and block scales of the bf16-rounded chain output instead of the bf16 output itself.
+
+The block names the chain (the bf16 classes' gated / ungated activation or the plain conversion, with its parameters), the
+output format (``bf16`` / ``f16`` / ``f32``, or ``mxfp8``: the fused requantization, whose codes and scales are two outputs)
+and the instruction class the operands run on (``in_fmt``: ``mxfp8`` on SM100 / SM103, ``mxfp8_k64`` on SM107, the operand
+block's key). The non-quantising chains run the shared epilogue loops through ``elem`` (the bf16 chain's term: the UE8M0
+block scales are operands of the instruction, so the accumulators are dequantised and the chain has no scale); the
+quantising chain runs the loops below (``grouped_loop`` / ``swapped_loop``) with its half-block amax exchange buffer
+(``smem_layout``).
 
 The term is the standalone quantizer's, applied to the same values: the chain's output rounded to bf16 (the class's
 intermediate), widened exactly to fp32; the block amax of 32 consecutive output columns by the quantizer's canonical pairwise
@@ -33,6 +41,10 @@ identity, so the gate lanes' leaves enter as ``+0`` and the bytes are the standa
 
 from __future__ import annotations
 
+import dataclasses
+from dataclasses import dataclass
+from typing import Optional, Tuple, Union
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -48,7 +60,7 @@ from ....batch_invariant.quantization.blocks import (
     pack_block_codes,
     sf_offset_128x4_dev,
 )
-from ....batch_invariant.quantization.cute_ext import CuteF32, select_f32
+from ....batch_invariant.quantization.cute_ext import CuteF32
 from ....batch_invariant.quantization.layout import SF_COL_TILE
 from ....batch_invariant.quantization.mx_spec import (
     BLOCK,
@@ -61,10 +73,23 @@ from ....batch_invariant.quantization.mx_spec import (
     saturate,
     scale_norm,
 )
+from ....batch_invariant.fp_interface.exact import f32_bits
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
-from .epilogue import GROUP, GroupedChain, MoeF32, fragment_offsets, store_plan
+from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS
+from ..spec_mxfp8 import MX_CLASSES
+from .epilogue import (
+    GROUP,
+    KINDS,
+    GroupedChain,
+    GroupedEpilogueBlock,
+    MoeF32,
+    fragment_offsets,
+    select_f32,
+    store_plan,
+)
 
-OUT_FMT = "mxfp8"  # the GroupedChain out_fmt of this epilogue: e4m3 codes + UE8M0 block scales of the bf16-rounded chain
+OUT_FMT = "mxfp8"  # the out_fmt of the fused requantization: e4m3 codes + UE8M0 block scales of the bf16-rounded chain
+MX_OUT_FMTS = ("bf16", "f16", "f32", OUT_FMT)  # the MXFP8 classes' output formats
 VEC_BYTES = 16
 XCH_BUFFERS = 2  # the half-block amax exchange of the gated chain, double-buffered by block parity (one barrier per block)
 BAR_EPI_XCH = 8  # named barrier ids BAR_EPI_XCH + warpgroup pair (the staged store uses BAR_EPI_STAGE + warpgroup)
@@ -83,7 +108,7 @@ def xch_layout(epi_warpgroups: int):
     return cute.make_layout((XCH_BUFFERS, epi_warpgroups, 128))
 
 
-def xch_bytes(chain: GroupedChain, epi_warpgroups: int) -> int:
+def xch_bytes(chain, epi_warpgroups: int) -> int:
     return (
         4 * XCH_BUFFERS * epi_warpgroups * 128
         if chain.out_fmt == OUT_FMT and chain.pair
@@ -99,7 +124,7 @@ def swap_xch_layout(token_tile: int):
     return cute.make_layout((XCH_BUFFERS, SWAP_XCH_WARPS, token_tile))
 
 
-def swap_xch_bytes(chain: GroupedChain, token_tile: int) -> int:
+def swap_xch_bytes(chain, token_tile: int) -> int:
     return (
         4 * XCH_BUFFERS * SWAP_XCH_WARPS * token_tile
         if chain.out_fmt == OUT_FMT and chain.pair
@@ -107,10 +132,95 @@ def swap_xch_bytes(chain: GroupedChain, token_tile: int) -> int:
     )
 
 
-def bf16_twin(chain: GroupedChain) -> GroupedChain:
+def bf16_twin(chain) -> GroupedChain:
     """The bf16 chain whose rounded output this epilogue quantizes."""
     assert chain.out_fmt == OUT_FMT, chain
     return GroupedChain(chain.kind, chain.act, "bf16", chain.params)
+
+
+@dataclass(frozen=True)
+class MxChain(GroupedEpilogueBlock):
+    """The epilogue block of a grouped GEMM of the MXFP8 classes: ``kind`` (``plain``, the gated ``glu`` on the (gate, up)
+    accumulator pair, or the ungated ``act`` on one accumulator), the activation and its binary32 parameters, the output
+    format (``bf16`` / ``f16`` / ``f32``: the bf16 chain's conversion through the shared loops; ``mxfp8``: the fused
+    requantization of the bf16-rounded chain, the codes and the 128x4 block scales through the loops of this module) and
+    the instruction class the operands run on (``in_fmt``: the operand block's key, not part of the chain's name -- the
+    compiled object carries it separately). The accumulators are dequantised by the instruction's block scales, so the
+    chain takes no scale operands. ``describe()`` names the chain as the bf16 classes name theirs."""
+
+    kind: str = "plain"
+    act: str = "silu"
+    out_fmt: str = "bf16"
+    params: Tuple[Optional[float], ...] = ()
+    in_fmt: str = "mxfp8"
+
+    def __post_init__(self):
+        assert self.kind in KINDS and self.out_fmt in MX_OUT_FMTS, self
+        assert self.in_fmt in MX_CLASSES, self
+        assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
+        if self.kind == "glu" and self.out_fmt not in ("bf16", OUT_FMT):
+            raise AssertionError(
+                "the gated chain converts to bf16 once (or the fused requantization quantizes that value in place)"
+            )
+        if self.out_fmt == OUT_FMT and self.kind not in ("glu", "act"):
+            raise AssertionError("the fused requantization quantizes a GEMM1 chain")
+        expected = len(ACT_PARAMS.get(self.act, ())) if self.kind == "glu" else 0
+        assert len(self.params) == expected, (self, expected)
+
+    @property
+    def quant(self) -> bool:
+        return self.out_fmt == OUT_FMT
+
+    @property
+    def twin(self) -> GroupedChain:
+        """The bf16 classes' chain with this chain's term: the one the shared loops convert, or the one the fused
+        requantization rounds and quantizes."""
+        return GroupedChain(
+            self.kind, self.act, "bf16" if self.quant else self.out_fmt, self.params
+        )
+
+    def with_class(self, in_fmt: str) -> "MxChain":
+        """The same chain on another instruction class."""
+        return dataclasses.replace(self, in_fmt=in_fmt)
+
+    @staticmethod
+    def of(chain: Union[GroupedChain, "MxChain"], in_fmt: str) -> "MxChain":
+        """The MX chain at ``in_fmt`` of a bf16 chain object (its kind, activation, output format and parameters) or of an MX
+        chain (its class replaced)."""
+        if isinstance(chain, MxChain):
+            return chain.with_class(in_fmt)
+        assert isinstance(chain, GroupedChain), chain
+        return MxChain(chain.kind, chain.act, chain.out_fmt, chain.params, in_fmt)
+
+    def elem(self, fp, acc, acc_gate, alpha_e=None, inv=None):
+        """One output element of a non-quantising chain: the bf16 chain's term, converted (the shared loops' path)."""
+        assert not self.quant, "the fused requantization runs its own loops"
+        return self.twin.elem(fp, acc, acc_gate)
+
+    def describe(self) -> str:
+        suffix = "".join(
+            "_pn" if v is None else f"_p{f32_bits(v):08x}" for v in self.params
+        )
+        if self.kind == "act":
+            return f"{self.act}_{self.out_fmt}"
+        if self.act == "silu":
+            return ("swiglu" if self.pair else "plain") + f"_{self.out_fmt}"
+        return f"{self.kind}_{self.act}_{self.out_fmt}{suffix}"
+
+    def smem_layout(self, epi_warpgroups: int, token_tile: Optional[int] = None):
+        """The half-block amax exchange of the gated fused requantization: per epilogue warpgroup and tile row in the
+        grouped body, per warp and token column in the swapped one (``token_tile`` given); None otherwise."""
+        if not (self.quant and self.pair):
+            return None
+        if token_tile is None:
+            return xch_layout(epi_warpgroups)
+        return swap_xch_layout(token_tile)
+
+    def grouped_loop(self):
+        return grouped_epilogue_quant_loop if self.quant else None
+
+    def swapped_loop(self):
+        return swapped_epilogue_quant_loop if self.quant else None
 
 
 def block_amax(fp, ys):

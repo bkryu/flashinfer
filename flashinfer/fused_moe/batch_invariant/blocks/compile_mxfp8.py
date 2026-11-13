@@ -26,7 +26,8 @@ from ....gemm.batch_invariant.generator import TILES_N_BLOCKSCALED, Knobs
 from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC
 from ..mx_permute import get_compiled_scatter_mx  # noqa: F401  (the scatter kernel shares the module)
 from .blockscaled_kernel import GROUP_ALIGN, MX_FMTS, GroupedBlockScaledGemmMX
-from .epilogue import GROUP, GroupedChain
+from .epilogue import GROUP, GroupedEpilogueBlock
+from .epilogue_mx import MxChain
 from .scheduler import MAX_E
 from .swap_mxfp8 import (  # noqa: F401  (re-exported)
     SwappedBlockScaledGemmMX,
@@ -49,7 +50,7 @@ BLOCK = SF_VEC["mxfp8"]  # elements per UE8M0 block scale
 
 
 def kernel_name(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, dense_a: bool = False
+    cfg: Knobs, chain: GroupedEpilogueBlock, in_fmt: str, dense_a: bool = False
 ) -> str:
     """The object's name: the instruction class, the chain (activation, output format, parameters) and the record
     without its ``grid_clusters`` (the grid is a launch argument); ``dense_a`` the dense packing's body."""
@@ -61,7 +62,7 @@ def kernel_name(
 
 
 def swapped_kernel_name(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, k_block: int = 0
+    cfg: Knobs, chain: GroupedEpilogueBlock, in_fmt: str, k_block: int = 0
 ) -> str:
     """The swapped decode body's object: the instruction class, the chain, the swapped record (its token tile) and the
     k-block when it is not the format's default (``_kb256``: the two-atom stage, `swap_k_block`)."""
@@ -92,14 +93,14 @@ def swap_k_block_arg(in_fmt: str, K: int, k_block: Optional[int] = None) -> int:
 
 
 def can_implement_grouped_mxfp8(
-    knobs: Knobs, N: int, K: int, E: int, chain: GroupedChain, in_fmt: str
+    knobs: Knobs, N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str
 ) -> bool:
     """Acceptance of the grouped block-scaled body on the MX plans: a well-formed dense record of the class's space at
     swizzle 1 (no in-cluster split, no operand swap, no B-reuse tile, no in-CTA chunk fold: the group scheduler has none of
     them) with a block-scaled tile N, a chain with a bf16 / f16 / f32 output, K a whole number of 32-element scale blocks
     (hence 16-byte e4m3 rows), 16-byte-aligned output rows, whole ``2 x GROUP`` column blocks for the gated chain, at most
     ``MAX_E`` experts."""
-    if in_fmt not in MX_FMTS or not isinstance(chain, GroupedChain):
+    if in_fmt not in MX_FMTS or not isinstance(chain, GroupedEpilogueBlock):
         return False
     if (
         not knobs.well_formed(in_fmt)
@@ -126,7 +127,7 @@ def can_implement_grouped_mxfp8(
 
 
 def compile_grouped_mxfp8_fn(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, dense_a: bool = False
+    cfg: Knobs, chain: GroupedEpilogueBlock, in_fmt: str, dense_a: bool = False
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one grouped MXFP8 specialisation (``dense_a``: the dense packing, any A row
     count)."""
@@ -178,7 +179,7 @@ def compile_grouped_mxfp8_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
         obj = GroupedBlockScaledGemmMX(cfg, chain, in_fmt, dense_a)
-        if chain.out_fmt == "mxfp8":
+        if chain.quant:
             osf_fake = cute.runtime.make_fake_tensor(
                 cutlass.Uint8,
                 (cute.sym_int(32, divisibility=512),),
@@ -219,7 +220,7 @@ def can_implement_swapped_mxfp8(
     N: int,
     K: int,
     E: int,
-    chain: GroupedChain,
+    chain: GroupedEpilogueBlock,
     in_fmt: str,
     k_block: int = 0,
 ) -> bool:
@@ -228,7 +229,7 @@ def can_implement_swapped_mxfp8(
     whole number of scale blocks, N % 8, the gate / up pairing, the output alignment -- whole 32-element blocks for the
     fused requantization --, at most ``MAX_E`` experts, a bf16 / f32 chain or the fused requantization). The body reads the
     dense packing only: the dense rows with the scale factors at the padded positions."""
-    if in_fmt not in MX_FMTS or not isinstance(chain, GroupedChain):
+    if in_fmt not in MX_FMTS or not isinstance(chain, GroupedEpilogueBlock):
         return False
     if not is_swapped_record(knobs) or not knobs.well_formed(in_fmt):
         return False
@@ -248,7 +249,7 @@ def can_implement_swapped_mxfp8(
 
 
 def can_implement_mxfp8(
-    knobs: Knobs, N: int, K: int, E: int, chain: GroupedChain, in_fmt: str
+    knobs: Knobs, N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str
 ) -> bool:
     """A record either grouped MX body takes: the padded / dense-A body (a dense record) or the swapped decode body (a
     narrow swapped record); the two spaces are disjoint."""
@@ -258,7 +259,7 @@ def can_implement_mxfp8(
 
 
 def compile_swapped_mxfp8_fn(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, k_block: int = 0
+    cfg: Knobs, chain: GroupedEpilogueBlock, in_fmt: str, k_block: int = 0
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one swapped MXFP8 specialisation (the dense packing; ``k_block`` as
     `swapped_kernel_name` spells it)."""
@@ -311,7 +312,7 @@ def compile_swapped_mxfp8_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
         obj = SwappedBlockScaledGemmMX(cfg, chain, in_fmt, k_block)
-        if chain.out_fmt == "mxfp8":
+        if chain.quant:
             osf_fake = cute.runtime.make_fake_tensor(
                 cutlass.Uint8,
                 (cute.sym_int(32, divisibility=SF_BUFFER_DIVISIBILITY),),
@@ -349,7 +350,7 @@ def compile_swapped_mxfp8_fn(
 
 @functools.cache
 def get_compiled_swapped_mxfp8(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, k_block: int = 0
+    cfg: Knobs, chain: GroupedEpilogueBlock, in_fmt: str, k_block: int = 0
 ) -> Any:
     """``kernel(a3, sfa, w3, sfw, out2[, out_sf], counts, grid)``: A ``(R, K, 1)`` the dense quantized rows (``R >= Tk +
     token tile``), ``sfa`` their flat 128x4 scale factors at the padded positions, W ``(N, K, E)``, ``sfw`` (``E``
@@ -364,14 +365,14 @@ def get_compiled_swapped_mxfp8(
 
 @functools.cache
 def get_compiled_grouped_mxfp8(
-    cfg: Knobs, chain: GroupedChain, in_fmt: str, dense_a: bool = False
+    cfg: Knobs, chain: GroupedEpilogueBlock, in_fmt: str, dense_a: bool = False
 ) -> Any:
     """``kernel(a3, b3, sfa, sfb, out2, counts, grid)``: A ``(Tk_pad, K, 1)`` e4m3 K-major (the padded permuted
     activations: group offsets at 128-row atoms), B ``(N, K, E)`` e4m3 K-major (the stacked expert weights), SFA / SFB
     the flat uint8 UE8M0 buffers in the 128x4 swizzled layout (SFB: ``E`` consecutive per-expert buffers), out
     ``(Tk_pad, Nout)`` row-major (``Nout = N``, or ``N / 2`` for the gated chains), counts ``(E,)`` int32, ``grid`` the
     persistent grid in clusters. ``in_fmt``: the instruction class, ``mxfp8`` (SM100 / SM103) or ``mxfp8_k64`` (SM107)."""
-    assert in_fmt in MX_FMTS and isinstance(chain, GroupedChain), (in_fmt, chain)
+    assert in_fmt in MX_FMTS and isinstance(chain, GroupedEpilogueBlock), (in_fmt, chain)
     return jit.build_and_load(
         MODULE,
         kernel_name(cfg, chain, in_fmt, dense_a),

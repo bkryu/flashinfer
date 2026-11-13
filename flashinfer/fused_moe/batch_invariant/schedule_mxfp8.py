@@ -29,7 +29,8 @@ from ...gemm.batch_invariant.generator import (
     knob_product,
 )
 from ...gemm.batch_invariant.heuristic import decode_sane
-from .blocks.epilogue import GroupedChain
+from .blocks.epilogue import GroupedEpilogueBlock
+from .blocks.epilogue_mx import OUT_FMT, MxChain, bf16_twin
 from .blocks.compile_mxfp8 import SWAP_K_BLOCKS, swap_k_block
 from .schedule import (
     TOP_K,
@@ -39,7 +40,8 @@ from .schedule import (
     rows_per_expert,
 )
 
-GEMM2_CHAIN = GroupedChain("plain", "silu", "bf16")
+#: GEMM2 of the MXFP8 classes: the dequantised accumulator converted to bf16 (the instruction class is the launch's).
+GEMM2_CHAIN = MxChain("plain", "silu", "bf16")
 #: SM cycles of one smem-stage round trip of the block-scaled mainloop (the stage's barrier wait, its scale-factor copies to TMEM,
 #: the commit) that the stream does not hide at a few rows per expert: empirical, one value for every part.
 STAGE_ROUND_TRIP_CYCLES = 76.0
@@ -102,7 +104,7 @@ def swapped_knobs_mx() -> List[Knobs]:
 
 
 def all_valid_configs_mx(
-    N: int, K: int, E: int, chain: GroupedChain, in_fmt: str = "mxfp8", clusters=None
+    N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str = "mxfp8", clusters=None
 ) -> List[Knobs]:
     """The grouped record space the guarantee is claimed over, for a weight shape, a chain and a class (the swapped records
     are the second space: :func:`all_valid_configs_mx_swapped`; the guarantee covers both)."""
@@ -116,7 +118,7 @@ def all_valid_configs_mx(
 
 
 def all_valid_configs_mx_swapped(
-    N: int, K: int, E: int, chain: GroupedChain, in_fmt: str = "mxfp8"
+    N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str = "mxfp8"
 ) -> List[Knobs]:
     """The swapped records the swapped body accepts for a weight shape, a chain and a class (the dense packing)."""
     from .blocks.compile_mxfp8 import can_implement_swapped_mxfp8
@@ -129,7 +131,7 @@ def all_valid_configs_mx_swapped(
 
 
 def all_valid_configs_mxfp8(
-    N: int, K: int, E: int, chain: GroupedChain, in_fmt: str = "mxfp8", clusters=None
+    N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str = "mxfp8", clusters=None
 ) -> List[Knobs]:
     """Both record spaces for a weight shape, a chain and a class: the grouped records, then the swapped ones."""
     return all_valid_configs_mx(
@@ -138,7 +140,7 @@ def all_valid_configs_mxfp8(
 
 
 @functools.lru_cache(maxsize=None)
-def chain_nodes_mx(chain: GroupedChain) -> float:
+def chain_nodes_mx(chain: GroupedEpilogueBlock) -> float:
     """The node count of the chain's term per output element, the exposed epilogue's cost unit (:func:`.schedule.chain_nodes`):
     the bf16 chains' own; the fused requantization's (``out_fmt == "mxfp8"``) the bf16-rounded chain's plus the quantizer
     class's element chain (the inverse scale applied, the e4m3 conversion) and its share of the block's scale chain and amax
@@ -146,10 +148,12 @@ def chain_nodes_mx(chain: GroupedChain) -> float:
     conversion and exact inverse)."""
     from ...batch_invariant.quantization import mx_spec
     from . import mterm as term
-    from .blocks.epilogue_mx import OUT_FMT, bf16_twin
 
     if chain.out_fmt != OUT_FMT:
-        return float(chain_nodes(chain))
+        # the bf16 chain's term (an MX chain's twin: the shared counter knows the bf16 and fp8 chain objects)
+        return float(
+            chain_nodes(chain.twin if isinstance(chain, MxChain) else chain)
+        )
     alg = term.TermAlgebra()
     fmt, rule = mx_spec.MXFP8, mx_spec.DEFAULT_RULE
     amax = alg.leaf("amax", 0)
@@ -171,7 +175,7 @@ def rank_grouped_mx(
     N: int,
     K: int,
     E: int,
-    chain: GroupedChain,
+    chain: GroupedEpilogueBlock,
     in_fmt: str = "mxfp8",
     sm_count: Optional[int] = None,
     family: Optional[str] = None,
@@ -180,6 +184,31 @@ def rank_grouped_mx(
     n_active: Optional[int] = None,
     swap: Optional[bool] = None,
 ) -> List[Knobs]:
+    """:func:`_rank_grouped_mx` memoised on its arguments (all hashable scalars; the chain a frozen dataclass, taken at
+    ``in_fmt``): the runner ranks at every forward without a tactic, once per token count."""
+    chain = MxChain.of(chain, in_fmt)
+    return list(
+        _rank_grouped_mx(
+            rows, N, K, E, chain, in_fmt, sm_count, family, k, nominal, n_active, swap
+        )
+    )
+
+
+@functools.lru_cache(maxsize=16384)
+def _rank_grouped_mx(
+    rows: int,
+    N: int,
+    K: int,
+    E: int,
+    chain: MxChain,
+    in_fmt: str,
+    sm_count: Optional[int],
+    family: Optional[str],
+    k: int,
+    nominal: bool,
+    n_active: Optional[int],
+    swap: Optional[bool],
+) -> Tuple[Knobs, ...]:
     """The ranked records for one GEMM over both record spaces: the grouped MX records the body accepts for the weight shape
     and the chain (at a decode-sized ``rows`` the dense dispatcher's structural guard, `heuristic.decode_sane`: 1-CTA tiles
     in an N-cluster, selects the candidates) and the swapped records the swapped body accepts (``swap``: None ranks them
@@ -271,7 +300,7 @@ def rank_grouped_mx(
         if rec not in seen:
             out.append(rec)
             seen.add(rec)
-    return out[:k]
+    return tuple(out[:k])
 
 
 def ranked_mx(
@@ -280,7 +309,7 @@ def ranked_mx(
     H: int,
     I: int,
     E: int,
-    chain1: GroupedChain,
+    chain1: GroupedEpilogueBlock,
     in_fmt: str = "mxfp8",
     sm_count: Optional[int] = None,
     family: Optional[str] = None,
@@ -329,7 +358,7 @@ def default_configs_mx(
     H: int,
     I: int,
     E: int,
-    chain1: GroupedChain,
+    chain1: GroupedEpilogueBlock,
     in_fmt: str = "mxfp8",
     sm_count: Optional[int] = None,
     family: Optional[str] = None,

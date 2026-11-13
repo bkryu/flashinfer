@@ -69,7 +69,7 @@ from ..spec_fp8 import act_quant_pre, glu_quant_pre, scaled_out_elem, w8a8_alpha
 
 GROUP = 8  # gate/up interleave granularity (columns): u x8, g x8, u x8, ...
 KINDS = ("plain", "glu", "act")
-OUT_FMTS = ("bf16", "f16", "f32", "mxfp8")  # the bf16 classes' output formats; mxfp8: the MXFP8 class's fused requantization
+OUT_FMTS = ("bf16", "f16", "f32")  # the bf16 classes' output formats
 OUT_FMTS_FP8 = ("e4m3", "bf16", "f32")  # the fp8 per-tensor classes' output formats
 STAGED_STORE = True  # the shared-memory staged, row-coalesced store of the 16-bit outputs (False: the direct path everywhere)
 BAR_EPI_STAGE = (
@@ -125,10 +125,13 @@ class GroupedEpilogueBlock:
       outputs convert per instruction into byte registers (the e4m3 output);
     * ``elem(fp, acc, acc_gate, alpha_e, inv)``: one output element of the chain from the accumulator (and its gate
       partner for a paired chain), every op through ``fp`` (the kernels' ``MoeF32``): converted for the 16- and 32-bit
-      outputs, the fp32 value before the paired conversion for the 8-bit one.
+      outputs, the fp32 value before the paired conversion for the 8-bit one;
+    * ``quant``: whether the chain writes a second output (the block scales of a requantising chain) through its own
+      epilogue loops (``grouped_loop`` / ``swapped_loop``: the loop functions the bodies call in place of the ones below)
+      with its own shared storage (``smem_layout``: a layout of fp32 words, or None).
 
-    A requantising epilogue block of a block-scaled class (its own scale operands, its chain and conversion) implements
-    this surface; the loops below need nothing else of it."""
+    A requantising epilogue block of a block-scaled class (its own chain, conversion and outputs) implements this surface
+    through those hooks; the loops below need nothing else of it."""
 
     kind: str
     act: str
@@ -162,6 +165,24 @@ class GroupedEpilogueBlock:
     def elem(self, fp, acc, acc_gate, alpha_e=None, inv=None):
         raise NotImplementedError
 
+    @property
+    def quant(self) -> bool:
+        """Whether the chain writes a second output (a requantising chain's block scales) through its own loops."""
+        return False
+
+    def smem_layout(self, epi_warpgroups: int, token_tile: Optional[int] = None):
+        """The chain's own shared storage in the grouped body (``token_tile`` None) or the swapped one, as a layout of fp32
+        words; None for a chain without one."""
+        return None
+
+    def grouped_loop(self):
+        """The chain's own grouped epilogue loop (a requantising chain), or None for :func:`grouped_epilogue_loop`."""
+        return None
+
+    def swapped_loop(self):
+        """The chain's own swapped epilogue loop (a requantising chain), or None for the swapped body's shared loop."""
+        return None
+
 
 @dataclass(frozen=True)
 class GroupedChain(GroupedEpilogueBlock):
@@ -178,12 +199,8 @@ class GroupedChain(GroupedEpilogueBlock):
     def __post_init__(self):
         assert self.kind in KINDS and self.out_fmt in OUT_FMTS, self
         assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
-        if self.kind == "glu" and self.out_fmt not in ("bf16", "mxfp8"):
-            raise AssertionError(
-                "the gated chain converts to bf16 once (or the MXFP8 class requantizes that value in place)"
-            )
-        if self.out_fmt == "mxfp8" and self.kind not in ("glu", "act"):
-            raise AssertionError("the fused MX requantization quantizes a GEMM1 chain")
+        if self.kind == "glu" and self.out_fmt != "bf16":
+            raise AssertionError("the gated chain converts to bf16 once")
         expected = len(ACT_PARAMS.get(self.act, ())) if self.kind == "glu" else 0
         assert len(self.params) == expected, (self, expected)
 

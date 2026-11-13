@@ -74,8 +74,9 @@ from .blockscaled_kernel import (
     plan_with_room,
     sf_view_experts,
 )
-from .epilogue import BAR_EPI_JOIN, GROUP, GroupedChain, MoeF32, fragment_offsets
+from .epilogue import BAR_EPI_JOIN, GROUP, GroupedEpilogueBlock, MoeF32, fragment_offsets
 from .epilogue_mx import (
+    MxChain,
     swap_xch_bytes,
     swap_xch_layout,
     swapped_epilogue_quant_loop,
@@ -177,12 +178,16 @@ class SwappedBlockScaledGemmMX:
     requantization on the accumulators (the UE8M0 block scales are operands of the instruction: no row or expert scale)."""
 
     def __init__(
-        self, knobs: Knobs, chain: GroupedChain, in_fmt: str = "mxfp8", k_block: int = 0
+        self,
+        knobs: Knobs,
+        chain: GroupedEpilogueBlock,
+        in_fmt: str = "mxfp8",
+        k_block: int = 0,
     ):
         """``k_block``: K elements per smem stage (0: the format's one 128-byte atom; 256: two atoms, `swap_k_block`), a
         placement of the same fold."""
-        assert isinstance(chain, GroupedChain), chain
         assert in_fmt in MX_FMTS and in_fmt in PLANS, in_fmt
+        chain = MxChain.of(chain, in_fmt)
         assert is_swapped_record(knobs), (
             "the swapped block-scaled body takes the narrow swapped records (128 weight rows x 8 / 16 / 32 tokens, 1-CTA)",
             knobs,
@@ -232,7 +237,7 @@ class SwappedBlockScaledGemmMX:
             a.element_type,
             w.element_type,
         )
-        assert (out_sf is not None) == (self.chain.out_fmt == "mxfp8"), (
+        assert (out_sf is not None) == self.chain.quant, (
             "the fused requantization chain writes its scale bytes"
         )
         sfw_t = sf_view_experts(
@@ -597,7 +602,7 @@ class SwappedBlockScaledGemmMX:
                 s_off, s_pre, counts, E, N, tn, WEIGHT_TILE, 1, raster_m, 0, 0
             )
             cute.arch.griddepcontrol_wait()  # the predecessor's buffers may alias the output
-            if cutlass.const_expr(self.chain.out_fmt == "mxfp8"):
+            if cutlass.const_expr(self.chain.quant):
                 # the fused requantization in the transposed orientation: the codes and the 128x4 block scales of the
                 # bf16-rounded chain, the scale bytes at the padded positions
                 swapped_epilogue_quant_loop(
