@@ -429,7 +429,6 @@ def _moe_mxfp8_fingerprint(
     )
 
 
-
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
