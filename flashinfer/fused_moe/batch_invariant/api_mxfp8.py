@@ -389,7 +389,7 @@ def grouped_gemm_mxfp8(
             raise ValueError(
                 f"grouped_gemm_mxfp8: swapped record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt}, k_block={kb or 'default'})"
             )
-        kernel = get_compiled_swapped_mxfp8(config, chain, in_fmt, kb)
+        kernel_of = lambda: get_compiled_swapped_mxfp8(config, chain, in_fmt, kb)  # noqa: E731
 
         def args(*outs):
             return (
@@ -407,7 +407,7 @@ def grouped_gemm_mxfp8(
             raise ValueError(
                 f"grouped_gemm_mxfp8: record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
             )
-        kernel = get_compiled_grouped_mxfp8(config, chain, in_fmt, dense_a)
+        kernel_of = lambda: get_compiled_grouped_mxfp8(config, chain, in_fmt, dense_a)  # noqa: E731
 
         def args(*outs):
             return (
@@ -426,16 +426,20 @@ def grouped_gemm_mxfp8(
             raise ValueError(
                 "grouped_gemm_mxfp8: the fused requantization allocates its two outputs"
             )
-        codes = _grouped_out("grouped_gemm_mxfp8", None, Tk, n_out, torch.uint8, a.device)
+        codes = _grouped_out(
+            "grouped_gemm_mxfp8", None, Tk, n_out, torch.uint8, a.device
+        )
         sf = torch.empty(sf_numel(sf_rows, n_out), dtype=torch.uint8, device=a.device)
         if Tk:
-            kernel(*args(codes, sf))
+            kernel_of()(
+                *args(codes, sf)
+            )  # the host rules above come before the JIT build
         return codes.view(torch.float8_e4m3fn), sf
     out = _grouped_out(
         "grouped_gemm_mxfp8", out, Tk, n_out, _OUT[chain.out_fmt], a.device
     )
     if Tk:
-        kernel(*args(out))
+        kernel_of()(*args(out))
     return out
 
 

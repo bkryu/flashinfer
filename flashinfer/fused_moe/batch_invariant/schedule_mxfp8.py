@@ -104,7 +104,12 @@ def swapped_knobs_mx() -> List[Knobs]:
 
 
 def all_valid_configs_mx(
-    N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str = "mxfp8", clusters=None
+    N: int,
+    K: int,
+    E: int,
+    chain: GroupedEpilogueBlock,
+    in_fmt: str = "mxfp8",
+    clusters=None,
 ) -> List[Knobs]:
     """The grouped record space the guarantee is claimed over, for a weight shape, a chain and a class (the swapped records
     are the second space: :func:`all_valid_configs_mx_swapped`; the guarantee covers both)."""
@@ -131,7 +136,12 @@ def all_valid_configs_mx_swapped(
 
 
 def all_valid_configs_mxfp8(
-    N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str = "mxfp8", clusters=None
+    N: int,
+    K: int,
+    E: int,
+    chain: GroupedEpilogueBlock,
+    in_fmt: str = "mxfp8",
+    clusters=None,
 ) -> List[Knobs]:
     """Both record spaces for a weight shape, a chain and a class: the grouped records, then the swapped ones."""
     return all_valid_configs_mx(
@@ -151,9 +161,7 @@ def chain_nodes_mx(chain: GroupedEpilogueBlock) -> float:
 
     if chain.out_fmt != OUT_FMT:
         # the bf16 chain's term (an MX chain's twin: the shared counter knows the bf16 and fp8 chain objects)
-        return float(
-            chain_nodes(chain.twin if isinstance(chain, MxChain) else chain)
-        )
+        return float(chain_nodes(chain.twin if isinstance(chain, MxChain) else chain))
     alg = term.TermAlgebra()
     fmt, rule = mx_spec.MXFP8, mx_spec.DEFAULT_RULE
     amax = alg.leaf("amax", 0)

@@ -1949,7 +1949,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             MoELayer(sharded, device=torch.device("cuda"))
         assert "expert parallelism" in str(excinfo.value), shard
         # the class's own refusal fires first and names the shard (the shared assertion stands behind it)
-        with pytest.raises(BatchInvariantUnsupportedError, match="expert-parallel shards"):
+        with pytest.raises(
+            BatchInvariantUnsupportedError, match="expert-parallel shards"
+        ):
             BatchInvariantMxfp8Runner(sharded, torch.device("cuda"))._check_support()
     layer = _layer(k, E, I)
     x, logits, w1, w2 = _problem(8, k, H, I, E, seed=9)
@@ -2039,7 +2041,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     with pytest.raises(errors) as excinfo:
         llama2(_logits_pack((xq, xsf), logits), W)
     assert "Llama4" in str(excinfo.value)
-    ids2 = torch.stack([torch.zeros(8, dtype=torch.int32), torch.ones(8, dtype=torch.int32)], 1).cuda()
+    ids2 = torch.stack(
+        [torch.zeros(8, dtype=torch.int32), torch.ones(8, dtype=torch.int32)], 1
+    ).cuda()
     assert llama2(
         _routed_pack((xq, xsf), ids2, torch.full((8, 2), 0.5, device="cuda")), W
     ).shape == (8, H)

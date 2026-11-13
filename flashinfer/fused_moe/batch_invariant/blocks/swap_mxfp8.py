@@ -74,7 +74,13 @@ from .blockscaled_kernel import (
     plan_with_room,
     sf_view_experts,
 )
-from .epilogue import BAR_EPI_JOIN, GROUP, GroupedEpilogueBlock, MoeF32, fragment_offsets
+from .epilogue import (
+    BAR_EPI_JOIN,
+    GROUP,
+    GroupedEpilogueBlock,
+    MoeF32,
+    fragment_offsets,
+)
 from .epilogue_mx import (
     MxChain,
     swap_xch_bytes,

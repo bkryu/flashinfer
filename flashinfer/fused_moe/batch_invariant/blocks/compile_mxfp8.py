@@ -27,7 +27,6 @@ from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC
 from ..mx_permute import get_compiled_scatter_mx  # noqa: F401  (the scatter kernel shares the module)
 from .blockscaled_kernel import GROUP_ALIGN, MX_FMTS, GroupedBlockScaledGemmMX
 from .epilogue import GROUP, GroupedEpilogueBlock
-from .epilogue_mx import MxChain
 from .scheduler import MAX_E
 from .swap_mxfp8 import (  # noqa: F401  (re-exported)
     SwappedBlockScaledGemmMX,
@@ -372,7 +371,10 @@ def get_compiled_grouped_mxfp8(
     the flat uint8 UE8M0 buffers in the 128x4 swizzled layout (SFB: ``E`` consecutive per-expert buffers), out
     ``(Tk_pad, Nout)`` row-major (``Nout = N``, or ``N / 2`` for the gated chains), counts ``(E,)`` int32, ``grid`` the
     persistent grid in clusters. ``in_fmt``: the instruction class, ``mxfp8`` (SM100 / SM103) or ``mxfp8_k64`` (SM107)."""
-    assert in_fmt in MX_FMTS and isinstance(chain, GroupedEpilogueBlock), (in_fmt, chain)
+    assert in_fmt in MX_FMTS and isinstance(chain, GroupedEpilogueBlock), (
+        in_fmt,
+        chain,
+    )
     return jit.build_and_load(
         MODULE,
         kernel_name(cfg, chain, in_fmt, dense_a),
