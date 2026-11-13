@@ -42,7 +42,7 @@ from .api import (
     launch_grid,
     permute_plan,
 )
-from .blocks.fp8bs_compile import GEMM2_CHAIN, OUT_FMT_QUANT, Fp8BsChain, gemm1_chain
+from .blocks.epilogue_fp8bs import GEMM2_CHAIN, OUT_FMT_QUANT, Fp8BsChain, gemm1_chain
 from .blocks.scheduler import MAX_E
 from .reference import TorchF32
 from .spec_fp8bs import BLOCK as QBLOCK
@@ -102,7 +102,7 @@ def fp8_block_quantize(
     activation layout) or ``[M, K / block]`` (``"K"``). ``out = (q, s)`` writes into the caller's tensors (``s`` in the requested
     layout, any strides). Bitwise identical for every ``wpr`` (:func:`quant_warps_per_row`), every batch composition and across
     runs."""
-    from .blocks.fp8bs_compile import get_compiled_fp8bs_quant
+    from .blocks.fp8bs_small import get_compiled_fp8bs_quant
 
     if x.dim() != 2 or x.dtype not in _DTYPE_STR:
         raise unsupported(
@@ -464,11 +464,10 @@ def grouped_gemm_fp8bs(
     chain's pairing; the f32 oracle output of GEMM1 reads the interleaved weight with the plain chain). The persistent grid is a
     launch argument, the device's capacity clipped to the launch's tile bound (`schedule.launch_tile_bound`: which CTA computes a
     tile, never the bits)."""
-    from .blocks.fp8bs_compile import (
+    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
+    from .schedule_fp8bs import (
         can_implement_grouped_fp8bs,
         can_implement_swapped_fp8bs,
-        get_compiled_grouped_fp8bs,
-        get_compiled_swapped_fp8bs,
     )
 
     # the shared operand rules at the class's alignment: K in whole smem stages of scale blocks, every row 16 bytes
@@ -531,9 +530,11 @@ def grouped_gemm_fp8bs(
             out,
             w_sf[0, :1, :1].reshape(1, 1),
         )  # the scale output is unread: any fp32 (1, 1) tensor
+    # the unified bodies on the promoted operand block: the chain carries the class's block and the weight interleave
+    body_chain = chain.at(block, interleaved)
     if Tk and config.swap_ab:
-        # the swapped decode body: the same operands, the same bits (no fused requantization output)
-        get_compiled_swapped_fp8bs(config, chain, interleaved, block)(
+        # the swapped body: the same operands, the same bits (no fused requantization output)
+        get_compiled_swapped(config, body_chain)(
             a.unsqueeze(-1),
             sfa_v,
             w.permute(1, 2, 0),
@@ -543,14 +544,15 @@ def grouped_gemm_fp8bs(
             launch_grid(a.device, config, Tk, E, N),
         )
     elif Tk:
-        get_compiled_grouped_fp8bs(config, chain, interleaved, block)(
+        get_compiled_grouped(config, body_chain)(
             a.unsqueeze(-1),
-            sfa_v,
             w.permute(1, 2, 0),
+            sfa_v,
             w_sf,
             out_k,
-            sfo_k,
+            *((sfo_k,) if quant else ()),
             counts,
+            Tk,
             launch_grid(a.device, config, Tk, E, N),
         )
     return (out, sfo) if quant else out
@@ -579,7 +581,7 @@ def fused_moe_fp8bs(
     a placement, the same bytes either way (:func:`.schedule_fp8bs.fused_quant_default` by default). ``plan``:
     ``route_plan``'s ``(counts, dest, src)``. ``w_round``: the f32 weights enter the fold as their bf16 rounding, by the
     combine kernel (the pre-routed packed-word convention), as in the bf16 op."""
-    from .blocks.fp8bs_compile import get_compiled_gather_rows_scales
+    from .blocks.fp8bs_small import get_compiled_gather_rows_scales
     from .permute import warps_per_row
     from .schedule_fp8bs import default_configs_fp8bs, fused_quant_default
 

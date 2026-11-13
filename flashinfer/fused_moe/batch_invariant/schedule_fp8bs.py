@@ -20,14 +20,13 @@ import functools
 from typing import List, Optional, Sequence, Tuple
 
 from ...gemm.batch_invariant.generator import CLUSTERS, Knobs, knob_product
-from .blocks.fp8bs_compile import (
+from .blocks.epilogue_fp8bs import (
     GEMM2_CHAIN,
+    OUT_FMT_QUANT,
     TILES_N_GROUPED,
     Fp8BsChain,
-    can_implement_grouped_fp8bs,
-    can_implement_swapped_fp8bs,
     gemm1_chain,
-    swapped_knobs_fp8bs,
+    quant_twin,
 )
 from .spec_fp8bs import BLOCK as QBLOCK
 from .spec_fp8bs import STAGE_K, check_block
@@ -41,6 +40,75 @@ from .schedule import (
 )
 
 IN_FMT = "e4m3_bs"
+
+
+def swapped_knobs_fp8bs() -> List[Knobs]:
+    """The swapped decode space of the block-scale classes (:mod:`.blocks.swap` at the format: one record per (weight tile 64 /
+    128, token tile 8 / 16 / 32 / 64))."""
+    from .blocks.swap import swapped_knobs
+
+    return swapped_knobs(IN_FMT)
+
+
+def can_implement_grouped_fp8bs(
+    knobs: Knobs,
+    N: int,
+    K: int,
+    E: int,
+    chain: Fp8BsChain,
+    interleaved: Optional[bool] = None,
+    block: int = QBLOCK,
+) -> bool:
+    """Acceptance of the grouped body for the block-scale classes (`blocks.compile.can_implement_grouped` at the chain taken at
+    ``block`` and ``interleaved``): a record of the dense block-scale class's space at swizzle 1 with a tile of two promotion
+    warpgroups (N 64 / 128 / 256), K in whole smem stages, the weight's rows whole scale blocks (the interleaved weight: of
+    both halves), the fused requantization only for the 128-wide class where the tile's outputs are whole 128-column blocks."""
+    from .blocks.compile import can_implement_grouped
+
+    if not isinstance(chain, Fp8BsChain):
+        return False
+    if chain.quant and check_block(block) != QBLOCK:
+        return False  # the fused requantization is the 128-wide class's
+    return can_implement_grouped(knobs, N, K, E, chain.at(block, interleaved))
+
+
+def can_implement_swapped_fp8bs(
+    knobs: Knobs,
+    N: int,
+    K: int,
+    E: int,
+    chain: Fp8BsChain,
+    interleaved: Optional[bool] = None,
+    block: int = QBLOCK,
+) -> bool:
+    """Acceptance of the swapped body for the block-scale classes (`blocks.compile.can_implement_swapped` at the chain taken at
+    ``block`` and ``interleaved``): a swapped record of the class (a 64- / 128-row weight tile, an 8 / 16 / 32 / 64 token tile,
+    1-CTA, no cluster), the bf16 / f32 chains (the fused requantization is not a spelling of this body), the operand rule."""
+    from .blocks.compile import can_implement_swapped
+
+    if not isinstance(chain, Fp8BsChain) or chain.quant:
+        return False  # the swapped body runs the bf16 / f32 chains
+    return can_implement_swapped(
+        knobs, N, K, E, chain.at(check_block(block), interleaved)
+    )
+
+
+def can_implement_fp8bs(
+    knobs: Knobs,
+    N: int,
+    K: int,
+    E: int,
+    chain: Fp8BsChain,
+    interleaved: Optional[bool] = None,
+    block: int = QBLOCK,
+) -> bool:
+    """A record either body takes for the block-scale classes: the grouped body (the dense-derived records) or the swapped body
+    (the swapped records); the two spaces are disjoint."""
+    return can_implement_grouped_fp8bs(
+        knobs, N, K, E, chain, interleaved, block
+    ) or can_implement_swapped_fp8bs(knobs, N, K, E, chain, interleaved, block)
+
+
 #: The fused requantization (GEMM1's output blocks quantized in its epilogue, the 256-wide gated tile) from this many rows per
 #: active expert; below it the standalone pass and GEMM1's free tile choice (empirical; a placement).
 FUSED_QUANT_MIN_ROWS = 128
@@ -92,8 +160,6 @@ def all_valid_configs_fp8bs_swapped(
 def chain_nodes_fp8bs(chain: Fp8BsChain) -> int:
     """The node count of a block-scale GEMM1 / GEMM2 chain's term: the bf16 chain's (the fused requantization: its bf16 twin's plus
     the quantizer's per-element multiply and conversion)."""
-    from .blocks.fp8bs_kernel import OUT_FMT_QUANT, quant_twin
-
     if chain.out_fmt == OUT_FMT_QUANT:
         return chain_nodes(quant_twin(chain)) + 2
     return chain_nodes(chain)

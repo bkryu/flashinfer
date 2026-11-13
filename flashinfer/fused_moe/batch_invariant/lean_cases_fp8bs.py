@@ -219,12 +219,8 @@ def dispatch_cases(block: int = 128) -> Dict:
     """Every record the block-scale dispatcher returns at the class ``block`` over ``GEOMS`` x ``TS`` x every nominal part x the
     chains x both requantization spellings (the standalone one alone at 32), with the first (T, H, I, E) that selects it."""
     from ...gemm.batch_invariant.heuristic import PARTS
-    from .blocks.fp8bs_compile import (
-        GEMM2_CHAIN,
-        can_implement_fp8bs,
-        gemm1_chain,
-    )
-    from .schedule_fp8bs import default_configs_fp8bs
+    from .blocks.epilogue_fp8bs import GEMM2_CHAIN, gemm1_chain
+    from .schedule_fp8bs import can_implement_fp8bs, default_configs_fp8bs
 
     disp: Dict = {}
     for H, I, E, k in GEOMS:
@@ -378,7 +374,7 @@ def render() -> str:
     )
     sw = swap_space()
     L.append(
-        "/-! The swapped decode space of the class (`blocks/fp8bs_swap_kernel.py`: the weights on the MMA's M in a 64- / 128-row "
+        "/-! The swapped decode space of the class (`blocks/swap.py` on the promoted operand block: the weights on the MMA's M in a 64- / 128-row "
         "tile, the tokens as the N tile): every record checked against the swapped body's static constraints, disjoint from the "
         "dense-derived records, the tile result invariant over the union of the two spaces (the promotion loop does not read the "
         "orientation). -/"

@@ -12,7 +12,7 @@ weight blocks), e4m3 codes.
   `[(V, reg), (128 / V, lane)]` of the standalone kernel (`blocks/fp8bs_small.py`: `V = 8`) computes it (`config_invarianceC
   .fmaxc` instantiated). There is no row digit: a block's bits depend on its 128 inputs alone (`block_locality`), which is why
   the class is batch invariant without any global-scale argument.
-* The fused requantization of the block-scale MoE class (`blocks/fp8bs_kernel.py`) holds a block's two 64-output halves in two
+* The fused requantization of the block-scale MoE class (`blocks/epilogue_fp8bs.py` on the unified grouped body) holds a block's two 64-output halves in two
   warpgroups: `blockAmax_halves` says the canonical tree IS the combine of the two half trees (the first half's leaves are
   elements 0 .. 63), so the exchange of the half amaxes computes the class's tree (definitionally).
 * The chains are fixed: `scaleT` -- `s = fmaxc(div(amax, 448), 1e-12)` (the dequantization scale the block-scale GEMM class

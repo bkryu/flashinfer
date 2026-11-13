@@ -3,7 +3,8 @@
 """Compile wrapper for the grouped GEMM bodies, every operand format: one TVM-FFI object per (knobs, chain[, packing]) with
 dynamic Tk, N, K and E, the chain naming its operand format (``bf16`` for the bf16 classes' :class:`GroupedChain`, ``e4m3``
 for the fp8 per-tensor classes' :class:`Fp8Chain`, the NVFP4 instruction classes for :class:`W4A4Chain`, the MXFP8 ones
-for :class:`.epilogue_mx.MxChain`), the output format
+for :class:`.epilogue_mx.MxChain`, ``e4m3_bs`` for the block-scale fp8 classes' :class:`.epilogue_fp8bs.Fp8BsChain`,
+which also carries the scale block and the weight interleave), the output format
 and the parameters; cache module ``batch_invariant_moe`` in FlashInfer's CuTe-DSL disk cache (this file, the routing,
 permutation, combine and scatter kernels are its roots; the bodies of every format are one source closure, so an edit to
 any moves every object's key). The persistent grid is a dynamic ``Int32`` argument of the compiled kernel
@@ -13,7 +14,8 @@ select the bodies' entry: the plain one (``kernel(a3, b3, out2, counts, grid)``)
 counts, alpha, sa, si, grid)``), ``block_scaled`` (``kernel(a3, b3, sfa, sfb, out2, counts, alpha, pts, grid)``),
 ``block_scaled_static`` (``kernel(a3, b3, sfa, sfb, out2, out_sf, counts, alpha, pts, aux, grid)``), or the MX chains'
 ``block_scaled_plain`` (``kernel(a3, b3, sfa, sfb, out2, counts, rows_sf, grid)``) and ``block_scaled_quant`` (``kernel(a3,
-b3, sfa, sfb, out2, out_sf, counts, rows_sf, grid)``: the fused requantization's codes and scale bytes).
+b3, sfa, sfb, out2, out_sf, counts, rows_sf, grid)``: the fused requantization's codes and scale bytes); the block-scale fp8
+chains take the same two entries with their fp32 block scales (``rows_sf`` unread; ``out_sf`` the fp32 scales).
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from ....batch_invariant import jit
 from ....gemm.batch_invariant.blocks.operands import ALIGN, IN_DT, OUT_DT
 from ....gemm.batch_invariant.generator import TILES_N, Knobs
 from ....gemm.batch_invariant.spec import (
+    BLOCK_K,
     BLOCK_SCALED,
     ELEM_BITS_OF,
     SF_ATOM_KBLOCKS,
@@ -43,6 +46,7 @@ from .epilogue import (
     GroupedEpilogueBlock,
     W4A4Chain,
 )
+from .epilogue_fp8bs import IN_FMT_BS, Fp8BsChain
 from .epilogue_mx import MX_OUT_FMTS, MxChain
 from .kernel import CHAINS, GROUP_ALIGN, GroupedBlockGemm
 from .operands import PACKINGS
@@ -99,6 +103,11 @@ def _is_block_scaled(chain: GroupedEpilogueBlock) -> bool:
     return chain.in_fmt in BLOCK_SCALED
 
 
+def _is_promoted(chain: GroupedEpilogueBlock) -> bool:
+    """The block-scale fp8 chains (:class:`.epilogue_fp8bs.Fp8BsChain`): the promoted operand block."""
+    return chain.in_fmt == IN_FMT_BS
+
+
 def blockscaled_k_align(in_fmt: str) -> int:
     """The K alignment of a block-scaled format's operands: whole scale blocks of whole 16-byte rows (two NVFP4 blocks of 16
     per 16 bytes, one MX block of 32 e4m3 elements)."""
@@ -149,6 +158,7 @@ def _operands_ok(chain: GroupedEpilogueBlock, N: int, K: int, E: int) -> bool:
         and N % al == 0
         and n_out % OUT_ALIGN_OF[chain.out_fmt] == 0
         and 1 <= E <= MAX_E
+        and chain.shape_ok(N, K, E)
     )
 
 
@@ -182,6 +192,8 @@ def can_implement_grouped(
             return False
     elif knobs.tile_n not in TILES_N:
         return False
+    if not chain.record_ok(knobs):
+        return False  # the chain's own record rule (the block-scale fp8 chains' promotion tiles)
     return _operands_ok(chain, N, K, E)
 
 
@@ -197,6 +209,51 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
     sym_no = cute.sym_int(32, divisibility=oal)
     c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
     f = dict(counts=c_fake, scales=())
+    if _is_promoted(chain):
+        # the block-scale fp8 operands: e4m3 elements, K in whole smem stages, N in whole scale blocks; the fp32 block scales
+        # of the rows (any strides) and of the experts (K-contiguous); the fused requantization's fp32 scale output
+        sym_r, sym_m = cute.sym_int(32), cute.sym_int(32)
+        sym_n = cute.sym_int(32, divisibility=chain.block)
+        sym_k = cute.sym_int(32, divisibility=BLOCK_K)
+        sym_kb, sym_nb, sym_ob = cute.sym_int(32), cute.sym_int(32), cute.sym_int(32)
+
+        def rows3(sym_rows):
+            return cute.runtime.make_fake_tensor(
+                in_dt,
+                (sym_rows, sym_k, 1),
+                (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
+                assumed_align=16,
+            )
+
+        f["a"], f["rows"] = rows3(sym_m), rows3(sym_r)
+        f["b"] = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_n, sym_k, sym_e),
+            (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
+            assumed_align=16,
+        )
+        f["sfa"] = cute.runtime.make_fake_tensor(
+            Float32,
+            (sym_m, sym_kb),
+            (cute.sym_int64(), cute.sym_int64()),
+            assumed_align=4,
+        )
+        f["sfb"] = cute.runtime.make_fake_tensor(
+            Float32,
+            (sym_e, sym_nb, sym_kb),
+            (cute.sym_int64(), cute.sym_int64(), 1),
+            assumed_align=4,
+        )
+        f["out"] = cute.runtime.make_fake_tensor(
+            out_dt,
+            (sym_m, sym_no),
+            (cute.sym_int64(divisibility=oal), 1),
+            assumed_align=16,
+        )
+        f["out_sf"] = cute.runtime.make_fake_tensor(
+            Float32, (sym_ob, cute.sym_int(32)), (cute.sym_int64(), 1), assumed_align=4
+        )
+        return f
     if _is_block_scaled(chain):
         dense_a = packing == "dense"
         sym_m = (
@@ -310,9 +367,9 @@ def compile_grouped_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
         body = GroupedBlockGemm(cfg, chain, packing=packing)
-        if _is_block_scaled(chain):
+        if _is_block_scaled(chain) or _is_promoted(chain):
             if not chain.operands:
-                # the MX chains: no further operand; the quantising chain writes its scale bytes as a second output
+                # the MX and the block-scale fp8 chains: no further operand; the quantising chain writes its scales as a second output
                 if chain.quant:
                     return cute.compile(
                         body.block_scaled_quant,
@@ -414,6 +471,7 @@ def get_compiled_grouped(
         packing,
         chain,
     )
+    assert not isinstance(chain, Fp8BsChain) or packing == "dense", chain
     return jit.build_and_load(
         MODULE,
         kernel_name(cfg, chain, packing=packing),
@@ -461,6 +519,8 @@ def can_implement_swapped(
         return False
     if _is_block_scaled(chain) and not knobs.well_formed(chain.in_fmt):
         return False
+    if not chain.swapped_record_ok(knobs):
+        return False
     return _operands_ok(chain, N, K, E)
 
 
@@ -495,7 +555,7 @@ def compile_swapped_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
         body = SwappedGroupedGemm(cfg, chain, gather=gather, k_block=k_block)
-        if _is_block_scaled(chain):
+        if _is_block_scaled(chain) or _is_promoted(chain):
             if not chain.operands:
                 if chain.quant:
                     return cute.compile(

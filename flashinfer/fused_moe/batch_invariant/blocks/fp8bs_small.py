@@ -15,11 +15,14 @@ declared ``cvt.rn.satfinite.e4m3x2.f32``.
 
 from __future__ import annotations
 
+import functools
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint8, Uint32
 
-from ....batch_invariant import canon
+from ....batch_invariant import canon, jit
+from ....batch_invariant.fp_interface.cute import get_cutlass_dtype
 from ....batch_invariant.quantization.blocks import LanePeers, pack_block_codes
 from ....batch_invariant.quantization.cute_ext import CuteF32
 from .. import pdl
@@ -44,6 +47,8 @@ SCALE_BLOCKS_PER_THREAD = (
 )
 #: The fused row + scale gather runs the row gather's block (``permute.GatherKernel``: ``WARPS`` warps of ``LANES`` lanes).
 GATHER_WARPS = 4
+#: The MoE classes' one JIT module (the bodies' cache key: an edit here moves every object's key).
+MODULE = "batch_invariant_moe"
 GATHER_LANES = 32
 
 
@@ -332,3 +337,166 @@ class GatherRowsScalesKernel:
                     if kb < KB:
                         mSp[(kb, p)] = vals[j]
         pdl.trigger_one_wave()
+
+
+# ----------------------------------------------------------------------------- the compile wrappers (module ``batch_invariant_moe``)
+
+
+def quant_kernel_name(
+    dtype_str: str,
+    wpr: int,
+    trigger: str = "none",
+    enable_pdl: bool = True,
+    block: int = BLOCK,
+) -> str:
+    """The standalone quantizer's name: the input dtype, the warps per row (a placement), the PDL trigger placement, PDL and
+    the block size where it is not the 128-wide class's; never M or K."""
+    return jit.sanitize_symbol_name(
+        f"fp8bs_quant_{dtype_str}_w{wpr}_t{trigger}_pdl{int(enable_pdl)}"
+        + (f"_b{block}" if check_block(block) != BLOCK else "")
+    )
+
+
+def gather_scales_name(k: int) -> str:
+    return jit.sanitize_symbol_name(f"moe_gather_scales_k{k}")
+
+
+def gather_rows_scales_name(k: int, wpr: int) -> str:
+    return jit.sanitize_symbol_name(
+        f"moe_gather_rows_scales_k{k}" + (f"_w{wpr}" if wpr > 1 else "")
+    )
+
+
+@functools.cache
+def get_compiled_fp8bs_quant(
+    dtype_str: str,
+    wpr: int,
+    trigger: str = "none",
+    enable_pdl: bool = True,
+    block: int = BLOCK,
+):
+    """``kernel(x [M, K] 16-bit, codes [M, K] u8, s (M, KB) f32 with free strides, M, K)``; one kernel per (dtype, warps per row,
+    trigger, block), in the MoE classes' module."""
+    dtype = get_cutlass_dtype(dtype_str)
+    name = quant_kernel_name(dtype_str, wpr, trigger, enable_pdl, block)
+
+    def compile_fn():
+        sym_m, sym_k, sym_kb = (
+            cute.sym_int(32),
+            cute.sym_int(32, divisibility=block),
+            cute.sym_int(32),
+        )
+        x = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, sym_k), (cute.sym_int64(divisibility=8), 1), assumed_align=16
+        )
+        y = cute.runtime.make_fake_tensor(
+            Uint8,
+            (sym_m, sym_k),
+            (cute.sym_int64(divisibility=16), 1),
+            assumed_align=16,
+        )
+        s = cute.runtime.make_fake_tensor(
+            Float32,
+            (sym_m, sym_kb),
+            (cute.sym_int64(), cute.sym_int64()),
+            assumed_align=4,
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return cute.compile(
+            BSQuantKernel(dtype, wpr, trigger, block),
+            x,
+            y,
+            s,
+            Int32(1),
+            Int32(block),
+            enable_pdl,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return jit.build_and_load(MODULE, name, compile_fn)
+
+
+@functools.cache
+def get_compiled_gather_rows_scales(k: int, wpr: int = 1):
+    """``kernel(x_bytes [T, B] u8, src [>= Tk] i32, x_perm [>= Tk, B] u8, sf (KB, T) f32 any strides, sf_perm (KB, >= Tk) f32,
+    Tk, B, KB)``: the fused row + scale gather (one launch); ``wpr`` warps per row (``permute.warps_per_row``)."""
+
+    def compile_fn():
+        sym_t, sym_n, sym_p = cute.sym_int(32), cute.sym_int(32), cute.sym_int(32)
+        sym_b = cute.sym_int(32, divisibility=16)
+        sym_kb, sym_t2 = cute.sym_int(32), cute.sym_int(32)
+        x_fake = cute.runtime.make_fake_tensor(
+            Uint8,
+            (sym_t, sym_b),
+            (cute.sym_int64(divisibility=16), 1),
+            assumed_align=16,
+        )
+        src_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
+        xp_fake = cute.runtime.make_fake_tensor(
+            Uint8,
+            (sym_p, sym_b),
+            (cute.sym_int64(divisibility=16), 1),
+            assumed_align=16,
+        )
+        s_fake = cute.runtime.make_fake_tensor(
+            Float32,
+            (sym_kb, sym_t2),
+            (cute.sym_int64(), cute.sym_int64()),
+            assumed_align=4,
+        )
+        sp_fake = cute.runtime.make_fake_tensor(
+            Float32, (sym_kb, sym_p), (cute.sym_int64(), 1), assumed_align=4
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return cute.compile(
+            GatherRowsScalesKernel(k, wpr),
+            x_fake,
+            src_fake,
+            xp_fake,
+            s_fake,
+            sp_fake,
+            Int32(1),
+            Int32(16),
+            Int32(1),
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return jit.build_and_load(MODULE, gather_rows_scales_name(k, wpr), compile_fn)
+
+
+@functools.cache
+def get_compiled_gather_scales(k: int):
+    """``kernel(sf (KB, T) f32 any strides, src [>= Tk] i32, sf_perm (KB, Tk) f32, Tk, KB)``."""
+
+    def compile_fn():
+        sym_kb, sym_t, sym_n, sym_tk = (
+            cute.sym_int(32),
+            cute.sym_int(32),
+            cute.sym_int(32),
+            cute.sym_int(32),
+        )
+        s_fake = cute.runtime.make_fake_tensor(
+            Float32,
+            (sym_kb, sym_t),
+            (cute.sym_int64(), cute.sym_int64()),
+            assumed_align=4,
+        )
+        src_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
+        sp_fake = cute.runtime.make_fake_tensor(
+            Float32, (sym_kb, sym_tk), (cute.sym_int64(), 1), assumed_align=4
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return cute.compile(
+            GatherScalesKernel(k),
+            s_fake,
+            src_fake,
+            sp_fake,
+            Int32(1),
+            Int32(1),
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return jit.build_and_load(MODULE, gather_scales_name(k), compile_fn)

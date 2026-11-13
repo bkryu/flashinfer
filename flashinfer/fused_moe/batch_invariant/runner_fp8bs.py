@@ -69,7 +69,9 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
     X_RULE = "an e4m3 [num_tokens, hidden_size] with its fp32 block scales (the DeepSeek pair)"
     ROW_RULE = f"a positive multiple of {QBLOCK} (whole smem stages of scale blocks of the intermediate and of both weights)"
     SCALE_RULE = f"the fp32 block scales [hidden_size / {QBLOCK}, num_tokens] of the activations (/ 32 for the 32-wide class)"
-    TACTIC_TAG = CLASS + "-v1"  # the block's class joins the cache key at the pack (`_cache_key_extras`)
+    TACTIC_TAG = (
+        CLASS + "-v1"
+    )  # the block's class joins the cache key at the pack (`_cache_key_extras`)
     N_ACT_TENSORS = 2
     N_WEIGHT_TENSORS = 4
 
@@ -156,7 +158,7 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
     def _ranked(self, T: int, fused: Optional[bool] = None) -> Tuple[list, list]:
         """The ranked records of both GEMMs over both record spaces at ``T`` tokens for the requantization spelling ``fused``
         (the default spelling's at this token count when None), memoised (`schedule_fp8bs.rank_grouped_fp8bs`)."""
-        from .blocks.fp8bs_compile import GEMM2_CHAIN
+        from .blocks.epilogue_fp8bs import GEMM2_CHAIN
         from .schedule import TOP_K, active_experts, rows_per_expert
         from .schedule_fp8bs import gemm1_chain, rank_grouped_fp8bs
 

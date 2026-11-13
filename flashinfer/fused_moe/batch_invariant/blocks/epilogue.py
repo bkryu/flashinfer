@@ -211,6 +211,18 @@ class GroupedEpilogueBlock:
         """Whether the chain reads the per-expert auxiliary scales (the static NVFP4 class's chains)."""
         return False
 
+    def record_ok(self, knobs) -> bool:
+        """The chain's own rule on a grouped record beyond the format's (the block-scale fp8 chains' promotion tiles)."""
+        return True
+
+    def swapped_record_ok(self, knobs) -> bool:
+        """The chain's own rule on a swapped record beyond the format's."""
+        return True
+
+    def shape_ok(self, N: int, K: int, E: int) -> bool:
+        """The chain's own operand rule beyond the format's alignment (whole scale blocks of a block-scale weight)."""
+        return True
+
     def tile_scale(self, fp, mAlpha, mSa, mAux, e):
         return None
 

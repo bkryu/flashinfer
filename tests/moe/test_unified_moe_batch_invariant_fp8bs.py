@@ -21,6 +21,8 @@ dispatcher's membership in the enumerated space at the nominal parts.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -594,6 +596,137 @@ def test_weight_view_and_the_trtllm_view_taken_as_given():
     check_shape_fp8bs(7168, 2048, 1024, 16)
 
 
+def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch):
+    """The block-scale fp8 chains run the backend's swapped body (:mod:`blocks.swap`), which reads the plan's group counts
+    under the chain's trigger rule (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own wait, the
+    body's own wait before the tables is the margin) and whose builder asserts the shipped placement is one of them; the
+    gather form belongs to the bf16 classes; the block-scaled k-block is not this format's."""
+    from flashinfer.fused_moe.batch_invariant import pdl
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_fp8bs import GEMM2_CHAIN
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import swapped_knobs_fp8bs
+
+    cfg = swapped_knobs_fp8bs()[0]
+    assert pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS
+    SwappedGroupedGemm(cfg, GEMM2_CHAIN)
+    SwappedGroupedGemm(cfg, GEMM2_CHAIN.at(32))
+    with pytest.raises(AssertionError):
+        SwappedGroupedGemm(cfg, GEMM2_CHAIN, gather=True)
+    with pytest.raises(AssertionError):
+        SwappedGroupedGemm(cfg, GEMM2_CHAIN, k_block=256)
+    monkeypatch.setattr(pdl, "TRIGGER", "early")
+    with pytest.raises(AssertionError):
+        SwappedGroupedGemm(cfg, GEMM2_CHAIN)
+
+
+def test_fp8bs_classes_run_on_the_unified_bodies():
+    """The block-scale fp8 classes have no body of their own: the backend's grouped and swapped bodies (:mod:`blocks.kernel`,
+    :mod:`blocks.swap`) take the chain through the promoted operand block (the dense fp8 fold reset per scale block, the
+    partials promoted by two warpgroups from an fp32 scale ring; the block and the weight interleave read off the chain;
+    whole warpgroups of threads for the register reconfiguration), the record spaces are the class's own (the dense
+    block-scale records at the promotion tiles; 64- / 128-row weight tiles x 8- to 64-token tiles swapped), the compiled
+    objects carry the format, the block and the interleave in their names, and one JIT module (``batch_invariant_moe``) holds
+    the kernels, the quantizer and the scale gathers, with no class-specific body in its source closure."""
+    from flashinfer.batch_invariant import jit
+    from flashinfer.fused_moe.batch_invariant.blocks import compile as C
+    from flashinfer.fused_moe.batch_invariant.blocks import fp8bs_small
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_fp8bs import (
+        GEMM2_CHAIN,
+        Fp8BsChain,
+        gemm1_chain,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.kernel import GroupedBlockGemm
+    from flashinfer.fused_moe.batch_invariant.blocks.operands import PromotedOperands
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import (
+        SwappedGroupedGemm,
+        is_swapped_record,
+        swapped_knobs,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import (
+        can_implement_fp8bs,
+        can_implement_grouped_fp8bs,
+        can_implement_swapped_fp8bs,
+        swapped_knobs_fp8bs,
+    )
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    fused, plain, plain32 = (
+        gemm1_chain("silu", fused=True),
+        GEMM2_CHAIN,
+        GEMM2_CHAIN.at(32),
+    )
+    oracle = Fp8BsChain("plain", "silu", "f32", interleaved=True)
+    assert (
+        fused.quant and not plain.quant and fused.operands == () and not fused.needs_aux
+    )
+    assert (fused.block, fused.il, plain32.block, oracle.il, GEMM2_CHAIN.il) == (
+        128,
+        True,
+        32,
+        True,
+        False,
+    )
+    assert fused.twin == gemm1_chain("silu") and plain.twin is plain
+    assert fused.grouped_loop() is None and fused.swapped_loop() is None
+    with pytest.raises(AssertionError):
+        gemm1_chain("silu", fused=True).at(
+            32
+        )  # the fused requantization is the 128-wide class's
+    with pytest.raises(AssertionError):
+        Fp8BsChain(
+            "glu", "silu", "bf16", interleaved=False
+        )  # the gated chain pairs the interleaved weight
+    dense = Knobs((128, 256), (1, 1), False, True, "m", 1)
+    for ch in (fused, plain, plain32, oracle):
+        body = GroupedBlockGemm(dense, ch)
+        ops = body.operands
+        assert ops == PromotedOperands(ch.block, ch.il) and ops.promoted
+        assert not ops.block_scaled and ops.dense_a and ops.in_fmt == "e4m3_bs"
+        assert (ops.spb, body.epi_warpgroups, body.threads) == (128 // ch.block, 2, 384)
+    # the record spaces are the class's own
+    assert [(c.tile_m, c.tile_n) for c in swapped_knobs("e4m3_bs")] == [
+        (wt, tn) for wt in (64, 128) for tn in (8, 16, 32, 64)
+    ]
+    assert swapped_knobs_fp8bs() == swapped_knobs("e4m3_bs")
+    sw = swapped_knobs_fp8bs()[0]
+    assert is_swapped_record(sw, "e4m3_bs") and not is_swapped_record(sw, "bf16")
+    assert SwappedGroupedGemm(sw, plain).operands == PromotedOperands(128, False)
+    assert can_implement_grouped_fp8bs(dense, 1024, 2048, 8, fused)
+    assert not can_implement_grouped_fp8bs(dense, 1024, 2048, 8, fused, block=32)
+    assert not can_implement_swapped_fp8bs(sw, 1024, 2048, 8, fused)
+    assert can_implement_swapped_fp8bs(sw, 1024, 2048, 8, plain, block=32)
+    assert not can_implement_fp8bs(
+        dense, 1024 + 64, 2048, 8, plain
+    )  # whole weight blocks
+    assert not can_implement_fp8bs(
+        dense, 1024, 2048 + 64, 8, plain
+    )  # whole smem stages of K
+    assert not can_implement_fp8bs(
+        Knobs((128, 32), (1, 1), False, True, "m", 1), 1024, 2048, 8, plain
+    )  # the promotion tiles
+    # the object names: the format, the chain with its block and interleave, the record
+    assert C.kernel_name(dense, fused).startswith("grouped_e4m3_bs_glu_silu_e4m3bs_")
+    assert C.kernel_name(dense, plain32).startswith(
+        "grouped_e4m3_bs_plain_silu_bf16_b32_"
+    )
+    assert C.kernel_name(dense, oracle).startswith("grouped_e4m3_bs_plain_silu_f32_il_")
+    assert C.swapped_kernel_name(sw, plain).startswith(
+        "swapped_e4m3_bs_plain_silu_bf16_"
+    )
+    # one module, no class-specific body in its closure
+    assert C.MODULE == fp8bs_small.MODULE == "batch_invariant_moe"
+    assert "batch_invariant_moe_fp8bs" not in jit.MODULE_ROOTS
+    srcs = jit.relative_sources("batch_invariant_moe")
+    gone = ("fp8bs_kernel.py", "fp8bs_swap_kernel.py", "fp8bs_compile.py")
+    assert not any(os.path.basename(src) in gone for src in srcs), srcs
+    for src in (
+        "fused_moe/batch_invariant/blocks/epilogue_fp8bs.py",
+        "fused_moe/batch_invariant/blocks/fp8bs_small.py",
+        "fused_moe/batch_invariant/blocks/operands.py",
+    ):
+        assert src in srcs, srcs
+
+
 @pytest.mark.parametrize(
     "family,sm_count",
     [("sm_107", 212), ("sm_107", 204), ("sm_100", 148), ("sm_103", 152)],
@@ -602,7 +735,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     """The dispatcher's pick for every bench geometry and token count lies in the enumerated grouped block-scale space of its
     GEMM (the fused requantization's chain in its whole-block subspace), for the gated and the ungated classes, at the nominal
     parts; the ranked list is short, distinct and inside the space; the requantization rule is a function of the rows per expert."""
-    from flashinfer.fused_moe.batch_invariant.blocks.fp8bs_compile import GEMM2_CHAIN
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_fp8bs import GEMM2_CHAIN
     from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
     from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import (
         FUSED_QUANT_MIN_ROWS,
@@ -1155,7 +1288,7 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
         MoEWeightsE4M3BS,
         fused_moe_fp8bs,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.fp8bs_compile import GEMM2_CHAIN
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_fp8bs import GEMM2_CHAIN
     from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import (
         all_valid_configs_fp8bs,
         all_valid_configs_fp8bs_swapped,
@@ -1284,7 +1417,7 @@ def test_swapped_decode_body_equals_the_padded_body(act):
         MoEWeightsE4M3BS,
         fused_moe_fp8bs,
     )
-    from flashinfer.fused_moe.batch_invariant.blocks.fp8bs_compile import GEMM2_CHAIN
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_fp8bs import GEMM2_CHAIN
     from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import (
         all_valid_configs_fp8bs_swapped,
         default_configs_fp8bs,
@@ -1838,14 +1971,14 @@ def test_block32_is_its_own_class_with_the_same_chains_and_spaces():
     acceptance read the block; the dispatcher's picks at 32 are members; the registry refuses another block."""
     from flashinfer.fused_moe.batch_invariant import mterm
     from flashinfer.fused_moe.batch_invariant import spec_fp8bs as SB
-    from flashinfer.fused_moe.batch_invariant.blocks.fp8bs_compile import (
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_fp8bs import (
         GEMM2_CHAIN,
-        can_implement_fp8bs,
         gemm1_chain,
     )
     from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import (
         all_valid_configs_fp8bs,
         all_valid_configs_fp8bs_swapped,
+        can_implement_fp8bs,
         default_configs_fp8bs,
     )
     from flashinfer.gemm.batch_invariant.spec import GemmSpec
