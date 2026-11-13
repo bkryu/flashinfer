@@ -62,7 +62,7 @@ from ....batch_invariant.quantization.mx_spec import (
     scale_norm,
 )
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
-from .epilogue import GROUP, GroupedChain, _chain_elem, fragment_offsets, store_plan
+from .epilogue import GROUP, GroupedChain, MoeF32, fragment_offsets, store_plan
 
 OUT_FMT = "mxfp8"  # the GroupedChain out_fmt of this epilogue: e4m3 codes + UE8M0 block scales of the bf16-rounded chain
 VEC_BYTES = 16
@@ -291,7 +291,7 @@ def grouped_epilogue_quant_loop(
                             if cutlass.const_expr(pair)
                             else None
                         )
-                        yb = _chain_elem(twin, tTR_rAcc[v], g)
+                        yb = twin.elem(MoeF32, tTR_rAcc[v], g)
                         ys_r[out_col[v]] = yb.to(Float32)
                 amax = block_amax(fp, [ys_r[j] for j in range(V)])
                 if cutlass.const_expr(SB == 2):
@@ -491,8 +491,8 @@ def swapped_epilogue_quant_loop(
             # the chain of every token column (a dead column's is the benign constant's: computed, never stored, and a token
             # column's reduction never mixes with another's), the block amax across the lanes
             for v in cutlass.range_constexpr(nv):
-                yb = _chain_elem(
-                    twin, tTR_rAcc[v], gate[v] if cutlass.const_expr(pair) else None
+                yb = twin.elem(
+                    MoeF32, tTR_rAcc[v], gate[v] if cutlass.const_expr(pair) else None
                 )
                 yf = yb.to(Float32)
                 ys[v] = yf

@@ -13,8 +13,13 @@ import BIKernels.Quant
 import BIKernels.QuantExport
 import BIKernels.QuantCases
 import BIKernels.Sampling
+import BIKernels.Stream
+import BIKernels.Draw
 import BIKernels.SamplingCases
 import BIKernels.MoE
+import BIKernels.MoEFp8
 import BIKernels.MoECases
+import BIKernels.MegaMoE
+import BIKernels.MegaMoECases
 import BIKernels.MoEMxfp8
 import BIKernels.MoEMxfp8Cases

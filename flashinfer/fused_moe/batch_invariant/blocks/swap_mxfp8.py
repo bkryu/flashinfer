@@ -74,7 +74,7 @@ from .blockscaled_kernel import (
     plan_with_room,
     sf_view_experts,
 )
-from .epilogue import BAR_EPI_JOIN, GROUP, GroupedChain, _chain_elem, fragment_offsets
+from .epilogue import BAR_EPI_JOIN, GROUP, GroupedChain, MoeF32, fragment_offsets
 from .epilogue_mx import (
     swap_xch_bytes,
     swap_xch_layout,
@@ -1047,8 +1047,8 @@ def swapped_epilogue_loop(
             for v in cutlass.range_constexpr(nv):
                 j = col0 + Int32(cols[v])
                 if j < rows_left:
-                    val = _chain_elem(
-                        chain,
+                    val = chain.elem(
+                        MoeF32,
                         tTR_rAcc[v],
                         gate[v] if cutlass.const_expr(pair) else None,
                     )
