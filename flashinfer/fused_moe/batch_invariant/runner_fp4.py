@@ -31,7 +31,9 @@ from .runner_nvfp4 import BatchInvariantMoeNvfp4Runner
 #: The backend's key: the name of its weight view and of its autotuner records, shared by the pair implementations.
 BACKEND_KEY = "batch_invariant_fp4"
 #: The quantization pairs the backend serves, each by its implementation runner (in the order they are advertised).
-PAIRS: Dict[Tuple[QuantFormat, QuantFormat], Type[MoERunner]] = {
+# the implementation runners (MoERunner subclasses constructed with (config, device); typed loosely: the base class's
+# constructor takes no arguments and the delegated entries are the implementations')
+PAIRS: Dict[Tuple[QuantFormat, QuantFormat], Type[Any]] = {
     (QuantFormat.NVFP4, QuantFormat.NVFP4): BatchInvariantMoeNvfp4Runner,
 }
 #: The pairs of the group that a later PR of the series brings (named by the refusal).
@@ -87,12 +89,12 @@ class BatchInvariantFp4Runner(MoERunner):
             self.device = torch.device("cuda", torch.cuda.current_device())
         impl = PAIRS.get(config.quant.pair)
         # an unserved pair is refused by check_support (the layer's filter never constructs this case)
-        self._impl: Optional[MoERunner] = (
+        self._impl: Optional[Any] = (
             impl(config, self.device) if impl is not None else None
         )
 
     @property
-    def impl(self) -> MoERunner:
+    def impl(self) -> Any:
         """The configured pair's implementation runner."""
         if self._impl is None:
             raise unsupported_pair(self.config.quant)
