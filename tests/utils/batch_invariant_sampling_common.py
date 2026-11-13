@@ -101,10 +101,13 @@ def precompile(
     label: str,
     workers_env: str = "BI_SAMPLING_PRECOMPILE_WORKERS",
 ) -> None:
-    """Compile ``specs`` on device-free workers (``sys.executable -c worker_code <chunk>``; the worker prints ``BAD
-    [...]`` with the failures), the device's architecture explicit so the module directory
-    (``FLASHINFER_CUDA_ARCH_LIST`` decides the workspace's segment, ``CUTE_DSL_ARCH`` the kernel target) is the one this
-    process loads from; asserts no failure and a filled module cache (``<module>_sm<cc>_cute_dsl``)."""
+    """Compile ``specs`` on worker processes (``sys.executable -c worker_code <chunk>``; the worker prints ``BAD [...]``
+    with the failures) that inherit this process's environment unchanged -- the same visible device, the same
+    ``CUTE_DSL_ARCH`` / ``FLASHINFER_CUDA_ARCH_LIST`` -- so they compile what this process would, into its module directory,
+    and a CI that validates the compiler environment of every process sees no change; asserts no failure and a filled
+    module cache (``<module>_sm<cc>_cute_dsl``). ``<workers_env>`` sets the pool size (default 8; 0 disables the pool and
+    the tests compile in-process); ``BI_SAMPLING_PRECOMPILE_DEVICE_FREE=1`` (a development host with many cores and no
+    such validation) compiles with no device visible and the device's architecture passed explicitly instead."""
     from flashinfer.compilation_context import CompilationContext
     from flashinfer.jit import env as jit_env
 
@@ -114,14 +117,21 @@ def precompile(
     random.Random(0).shuffle(
         specs
     )  # spread the heavy (cluster) kernels over the workers
-    workers = int(os.environ.get(workers_env, min(32, os.cpu_count() or 8)))
+    workers = int(os.environ.get(workers_env, min(8, os.cpu_count() or 1)))
+    if workers <= 0 or not specs:
+        print(f"{label} precompile pool off: the tests compile in-process", flush=True)
+        return
     workers = max(1, min(workers, len(specs)))
-    env = dict(
-        os.environ,
-        CUDA_VISIBLE_DEVICES="",
-        CUTE_DSL_ARCH=f"sm_{major}{minor}",
-        FLASHINFER_CUDA_ARCH_LIST=" ".join(f"{a}.{b}" for a, b in archs),
-    )
+    env = dict(os.environ)
+    if os.environ.get("BI_SAMPLING_PRECOMPILE_DEVICE_FREE") == "1":
+        # no device in the workers: the device's architecture explicitly, so the module directory
+        # (FLASHINFER_CUDA_ARCH_LIST decides the workspace's segment, CUTE_DSL_ARCH the kernel target) is the one this
+        # process loads from
+        env.update(
+            CUDA_VISIBLE_DEVICES="",
+            CUTE_DSL_ARCH=f"sm_{major}{minor}",
+            FLASHINFER_CUDA_ARCH_LIST=" ".join(f"{a}.{b}" for a, b in archs),
+        )
     chunks = [specs[i::workers] for i in range(workers)]
 
     def run(chunk):
@@ -171,17 +181,23 @@ PTX_FP_LIKE = re.compile(
 
 
 def compile_device_free(tmp_path, code: str, timeout: int = 1800) -> Tuple[str, str]:
-    """Run ``code`` (one kernel's compile) with no GPU visible and the IR kept in ``tmp_path``; returns the MLIR and the
-    PTX, after the generic checks: no ``arith`` float op or ``math`` dialect op, no fast-math, no approximate division or
-    reciprocal anywhere."""
+    """Run ``code`` (one kernel's compile) in a subprocess with the IR kept in ``tmp_path``; returns the MLIR and the PTX,
+    after the generic checks: no ``arith`` float op or ``math`` dialect op, no fast-math, no approximate division or
+    reciprocal anywhere. The subprocess inherits this process's environment: with a device visible it targets that device
+    as this process would (a CI that validates the compiler environment of every process sees the same ``CUTE_DSL_ARCH``
+    / ``FLASHINFER_CUDA_ARCH_LIST``); without one the compile is device-free with the target from ``BI_TEST_ARCH``
+    (default ``sm_100a``)."""
     env = dict(
         os.environ,
-        CUDA_VISIBLE_DEVICES="",
         CUTE_DSL_KEEP_IR="1",
         CUTE_DSL_KEEP="ptx",
         FLASHINFER_CUTE_DSL_DISABLE_CACHE="1",
-        CUTE_DSL_ARCH=os.environ.get("BI_TEST_ARCH", "sm_100a"),
     )
+    if not torch.cuda.is_available():
+        env.update(
+            CUDA_VISIBLE_DEVICES="",
+            CUTE_DSL_ARCH=os.environ.get("BI_TEST_ARCH", "sm_100a"),
+        )
     r = subprocess.run(
         [sys.executable, "-c", code],
         cwd=tmp_path,
