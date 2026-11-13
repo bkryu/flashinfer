@@ -2,34 +2,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """The DeepSeekFp8 x DeepSeekFp8 pair of the batch-invariant fp8-block MoE backend of the unified MoE layer
 (``BatchInvariantFp8BlockConfig`` under ``QuantConfig(DeepSeekFp8, DeepSeekFp8)`` -> ``BatchInvariantFp8BlockRunner`` ->
-``BatchInvariantDeepSeekFp8Runner``, the pair's runner): the DeepSeek-style block-scale classes ``moe.e4m3bs.<act>`` on
-SM100 / SM103 / SM107.
+``BatchInvariantDeepSeekFp8Runner``, the pair's runner): the DeepSeek-style block-scale classes ``moe.e4m3bs.<act>`` (128-wide
+blocks) and ``moe.e4m3bs32.<act>`` (32-wide) on SM100 / SM103 / SM107.
 
-The surface is TRTLLM-Gen's block-fp8 one under the DeepSeek pair: e4m3 activations with their fp32
-block scales (``hidden_states_scale [H / 128, T]``, as ``TrtllmFp8BlockConfig.prepare_activations`` hands them; the ``[T,
-H / 128]`` layout is taken too), the weights prepared from the bf16 experts per 128x128 block (or FlashInfer's DeepSeek weight
-view taken as given), every routing input mode (``FromLogits`` runs the class's own routing kernel), every typed activation of
-the layer. The combine is the slot-order fp32 fold (``do_finalize=True`` only), the tactics are the ranked block-scale grouped
-record pairs in both requantization spellings (any tactic gives the same bits), and an unsupported configuration raises
-:class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+The surface is TRTLLM-Gen's block-fp8 one under the DeepSeek pair: e4m3 activations with their fp32 block scales
+(``hidden_states_scale [H / block, T]``, as ``TrtllmFp8BlockConfig.prepare_activations`` hands them; the ``[T, H / block]``
+layout is taken too), the weights prepared from the bf16 experts per block (or FlashInfer's DeepSeek weight view taken as
+given), every routing input mode and every typed activation of the layer through the shared flow of
+:class:`.runner.BatchInvariantMoeRunnerBase` (the pack, the fused route + plan launch, the launch). The class is the prepared
+weights' block size, read off the view at the pack. The tactics are the ranked block-scale record pairs in both
+requantization spellings (any tactic gives the same bits); the combine is the slot-order fp32 fold (``do_finalize=True``
+only); an unsupported configuration raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of
+falling back.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
-from ...batch_invariant.support import check_device, unsupported
-from ..api import MoEActivationPack, MoEWeightPack, RoutingInputMode
-from ..runners import _validate_logits_inputs, _validate_prerouted_inputs
-from .runner import (
-    _TACTIC_FIELDS,
-    MOE_BF16_ARCHS,
-    _configs_from_tactic,
-    _tactic,
-    routing_term,
-)
+from ...batch_invariant.support import unsupported
+from ..api import MoEActivationPack, MoEWeightPack
+from .runner import _TACTIC_FIELDS, MOE_BF16_ARCHS, _configs_from_tactic, _tactic
 from .runner_fp8_block import PAIR_DEEPSEEK_FP8, BatchInvariantFp8BlockRunner
 from .spec_fp8bs import BLOCK as QBLOCK
 from .spec_fp8bs import CLASS, CLASS_OF
@@ -52,7 +47,7 @@ def MoEWeightsE4M3BS_block_of(inputs: List[torch.Tensor]) -> int:
     """The scale block size of the packed inputs' weights (``w1`` and its scales)."""
     from .api_fp8bs import MoEWeightsE4M3BS
 
-    return MoEWeightsE4M3BS.block_of(inputs[4], inputs[5])
+    return MoEWeightsE4M3BS.block_of(inputs[_W1], inputs[_W1SF])
 
 
 def _configs_from_tactic_bs(t: tuple):
@@ -67,51 +62,21 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
 
     supported_quant_variants = (PAIR_DEEPSEEK_FP8,)
 
-    # ---- support ---------------------------------------------------------------------------------------------------
-    def _check_support(self) -> None:
-        super()._check_support()
-        cfg = self.config
-        check_device(self.device, CLASS, MOE_FP8BS_ARCHS)
-        try:
-            self._activation()
-        except ValueError as e:
-            raise unsupported(
-                CLASS,
-                f"activation {cfg.activation!r}",
-                "one of the layer's typed activations",
-            ) from e
-        experts = cfg.experts
-        if experts.num_fused_shared_experts:
-            raise unsupported(
-                CLASS,
-                "fused shared experts",
-                "num_fused_shared_experts = 0 (a shared expert is one more routed slot)",
-            )
-        if experts.intermediate_size % QBLOCK or experts.intermediate_size <= 0:
-            raise unsupported(
-                CLASS,
-                f"intermediate_size {experts.intermediate_size}",
-                f"a positive multiple of {QBLOCK} (whole scale blocks of the intermediate and of both weights)",
-            )
-        routing = cfg.routing
-        if not 1 <= routing.top_k <= min(routing.num_experts, 16):
-            raise unsupported(
-                CLASS, f"top_k {routing.top_k}", "1 <= top_k <= min(num_experts, 16)"
-            )
-        if not 1 <= routing.num_experts <= 1024:
-            raise unsupported(
-                CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
-            )
-        # the routing term (the bf16 backend's methods, DeepSeekV3's expert groups under their shape rule, the Llama4 top-1 rule):
-        # the shared derivation; expert-parallel shards are refused by name in super()._check_support() (the backend's
-        # `supports_expert_parallelism = False`)
-        self._method, self._grouped_other = routing_term(routing, CLASS)
-        if not cfg.finalize.do_finalize:
-            raise unsupported(
-                CLASS,
-                "do_finalize=False",
-                "do_finalize=True (the slot-order combine is part of the class)",
-            )
+    CLASS = CLASS
+    ARCHS = MOE_FP8BS_ARCHS
+    X_DTYPE = torch.float8_e4m3fn
+    ROW_ALIGN = QBLOCK
+    X_RULE = "an e4m3 [num_tokens, hidden_size] with its fp32 block scales (the DeepSeek pair)"
+    ROW_RULE = f"a positive multiple of {QBLOCK} (whole smem stages of scale blocks of the intermediate and of both weights)"
+    SCALE_RULE = f"the fp32 block scales [hidden_size / {QBLOCK}, num_tokens] of the activations (/ 32 for the 32-wide class)"
+    TACTIC_TAG = CLASS + "-v1"  # the block's class joins the cache key at the pack (`_cache_key_extras`)
+    N_ACT_TENSORS = 2
+    N_WEIGHT_TENSORS = 4
+
+    def __init__(self, config, device) -> None:
+        super().__init__(config, device)
+        self._block: int = QBLOCK
+        self._fused: bool = False
 
     # ---- inputs ----------------------------------------------------------------------------------------------------
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
@@ -128,127 +93,69 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
     ) -> List[torch.Tensor]:
         self._require_built()
         self._validate_pack_contract(act)
-        from .api import route, route_plan
-        from .api_fp8bs import MoEWeightsE4M3BS, scale_mn_view
+        # the class is the prepared weights' block size: the activation scales are checked against it in `_act_tensors`
+        self._block = self._weights_from_view(weights.get_view(self.backend_key)).block
+        return super().pack_inputs(act, weights)
 
-        cfg = self.config
-        plan: List[torch.Tensor] = []
+    def _act_tensors(self, act: MoEActivationPack) -> List[torch.Tensor]:
+        """The pair's activation pack: the e4m3 rows and their fp32 block scales in the kernel's ``[H / block, T]`` layout
+        (the ``[T, H / block]`` layout taken too), and the class's shape rule on the configuration at this hidden size."""
+        from .api_fp8bs import check_shape_fp8bs, scale_mn_view
+
         x = act.hidden_states_q
-        if x.dtype != torch.float8_e4m3fn or x.ndim != 2:
+        if x.dtype != self.X_DTYPE or x.ndim != 2:
             raise unsupported(
-                CLASS,
-                f"hidden_states_q {x.dtype} of rank {x.ndim}",
-                "an e4m3 [num_tokens, hidden_size] with its fp32 block scales (the DeepSeek pair)",
+                self.CLASS, f"hidden_states_q {x.dtype} of rank {x.ndim}", self.X_RULE
             )
         if act.hidden_states_scale is None:
-            raise unsupported(
-                CLASS,
-                "no hidden_states_scale",
-                f"the fp32 block scales [hidden_size / {QBLOCK}, num_tokens] of the activations (/ 32 for the 32-wide class)",
-            )
+            raise unsupported(self.CLASS, "no hidden_states_scale", self.SCALE_RULE)
         x = x.contiguous()
-        T = x.shape[0]
-        k, E = cfg.routing.top_k, cfg.routing.num_experts
-        if x.shape[1] % QBLOCK:
-            raise unsupported(
-                CLASS,
-                f"hidden size {x.shape[1]}",
-                f"a multiple of {QBLOCK} (whole smem stages of scale blocks)",
-            )
-        w = MoEWeightsE4M3BS.from_view(weights.get_view(self.backend_key))
-        # the class is the prepared weights' (`deepseek_fp8_block_size`): the activation scales must be of the same block
-        self._block = w.block
+        T, H = x.shape
+        if H % QBLOCK:
+            raise unsupported(self.CLASS, f"hidden size {H}", self.ROW_RULE)
+        cfg = self.config
+        check_shape_fp8bs(
+            H,
+            cfg.experts.intermediate_size,
+            cfg.routing.num_experts,
+            cfg.routing.top_k,
+            self._block,
+        )
         sx = (
             scale_mn_view(
                 act.hidden_states_scale,
-                x.shape[1] // w.block,
+                H // self._block,
                 T,
                 "hidden_states_scale",
-                w.block,
+                self._block,
             )
             .t()
             .contiguous()
         )
-        if (
-            x.shape[1] != w.hidden_size
-            or w.num_experts != E
-            or cfg.experts.intermediate_size != w.intermediate_size
-        ):
-            raise unsupported(
-                CLASS,
-                f"weights (E {w.num_experts}, I {w.intermediate_size}, H {w.hidden_size}) for hidden {x.shape[1]}, E {E}, I {cfg.experts.intermediate_size}",
-                "weights prepared for this configuration",
-            )
-        a = self._activation()
-        if (w.gated, w.act, w.params) != (a.gated, a.act, a.params):
-            raise unsupported(
-                CLASS,
-                f"{type(cfg.activation).__name__} with weights prepared for another activation",
-                "weights prepared with the layer's activation",
-            )
-        mode = act.routing_input_mode
-        if mode is RoutingInputMode.FromLogits:
-            _validate_logits_inputs(act, T, E, type(self).__name__)
-            # the group-limited selection is a term of the DeepSeekV3 method; with another method the groups have no
-            # meaning in this module (with pre-routed ids the group structure never enters the computation)
-            if self._grouped_other:
-                raise unsupported(
-                    CLASS,
-                    f"expert groups (n_group / topk_group) with {cfg.routing.method!r} from logits",
-                    "the groups with DeepSeekV3, or pre-routed ids",
-                )
-            if self._method is None:
-                raise unsupported(
-                    CLASS,
-                    f"routing method {cfg.routing.method!r} from logits",
-                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm, TopK, Llama4, TopKSigmoid or DeepSeekV3",
-                )
-            bias = act.routing_bias
-            if (bias is not None) != self._method.bias:
-                raise unsupported(
-                    CLASS,
-                    "a routing bias" if bias is not None else "no routing bias",
-                    "a bias exactly for the methods that select on sigmoid(l) + bias",
-                )
-            scale = cfg.routing.routed_scaling_factor if self._method.scaled else None
-            if self._method.scaled and scale is None:
-                scale = 1.0
-            from .blocks.scheduler import MAX_E
-            from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
+        return [x, sx]
 
-            if (
-                0 < T <= ROUTE_PLAN_MAX_TOKENS
-                and T * k <= ROUTE_PLAN_MAX_SLOTS
-                and cfg.routing.num_experts <= MAX_E
-            ):
-                # routing and the permutation plan in one launch (a placement: the same bits and integers)
-                ids, wts, counts, dest, src = route_plan(
-                    act.routing_logits, k, self._method, bias, scale
-                )
-                plan = [counts, dest, src]
-            else:
-                ids, wts = route(act.routing_logits, k, self._method, bias, scale)
-        else:
-            _validate_prerouted_inputs(
-                act,
-                T,
-                k,
-                type(self).__name__,
-                allowed_weights_dtypes=(torch.bfloat16, torch.float32),
-                require_contiguous=True,
-            )
-            ids = act.topk_ids.contiguous()
-            wts = act.topk_weights
-            if mode is RoutingInputMode.PackedPrecomputed:
-                wts = wts.to(
-                    torch.bfloat16
-                )  # the packed word carries the weight as bf16
-            wts = wts.to(torch.float32).contiguous()
-        out = torch.empty(T, x.shape[1], dtype=torch.bfloat16, device=x.device)
-        return [x, sx, ids, wts, w.w1, w.w1_sf, w.w2, w.w2_sf, out] + plan
+    # ---- the weight view -------------------------------------------------------------------------------------------
+    def _weights_from_view(self, view):
+        from .api_fp8bs import MoEWeightsE4M3BS
+
+        return MoEWeightsE4M3BS.from_view(view)
+
+    def _weight_tensors(self, w) -> List[torch.Tensor]:
+        return [w.w1, w.w1_sf, w.w2, w.w2_sf]
+
+    def _weights_from_tensors(self, a, tensors: List[torch.Tensor]):
+        from .api_fp8bs import MoEWeightsE4M3BS
+
+        w1, w1_sf, w2, w2_sf = tensors
+        self._block = MoEWeightsE4M3BS.block_of(w1, w1_sf)
+        return MoEWeightsE4M3BS(
+            w1, w1_sf, w2, w2_sf, a.gated, a.act, a.params, self._block
+        )
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
-    def _ranked(self, T: int, fused: bool) -> Tuple[list, list]:
+    def _ranked(self, T: int, fused: Optional[bool] = None) -> Tuple[list, list]:
+        """The ranked records of both GEMMs over both record spaces at ``T`` tokens for the requantization spelling ``fused``
+        (the default spelling's at this token count when None), memoised (`schedule_fp8bs.rank_grouped_fp8bs`)."""
         from .blocks.fp8bs_compile import GEMM2_CHAIN
         from .schedule import TOP_K, active_experts, rows_per_expert
         from .schedule_fp8bs import gemm1_chain, rank_grouped_fp8bs
@@ -260,12 +167,12 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
             cfg.experts.intermediate_size,
         )
         H = self._hidden
-        block = getattr(self, "_block", QBLOCK)
+        if fused is None:
+            fused = self._fused_default(T)
         rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
         n1 = 2 * I if a.gated else I
-        # the ranked lists hold both record spaces (the grouped records and the swapped decode records): the autotuner's alternatives
         return (
             rank_grouped_fp8bs(
                 rows,
@@ -277,7 +184,7 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
                 family,
                 TOP_K,
                 n_active=n_act,
-                block=block,
+                block=self._block,
             ),
             rank_grouped_fp8bs(
                 rows,
@@ -289,20 +196,31 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
                 family,
                 TOP_K,
                 n_active=n_act,
-                block=block,
+                block=self._block,
             ),
         )
 
-    def _default(self, T: int):
+    def _fused_default(self, T: int) -> bool:
         from .schedule_fp8bs import fused_quant_default
 
         cfg = self.config
-        block = getattr(self, "_block", QBLOCK)
-        fused = fused_quant_default(
-            T, cfg.routing.top_k, cfg.routing.num_experts, block
+        return fused_quant_default(
+            T, cfg.routing.top_k, cfg.routing.num_experts, self._block
         )
+
+    def _default(self, T: int):
+        """``(c1, c2, fused)``: the dispatcher's records and spelling at ``T`` tokens."""
+        fused = self._fused_default(T)
         r1, r2 = self._ranked(T, fused)
         return r1[0], r2[0], fused
+
+    def _pick(self, T: int) -> Tuple[Any, Any]:
+        c1, c2, self._fused = self._default(T)
+        return c1, c2
+
+    def _configs_of_tactic(self, tactic: Any) -> Tuple[Any, Any]:
+        c1, c2, self._fused = _configs_from_tactic_bs(tuple(tactic))
+        return c1, c2
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
         """The ranked record pairs of both requantization spellings, the dispatcher's spelling first (every tactic computes
@@ -311,7 +229,7 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         self._hidden = int(inputs[_X].shape[1])
         self._block = MoEWeightsE4M3BS_block_of(inputs)
         T = int(inputs[_X].shape[0])
-        _, _, default_fused = self._default(T)
+        default_fused = self._fused_default(T)
         out: List[Any] = []
         # both requantization spellings at the 128-wide class; the 32-wide class has the standalone pass only
         spellings = (
@@ -323,35 +241,15 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         return out
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + (
-            CLASS_OF[getattr(self, "_block", QBLOCK)] + "-v1",
-        )
+        return super()._cache_key_extras() + (CLASS_OF[self._block] + "-v1",)
 
     # ---- launch ----------------------------------------------------------------------------------------------------
-    def forward(
-        self,
-        inputs: List[torch.Tensor],
-        tactic: Any = -1,
-        do_preparation: bool = False,
-        **kwargs,
-    ) -> torch.Tensor:
-        self._require_built()
-        from .api_fp8bs import MoEWeightsE4M3BS, fused_moe_fp8bs
+    def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
+        from .api_fp8bs import fused_moe_fp8bs
 
-        x, sx, ids, wts, w1, w1_sf, w2, w2_sf, out = inputs[:9]
-        plan = tuple(inputs[9:12]) if len(inputs) >= 12 else None
-        self._hidden = int(x.shape[1])
-        self._block = MoEWeightsE4M3BS.block_of(w1, w1_sf)
-        if tactic == -1 or tactic is None:
-            c1, c2, fused = self._default(int(x.shape[0]))
-        else:
-            c1, c2, fused = _configs_from_tactic_bs(tuple(tactic))
-        a = self._activation()
-        w = MoEWeightsE4M3BS(
-            w1, w1_sf, w2, w2_sf, a.gated, a.act, a.params, self._block
-        )
+        xq, sx = x
         fused_moe_fp8bs(
-            x,
+            xq,
             sx,
             ids,
             wts,
@@ -359,8 +257,9 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
             out=out,
             config1=c1,
             config2=c2,
-            fuse_quant=fused,
+            fuse_quant=self._fused,
             plan=plan,
+            w_round=getattr(inputs, "w_round", False),
         )
         return out
 

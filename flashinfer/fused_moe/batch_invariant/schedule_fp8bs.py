@@ -15,6 +15,8 @@ Numerics-neutral: every record of the space computes the class.
 
 from __future__ import annotations
 
+import functools
+
 from typing import List, Optional, Sequence, Tuple
 
 from ...gemm.batch_invariant.generator import CLUSTERS, Knobs, knob_product
@@ -111,6 +113,30 @@ def rank_grouped_fp8bs(
     swap: Optional[bool] = None,
     block: int = QBLOCK,
 ) -> List[Knobs]:
+    """:func:`_rank_grouped_fp8bs` memoised on its arguments (all hashable scalars; the chain a frozen dataclass): the runner
+    ranks at every forward without a tactic, once per token count."""
+    return list(
+        _rank_grouped_fp8bs(
+            rows, N, K, E, chain, sm_count, family, k, nominal, n_active, swap, block
+        )
+    )
+
+
+@functools.lru_cache(maxsize=16384)
+def _rank_grouped_fp8bs(
+    rows: int,
+    N: int,
+    K: int,
+    E: int,
+    chain: Fp8BsChain,
+    sm_count: Optional[int],
+    family: Optional[str],
+    k: int,
+    nominal: bool,
+    n_active: Optional[int],
+    swap: Optional[bool],
+    block: int,
+) -> Tuple[Knobs, ...]:
     """The ranked records for one block-scale GEMM over both record spaces, as the bf16 backend's ``schedule.rank_grouped``: the
     grouped records the padded body accepts (at a decode-sized ``rows`` the dense dispatcher's structural guard and its few-token
     N-cluster rule select the candidates) and the swapped decode records the swapped body accepts (``swap``: None ranks them with
@@ -232,7 +258,7 @@ def rank_grouped_fp8bs(
         if rec not in seen:
             out.append(rec)
             seen.add(rec)
-    return out[:k]
+    return tuple(out[:k])
 
 
 def fused_quant_default(T: int, k: int, E: int, block: int = QBLOCK) -> bool:

@@ -90,6 +90,7 @@ from ..spec_fp8bs import block_chain, check_block, elem_digit, leaf_value, quant
 from .epilogue import (
     BAR_EPI_STAGE,
     GROUP,
+    GroupedEpilogueBlock,
     MoeF32,
     fragment_offsets,
     staging_bytes,
@@ -98,6 +99,8 @@ from .epilogue import (
 )
 from .scheduler import MAX_E, TABLE_SMEM_BYTES, GroupScheduler, build_group_tables
 
+#: The operand format of the block-scale fp8 classes (the dense block-scale GEMM class's key).
+IN_FMT_BS = "e4m3_bs"
 #: The chain out_fmt of the fused requantization: e4m3 codes + fp32 block scales of the bf16-rounded chain.
 OUT_FMT_QUANT = "e4m3bs"
 OUT_FMTS = ("bf16", "f32", OUT_FMT_QUANT)
@@ -224,12 +227,14 @@ def grouped_scale_ring_bytes(knobs: Knobs, block: int, interleaved: bool) -> int
 
 
 @dataclass(frozen=True)
-class Fp8BsChain:
-    """The epilogue chain of a grouped block-scale GEMM: ``kind`` (``plain``, the gated ``glu`` on an accumulator pair, or the
+class Fp8BsChain(GroupedEpilogueBlock):
+    """The epilogue block of a grouped block-scale GEMM: ``kind`` (``plain``, the gated ``glu`` on an accumulator pair, or the
     ungated ``act`` on one accumulator), the activation, the output format (``bf16``: the chain's bf16 output; ``f32``: the
-    promoted fold as it stands, the oracle output; ``e4m3bs``: the fused requantization of the bf16-rounded chain) and the
-    activation's parameters (binary32 values, ``None`` for an absent clamp / scale: ``spec.ACT_PARAMS``). ``describe()`` names
-    it, parameters included (their bit patterns), so every parameter set is its own compiled kernel."""
+    promoted fold as it stands, the oracle output; ``e4m3bs``: the fused requantization of the bf16-rounded chain, the codes
+    and the block scales its two outputs) and the activation's parameters (binary32 values, ``None`` for an absent clamp /
+    scale: ``spec.ACT_PARAMS``). The block scales are promoted into the fold by the body, so the chain takes no scale
+    operands; the scale block size is the body's parameter. ``describe()`` names it, parameters included (their bit
+    patterns), so every parameter set is its own compiled kernel."""
 
     kind: str = "plain"
     act: str = "silu"
@@ -247,8 +252,22 @@ class Fp8BsChain:
         assert len(self.params) == expected, (self, expected)
 
     @property
-    def pair(self) -> bool:
-        return self.kind == "glu"
+    def in_fmt(self) -> str:
+        return IN_FMT_BS
+
+    @property
+    def quant(self) -> bool:
+        return self.out_fmt == OUT_FMT_QUANT
+
+    def elem(self, fp, acc, acc_gate, alpha_e=None, inv=None):
+        """One output element of a bf16 / f32 chain: the bf16 classes' term, converted (the fused requantization runs the
+        body's own epilogue)."""
+        assert not self.quant, "the fused requantization runs the promotion warpgroups' epilogue"
+        if self.pair:
+            return glu_elem(fp, acc_gate, acc, self.act, self.out_fmt, self.params)
+        if self.kind == "act":
+            return act_elem(fp, acc, self.act, self.out_fmt, self.params)
+        return fp.cvt_out(acc, self.out_fmt)
 
     def describe(self) -> str:
         suffix = "".join(
@@ -283,14 +302,8 @@ def fused_quant_ok(chain: Fp8BsChain, tile_n: int) -> bool:
 
 
 def _chain_elem_bs(chain: Fp8BsChain, acc, acc_gate):
-    """One output element of a bf16 / f32 chain: the gated term of the (gate, up) accumulator pair, the ungated activation of
-    one accumulator, or the plain conversion; every op in fp32 through ``MoeF32`` (the bf16 classes' chains)."""
-    fp = MoeF32
-    if chain.pair:
-        return glu_elem(fp, acc_gate, acc, chain.act, chain.out_fmt, chain.params)
-    if chain.kind == "act":
-        return act_elem(fp, acc, chain.act, chain.out_fmt, chain.params)
-    return fp.cvt_out(acc, chain.out_fmt)
+    """One output element of a bf16 / f32 chain through ``MoeF32`` (the chain's own ``elem``)."""
+    return chain.elem(MoeF32, acc, acc_gate)
 
 
 class GroupedBlockScaleFp8Gemm:

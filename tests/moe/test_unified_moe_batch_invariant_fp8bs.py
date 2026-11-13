@@ -1482,7 +1482,8 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         with pytest.raises(RuntimeError) as excinfo:
             MoELayer(sharded, device=torch.device("cuda"))
         assert "expert parallelism" in str(excinfo.value), shard
-        with pytest.raises(NotImplementedError, match="expert parallelism"):
+        # the class's own refusal fires first and names the shard (the shared assertion stands behind it)
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="expert-parallel shards"):
             BatchInvariantDeepSeekFp8Runner(
                 sharded, torch.device("cuda")
             )._check_support()

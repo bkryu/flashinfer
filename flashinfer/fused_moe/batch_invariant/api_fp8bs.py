@@ -28,12 +28,20 @@ import torch
 
 from ...batch_invariant.fp_interface import exact as fp32
 from ...batch_invariant.support import unsupported
-from ...gemm.batch_invariant.api import persistent_clusters, sm_count_of
-from .schedule import launch_tile_bound
+from ...gemm.batch_invariant.api import sm_count_of
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.spec import BLOCK_K
 from . import spec as S
-from .api import interleave_fc1, permute_plan
+from .api import (
+    _check_fused_inputs,
+    _check_grouped_chain,
+    _check_grouped_operands,
+    _grouped_out,
+    combine_rows,
+    interleave_fc1,
+    launch_grid,
+    permute_plan,
+)
 from .blocks.fp8bs_compile import GEMM2_CHAIN, OUT_FMT_QUANT, Fp8BsChain, gemm1_chain
 from .blocks.scheduler import MAX_E
 from .reference import TorchF32
@@ -463,32 +471,20 @@ def grouped_gemm_fp8bs(
         get_compiled_swapped_fp8bs,
     )
 
-    if (
-        a.dtype != torch.float8_e4m3fn
-        or w.dtype != torch.float8_e4m3fn
-        or a.dim() != 2
-        or w.dim() != 3
-    ):
-        raise TypeError("grouped_gemm_fp8bs takes e4m3 a [Tk, K] and w [E, N, K]")
-    Tk, K = a.shape
-    E, N, K2 = w.shape
-    if (
-        K != K2
-        or a.stride(1) != 1
-        or not w.is_contiguous()
-        or a.stride(0) % ALIGN_E4M3
-        or K % BLOCK_K
-    ):
-        raise ValueError(
-            "grouped_gemm_fp8bs: K-contiguous, 16-byte-aligned operands of one K, a whole number of scale blocks "
-            f"(a {tuple(a.shape)} strides {tuple(a.stride())}, w {tuple(w.shape)})"
-        )
-    if (
-        counts.dtype != torch.int32
-        or tuple(counts.shape) != (E,)
-        or not counts.is_contiguous()
-    ):
-        raise ValueError("grouped_gemm_fp8bs: counts must be a contiguous int32 [E]")
+    # the shared operand rules at the class's alignment: K in whole smem stages of scale blocks, every row 16 bytes
+    _, K, E, N, Tk = _check_grouped_operands(
+        "grouped_gemm_fp8bs",
+        a,
+        w,
+        counts,
+        a.shape[0],
+        None,
+        torch.float8_e4m3fn,
+        ALIGN_E4M3,
+        "e4m3",
+        k_align=BLOCK_K,
+        n_align=ALIGN_E4M3,
+    )
     block = MoEWeightsE4M3BS.block_of(w, w_sf)
     KB, NB = K // block, N // block
     if (
@@ -510,22 +506,14 @@ def grouped_gemm_fp8bs(
             f"grouped_gemm_fp8bs: {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, interleaved={interleaved}, block={block})"
         )
     sfa_v = scale_mn_view(sfa, KB, Tk, "sfa", block)
-    n_out = N // 2 if chain.pair else N
+    n_out = _check_grouped_chain("grouped_gemm_fp8bs", N, chain)
     quant = chain.out_fmt == OUT_FMT_QUANT
     if quant:
-        if out is None:
-            out = torch.empty(Tk, n_out, dtype=torch.float8_e4m3fn, device=a.device)
+        out = _grouped_out(
+            "grouped_gemm_fp8bs", out, Tk, n_out, torch.float8_e4m3fn, a.device
+        )
         if sfo is None:
             sfo = torch.empty(n_out // QBLOCK, Tk, dtype=torch.float32, device=a.device)
-        if (
-            out.dtype != torch.float8_e4m3fn
-            or tuple(out.shape) != (Tk, n_out)
-            or out.stride(1) != 1
-            or out.stride(0) % 16
-        ):
-            raise ValueError(
-                "grouped_gemm_fp8bs: out must be a 16-byte-aligned row-major e4m3 [Tk, n_out]"
-            )
         if (
             tuple(sfo.shape) != (n_out // QBLOCK, Tk)
             or sfo.dtype != torch.float32
@@ -536,18 +524,9 @@ def grouped_gemm_fp8bs(
             )
         out_k, sfo_k = out.view(torch.uint8), sfo
     else:
-        out_dtype = _OUT_DTYPE[chain.out_fmt]
-        if out is None:
-            out = torch.empty(Tk, n_out, dtype=out_dtype, device=a.device)
-        if (
-            out.dtype != out_dtype
-            or tuple(out.shape) != (Tk, n_out)
-            or out.stride(1) != 1
-            or out.stride(0) % 8
-        ):
-            raise ValueError(
-                "grouped_gemm_fp8bs: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
-            )
+        out = _grouped_out(
+            "grouped_gemm_fp8bs", out, Tk, n_out, _OUT_DTYPE[chain.out_fmt], a.device
+        )
         out_k, sfo_k = (
             out,
             w_sf[0, :1, :1].reshape(1, 1),
@@ -561,10 +540,7 @@ def grouped_gemm_fp8bs(
             w_sf,
             out_k,
             counts,
-            min(
-                persistent_clusters(a.device, config),
-                launch_tile_bound(config, Tk, E, N),
-            ),
+            launch_grid(a.device, config, Tk, E, N),
         )
     elif Tk:
         get_compiled_grouped_fp8bs(config, chain, interleaved, block)(
@@ -575,10 +551,7 @@ def grouped_gemm_fp8bs(
             out_k,
             sfo_k,
             counts,
-            min(
-                persistent_clusters(a.device, config),
-                launch_tile_bound(config, Tk, E, N),
-            ),
+            launch_grid(a.device, config, Tk, E, N),
         )
     return (out, sfo) if quant else out
 
@@ -596,6 +569,7 @@ def fused_moe_fp8bs(
     fuse_quant: Optional[bool] = None,
     return_intermediates: bool = False,
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    w_round: bool = False,
 ):
     """The block-scale fp8 MoE FFN for pre-routed tokens: ``xq [T, H]`` e4m3 with ``sx`` its block scales (``[H / 128, T]``, or
     ``[T, H / 128]``), ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` fp32; ``out[t] = sum_r w[t, r] * y_r``
@@ -603,41 +577,24 @@ def fused_moe_fp8bs(
     ``config1`` / ``config2``: the grouped records (any record of the space gives the same bits; the dispatcher's pick by
     default); ``fuse_quant``: the intermediate's requantization in GEMM1's epilogue (True) or by the standalone pass (False):
     a placement, the same bytes either way (:func:`.schedule_fp8bs.fused_quant_default` by default). ``plan``:
-    ``route_plan``'s ``(counts, dest, src)``."""
+    ``route_plan``'s ``(counts, dest, src)``. ``w_round``: the f32 weights enter the fold as their bf16 rounding, by the
+    combine kernel (the pre-routed packed-word convention), as in the bf16 op."""
     from .blocks.fp8bs_compile import get_compiled_gather_rows_scales
-    from .combine import get_compiled_combine, warps_per_token
     from .permute import warps_per_row
     from .schedule_fp8bs import default_configs_fp8bs, fused_quant_default
 
-    if (
-        xq.dtype != torch.float8_e4m3fn
-        or xq.dim() != 2
-        or xq.stride(1) != 1
-        or xq.stride(0) % ALIGN_E4M3
-    ):
-        raise TypeError(
-            "fused_moe_fp8bs: xq must be a row-major, 16-byte-aligned e4m3 [T, H]"
-        )
-    T, H = xq.shape
-    if w.hidden_size != H:
-        raise ValueError(
-            f"fused_moe_fp8bs: xq has H = {H}, the weights H = {w.hidden_size}"
-        )
-    k = token_selected_experts.shape[1]
-    if (
-        tuple(token_selected_experts.shape) != (T, k)
-        or token_selected_experts.dtype != torch.int32
-    ):
-        raise TypeError(
-            "fused_moe_fp8bs: token_selected_experts must be an int32 [T, k]"
-        )
-    if (
-        tuple(token_final_scales.shape) != (T, k)
-        or token_final_scales.dtype != torch.float32
-    ):
-        raise TypeError("fused_moe_fp8bs: token_final_scales must be a float32 [T, k]")
-    experts = token_selected_experts.contiguous()
-    scales = token_final_scales.contiguous()
+    # the shared fused-entry rules (the rows' alignment, the ids and weights, the output)
+    T, H, k, experts, scales, out = _check_fused_inputs(
+        "fused_moe_fp8bs",
+        xq,
+        token_selected_experts,
+        token_final_scales,
+        out,
+        w.hidden_size,
+        torch.float8_e4m3fn,
+        ALIGN_E4M3,
+        "e4m3",
+    )
     E, I, block = w.num_experts, w.intermediate_size, w.block
     check_shape_fp8bs(H, I, E, k, block)
     dev = xq.device
@@ -645,17 +602,6 @@ def fused_moe_fp8bs(
     sx_kt = scale_mn_view(
         sx, KB, T, "hidden_states_scale", block
     ).t()  # as [KB, T] (a view; the gather reads its strides)
-    if out is None:
-        out = torch.empty(T, H, dtype=torch.bfloat16, device=dev)
-    if (
-        tuple(out.shape) != (T, H)
-        or out.dtype != torch.bfloat16
-        or out.stride(1) != 1
-        or out.stride(0) % 8
-    ):
-        raise ValueError(
-            "fused_moe_fp8bs: out must be a row-major, 16-byte-aligned bf16 [T, H]"
-        )
     if fuse_quant is None:
         fuse_quant = (
             fused_quant_default(T, k, E) and block == QBLOCK
@@ -729,10 +675,7 @@ def fused_moe_fp8bs(
     y = grouped_gemm_fp8bs(
         aq, sa, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN
     )  # [Tk_a, H] bf16
-    if T:
-        get_compiled_combine(
-            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev))
-        )(y[:Tk], dest, scales, out, T, H)
+    combine_rows(y[:Tk], dest, scales, out, k, w_round)
     if return_intermediates:
         # the live rows under the common keys; the tail-carrying buffers the kernels consume under ``*_buf`` (a kernel timed
         # on a live-row view reintroduces the out-of-bounds boxes)
