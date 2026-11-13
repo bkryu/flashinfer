@@ -166,12 +166,16 @@ def logCoeffsTail : List String :=
 range. -/
 def hugeC : String := "1.2676506002282294e+30"
 
-/-- The declared natural log of a positive `x` (`spec.log_term`, Cephes logf): `x = m 2^e` through the exact `frexpm` /
-`frexpe`, the exact select `lt = clamp((sqrt(1/2) - m) 2^100, 0, 1)` recentres `m` into `z = m + lt m - 1` and
-`e' = e - lt`; `z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi`. -/
+/-- The declared natural log of a positive `x` (`spec.log_term`, Cephes logf): a positive subnormal `x` is first scaled
+into the normal range by the exact select `sub = clamp((2^-126 - x) 2^100 2^100, 0, 1)` (`x' = mul(x, add(1, mul(sub,
+2^24 - 1)))`, the exponent takes `mul(sub, -24)` back), then `x' = m 2^e` through the exact `frexpm` / `frexpe`, the
+exact select `lt = clamp((sqrt(1/2) - m) 2^100, 0, 1)` recentres `m` into `z = m + lt m - 1` and `e' = e - lt`;
+`z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi`. -/
 def logT (x : MTerm) : MTerm :=
-  let m := MTerm.frexpm x
-  let ex := MTerm.frexpe x
+  let sub := MTerm.fmax (.fmin (.mul (.mul (.add (c "1.1754943508222875e-38") (.neg x)) (c hugeC)) (c hugeC)) (c "1.0")) (c "0.0")
+  let xn := MTerm.mul x (.add (c "1.0") (.mul sub (c "16777215.0")))
+  let m := MTerm.frexpm xn
+  let ex := MTerm.add (.frexpe xn) (.mul sub (c "-24.0"))
   let lt := MTerm.fmax (.fmin (.mul (.add (c "0.7071067690849304") (.neg m)) (c hugeC)) (c "1.0")) (c "0.0")
   let z := MTerm.add (.add m (.mul lt m)) (c "-1.0")
   let ex := MTerm.add ex (.neg lt)
@@ -429,12 +433,12 @@ theorem grouped_tile_reset (cfg : GEMM.Config) (S : Nat) (prev₁ prev₂ : GEMM
 
 /-! ## The swapped records: a second placement space of the grouped GEMM
 
-The swapped body (`fused_moe/batch_invariant/blocks/swap_bf16.py`) computes `Cᵀ` per expert: the expert's weight rows on the
+The swapped body (`fused_moe/batch_invariant/blocks/swap.py`) computes `Cᵀ` per expert: the expert's weight rows on the
 MMA's M side (128 rows per CTA, or 64) and the group's tokens on its N side as a narrow tile of 8 / 16 / 32 rows. The tcgen05 step
 folds the same K sequence per output element whichever operand carries the token, so every output element is the dense
 class's `kfold` of the row's data and the expert's column: the swapped records are placements (`groupedRow` erases the
 orientation with the grouping), and the dispatcher ranks them with the grouped records. The predicate mirrors
-`blocks/swap_bf16.is_swapped_record`; the space is the three token tiles of the 128-row weight tile and the two wider ones of
+`blocks/swap.is_swapped_record` at the bf16 format; the space is the three token tiles of the 128-row weight tile and the two wider ones of
 the 64-row tile. -/
 
 /-- A swapped record of the bf16 classes: the swapped 1-CTA record at 128 weight rows and a narrow token tile (8 / 16 / 32) or
