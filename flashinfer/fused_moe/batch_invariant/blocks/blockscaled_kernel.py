@@ -47,7 +47,7 @@ from ....gemm.batch_invariant.generator import Knobs
 from ....batch_invariant.quantization.layout import SF_COL_TILE
 from ....gemm.batch_invariant.spec import SF_ATOM_KBLOCKS, SF_ATOM_ROWS
 from .epilogue import (
-    GroupedChain,
+    GroupedEpilogueBlock,
     grouped_epilogue_loop,
     staged_store,
     staging_bytes,
@@ -68,6 +68,7 @@ GROUP_ALIGN = SF_ATOM_ROWS
 #: Epilogue warpgroups of the block-scaled grouped kernel (the chains are the epilogue leg once the stores are vectors).
 from .epilogue_mx import (  # noqa: E402
     BAR_EPI_JOIN,
+    MxChain,
     grouped_epilogue_quant_loop,
     xch_bytes,
     xch_layout,
@@ -255,7 +256,7 @@ class GroupedBlockScaledGemmMX:
     def __init__(
         self,
         knobs: Knobs,
-        chain: GroupedChain,
+        chain: GroupedEpilogueBlock,
         in_fmt: str = "mxfp8",
         dense_a: bool = False,
     ):
@@ -263,8 +264,8 @@ class GroupedBlockScaledGemmMX:
         row), the scale factors at the padded positions (one 128x4 atom per (expert, 128-row tile): the swapped decode
         body's packing, :mod:`.swap_mxfp8`), the output's rows the A rows; the stale rows of a partial tile (the next
         group's rows) are never stored. Default: the padded packing."""
-        assert isinstance(chain, GroupedChain), chain
         assert in_fmt in MX_FMTS, in_fmt
+        chain = MxChain.of(chain, in_fmt)
         self.knobs, self.chain, self.in_fmt, self.dense_a = (
             knobs,
             chain,
@@ -744,7 +745,7 @@ class GroupedBlockScaledGemmMX:
                 mma_m_in_cluster,
                 cta_n_in_cluster,
             )
-            if cutlass.const_expr(self.chain.out_fmt == "mxfp8"):
+            if cutlass.const_expr(self.chain.quant):
                 # the MXFP8 class's fused requantization: the codes and the 128x4 block scales of the bf16-rounded chain
                 grouped_epilogue_quant_loop(
                     st,

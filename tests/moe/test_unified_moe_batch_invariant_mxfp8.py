@@ -1517,6 +1517,7 @@ def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
         can_implement_swapped_mxfp8,
     )
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
     from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
     import flashinfer
@@ -1658,9 +1659,7 @@ def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
                         cfg.describe(),
                         a.act,
                     )
-                    codes, sf = gg(
-                        W, cfg, GroupedChain("glu", a.act, "mxfp8", a.params)
-                    )
+                    codes, sf = gg(W, cfg, MxChain("glu", a.act, "mxfp8", a.params))
                     pk, sfr = _quant_ref(ref_a)
                     assert torch.equal(codes.view(torch.uint8).cpu()[:Tk], pk), (
                         counts[:4],
@@ -1676,7 +1675,7 @@ def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
                     bits(gg(Wu, cfg, GroupedChain("act", "relu2", "bf16"))[:Tk].cpu()),
                     bits(ref_u),
                 )
-                codes, sf = gg(Wu, cfg, GroupedChain("act", "relu2", "mxfp8"))
+                codes, sf = gg(Wu, cfg, MxChain("act", "relu2", "mxfp8"))
                 pk, sfr = _quant_ref(ref_u)
                 assert torch.equal(codes.view(torch.uint8).cpu()[:Tk], pk)
                 assert torch.equal(_unswizzle(sf, sf_rows, N).cpu()[pos_pad], sfr)
@@ -1946,7 +1945,8 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         with pytest.raises(RuntimeError) as excinfo:
             MoELayer(sharded, device=torch.device("cuda"))
         assert "expert parallelism" in str(excinfo.value), shard
-        with pytest.raises(NotImplementedError, match="expert parallelism"):
+        # the class's own refusal fires first and names the shard (the shared assertion stands behind it)
+        with pytest.raises(BatchInvariantUnsupportedError, match="expert-parallel shards"):
             BatchInvariantMxfp8Runner(sharded, torch.device("cuda"))._check_support()
     layer = _layer(k, E, I)
     x, logits, w1, w2 = _problem(8, k, H, I, E, seed=9)
