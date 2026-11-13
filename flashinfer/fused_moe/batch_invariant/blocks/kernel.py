@@ -953,7 +953,6 @@ class GroupedBlockGemm:
                 ops.epilogue_loop("grouped")(
                     st,
                     self.chain,
-                    self.chain.twin,
                     ops.interleaved,
                     tidx,
                     warp_idx,

@@ -264,7 +264,7 @@ def _rank_grouped_fp8bs(
 
     space = dense + swapped
     if not space:
-        return []
+        return ()
     guarded = [c for c in dense if decode_sane(c, rows, False, True)] or dense
     if rows <= TOKEN_BOX_ROWS // 4:
         # the dense block-scale dispatcher's few-token rule: the 128-row token box is at least three quarters zero-fill, a TMA

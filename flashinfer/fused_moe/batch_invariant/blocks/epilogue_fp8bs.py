@@ -599,7 +599,6 @@ def block_amax_tree(fp, ys):
 def grouped_blockscale_epilogue_loop(
     st,
     chain: cutlass.Constexpr,
-    twin: cutlass.Constexpr,
     interleaved: cutlass.Constexpr,
     tidx: Int32,
     warp_idx: Int32,
@@ -630,6 +629,7 @@ def grouped_blockscale_epilogue_loop(
     class's ``block``-column block of the group's columns)."""
     pair = chain.pair
     quant = chain.out_fmt == OUT_FMT_QUANT
+    twin = chain.twin  # the fused requantization's rounding chain (the bf16 twin); the chain itself otherwise
     out_dt = mOut.element_type
     g = warp_idx // 4  # this warp's promotion group
     tidx_g = tidx % 128

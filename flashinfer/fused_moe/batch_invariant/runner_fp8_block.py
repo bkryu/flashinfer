@@ -18,7 +18,7 @@ raises the mode's error naming the pairs served, as the config's ``prepare_weigh
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple, Type
+from typing import Any, ClassVar, List, Optional, Tuple, Type
 
 import torch
 
@@ -57,7 +57,10 @@ class BatchInvariantFp8BlockRunner(BatchInvariantMoeRunnerBase):
     flow; a bare instance of this class serves no pair."""
 
     backend_key = "batch_invariant_fp8_block"
-    supported_quant_variants = (PAIR_MXFP8, PAIR_DEEPSEEK_FP8)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        PAIR_MXFP8,
+        PAIR_DEEPSEEK_FP8,
+    )
     # The classes' EP form is not part of this backend: the layer's shard hint lists the runners by this flag, the shared
     # assertion refuses a shard, and ``_check_experts`` states the refusal in the backend's terms first.
     supports_expert_parallelism = False

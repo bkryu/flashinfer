@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Any, Callable, Union
+from typing import Any, Callable, TypeGuard, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -103,7 +103,7 @@ def _is_block_scaled(chain: GroupedEpilogueBlock) -> bool:
     return chain.in_fmt in BLOCK_SCALED
 
 
-def _is_promoted(chain: GroupedEpilogueBlock) -> bool:
+def _is_promoted(chain: GroupedEpilogueBlock) -> TypeGuard[Fp8BsChain]:
     """The block-scale fp8 chains (:class:`.epilogue_fp8bs.Fp8BsChain`): the promoted operand block."""
     return chain.in_fmt == IN_FMT_BS
 
