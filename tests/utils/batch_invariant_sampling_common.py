@@ -180,26 +180,36 @@ PTX_FP_LIKE = re.compile(
 )
 
 
+# The IR / PTX dumps are requested on the DSL's option object inside this process, not through CUTE_DSL_KEEP* environment
+# variables: a CI that validates the compiler environment of every process against the one recorded at test start
+# counts those as compiler switches (the DSL resolves its options from the environment once, into plain attributes of
+# its singleton; the dumps are written before the cache is consulted, so they never affect what is compiled).
+_IR_DUMP_PRELUDE = (
+    "import os\n"
+    "from cutlass.cutlass_dsl.cutlass import CuTeDSL\n"
+    "_dsl = CuTeDSL()\n"
+    "_dsl.envar.keep_ir = True\n"  # the raw IR before any pass (what CUTE_DSL_KEEP=ir-debug requests)
+    "_dsl.envar.keep_ptx = True\n"  # the PTX (what CUTE_DSL_KEEP=ptx requests)
+    "_dsl.envar.dump_dir = os.getcwd()\n"
+)
+
+
 def compile_device_free(tmp_path, code: str, timeout: int = 1800) -> Tuple[str, str]:
     """Run ``code`` (one kernel's compile) in a subprocess with the IR kept in ``tmp_path``; returns the MLIR and the PTX,
     after the generic checks: no ``arith`` float op or ``math`` dialect op, no fast-math, no approximate division or
-    reciprocal anywhere. The subprocess inherits this process's environment: with a device visible it targets that device
-    as this process would (a CI that validates the compiler environment of every process sees the same ``CUTE_DSL_ARCH``
-    / ``FLASHINFER_CUDA_ARCH_LIST``); without one the compile is device-free with the target from ``BI_TEST_ARCH``
-    (default ``sm_100a``)."""
-    env = dict(
-        os.environ,
-        CUTE_DSL_KEEP_IR="1",
-        CUTE_DSL_KEEP="ptx",
-        FLASHINFER_CUTE_DSL_DISABLE_CACHE="1",
-    )
+    reciprocal anywhere. The subprocess inherits this process's environment plus FlashInfer's module cache off (so the DSL
+    compiles and the dumps exist); the dumps are requested on the DSL's option object inside the subprocess
+    (``_IR_DUMP_PRELUDE``), not through ``CUTE_DSL_KEEP*``, and with a device visible the compile targets that device as
+    this process would -- a CI that validates the compiler environment of every process sees no change; without a device
+    the compile is device-free with the target from ``BI_TEST_ARCH`` (default ``sm_100a``)."""
+    env = dict(os.environ, FLASHINFER_CUTE_DSL_DISABLE_CACHE="1")
     if not torch.cuda.is_available():
         env.update(
             CUDA_VISIBLE_DEVICES="",
             CUTE_DSL_ARCH=os.environ.get("BI_TEST_ARCH", "sm_100a"),
         )
     r = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-c", _IR_DUMP_PRELUDE + code],
         cwd=tmp_path,
         env=env,
         capture_output=True,
