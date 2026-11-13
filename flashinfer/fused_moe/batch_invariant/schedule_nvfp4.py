@@ -33,7 +33,7 @@ from ...gemm.batch_invariant.generator import (
     Knobs,
     knob_product,
 )
-from .blocks.epilogue import W4A4Chain
+from .blocks.epilogue import GroupedEpilogueBlock, W4A4Chain
 from .blocks.swap import swapped_knobs
 from .schedule import (  # noqa: F401  (re-exported)
     TOP_K,
@@ -93,13 +93,19 @@ def token_tile_default(rows: int) -> Optional[int]:
     return None
 
 
-def chain_nodes_nvfp4(chain: W4A4Chain) -> int:
+def chain_nodes_nvfp4(chain) -> int:
     """The node count of the chain's term per output element (the exposed epilogue's cost unit): the W4A4 gated / ungated chain on the
     row-scaled accumulators (``glu_scaled_elem`` / ``act_scaled_elem``), GEMM2's scaled conversion, or the static class's GEMM1 -- the
-    fp32 gated value plus its share of the block's quantization (the block's scale and codes over its 16 outputs)."""
+    fp32 gated value plus its share of the block's quantization (the block's scale and codes over its 16 outputs); the MXFP4
+    classes' chains by :func:`.schedule_mxfp4.chain_nodes_mx`."""
     from . import mterm as term
     from . import spec_nvfp4 as Q
+    from .blocks.epilogue import Mxfp4Chain
 
+    if isinstance(chain, Mxfp4Chain):
+        from .schedule_mxfp4 import chain_nodes_mx
+
+        return chain_nodes_mx(chain)
     alg = term.TermAlgebra()
     s = Q.w4a4_row_scale(alg, alg.leaf("alpha", 0), alg.leaf("pts"))
     g, u = alg.leaf("g", 0, 0), alg.leaf("u", 0, 0)
@@ -204,7 +210,7 @@ def rank_grouped_nvfp4(
     N: int,
     K: int,
     E: int,
-    chain: W4A4Chain,
+    chain: GroupedEpilogueBlock,
     in_fmt: str,
     sm_count: Optional[int] = None,
     family: Optional[str] = None,

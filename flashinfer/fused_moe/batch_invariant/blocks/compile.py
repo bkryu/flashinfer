@@ -44,6 +44,7 @@ from .epilogue import (
     OUT_FMTS_W4A4,
     GroupedChain,
     GroupedEpilogueBlock,
+    Mxfp4Chain,
     W4A4Chain,
 )
 from .epilogue_fp8bs import IN_FMT_BS, Fp8BsChain
@@ -70,7 +71,7 @@ OUT_ALIGN_OF = dict(ALIGN, mxfp8=32, nvfp4=32, e4m3bs=16)
 #: A scale-factor buffer is a whole number of 512-byte atoms.
 SF_BUFFER_DIVISIBILITY = SF_ATOM_ROWS * SF_ATOM_KBLOCKS
 #: The chain classes of the block-scaled formats (each names its instruction class through ``at``).
-BLOCKSCALED_CHAINS = (W4A4Chain, MxChain)
+BLOCKSCALED_CHAINS = (W4A4Chain, MxChain, Mxfp4Chain)
 #: The output formats the block-scaled bodies' chains declare: the W4A4 chains' and the MX chains'.
 BLOCK_SCALED_OUT_FMTS = tuple(dict.fromkeys(OUT_FMTS_W4A4 + MX_OUT_FMTS))
 
@@ -367,10 +368,10 @@ def compile_grouped_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
         body = GroupedBlockGemm(cfg, chain, packing=packing)
-        if _is_block_scaled(chain) or _is_promoted(chain):
-            if isinstance(chain, MxChain) or _is_promoted(chain):
-                # the MX and the block-scale fp8 chains: no operand beyond the output (the quantising chain writes its scales
-                # as a second output); the W4A4 unscaled oracle keeps the ``block_scaled`` entry and leaves its alpha / pts unread
+        if _is_block_scaled(chain):
+            if isinstance(chain, (MxChain, Mxfp4Chain)) or _is_promoted(chain):
+                # the MX chains (MXFP8, MXFP4) and the block-scale fp8 chains: no operand beyond the output (the quantising chain
+                # writes its scales as a second output); the W4A4 unscaled oracle keeps ``block_scaled`` (alpha / pts unread)
                 if chain.quant:
                     return cute.compile(
                         body.block_scaled_quant,
@@ -556,8 +557,8 @@ def compile_swapped_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
         body = SwappedGroupedGemm(cfg, chain, gather=gather, k_block=k_block)
-        if _is_block_scaled(chain) or _is_promoted(chain):
-            if isinstance(chain, MxChain) or _is_promoted(chain):
+        if _is_block_scaled(chain):
+            if isinstance(chain, (MxChain, Mxfp4Chain)) or _is_promoted(chain):
                 # the MX and the block-scale fp8 chains' entries; the W4A4 unscaled oracle keeps ``block_scaled`` (alpha / pts unread)
                 if chain.quant:
                     return cute.compile(

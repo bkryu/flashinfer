@@ -192,7 +192,7 @@ class GroupedBlockGemm:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        """The entry of the block-scaled chains without further operands (the MX classes: the e8m0 scales of both operands
+        """The entry of the block-scaled chains without further operands (the MX classes, MXFP8 and MXFP4: the e8m0 scales of both operands
         are applied inside the instruction, no global or per-row scale): ``rows_sf`` the rows of the A operand's scale-factor
         buffer (the padded row count of the dense packing); the block-scale fp8 chains (``sfa`` / ``sfb`` their fp32 block
         scales, ``rows_sf`` unread)."""

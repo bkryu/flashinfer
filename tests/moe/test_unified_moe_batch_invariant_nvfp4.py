@@ -188,8 +188,8 @@ def _routed_pack(x, ids, weights, packed: bool = False) -> MoEActivationPack:
 
 def test_backend_is_registered_and_never_a_default_candidate():
     """The fp4 config is a known backend of the layer, mapped to the fp4 runner, absent from the default candidates; the
-    runner serves the NVFP4 x NVFP4 pair through the NVFP4 implementation runner (the two share the backend's key), declares
-    the three routing modes and every activation class of the layer for the pair."""
+    runner serves the NVFP4 x NVFP4 pair through the NVFP4 implementation runner (the two share the backend's key) beside the
+    MXFP4 x MXFP4 pair, declares the three routing modes and every activation class of the layer for the pair."""
     assert BatchInvariantFp4Config in ALL_BACKEND_CONFIGS
     assert _BACKEND_RUNNERS[BatchInvariantFp4Config] is BatchInvariantFp4Runner
     assert not any(
@@ -204,7 +204,8 @@ def test_backend_is_registered_and_never_a_default_candidate():
     assert BatchInvariantMoeNvfp4Runner.backend_key == KEY
     assert BatchInvariantFp4Runner.supported_quant_variants == (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
-    )
+        (QuantFormat.MXFP4, QuantFormat.MXFP4),
+    )  # the pairs served: this suite's and the MXFP4 x MXFP4 pair's (its own suite)
     assert BatchInvariantFp4Runner.supports_quant(_NVFP4)
     assert BatchInvariantFp4Runner.supports_per_token_scale
     assert set(BatchInvariantFp4Runner.supported_activation_classes) == {

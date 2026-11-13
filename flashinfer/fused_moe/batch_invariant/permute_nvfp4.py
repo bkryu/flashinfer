@@ -46,15 +46,24 @@ class ScatterFp4Kernel:
     the row's first warp moves the per-token scale."""
 
     def __init__(
-        self, k: int, wpr: int = 1, sf_src: str = "128x4", unit_pts: bool = False
+        self,
+        k: int,
+        wpr: int = 1,
+        sf_src: str = "128x4",
+        unit_pts: bool = False,
+        no_pts: bool = False,
+        block: int = 16,
     ):
         """``sf_src``: the source scale factors' layout -- ``"128x4"`` (the quantizer's swizzled buffer) or ``"linear"`` (row-major
-        ``[T, K / 16]`` bytes, the layout of the per-tensor activation pack of the TRTLLM backends: the kernel assembles each 4-byte
-        group of the destination atom from the row's bytes, a zero past the row's last block); ``unit_pts``: the rows' per-token
-        scales are one (the per-tensor pack: nothing to read, the destination gets ``1.0``). Both placements of the same bytes."""
+        ``[T, K / block]`` bytes, the layout of the per-tensor activation pack of the TRTLLM backends: the kernel assembles each
+        4-byte group of the destination atom from the row's bytes, a zero past the row's last block); ``unit_pts``: the rows'
+        per-token scales are one (the per-tensor pack: nothing to read, the destination gets ``1.0``); ``no_pts``: the class
+        carries no per-token scale (the MX classes: nothing is read or stored); ``block``: the elements per scale of the
+        linear source layout. Placements of the same bytes."""
         assert wpr >= 1 and wpr & (wpr - 1) == 0, wpr
         assert sf_src in ("128x4", "linear"), sf_src
         self.k, self.wpr, self.sf_src, self.unit_pts = k, wpr, sf_src, unit_pts
+        self.no_pts, self.block = no_pts, block
 
     @cute.jit
     def __call__(
@@ -125,18 +134,21 @@ class ScatterFp4Kernel:
         )
         n_groups = pcols // Int32(SF_COL_TILE)
         n_sf = (n_groups - lane - part * Int32(LANES) + step - Int32(1)) // step
-        nb = B // Int32(8)  # scale blocks per row (K / 16): the linear row's bytes
+        nb = B // Int32(
+            self.block // 2
+        )  # scale blocks per row (K / block): the linear row's bytes
         if w < stride:
             for r in cutlass.range(0, n_rows, 1):
                 i = w + r * stride
                 t = i // Int32(self.k)
                 p = mDest[i]
                 ps = mDestSf[i]
-                if (lane == 0) & (part == 0):
-                    if cutlass.const_expr(self.unit_pts):
-                        mPtsp[ps] = Float32(1.0)
-                    else:
-                        mPtsp[ps] = mPts[t]
+                if cutlass.const_expr(not self.no_pts):
+                    if (lane == 0) & (part == 0):
+                        if cutlass.const_expr(self.unit_pts):
+                            mPtsp[ps] = Float32(1.0)
+                        else:
+                            mPtsp[ps] = mPts[t]
                 row_x = mX[(t, None)]
                 row_p = mXp[(p, None)]
                 for jj in cutlass.range(0, n_mine, 1):
@@ -170,8 +182,9 @@ class ScatterSfKernel:
     factors and row scales from the dense rows to the padded positions (``k = 1``, ``dest`` the padded position of every
     dense row). One lane per 4-byte group, one warp per row, the warps of a capped grid striding over the rows."""
 
-    def __init__(self, k: int):
-        self.k = k
+    def __init__(self, k: int, no_pts: bool = False):
+        """``no_pts``: the class carries no per-token scale (the MX classes): the row scales are neither read nor stored."""
+        self.k, self.no_pts = k, no_pts
 
     @cute.jit
     def __call__(
@@ -225,8 +238,9 @@ class ScatterSfKernel:
             i = w + r * stride
             t = i // Int32(self.k)
             p = mDest[i]
-            if lane == 0:
-                mPtsp[p] = mPts[t]
+            if cutlass.const_expr(not self.no_pts):
+                if lane == 0:
+                    mPtsp[p] = mPts[t]
             for jj in cutlass.range(0, n_mine, 1):
                 g = jj * LANES + lane
                 dst32[_sf_group_offset(p, g, pcols) // 4] = src32[
@@ -243,12 +257,18 @@ def scatter_grid(Tk: Int32) -> Int32:
 
 @functools.cache
 def get_compiled_scatter_fp4(
-    k: int, wpr: int = 1, sf_src: str = "128x4", unit_pts: bool = False
+    k: int,
+    wpr: int = 1,
+    sf_src: str = "128x4",
+    unit_pts: bool = False,
+    no_pts: bool = False,
+    block: int = 16,
 ) -> Any:
     """``kernel(x4 [T, B] u8, sf [n_src] u8, pts [T] f32, dest [T k] i32, dest_sf [T k] i32, x_perm [rows, B] u8, sf_perm
     [n_dst] u8, pts_perm [rows_sf] f32, Tk, B, pcols)``, ``B % 16 == 0``; ``wpr`` warps per row (``warps_per_row``); ``sf_src``
-    the source scale factors' layout (``"128x4"`` / ``"linear"``: ``sf`` then the row-major ``[T, K / 16]`` bytes, any count);
-    ``unit_pts``: the per-token scales are one (``pts`` unread, a 1-element placeholder)."""
+    the source scale factors' layout (``"128x4"`` / ``"linear"``: ``sf`` then the row-major ``[T, K / block]`` bytes, any count);
+    ``unit_pts``: the per-token scales are one (``pts`` unread, a 1-element placeholder); ``no_pts``: no per-token scale at all
+    (``pts`` / ``pts_perm`` unread, 1-element placeholders); ``block``: the elements per scale of the linear layout."""
 
     def compile_fn():
         sym_t, sym_n, sym_p, sym_b = (
@@ -276,7 +296,10 @@ def get_compiled_scatter_fp4(
             Uint8, (sym_s,), (1,), assumed_align=16 if sf_src == "128x4" else 1
         )
         pts_fake = cute.runtime.make_fake_tensor(
-            Float32, (cute.sym_int(32) if unit_pts else sym_t,), (1,), assumed_align=4
+            Float32,
+            (cute.sym_int(32) if (unit_pts or no_pts) else sym_t,),
+            (1,),
+            assumed_align=4,
         )
         d_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         ds_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
@@ -294,7 +317,7 @@ def get_compiled_scatter_fp4(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            ScatterFp4Kernel(k, wpr, sf_src, unit_pts),
+            ScatterFp4Kernel(k, wpr, sf_src, unit_pts, no_pts, block),
             x_fake,
             sf_fake,
             pts_fake,
@@ -317,14 +340,17 @@ def get_compiled_scatter_fp4(
             + (f"_w{wpr}" if wpr > 1 else "")
             + ("_lin" if sf_src == "linear" else "")
             + ("_unit" if unit_pts else "")
+            + ("_nopts" if no_pts else "")
+            + (f"_b{block}" if block != 16 else "")
         ),
         compile_fn,
     )
 
 
 @functools.cache
-def get_compiled_scatter_sf(k: int) -> Any:
-    """``kernel(sf [n_src] u8, pts [T] f32, dest [T k] i32, sf_perm [n_dst] u8, pts_perm [rows_sf] f32, Tk, pcols)``."""
+def get_compiled_scatter_sf(k: int, no_pts: bool = False) -> Any:
+    """``kernel(sf [n_src] u8, pts [T] f32, dest [T k] i32, sf_perm [n_dst] u8, pts_perm [rows_sf] f32, Tk, pcols)``;
+    ``no_pts``: the per-token scales are neither read nor stored (1-element placeholders)."""
 
     def compile_fn():
         sym_s, sym_t, sym_n, sym_sp, sym_p = (
@@ -347,7 +373,7 @@ def get_compiled_scatter_sf(k: int) -> Any:
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            ScatterSfKernel(k),
+            ScatterSfKernel(k, no_pts),
             sf_fake,
             pts_fake,
             d_fake,
@@ -360,5 +386,7 @@ def get_compiled_scatter_sf(k: int) -> Any:
         )
 
     return jit.build_and_load(
-        MODULE, jit.sanitize_symbol_name(f"moe_scatter_sf_k{k}"), compile_fn
+        MODULE,
+        jit.sanitize_symbol_name(f"moe_scatter_sf_k{k}" + ("_nopts" if no_pts else "")),
+        compile_fn,
     )
