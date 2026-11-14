@@ -2114,7 +2114,10 @@ def top_k_top_p_sampling_from_logits(
     top_k_max: Optional[int] = None,
     *,
     batch_invariant: bool = False,
-) -> torch.Tensor:
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    return_logprob: bool = False,
+    return_kept_logprob: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits.
 
     With ``batch_invariant=True`` the kept set is the batch-invariant class ``support.row.v1`` over the ``lse.row``
@@ -2209,11 +2212,28 @@ def top_k_top_p_sampling_from_logits(
         index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
         construction), and so is ``top_k_max`` (one kernel, no fast path). Anything the classes do not cover raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+    temperature : Optional[Union[torch.Tensor, float]]
+        Only with ``batch_invariant=True`` (``ValueError`` otherwise: the operator's kernel takes none). ``None`` (no
+        scaling), a positive scalar, or a tensor with one positive value per row (float16 / bfloat16 / float32 / float64,
+        the last rounded to float32) of shape ``logits.shape[:-1]`` or ``(rows,)``, applied inside the class's chain
+        (``c = log2(e) / temperature``) exactly as :func:`softmax` and :func:`log_probs` apply it: the kept set, the draw
+        and the returned log-probability are those of ``softmax(logits / temperature)``. A scalar is validated on the
+        host; a tensor's values are not (a ``0`` yields an invalid row).
+    return_logprob : bool
+        Only with ``batch_invariant=True``. Also return the drawn token's natural log-probability under the **full**
+        distribution at the given temperature (fp32, the samples' shape, NaN for an invalid row): bit for bit
+        :func:`log_probs` ``(logits, samples, temperature)``, never renormalised over the kept set -- the value a trainer
+        re-scoring the token computes, so the rollout's and the trainer's log-probabilities are the same bits.
+    return_kept_logprob : bool
+        Only with ``batch_invariant=True``. Also return the drawn token's natural log-probability renormalised over the
+        kept set, ``ln(e_t / mass)`` (fp32, the samples' shape, NaN for an invalid row): the probability the token was
+        actually drawn with (the processed log-probability of the engines' filtered modes).
 
     Returns
     -------
     samples: torch.Tensor
-        Sampled categories, shape ``(batch_size,)``.
+        Sampled categories, shape ``(batch_size,)``. Under ``batch_invariant=True`` with ``return_logprob`` and / or
+        ``return_kept_logprob`` the tuple ``(samples[, logp][, kept_logp])``.
 
     Examples
     --------
@@ -2270,6 +2290,14 @@ def top_k_top_p_sampling_from_logits(
             generator,
             seed,
             offset,
+            temperature=temperature,
+            return_logprob=return_logprob,
+            return_kept_logprob=return_kept_logprob,
+        )
+    if temperature is not None or return_logprob or return_kept_logprob:
+        raise ValueError(
+            "temperature, return_logprob and return_kept_logprob are available under batch_invariant=True only "
+            "(the operator's kernel takes none of them)"
         )
     if filter_apply_order == "top_k_first":
         if _top_k_first_fast_path_applicable(logits, top_k, indices, top_k_max):

@@ -8,10 +8,12 @@ one launch (``draw_support_kernel.py``; the generic entry ``draw_support_api.dra
 Device-free: the pinned receipts (the two classes' fingerprints joined; the dimensions move them, the parameter values do
 not), the exact model is the support model then the draw model over the masked row, the error contract, the kernel's PTX
 (only the declared forms). On an SM100 / SM103 / SM107 device with the CuTe DSL: tokens, validity and the kept mass bitwise
-against the exact model for probability and logits inputs (with the drawn token's renormalised log-probability), f32 /
-bf16, every filter set and both orders, across single-CTA / cluster / staged members and the dispatcher's picks; the
-composition equals the support's mask then the plain draw over the masked weights, the five public entries equal the
-generic entry, the token's log-probability is the support's renormalised one at the token (R4); the index gather; the
+against the exact model for probability and logits inputs (with the drawn token's log-probability under the full
+distribution and under the kept set), f32 / bf16, every filter set and both orders, across single-CTA / cluster / staged
+members and the dispatcher's picks; the composition equals the support's mask then the plain draw over the masked weights,
+the five public entries equal the generic entry (the logits entry with its temperature and its two log-probabilities), the
+token's full-distribution log-probability is ``log_probs`` at the token and the kept one the support's renormalised
+log-probability there (R4); the index gather; the
 generator-only call shape (the pair reserved as the operator's own path reserves it: 32 per row for the rejection
 samplers, one for min-p) and the key forms; batch invariance the way the operator's kernels were probed (a row alone == at
 slot 5 of 64 == at slot 5 of 8; a permutation moves no token) and sub-batches; degenerate parameters and invalid rows;
@@ -195,15 +197,21 @@ def _bits(t):
     return torch.nan_to_num(t.cpu(), 0.0).view(torch.int32)
 
 
-def _same(r, ref, lp=False, label=""):
+def _same_nan(a, b, what):
+    a, b = a.cpu(), b.cpu()
+    assert torch.equal(torch.isnan(a), torch.isnan(b)) and torch.equal(
+        _bits(a), _bits(b)
+    ), what
+
+
+def _same(r, ref, lp=False, label="", lpk=False):
     assert torch.equal(r["samples"].cpu().long(), ref["samples"]), f"{label} token"
     assert torch.equal(r["valid"].cpu(), ref["valid"]), f"{label} valid"
     assert torch.equal(_bits(r["mass"]), _bits(ref["mass"])), f"{label} mass"
     if lp:
-        a, b = r["logp"].cpu(), ref["logprobs"]
-        assert torch.equal(torch.isnan(a), torch.isnan(b)) and torch.equal(
-            _bits(a), _bits(b)
-        ), f"{label} logprob"
+        _same_nan(r["logp"], ref["logprobs"], f"{label} logprob (full distribution)")
+    if lpk:
+        _same_nan(r["kept_logp"], ref["kept_logprobs"], f"{label} kept logprob")
 
 
 # ------------------------------------------------------------------------------------------------ device-free
@@ -330,16 +338,19 @@ def test_unsupported_inputs_raise_before_any_kernel():
 # selection with its early finish), logits under all three filters on a cluster with a per-row temperature, the gather and
 # the token's log-probability.
 IR_CASES = [
-    ("f32", 4096, (128, 1, 4), False, "kp", False, False, False),
-    ("bf16", 32768, (64, 1, 8, "regs", 4), True, "kpm", True, True, True),
+    # (dtype, N, config, logits, filters, per-row temperature, gather, full log-probability, kept log-probability)
+    ("f32", 4096, (128, 1, 4), False, "kp", False, False, False, False),
+    ("bf16", 32768, (64, 1, 8, "regs", 4), True, "kpm", True, True, True, True),
+    # top-k alone on logits with the full log-probability: the row sum tree only for it, no fixed-point mass, no division
+    ("f32", 4096, (128, 1, 4), True, "k", False, False, True, False),
 ]
 
 
 @pytest.mark.parametrize(
-    "dtype,N,cfg,from_logits,fset,trow,idx,lp", IR_CASES, ids=lambda v: str(v)
+    "dtype,N,cfg,from_logits,fset,trow,idx,lp,lpk", IR_CASES, ids=lambda v: str(v)
 )
 def test_draw_support_ir_uses_only_declared_forms(
-    tmp_path, dtype, N, cfg, from_logits, fset, trow, idx, lp
+    tmp_path, dtype, N, cfg, from_logits, fset, trow, idx, lp, lpk
 ):
     """Compile one kernel per code path with no GPU visible and check the PTX: `.rn` arithmetic only, `ex2.approx` iff
     logits and `lg2.approx` iff the log-probability, the declared `cvt.rzi.s64.f32` iff top-p, the divisions declared
@@ -352,7 +363,7 @@ def test_draw_support_ir_uses_only_declared_forms(
         "from flashinfer.batch_invariant.sampling.draw_support_kernel import get_compiled_kernel\n"
         "from flashinfer.batch_invariant.sampling.support_spec import Filters\n"
         f"get_compiled_kernel({dtype!r}, {N}, LSEConfig{cfg}, {from_logits}, Filters({f.top_k!r}, {f.top_p!r}, {f.min_p!r}, {f.order!r}), "
-        f"{trow}, {idx}, {lp}, False)\n"
+        f"{trow}, {idx}, {lp}, False, 'mass', {lpk})\n"
     )
     _, ptx = compile_device_free(tmp_path, code)
     bad = bad_ptx_ops(ptx)
@@ -361,7 +372,7 @@ def test_draw_support_ir_uses_only_declared_forms(
         "lg2.approx.ftz.f32", ""
     )
     assert ("ex2.approx.ftz.f32" in ptx) == from_logits
-    assert ("lg2.approx.ftz.f32" in ptx) == lp
+    assert ("lg2.approx.ftz.f32" in ptx) == (lp or lpk)
     assert ("cvt.rzi.s64.f32" in ptx) == (f.top_p is not None)
     divs = (1 if trow else 0) + (1 if f.top_p is not None else 0)
     assert ptx.count("div.rn.f32") == divs, (ptx.count("div.rn.f32"), divs)
@@ -403,7 +414,9 @@ def _fset(f: Filters):
     )
 
 
-def _spec(ds, N, cfg, from_logits, fset, trow, idx=False, lp=False, pdl=_PDL):
+def _spec(
+    ds, N, cfg, from_logits, fset, trow, idx=False, lp=False, pdl=_PDL, lpk=False
+):
     return (
         ds,
         N,
@@ -415,6 +428,7 @@ def _spec(ds, N, cfg, from_logits, fset, trow, idx=False, lp=False, pdl=_PDL):
         lp,
         pdl,
         "mass",
+        lpk,
     )
 
 
@@ -431,17 +445,19 @@ def _suite_specs(sm):
             for fset in SETS_BY_N[N]:
                 for c in _configs(N, eb):
                     specs.append(_spec(ds, N, c, False, fset, False))
-                    specs.append(_spec(ds, N, c, True, fset, True, lp=True))
+                    specs.append(_spec(ds, N, c, True, fset, True, lp=True, lpk=True))
                 d12 = _d(N, 12, eb, sm)
                 specs.append(_spec(ds, N, d12, False, fset, False))
-                specs.append(_spec(ds, N, d12, True, fset, True, lp=True))
+                specs.append(_spec(ds, N, d12, True, fset, True, lp=True, lpk=True))
     # the composition / public-entries test and the degenerate parameters (N = 1000)
     for fset in ("k", "p", "m", "kp", "kpj"):
         specs.append(_spec("f32", 1000, _d(1000, 6, 4, sm), False, fset, False))
     for fset in ("kp", "kpj"):
         d6 = _d(1000, 6, 2, sm)
         specs.append(_spec("bf16", 1000, d6, True, fset, False))
-        specs.append(_spec("bf16", 1000, d6, True, fset, False, lp=True))
+        specs.append(_spec("bf16", 1000, d6, True, fset, False, lp=True, lpk=True))
+        specs.append(_spec("bf16", 1000, d6, True, fset, False, lpk=True))
+        specs.append(_spec("bf16", 1000, d6, True, fset, True))
     for fset in ("k", "p", "m"):
         specs.append(_spec("f32", 1000, _d(1000, 8, 4, sm), False, fset, False))
     # the index gather (probabilities; logits with the log-probability)
@@ -529,8 +545,9 @@ def test_probs_match_exact_model_across_configs(dtype, N):
 @pytest.mark.parametrize("dtype", DT, ids=["f32", "bf16"])
 @pytest.mark.parametrize("N", NS)
 def test_logits_match_exact_model_and_logprob(dtype, N):
-    """Logits with per-row temperatures and ties: token, validity, the kept mass and the drawn token's renormalised
-    log-probability equal the exact model bit for bit across configs."""
+    """Logits with per-row temperatures and ties: token, validity, the kept mass and the drawn token's two
+    log-probabilities (under the full distribution, under the kept set) equal the exact model bit for bit across
+    configs; the full one is ``log_probs`` at the drawn token, bit for bit (R4)."""
     M = 12
     x = tied_logits(M, N, dtype, seed=4)
     s, o = keys(M, 3)
@@ -542,11 +559,27 @@ def test_logits_match_exact_model_and_logprob(dtype, N):
         )
         for cfg in _configs(N, dtype.itemsize) + [None]:
             r = logits_draw(
-                x, s, o, temperature=temps, return_logprob=True, config=cfg, **kw
+                x,
+                s,
+                o,
+                temperature=temps,
+                return_logprob=True,
+                return_kept_logprob=True,
+                config=cfg,
+                **kw,
             )
             _same(
-                r, ref, lp=True, label=f"{fset} {cfg.describe() if cfg else 'default'}"
+                r,
+                ref,
+                lp=True,
+                lpk=True,
+                label=f"{fset} {cfg.describe() if cfg else 'default'}",
             )
+        ok = r["valid"]
+        full = flashinfer.sampling.log_probs(x, r["samples"].clamp(min=0), temps)
+        assert torch.equal(_bits(r["logp"][ok]), _bits(full[ok])), (
+            f"{fset}: the full-distribution log-probability is not log_probs at the token"
+        )
 
 
 @needs_device
@@ -632,10 +665,21 @@ def test_support_then_draw_and_the_public_entries():
         for i in range(M):
             if bool(r2["valid"][i]):
                 assert bool(sup2.mask[i, int(r2["samples"][i])])
-    # logits: the public entry has no temperature; the token's log-probability is the support's renormalised one (R4)
+    # logits: the kept log-probability is the support's renormalised one at the token and the full one is log_probs
+    # there (R4); the public entry returns (samples[, logp][, kept_logp]) and takes the temperature the classes take
     x = tied_logits(M, N, torch.bfloat16, seed=2)
+    temps = torch.rand(M, device="cuda") + 0.5
     for order in ("top_k_first", "joint"):
-        rl = logits_draw(x, s, o, top_k=ks, top_p=ps, order=order, return_logprob=True)
+        rl = logits_draw(
+            x,
+            s,
+            o,
+            top_k=ks,
+            top_p=ps,
+            order=order,
+            return_logprob=True,
+            return_kept_logprob=True,
+        )
         assert torch.equal(
             flashinfer.sampling.top_k_top_p_sampling_from_logits(
                 x,
@@ -648,25 +692,64 @@ def test_support_then_draw_and_the_public_entries():
             ),
             rl["samples"],
         )
+        tk, lpf, lpk = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            x,
+            ks,
+            ps,
+            filter_apply_order=order,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            return_logprob=True,
+            return_kept_logprob=True,
+        )
+        assert torch.equal(tk, rl["samples"])
+        _same_nan(lpf, rl["logp"], "public logp")
+        _same_nan(lpk, rl["kept_logp"], "public kept_logp")
+        tk2, lpk2 = top_k_top_p_sampling_from_logits_batch_invariant(
+            x,
+            ks,
+            ps,
+            filter_apply_order=order,
+            seed=s,
+            offset=o,
+            return_kept_logprob=True,
+        )
+        assert torch.equal(tk2, rl["samples"])
+        _same_nan(lpk2, rl["kept_logp"], "entry kept_logp")
+        rt = logits_draw(x, s, o, top_k=ks, top_p=ps, order=order, temperature=temps)
         assert torch.equal(
-            top_k_top_p_sampling_from_logits_batch_invariant(
-                x, ks, ps, filter_apply_order=order, seed=s, offset=o
+            flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                x,
+                ks,
+                ps,
+                filter_apply_order=order,
+                seed=s,
+                offset=o,
+                batch_invariant=True,
+                temperature=temps,
             ),
-            rl["samples"],
+            rt["samples"],
         )
         supl = sampling_support(
             x, top_k=ks, top_p=ps, order=order, from_logits=True, return_logprobs=True
         )
         assert torch.equal(rl["mass"], supl.mass)
+        full = flashinfer.sampling.log_probs(x, rl["samples"].clamp(min=0))
         for i in range(M):
             if bool(rl["valid"][i]):
                 t = int(rl["samples"][i])
                 assert bool(supl.mask[i, t])
-                assert rl["logp"][i].view(torch.int32).item() == (
+                assert rl["kept_logp"][i].view(torch.int32).item() == (
                     supl.logprobs[i, t].view(torch.int32).item()
                 )
+                assert rl["logp"][i].view(torch.int32).item() == (
+                    full[i].view(torch.int32).item()
+                )
             else:
-                assert bool(torch.isnan(rl["logp"][i]))
+                assert bool(torch.isnan(rl["logp"][i])) and bool(
+                    torch.isnan(rl["kept_logp"][i])
+                )
     bad = w.clone()
     bad[1, 3] = float("nan")
     with pytest.raises(ValueError, match="NaN"):
@@ -685,6 +768,8 @@ def test_support_then_draw_and_the_public_entries():
         probs_draw(w, s, o)
     with pytest.raises(ValueError, match="log-probability"):
         probs_draw(w, s, o, top_k=5, return_logprob=True)
+    with pytest.raises(ValueError, match="log-probability"):
+        probs_draw(w, s, o, top_k=5, return_kept_logprob=True)
     with pytest.raises(ValueError, match="Invalid filter_apply_order"):
         flashinfer.sampling.top_k_top_p_sampling_from_probs(
             w,
@@ -1146,6 +1231,16 @@ def test_default_path_is_the_operator_kernel(monkeypatch):
         lg, 40, 0.9, seed=seed, offset=off
     )
     assert t.shape == (M,) and tl.shape == (M,)
+    # the logits entry's temperature and log-probabilities exist under the flag only: the default path refuses them
+    for kw in (
+        {"temperature": 0.7},
+        {"return_logprob": True},
+        {"return_kept_logprob": True},
+    ):
+        with pytest.raises(ValueError, match="batch_invariant=True"):
+            flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                lg, 40, 0.9, seed=seed, offset=off, **kw
+            )
     for fn, x, args in (
         (flashinfer.sampling.top_k_sampling_from_probs, probs, (40,)),
         (flashinfer.sampling.top_p_sampling_from_probs, probs, (0.9,)),
