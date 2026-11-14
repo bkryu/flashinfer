@@ -1,24 +1,25 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """The NVFP4 MoE classes' grouped-GEMM dispatcher: the dense 4-bit GEMM class's ranking heuristic at the grouped launch's
-shape, as the bf16 classes' (:mod:`.schedule`).
+shape, as the bf16 classes' (:mod:`.schedule`, whose terms this module reuses).
 
 The grouped block-scaled GEMM is the dense NVFP4 class under a different scheduler (one segment of rows per expert, whole
 128-row scale-factor atoms per segment), so its records are ranked by the dense dispatcher's model
-(:func:`flashinfer.gemm.batch_invariant.schedule.rank_topk` at the instruction class ``in_fmt``: the part's roofline with
-nominal constants, no measured tables) at the dense shape whose tiles and operand bytes are the grouped launch's: ``M`` =
-the rows of one active expert rounded up to the scale-factor atom (the grouped kernel computes whole atoms per group,
-whether or not their rows are real), ``N`` = the active experts' weight rows side by side (every group's tiles count, and the
-weights are read once per group). The ranking is mapped onto the grouped block-scaled space (the dense records at swizzle 1:
-no in-cluster split, no operand swap, no B-reuse tile), filtered by the grouped body's acceptance and by the tile-fit guard: a
-record whose M tile is taller than the group's padded rows is not a candidate (the group scheduler's tiles never span groups,
-so the rows past the group are padding the tile computes for nothing; the dense estimate, which prices such a tile as a dense
-M tail, overrates it there). At few rows per active expert the swapped decode body (:mod:`.blocks.swap_nvfp4`: the weights on
-the MMA's M side, the group's tokens a narrow N tile) leads the ranking by a structural rule -- its record is the narrowest
-swapped token tile the rows per active expert fill to at most three quarters, the padded body otherwise
-(:func:`token_tile_default`) -- so the GEMM traffic at decode is the weights read once instead of a 128-row token atom per
-weight tile. Numerics-neutral: every record of either space is canonical (the same bits), so the dispatcher may depend on
-anything; the ranked list is what the autotuner profiles under ``batch_invariant``.
+(:func:`flashinfer.gemm.batch_invariant.heuristic.estimate_cycles` at the instruction class ``in_fmt``: the part's roofline
+with nominal constants, no measured tables) at the dense shape whose tiles, M tail and operand bytes are the grouped
+launch's: ``M`` = the rows of one active expert, ``N`` = the active experts' weight rows side by side (every group's tiles
+count, and the weights are read once per group). Two record spaces are ranked together, as the bf16 classes' dispatcher
+ranks them: the grouped records (the dense records at swizzle 1: no in-cluster split, no operand swap, no B-reuse tile, no
+in-CTA chunk fold) and the swapped records (:mod:`.blocks.swap`: the weights on the MMA's M side, 128 rows per CTA, the
+group's tokens a narrow N tile of 8 / 16 / 32 rows), which the dense model prices as a swapped decode record. The grouped
+launch's own terms on the dense estimate are the bf16 dispatcher's: the pair term (the cluster tile's dummy share), the
+swapped records' spill factor (the Poisson expectation of token tiles per active expert), the last tile's exposed epilogue
+chain (this class's chain term: the W4A4 gated chain, or the static class's chain plus its share of the block quantization;
+four epilogue warpgroups) and the token box's zero-fill past the group's rows at the packed fp4 element width, rounded to three
+significant digits so records the estimate cannot separate fall through to the structural raster and the enumeration order.
+Every record of either space is filtered by its body's acceptance. Numerics-neutral: every record of either space is
+canonical (the same bits), so the dispatcher may depend on anything; the ranked list is what the autotuner profiles under
+``batch_invariant``.
 """
 
 from __future__ import annotations
@@ -29,13 +30,24 @@ from ...gemm.batch_invariant.generator import (
     CLUSTERS,
     TILES_M_BLOCKSCALED,
     TILES_N_BLOCKSCALED,
-    TILES_N_NARROW,
     Knobs,
     knob_product,
 )
-from ...gemm.batch_invariant.schedule import rank_topk
-from .blocks.epilogue_nvfp4 import W4A4Chain
-from .schedule import TOP_K, active_experts, rows_per_expert  # noqa: F401  (re-exported)
+from .blocks.epilogue import GroupedEpilogueBlock, W4A4Chain
+from .blocks.swap import swapped_knobs
+from .schedule import (  # noqa: F401  (re-exported)
+    TOP_K,
+    active_experts,
+    exposed_epilogue_cycles,
+    pair_term,
+    raster_for,
+    rows_per_expert,
+    tiles_term,
+    zero_fill_cycles,
+)
+
+#: Epilogue warpgroups of the grouped block-scaled body (:data:`.blocks.operands.EPI_WARPGROUPS_BLOCKSCALED`): the exposed
+#: epilogue term splits a tile's chains between them.
 
 GROUP_ALIGN = (
     128  # the padded group alignment the dispatcher ranks at (one scale-factor atom)
@@ -58,32 +70,87 @@ def grouped_knobs_blockscaled(clusters=None) -> List[Knobs]:
 
 
 def swapped_knobs_blockscaled() -> List[Knobs]:
-    """The swapped decode space of the grouped block-scaled classes (:mod:`.blocks.swap_nvfp4`): the dense class's swapped 1-CTA
+    """The swapped decode space of the grouped block-scaled classes (:mod:`.blocks.swap`): the dense class's swapped 1-CTA
     records at the narrow token tiles (128 weight rows x 8 / 16 / 32 tokens), one per tile, no cluster, swizzle 1. Disjoint from
     the grouped space; the body reads the dense packing."""
-    return [
-        Knobs((128, tn), (1, 1), False, True, "m", 1, swap_ab=True)
-        for tn in TILES_N_NARROW
-    ]
+    return swapped_knobs("nvfp4")
 
 
 #: The average rows per active expert fill at most three quarters of the swapped token tile (an empirical margin).
 SWAP_TILE_FILL = (3, 4)
-#: The tiles the rule may pick: the narrowest. The wider swapped tiles measured behind the padded body's dense records of this
-#: dispatcher at the layer level (8-16 rows per active expert); they stay records of the space, selectable.
+#: The narrowest swapped tile: the structural rule's pick (the bench's reference point; the ranking decides the dispatch).
 SWAP_TILES_DEFAULT = (8,)
 
 
 def token_tile_default(rows: int) -> Optional[int]:
-    """The swapped decode body's token tile for ``rows`` rows per active expert: the narrowest swapped tile of ``SWAP_TILES_DEFAULT``
-    the average fills to at most ``SWAP_TILE_FILL`` (a quarter of the tile stays free for the load's unevenness: an expert above the
-    average still fits one tile, so the weights are read once), ``None`` when none does (the padded body: a 128-row token atom holds
-    the group's rows). A structural rule (the rows vs the tile), no measured table; a placement: both bodies compute the same bits."""
+    """The structural rule of the first campaign (kept as the benches' reference point, not the dispatch): the narrowest swapped
+    tile of ``SWAP_TILES_DEFAULT`` the average rows per active expert fill to at most ``SWAP_TILE_FILL``, ``None`` otherwise. The
+    dispatch ranks the swapped records with the grouped ones (:func:`rank_grouped_nvfp4`)."""
     num, den = SWAP_TILE_FILL
     for tn in SWAP_TILES_DEFAULT:
         if rows * den <= tn * num:
             return tn
     return None
+
+
+def chain_nodes_nvfp4(chain) -> int:
+    """The node count of the chain's term per output element (the exposed epilogue's cost unit): the W4A4 gated / ungated chain on the
+    row-scaled accumulators (``glu_scaled_elem`` / ``act_scaled_elem``), GEMM2's scaled conversion, or the static class's GEMM1 -- the
+    fp32 gated value plus its share of the block's quantization (the block's scale and codes over its 16 outputs); the MXFP4
+    classes' chains by :func:`.schedule_mxfp4.chain_nodes_mx`."""
+    from . import mterm as term
+    from . import spec_nvfp4 as Q
+    from .blocks.epilogue import Mxfp4Chain
+
+    if isinstance(chain, Mxfp4Chain):
+        from .schedule_mxfp4 import chain_nodes_mx
+
+        return chain_nodes_mx(chain)
+    alg = term.TermAlgebra()
+    s = Q.w4a4_row_scale(alg, alg.leaf("alpha", 0), alg.leaf("pts"))
+    g, u = alg.leaf("g", 0, 0), alg.leaf("u", 0, 0)
+    if chain.static_quant:
+        # the block's DAG (the fp32 values, the amax tree, the scale, the codes) sized once and split over its outputs
+        gs = alg.leaf("gs2", 0)
+        if chain.pair:
+            vals = [
+                Q.glu_scaled_pre(
+                    alg,
+                    alg.leaf("g", 0, j),
+                    alg.leaf("u", 0, j),
+                    s,
+                    chain.act,
+                    chain.params,
+                )
+                for j in range(Q.NVFP4_BLOCK)
+            ]
+        else:
+            vals = [
+                Q.act_scaled_pre(alg, alg.leaf("u", 0, j), s, chain.act, chain.params)
+                for j in range(Q.NVFP4_BLOCK)
+            ]
+        sf_d, codes = Q.static_block(alg, vals, gs)
+        return -(-_dag_size([sf_d, *codes]) // Q.NVFP4_BLOCK)
+    if chain.pair:
+        t = Q.glu_scaled_elem(alg, g, u, s, chain.act, chain.out_fmt, chain.params)
+    elif chain.kind == "act":
+        t = Q.act_scaled_elem(alg, u, s, chain.act, chain.out_fmt, chain.params)
+    else:
+        t = Q.scaled_out_elem(alg, u, s, chain.out_fmt)
+    return term.size(t)
+
+
+def _dag_size(roots) -> int:
+    """The distinct nodes reachable from several roots (``mterm.size`` over one): a block's terms share their sub-terms."""
+    seen: set = set()
+    stack = list(roots)
+    while stack:
+        c = stack.pop()
+        if c.uid in seen:
+            continue
+        seen.add(c.uid)
+        stack.extend(a for a in c.args if hasattr(a, "uid"))
+    return len(seen)
 
 
 def _grouped(cfg: Knobs) -> Knobs:
@@ -106,7 +173,9 @@ def all_valid_configs_nvfp4(
 ) -> List[Knobs]:
     """The configuration space the grouped guarantee is claimed over, for an expert weight shape, a chain and an
     instruction class."""
-    from .blocks.compile_nvfp4 import can_implement_grouped_nvfp4
+    from .blocks.compile import (
+        can_implement_grouped_blockscaled as can_implement_grouped_nvfp4,
+    )
 
     return [
         k
@@ -120,7 +189,9 @@ def all_valid_configs_nvfp4_swapped(
 ) -> List[Knobs]:
     """The swapped decode records the swapped body accepts for an expert weight shape, a chain and an instruction class (the
     dense packing); the guarantee is claimed over this space and the grouped space together."""
-    from .blocks.compile_nvfp4 import can_implement_swapped_nvfp4
+    from .blocks.compile import (
+        can_implement_swapped_blockscaled as can_implement_swapped_nvfp4,
+    )
 
     return [
         k
@@ -130,7 +201,7 @@ def all_valid_configs_nvfp4_swapped(
 
 
 def padded_rows(rows: int) -> int:
-    """The rows per active expert the ranking sees: whole scale-factor atoms."""
+    """The rows per active expert rounded up to whole scale-factor atoms (the grouped kernel's tile fit)."""
     return -(-max(1, rows) // GROUP_ALIGN) * GROUP_ALIGN
 
 
@@ -139,7 +210,7 @@ def rank_grouped_nvfp4(
     N: int,
     K: int,
     E: int,
-    chain: W4A4Chain,
+    chain: GroupedEpilogueBlock,
     in_fmt: str,
     sm_count: Optional[int] = None,
     family: Optional[str] = None,
@@ -148,57 +219,95 @@ def rank_grouped_nvfp4(
     n_active: Optional[int] = None,
     swap: Optional[bool] = None,
 ) -> List[Knobs]:
-    """The ranked grouped records for one GEMM: the swapped decode body's record first when the rows per active expert fit
-    a narrow token tile with room to spare (:func:`token_tile_default`; ``swap`` True / False forces / forbids it -- the padded packing takes
-    the grouped records only), then the dense ranking of the instruction class at ``(M = padded rows, N = n_active * N)``
-    mapped onto the grouped space, in rank order, de-duplicated, the records whose M tile fits the padded rows of a group
-    (a taller tile computes padding only), at least ``k`` records when the spaces have them (the ranking is extended by the
-    rest of the grouped space in its enumeration order, so the list is never empty for an implementable shape: the 128-row
-    tiles always fit)."""
-    from .blocks.compile_nvfp4 import (
-        can_implement_grouped_nvfp4,
-        can_implement_swapped_nvfp4,
-    )
+    """The ranked records for one GEMM over both record spaces (the bf16 dispatcher's form, :func:`.schedule.rank_grouped`): the
+    grouped records the grouped body accepts for the weight shape, the chain and the instruction class (at a decode-sized ``rows``
+    the dense dispatcher's structural guard, `heuristic.decode_sane`, selects the candidates; a record whose M tile is taller than
+    the group's padded rows is excluded: the group scheduler's tiles never span groups) and the swapped records the swapped body
+    accepts (``swap``: None ranks them with the rest, True keeps only them, False excludes them), ordered by the shared contract's
+    cost (:func:`.schedule.record_cost` at this class's instruction class, with this class's chain term in nodes: the dense estimate
+    under the ranking's overrides times the pair and token-tile terms, the exposed epilogue chain, the token box's exposed zero fill
+    at the packed fp4 width and the body's per-launch fixed cost), rounded to three significant digits; the grouped scheduler's
+    structural raster first among twins, ties in the spaces' enumeration order (the grouped records before the swapped ones, the
+    narrower token tile first). Each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the
+    list: distinct records, at most ``k``, never empty for an implementable shape."""
+    import dataclasses
 
+    from ...gemm.batch_invariant.heuristic import decode_sane
+    from .blocks.compile import (
+        can_implement_grouped_blockscaled as can_implement_grouped_nvfp4,
+    )
+    from .blocks.compile import (
+        can_implement_swapped_blockscaled as can_implement_swapped_nvfp4,
+    )
+    from .schedule import record_cost
+
+    fam = family or "sm_107"
+    m_fit = padded_rows(rows)
+    dense = (
+        []
+        if swap is True
+        else [
+            c
+            for c in grouped_knobs_blockscaled()
+            if c.tile_m <= m_fit
+            and can_implement_grouped_nvfp4(c, N, K, E, chain, in_fmt)
+        ]
+    )
+    swapped = (
+        []
+        if swap is False
+        else [
+            c
+            for c in swapped_knobs_blockscaled()
+            if can_implement_swapped_nvfp4(c, N, K, E, chain, in_fmt)
+        ]
+    )
+    space = dense + swapped
+    guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
+    nodes = chain_nodes_nvfp4(chain)
+
+    def key(i, c):
+        # the shared contract's cost (`schedule.record_cost`) at this class's instruction class and chain term
+        est = record_cost(
+            c,
+            rows,
+            n_active or E,
+            N,
+            K,
+            nodes,
+            chain.pair,
+            fam,
+            sm_count,
+            in_fmt,
+            nominal,
+        )
+        return (
+            float(f"{est:.3g}"),
+            0 if (c.swap_ab or c.raster_along == raster_for(c, rows)) else 1,
+            i,
+        )
+
+    ranked = [
+        c for _k, c in sorted((key(i, c), c) for i, c in enumerate(guarded + swapped))
+    ]
+    members = set(space)
     out: List[Knobs] = []
     seen = set()
-    tn = None
-    if swap is not False:
-        tn = (
-            token_tile_default(rows)
-            if swap is None
-            else (token_tile_default(rows) or TILES_N_NARROW[-1])
+    for rec in ranked[: -(-k // 2)]:
+        twin = dataclasses.replace(
+            rec, raster_along="n" if rec.raster_along == "m" else "m"
         )
-    if tn is not None:
-        sw = Knobs((128, tn), (1, 1), False, True, "m", 1, swap_ab=True)
-        if can_implement_swapped_nvfp4(sw, N, K, E, chain, in_fmt):
-            out.append(sw)
-            seen.add(sw)
-    m = padded_rows(rows)
-    ranked = rank_topk(
-        m,
-        (n_active or E) * N,
-        K,
-        1,
-        "k",
-        sm_count,
-        max(k, 10),
-        family,
-        in_fmt,
-        nominal,
-    )
-    for cand in [_grouped(c) for c in ranked] + grouped_knobs_blockscaled():
-        if (
-            cand in seen
-            or cand.tile_m > m
-            or not can_implement_grouped_nvfp4(cand, N, K, E, chain, in_fmt)
-        ):
-            continue
-        seen.add(cand)
-        out.append(cand)
+        for cand in (rec, twin):
+            if cand not in seen and (cand is rec or cand in members):
+                out.append(cand)
+                seen.add(cand)
+    for rec in ranked:
         if len(out) >= k:
             break
-    return out
+        if rec not in seen:
+            out.append(rec)
+            seen.add(rec)
+    return out[:k]
 
 
 def default_configs_nvfp4(

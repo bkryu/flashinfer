@@ -28,7 +28,7 @@ gradient), bitwise reproducibility of ``dw``, changing token counts in one
 process and the autograd wrapper end to end.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_rmsnorm_det_train`` facade and the ``flashinfer`` top-level
@@ -44,7 +44,7 @@ from pathlib import Path
 
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_det_train")
 cake_build = cake_package("cake_rmsnorm_det_train", "cake_build")
@@ -1471,9 +1471,12 @@ def test_changing_rows_in_one_process_does_not_rebuild(hidden: int) -> None:
     eps = EPS[hidden]
     generator = _generator(hidden, 17)
     w = _weight(hidden, generator)
-    _check_case(hidden, 64)
+    row_counts = (1, 65, 16172, 7, 16231, 255)
+    # Each row-count window can select a different module on first use.
+    for rows in (64, *row_counts):
+        _check_case(hidden, rows)
     loaded_before = loader.load.cache_info().misses
-    for rows in (1, 65, 16172, 7, 16231, 255):
+    for rows in row_counts:
         x = _rows(rows, hidden, generator=generator)
         g = _rows(rows, hidden, generator=generator)
         y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
@@ -1484,7 +1487,7 @@ def test_changing_rows_in_one_process_does_not_rebuild(hidden: int) -> None:
         _assert_bf16_close(dx, dx_ref, f"dx rows={rows}")
         _assert_dw(dw, dw_ref, g, x, rstd, f"dw rows={rows}")
     assert loader.load.cache_info().misses == loaded_before, (
-        "a changed token count rebuilt a module"
+        "revisiting token counts loaded another module"
     )
 
 

@@ -82,7 +82,7 @@ theorem requant_input_is_rounded_chain (act : GAct) (g u : MTerm) : gemm1T act g
 
 /-- The grouped MX space: the dense records of BOTH MX spaces at swizzle 1 -- no in-cluster split, no operand swap, no
 in-CTA chunk fold, no B-reuse tile (tile M 512: the group scheduler has none of them) -- so one record list serves the
-SM107 and the SM100 / SM103 class (mirror of `blocks/compile_mxfp8.py::can_implement_grouped_mxfp8`'s record clause and
+SM107 and the SM100 / SM103 class (mirror of `schedule_mxfp8.can_implement_grouped_mxfp8`'s record clause and
 `schedule_mxfp8.grouped_knobs_mx`). -/
 def groupedOK (cfg : GEMM.Config) : Bool :=
   GEMM.ConfigOKMx8 cfg && GEMM.ConfigOKMx8K64 cfg && cfg.swizzle == 1 && cfg.clusterK == 1 && !cfg.swapAb &&
@@ -90,7 +90,7 @@ def groupedOK (cfg : GEMM.Config) : Bool :=
 
 /-! ## The swapped records: a second placement space of the grouped MX GEMM
 
-The swapped decode body (`fused_moe/batch_invariant/blocks/swap_mxfp8.py`) computes `Cᵀ` per expert: the expert's weight rows on
+The swapped body (`fused_moe/batch_invariant/blocks/swap.py`, the unified bodies' swapped form) computes `Cᵀ` per expert: the expert's weight rows on
 the MMA's M side (128 rows per CTA, one scale-factor atom) and the group's tokens on its N side as a narrow tile of 8 / 16 / 32
 rows read from the dense packing (their scale factors gathered from the padded positions). The block-scaled step is symmetric in
 its operands and folds the same K sequence per output element whichever carries the token, so every output element is the dense
@@ -98,7 +98,7 @@ MX class's fold of the row's data and the expert's column (`grouped_eq_dense_*`)
 with the grouped ones. The fused requantization in the transposed orientation is the quantizer's term on the same bf16-rounded
 value (`requant_input_is_rounded_chain`), its block amax gathered across lanes: the max of non-negative values is exact in every
 association (`MXQuant.lean`), so the bytes are the standalone quantizer's. The predicate mirrors
-`blocks/swap_mxfp8.is_swapped_record`; the space is the three token tiles, a member of both dense MX classes' predicates. -/
+`blocks/swap.is_swapped_record` at the MX format; the space is the three token tiles, a member of both dense MX classes' predicates. -/
 def groupedSwapOK (cfg : GEMM.Config) : Bool :=
   GEMM.ConfigOKMx8 cfg && GEMM.ConfigOKMx8K64 cfg && cfg.swizzle == 1 && cfg.clusterK == 1 && cfg.swapAb && cfg.tm == 128 &&
   (cfg.tn == 8 || cfg.tn == 16 || cfg.tn == 32) && cfg.clusterM == 1 && cfg.clusterN == 1 && !cfg.twoCta && !cfg.ctaChunks

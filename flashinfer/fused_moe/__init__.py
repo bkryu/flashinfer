@@ -48,8 +48,9 @@ from .api import (  # noqa: F401
     CudnnGroupedGemmNvfp4Config,
     CuteDslConfig,
     BatchInvariantBf16Config,
-    BatchInvariantFp4Config,
     BatchInvariantFp8BlockConfig,
+    BatchInvariantFp4Config,
+    BatchInvariantFp8PerTensorConfig,
     FrostLowLatencyConfig,
     PrimsTsConfig,
     CutlassBf16Config,
@@ -323,6 +324,13 @@ def __getattr__(name: str):
             stacklevel=2,
         )
         return CuteDslRunner
+    if name == "BGMVMoEBlackwellPlan":
+        warnings.warn(
+            "BGMVMoEBlackwellPlan is deprecated; use BGMVMoECakePlan instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return BGMVMoECakePlan
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -368,8 +376,9 @@ __all__ = [
     "CudnnGroupedGemmNvfp4Runner",
     "CuteDslConfig",
     "BatchInvariantBf16Config",
-    "BatchInvariantFp4Config",
     "BatchInvariantFp8BlockConfig",
+    "BatchInvariantFp4Config",
+    "BatchInvariantFp8PerTensorConfig",
     "FrostLowLatencyConfig",
     "CutlassBf16Config",
     "CutlassBf16Runner",
@@ -521,6 +530,7 @@ __all__ = [
     "cudnn_frost_grouped_gemm1_swiglu",
     "cudnn_frost_grouped_gemm1_swiglu_workspace_size",
     "bgmv_moe",
+    "BGMVMoEBlackwellPlan",
     "BGMVMoECakePlan",
     "BGMVMoEPortablePlan",
     "bgmv_moe_shrink",

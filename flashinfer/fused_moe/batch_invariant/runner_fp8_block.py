@@ -7,6 +7,11 @@ class family and its runner: MXFP8 x MXFP8 runs the classes ``moe.mxfp8.<act>`` 
 DeepSeekFp8 pair (the block-scale classes) arrives with the block-scale MoE PR. Every pair keeps its own kernels, classes,
 fingerprints and pack conventions: the grouping is the surface alone.
 
+The pair runners take the shared pack / plan / launch flow of :class:`.runner.BatchInvariantMoeRunnerBase` (its reviewed
+rules: the bounds at every entry, the deferred from-logits refusal, the routed scaling factor built at construction, the
+packed mode's weights rounded by the combine kernel, the memoised ranking) and set the format hooks; the backend's own
+rules here are the dense expert placement (an expert-parallel shard is refused by name) and ``do_finalize=True``.
+
 The layer admits the backend for the declared pairs only (``supports_quant``); constructing the runner for another pair
 raises the mode's error naming the pairs served, as the config's ``prepare_weights`` / ``prepare_activations`` do.
 """
@@ -17,28 +22,9 @@ from typing import Any, List, Optional, Tuple, Type
 
 import torch
 
-from ...autotuner import TuningConfig
-from ...batch_invariant.support import BatchInvariantUnsupportedError
-from ..api import (
-    GELU,
-    GeGLU,
-    GeGLUTanh,
-    Identity,
-    MoEConfig,
-    MoEWeightPack,
-    MoEActivationPack,
-    PowLU,
-    QuantConfig,
-    QuantFormat,
-    ReLU,
-    ReLU2,
-    RoutingInputMode,
-    SiLU,
-    SiTU,
-    SwiGLU,
-    SwiGLUStep,
-)
-from ..runners import MoERunner
+from ...batch_invariant.support import BatchInvariantUnsupportedError, unsupported
+from ..api import MoEActivationPack, MoEConfig, MoEWeightPack, QuantConfig, QuantFormat
+from .runner import BatchInvariantMoeRunnerBase
 
 #: The quantization pairs of the fp8 formats with block scales.
 PAIR_MXFP8 = (QuantFormat.MXFP8, QuantFormat.MXFP8)
@@ -60,35 +46,17 @@ def unsupported_pair(quant: QuantConfig) -> BatchInvariantUnsupportedError:
     )
 
 
-class BatchInvariantFp8BlockRunner(MoERunner):
+class BatchInvariantFp8BlockRunner(BatchInvariantMoeRunnerBase):
     """The unified layer's runner for the batch-invariant fp8-block MoE classes: constructing it for a served pair gives
-    the pair's runner (a subclass, ``implementation``), which carries the pair's inputs, tactics and launch."""
+    the pair's runner (a subclass, ``implementation``), which carries the pair's inputs, tactics and launch on the shared
+    flow; a bare instance of this class serves no pair."""
 
     backend_key = "batch_invariant_fp8_block"
-    supported_routing_modes = (
-        RoutingInputMode.FromLogits,
-        RoutingInputMode.PackedPrecomputed,
-        RoutingInputMode.UnpackedPrecomputed,
-    )
     supported_quant_variants = (PAIR_MXFP8,)
-    supported_output_formats = (QuantFormat.BF16,)
-    # every typed activation of the layer, for every pair: the bf16 classes' chains on the fp32 accumulators
-    # (``spec.activation_of``)
-    supported_activation_classes = (
-        SwiGLU,
-        SwiGLUStep,
-        GeGLU,
-        GeGLUTanh,
-        SiTU,
-        PowLU,
-        ReLU2,
-        Identity,
-        GELU,
-        ReLU,
-        SiLU,
-    )
-    # Expert-parallel shards (a local expert range with ids outside it) are the EP classes of a later PR.
+    # The classes' EP form is not part of this backend: the layer's shard hint lists the runners by this flag, the shared
+    # assertion refuses a shard, and ``_check_experts`` states the refusal in the backend's terms first.
     supports_expert_parallelism = False
+    CLASS = "moe.fp8_block"
 
     @classmethod
     def implementation(
@@ -113,18 +81,26 @@ class BatchInvariantFp8BlockRunner(MoERunner):
             cls = impl
         return super().__new__(cls)
 
+    def _bare(self) -> bool:
+        """A bare instance of the backend's class: no pair's runner."""
+        return type(self) is BatchInvariantFp8BlockRunner
+
     # the runners' lifecycle and pack-contract rules on the backend's class itself: a served pair constructs its
-    # implementation runner, which overrides these; a bare instance of this class serves no pair
+    # implementation runner, which takes the shared flow; a bare instance refuses after the shared checks
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        self._require_built()
-        self._validate_pack_contract(act)
-        raise unsupported_pair(self.config.quant)
+        if self._bare():
+            self._require_built()
+            self._validate_pack_contract(act)
+            raise unsupported_pair(self.config.quant)
+        return super().pack_inputs(act, weights)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
-        self._require_built()
-        raise unsupported_pair(self.config.quant)
+        if self._bare():
+            self._require_built()
+            raise unsupported_pair(self.config.quant)
+        return super().get_valid_tactics(inputs, profile)
 
     def forward(
         self,
@@ -133,29 +109,34 @@ class BatchInvariantFp8BlockRunner(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
-        self._require_built()
-        raise unsupported_pair(self.config.quant)
+        if self._bare():
+            self._require_built()
+            raise unsupported_pair(self.config.quant)
+        return super().forward(inputs, tactic, do_preparation, **kwargs)
 
-    def __init__(self, config: MoEConfig, device: Any) -> None:
-        super().__init__()
-        self.config = config
-        self.device = torch.device(device)
-        if self.device.index is None and self.device.type == "cuda":
-            self.device = torch.device("cuda", torch.cuda.current_device())
-        # exact shapes: the dispatcher's pick is a function of the token count (every tactic computes the same bits)
-        self.tuning_config = TuningConfig(use_cuda_graph=True)
-        self._part: Optional[Tuple[int, str]] = None
+    # ---- the backend's rules ---------------------------------------------------------------------------------------
+    def _check_support(self) -> None:
+        self._check_experts()
+        super()._check_support()
 
-    def _activation(self):
-        """The chain of the layer's activation (``spec.ActSpec``: gating, chain name, binary32 parameters)."""
-        from .spec import activation_of
+    def _check_experts(self) -> None:
+        experts, routing = self.config.experts, self.config.routing
+        if experts.local_expert_offset or (
+            experts.local_num_experts not in (None, 0, routing.num_experts)
+        ):
+            raise unsupported(
+                self.CLASS,
+                "expert-parallel shards (local_expert_offset / local_num_experts)",
+                "the full expert set (the classes' EP form is not part of this backend)",
+            )
 
-        return activation_of(self.config.activation)
-
-    def _build(self) -> None:
-        from ...gemm.batch_invariant.api import part_of
-
-        self._part = part_of(self.device)
+    def _check_support_extra(self) -> None:
+        if not self.config.finalize.do_finalize:
+            raise unsupported(
+                self.CLASS,
+                "do_finalize=False",
+                "do_finalize=True (the slot-order combine is part of the class)",
+            )
 
 
 __all__ = [

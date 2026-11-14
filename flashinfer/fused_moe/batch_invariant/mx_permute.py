@@ -24,7 +24,7 @@ from cutlass import Int32, Int64, Uint8
 
 from ...batch_invariant import jit
 
-MODULE = "batch_invariant_moe_mxfp8"
+MODULE = "batch_invariant_moe"  # the MoE kernels' one module (the scatter shares the bodies' cache key)
 WARPS = 4
 LANES = 32
 VEC_BYTES = 16
@@ -100,6 +100,10 @@ class ScatterMxKernel:
         i = cutlass.min(i_raw, Tk - Int32(1))
         p = mDest[i]
         p_sf = mDestSf[i]
+        # a dropped slot (an id outside the expert range) has no position (the plan marks it -1): nothing is written for it
+        live = valid & (p >= Int32(0))
+        p = cutlass.max(p, Int32(0))
+        p_sf = cutlass.max(p_sf, Int32(0))
         t = i // Int32(self.k)
         # the values: 16-byte vectors, this warp's slabs of 32 (lanes stride inside a slab)
         atom = cute.make_copy_atom(
@@ -115,7 +119,7 @@ class ScatterMxKernel:
             j = (jj * Int32(wpr) + part) * LANES + lane
             jc = cutlass.min(j, n_vec - Int32(1))
             cute.copy(atom, cute.local_tile(row_x, (VEC_BYTES,), (jc,)), frag)
-            if valid & (j < n_vec):
+            if live & (j < n_vec):
                 cute.copy(atom, frag, cute.local_tile(row_p, (VEC_BYTES,), (jc,)))
         # the scale bytes: linear source (row t, column j) -> the swizzled destination (row p, column j); padding columns zero
         n_sf_slabs = (pcols + Int32(LANES - 1)) // Int32(LANES)
@@ -125,7 +129,7 @@ class ScatterMxKernel:
             v = Uint8(0)
             if j < nb:
                 v = mSf[t.to(Int64) * nb.to(Int64) + j.to(Int64)]
-            if valid & (j < pcols):
+            if live & (j < pcols):
                 mSfp[_sf_byte_offset(p_sf, j, pcols)] = v
         cute.arch.griddepcontrol_launch_dependents()
 

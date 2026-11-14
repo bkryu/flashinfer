@@ -52,44 +52,28 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm_blockscaled": (
         "gemm/batch_invariant/blocks/compile_blockscaled.py",
     ),
+    # the block-scale fp8 kernels (the DeepSeek-style class behind gemm_fp8_nt_groupwise): their own module
+    "batch_invariant_gemm_fp8_blockscale": (
+        "gemm/batch_invariant/blocks/compile_fp8bs.py",
+    ),
     # the attention kernels (the row body, the Swaps-AB decode body) and the split-KV fixup share one module
     "batch_invariant_attention": (
         "attention/batch_invariant/blocks/compile.py",
         "attention/batch_invariant/swaps/compile.py",
         "attention/batch_invariant/fixup.py",
     ),
-    # the bf16 MoE kernels: the grouped GEMM (which composes the dense GEMM blocks: they are in its closure), the
-    # routing, permutation and combine kernels; the MoE API, dispatcher and runner stay outside
+    # the MoE kernels of the bf16, the fp8 per-tensor, the NVFP4 and the MXFP8 classes: the grouped and the swapped GEMM
+    # bodies (one source for every operand format, composing the dense and the block-scaled GEMM blocks: they are in its
+    # closure), the routing, permutation, combine, fp4 scatter and MX scatter kernels; the MoE API, dispatchers and runners
+    # stay outside
     "batch_invariant_moe": (
         "fused_moe/batch_invariant/blocks/compile.py",
         "fused_moe/batch_invariant/route.py",
         "fused_moe/batch_invariant/route_plan.py",
         "fused_moe/batch_invariant/permute.py",
-        "fused_moe/batch_invariant/combine.py",
-    ),
-    # the MXFP8 MoE kernels: the grouped block-scaled GEMM (which composes the block-scaled dense blocks and the grouped
-    # epilogue / scheduler) and the scatter kernel; the routing, permutation and combine kernels are the bf16 module's
-    "batch_invariant_moe_mxfp8": (
-        "fused_moe/batch_invariant/blocks/compile_mxfp8.py",
-        "fused_moe/batch_invariant/mx_permute.py",
-    ),
-    # the mixed MX classes (e2m1 weights x e4m3 activations) on the same body: their own module, so an edit to the mixed
-    # plans leaves the one-format block-scaled module's objects valid (an edit to the shared body moves both)
-    "batch_invariant_gemm_blockscaled_mixed": (
-        "gemm/batch_invariant/blocks/compile_blockscaled_mixed.py",
-    ),
-    # the mixed MXFP4-weight x MXFP8-activation MoE kernels: the grouped block-scaled GEMM on the mixed plans (which composes
-    # the block-scaled dense blocks and the grouped epilogues / scheduler) and the MX scatter kernel; the routing,
-    # permutation and combine kernels are the bf16 module's
-    "batch_invariant_moe_mxfp4w8a": (
-        "fused_moe/batch_invariant/blocks/compile_mxfp4w8a.py",
-        "fused_moe/batch_invariant/mx_permute.py",
-    ),
-    # the NVFP4 MoE kernels: the grouped block-scaled GEMM (composing the block-scaled dense blocks) and the fp4 scatter
-    # kernels; the routing, plan and combine kernels stay in the bf16 module
-    "batch_invariant_moe_nvfp4": (
-        "fused_moe/batch_invariant/blocks/compile_nvfp4.py",
         "fused_moe/batch_invariant/permute_nvfp4.py",
+        "fused_moe/batch_invariant/mx_permute.py",
+        "fused_moe/batch_invariant/combine.py",
     ),
     # the NVFP4 MoE classes' row-mapped per-token quantization (the quantizer class's kernel with a destination row map)
     "batch_invariant_moe_nvfp4_quant": (
@@ -106,7 +90,7 @@ MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm_blockscaled": (
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
-    "batch_invariant_gemm_blockscaled_mixed": (
+    "batch_invariant_gemm_fp8_blockscale": (
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
 }
@@ -128,19 +112,7 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),
-    "batch_invariant_moe_mxfp8": (
-        "gemm/batch_invariant/schedule.py",
-        "gemm/batch_invariant/heuristic.py",
-    ),
-    "batch_invariant_gemm_blockscaled_mixed": (
-        "gemm/batch_invariant/schedule.py",
-        "gemm/batch_invariant/heuristic.py",
-    ),
-    "batch_invariant_moe_mxfp4w8a": (
-        "gemm/batch_invariant/schedule.py",
-        "gemm/batch_invariant/heuristic.py",
-    ),
-    "batch_invariant_moe_nvfp4": (
+    "batch_invariant_gemm_fp8_blockscale": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),

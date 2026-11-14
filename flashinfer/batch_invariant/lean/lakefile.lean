@@ -19,6 +19,9 @@ lean_exe quantconformance where
 lean_exe samplingconformance where
   root := `SamplingMain
 
+lean_exe megamoeconformance where
+  root := `MegaMoEMain
+
 lean_exe axioms where
   root := `Axioms
   supportInterpreter := true
@@ -29,8 +32,8 @@ lean_exe moeconformance where
 lean_exe moemxfp8conformance where
   root := `MoEMxfp8Main
 
-lean_exe moemxfp4w8aconformance where
-  root := `MoEMxfp4w8aMain
-
 lean_exe moenvfp4conformance where
   root := `MoENvfp4Main
+
+lean_exe moemxfp4conformance where
+  root := `MoEMxfp4Main

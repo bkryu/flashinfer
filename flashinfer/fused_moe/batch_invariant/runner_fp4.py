@@ -8,13 +8,13 @@ implementations share the backend's weight-view key, so ``MoEWeightPack.prepare_
 takes the view ``BatchInvariantFp4Config.prepare_weights`` built for the configured pair. The pairs served here:
 
 * NVFP4 x NVFP4 -- :mod:`.runner_nvfp4`, the W4A4 classes ``moe.nvfp4.<act>``;
-* MXFP4 x MXFP8 -- :mod:`.runner_mxfp4w8a`, the mixed classes ``moe.mxfp4w8a.<act>``.
+* MXFP4 x MXFP4 -- :mod:`.runner_mxfp4`, the classes ``moe.mxfp4.<act>`` (UE8M0 block scales on both operands).
 
-A pair outside ``supported_quant_variants`` is skipped by ``MoELayer``'s
+MXFP4 x MXFP8 arrives with the mixed MoE PR. A pair outside ``supported_quant_variants`` is skipped by ``MoELayer``'s
 candidate filter (``supports_quant``) and refused by the runner's ``check_support`` and by the config's ``prepare_weights`` /
 ``prepare_activations`` with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming the served pairs.
-The kernel classes keep their registry names (``fingerprint("fused_moe_nvfp4", ...)`` / ``fingerprint("fused_moe_mxfp4w8a",
-...)``): the backend's key names the group, not a class.
+The kernel classes keep their registry names (``fingerprint("fused_moe_nvfp4", ...)``): the backend's key names the group, not
+a class.
 """
 
 from __future__ import annotations
@@ -27,16 +27,20 @@ from ...autotuner import TuningConfig
 from ...batch_invariant.support import BatchInvariantUnsupportedError
 from ..api import MoEActivationPack, MoEWeightPack, QuantConfig, QuantFormat
 from ..runners import MoERunner
-from .runner_mxfp4w8a import BatchInvariantMoeMxfp4w8aRunner
+from .runner_mxfp4 import BatchInvariantMoeMxfp4Runner
 from .runner_nvfp4 import BatchInvariantMoeNvfp4Runner
 
 #: The backend's key: the name of its weight view and of its autotuner records, shared by the pair implementations.
 BACKEND_KEY = "batch_invariant_fp4"
 #: The quantization pairs the backend serves, each by its implementation runner (in the order they are advertised).
-PAIRS: Dict[Tuple[QuantFormat, QuantFormat], Type[MoERunner]] = {
+# the implementation runners (MoERunner subclasses constructed with (config, device); typed loosely: the base class's
+# constructor takes no arguments and the delegated entries are the implementations')
+PAIRS: Dict[Tuple[QuantFormat, QuantFormat], Type[Any]] = {
     (QuantFormat.NVFP4, QuantFormat.NVFP4): BatchInvariantMoeNvfp4Runner,
-    (QuantFormat.MXFP4, QuantFormat.MXFP8): BatchInvariantMoeMxfp4w8aRunner,
+    (QuantFormat.MXFP4, QuantFormat.MXFP4): BatchInvariantMoeMxfp4Runner,
 }
+#: The pairs of the group that a later PR of the series brings (named by the refusal).
+PENDING_PAIRS = "MXFP4 x MXFP8 arrives with the mixed MoE PR"
 
 
 def pair_name(pair: Tuple[QuantFormat, QuantFormat]) -> str:
@@ -44,11 +48,12 @@ def pair_name(pair: Tuple[QuantFormat, QuantFormat]) -> str:
 
 
 def unsupported_pair(quant: QuantConfig) -> BatchInvariantUnsupportedError:
-    """The refusal of a quantization pair the fp4 backend does not serve: it names the served pairs."""
+    """The refusal of a quantization pair the fp4 backend does not serve: it names the served pairs (and the pending ones)."""
     served = ", ".join(pair_name(p) for p in PAIRS)
+    pending = f"; {PENDING_PAIRS}" if PENDING_PAIRS else ""
     return BatchInvariantUnsupportedError(
         f"batch_invariant=True: the fp4 MoE backend `{BACKEND_KEY}` (BatchInvariantFp4Config) does not serve the "
-        f"quantization weight={quant.weight.name}, activation={quant.activation.name}; it serves {served}. "
+        f"quantization weight={quant.weight.name}, activation={quant.activation.name}; it serves {served}{pending}. "
         "The batch-invariant mode never falls back to another kernel; call without batch_invariant=True to use the "
         "regular backends."
     )
@@ -72,8 +77,8 @@ class BatchInvariantFp4Runner(MoERunner):
     supported_activation_classes_by_quant = {
         pair: tuple(impl.supported_activation_classes) for pair, impl in PAIRS.items()
     }
-    # the NVFP4 pair consumes a pre-quantized pack's per-token scale (the class's own ``pts``); the MXFP4 x MXFP8 pair
-    # rejects the flag itself
+    # the NVFP4 pair consumes a pre-quantized pack's per-token scale (the class's own ``pts``); the MX pair has none and
+    # rejects the flag itself (``check_support`` of its implementation)
     supports_per_token_scale = any(
         impl.supports_per_token_scale for impl in PAIRS.values()
     )
@@ -87,12 +92,12 @@ class BatchInvariantFp4Runner(MoERunner):
             self.device = torch.device("cuda", torch.cuda.current_device())
         impl = PAIRS.get(config.quant.pair)
         # an unserved pair is refused by check_support (the layer's filter never constructs this case)
-        self._impl: Optional[MoERunner] = (
+        self._impl: Optional[Any] = (
             impl(config, self.device) if impl is not None else None
         )
 
     @property
-    def impl(self) -> MoERunner:
+    def impl(self) -> Any:
         """The configured pair's implementation runner."""
         if self._impl is None:
             raise unsupported_pair(self.config.quant)
@@ -106,6 +111,8 @@ class BatchInvariantFp4Runner(MoERunner):
     def _check_support(self) -> None:
         if self._impl is None:
             raise unsupported_pair(self.config.quant)
+        # the pair's own shard refusal first (the class's terms), then the layer's generic rules, then the pair's
+        self._impl._check_experts()
         super()._check_support()
         self._impl.check_support()
 

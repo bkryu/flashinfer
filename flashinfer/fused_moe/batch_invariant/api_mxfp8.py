@@ -31,14 +31,25 @@ from ...batch_invariant.quantization.layout import padded_sf_cols as _padded_sf_
 from ...batch_invariant.quantization.layout import sf_numel as _sf_numel
 from ...batch_invariant.quantization.mx_api import mxfp8_quantize_batch_invariant
 from ...batch_invariant.support import compute_capability, unsupported
-from ...gemm.batch_invariant.api import persistent_clusters, sm_count_of
-from .schedule import launch_tile_bound
+from ...gemm.batch_invariant.api import sm_count_of
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.heuristic import family_of
 from ...gemm.batch_invariant.schedule import chunks_for, mx_class_for
 from . import spec as S
-from .api import interleave_fc1, route
-from .blocks.epilogue import GroupedChain
+from .api import (
+    _check_fused_inputs,
+    _check_grouped_chain,
+    _check_grouped_operands,
+    _grouped_out,
+    combine_rows,
+    interleave_fc1,
+    launch_grid,
+    permute_plan,
+    route,
+)
+from .api import padded_rows_bound as _padded_rows_bound
+from .blocks.epilogue import GroupedEpilogueBlock
+from .blocks.epilogue_mx import MxChain
 from .spec_mxfp8 import BLOCK, CLASS, MX_CLASSES
 
 #: The padded group alignment (rows): one 128x4 scale-factor atom.
@@ -51,6 +62,7 @@ PACKINGS = ("padded", "dense")
 #: The routed expert bound of the routing kernel (the bf16 classes' bucket); the group tables take ``MAX_E``.
 E_MAX = 1024
 K_MAX = 16
+ALIGN_E4M3 = 16  # e4m3 elements per 16-byte row: the TMA alignment of every operand
 _OUT = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
 
 
@@ -71,11 +83,8 @@ def padded_sf_cols(K: int) -> int:
 
 def padded_rows_bound(T: int, k: int, E: int, align: int = GROUP_ALIGN) -> int:
     """An upper bound of the padded expanded row count ``sum_e roundup(counts[e], align)`` that does not read the device
-    (CUDA-graph safe): every active expert pads at most ``align - 1`` rows."""
-    n = T * k
-    if n == 0:
-        return 0
-    return -(-(n + (align - 1) * min(E, n)) // align) * align
+    (CUDA-graph safe): every active expert pads at most ``align - 1`` rows (the shared bound at the class's alignment)."""
+    return _padded_rows_bound(T, k, E, align)
 
 
 def check_shape_mxfp8(H: int, I: int, E: int, k: Optional[int] = None) -> None:
@@ -220,20 +229,16 @@ class MoEWeightsMXFP8:
         return self.w1.shape[1]
 
     @property
-    def chain1(self) -> GroupedChain:
+    def chain1(self) -> MxChain:
         """The GEMM1 epilogue chain of the class: the gated ``act`` on the (gate, up) pair or the ungated ``act`` on the
-        single accumulator, with the parameters (the bf16 classes' chains: no scale)."""
-        return GroupedChain(
-            "glu" if self.gated else "act", self.act, "bf16", self.params
-        )
+        single accumulator, with the parameters (the bf16 classes' chain: no scale; the instruction class is the launch's)."""
+        return MxChain("glu" if self.gated else "act", self.act, "bf16", self.params)
 
     @property
-    def chain1_quant(self) -> GroupedChain:
+    def chain1_quant(self) -> MxChain:
         """The fused-requantization spelling of ``chain1``: the same chain, its bf16-rounded value quantized by the
         ``mxfp8.quant`` class in the epilogue (codes and 128x4 block scales out, no bf16 intermediate)."""
-        return GroupedChain(
-            "glu" if self.gated else "act", self.act, "mxfp8", self.params
-        )
+        return MxChain("glu" if self.gated else "act", self.act, "mxfp8", self.params)
 
     def view(self) -> Dict[str, object]:
         """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for this backend."""
@@ -296,7 +301,7 @@ def grouped_gemm_mxfp8(
     w_sf: torch.Tensor,
     counts: torch.Tensor,
     config: Knobs,
-    chain: GroupedChain,
+    chain: GroupedEpilogueBlock,
     in_fmt: Optional[str] = None,
     out: Optional[torch.Tensor] = None,
     dense_a: bool = False,
@@ -314,37 +319,35 @@ def grouped_gemm_mxfp8(
     the padded positions (``sf_numel(sf_rows, K)`` bytes, ``sf_rows`` the padded rows incl. the tail; derived from the
     buffer when not given), the output's rows ``a``'s; the fused requantization's scales land at the padded positions. The
     record selects the body: a dense record runs the padded body (on either packing), a swapped record (``config.swap_ab``:
-    128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap_mxfp8`) the swapped body on
-    the dense packing (``a`` carries at least the token tile's rows past the live rows: ``DENSE_TAIL``)."""
-    from .blocks.compile_mxfp8 import (
+    128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap`) the swapped body on
+    the dense packing (``a`` carries at least the token tile's rows past the live rows: ``DENSE_TAIL``). Both bodies are the
+    unified grouped bodies (:mod:`.blocks.kernel` / :mod:`.blocks.swap`) on the block-scaled operand block at the MX
+    chain's instruction class."""
+    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
+    from .schedule_mxfp8 import (
         can_implement_grouped_mxfp8,
         can_implement_swapped_mxfp8,
-        get_compiled_grouped_mxfp8,
-        get_compiled_swapped_mxfp8,
         swap_k_block_arg,
     )
 
-    if (
-        a.dtype != torch.float8_e4m3fn
-        or w.dtype != torch.float8_e4m3fn
-        or a.dim() != 2
-        or w.dim() != 3
-    ):
-        raise TypeError("grouped_gemm_mxfp8 takes e4m3 a [Tk_pad, K] and w [E, N, K]")
-    Tk, K = a.shape
-    E, N, K2 = w.shape
-    if K != K2 or a.stride(1) != 1 or a.stride(0) != K or not w.is_contiguous():
-        raise ValueError("grouped_gemm_mxfp8: K-contiguous operands of one K")
+    # the shared operand rules at the class's alignment: K in whole scale blocks, N at the weight-row rule, every row 16 bytes
+    _, K, E, N, Tk = _check_grouped_operands(
+        "grouped_gemm_mxfp8",
+        a,
+        w,
+        counts,
+        a.shape[0],
+        None,
+        torch.float8_e4m3fn,
+        ALIGN_E4M3,
+        "e4m3",
+        k_align=BLOCK,
+        n_align=8,
+    )
     if not dense_a and Tk % GROUP_ALIGN:
         raise ValueError(
             "grouped_gemm_mxfp8: the padded rows are a multiple of the 128-row scale-factor atom"
         )
-    if (
-        counts.dtype != torch.int32
-        or tuple(counts.shape) != (E,)
-        or not counts.is_contiguous()
-    ):
-        raise ValueError("grouped_gemm_mxfp8: counts must be a contiguous int32 [E]")
     a_sf, w_sf = _bytes(a_sf, "a_sf").reshape(-1), _bytes(w_sf, "w_sf").reshape(-1)
     if dense_a:
         if sf_rows is None:
@@ -366,16 +369,15 @@ def grouped_gemm_mxfp8(
     in_fmt = in_fmt or mx_class_of(a.device)
     if in_fmt not in MX_CLASSES:
         raise ValueError(f"grouped_gemm_mxfp8: unknown instruction class {in_fmt!r}")
+    chain = MxChain.of(chain, in_fmt)
+    n_out = _check_grouped_chain("grouped_gemm_mxfp8", N, chain)
 
     def grid_of():
         # the persistent grid clipped to the launch's tile bound from the static sizes (``a``'s rows bound the live rows): which
         # CTA computes a tile, never the bits; ``grid`` overrides
         if grid is not None:
             return grid
-        return min(
-            persistent_clusters(a.device, config),
-            launch_tile_bound(config, a.shape[0], E, N),
-        )
+        return launch_grid(a.device, config, a.shape[0], E, N)
 
     if config.swap_ab:
         if not dense_a:
@@ -388,7 +390,7 @@ def grouped_gemm_mxfp8(
             raise ValueError(
                 f"grouped_gemm_mxfp8: swapped record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt}, k_block={kb or 'default'})"
             )
-        kernel = get_compiled_swapped_mxfp8(config, chain, in_fmt, kb)
+        kernel_of = lambda: get_compiled_swapped(config, chain, k_block=kb)  # noqa: E731
 
         def args(*outs):
             return (
@@ -406,7 +408,9 @@ def grouped_gemm_mxfp8(
             raise ValueError(
                 f"grouped_gemm_mxfp8: record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
             )
-        kernel = get_compiled_grouped_mxfp8(config, chain, in_fmt, dense_a)
+        kernel_of = lambda: get_compiled_grouped(  # noqa: E731
+            config, chain, packing="dense" if dense_a else "padded"
+        )
 
         def args(*outs):
             return (
@@ -416,35 +420,30 @@ def grouped_gemm_mxfp8(
                 w_sf,
                 *outs,
                 counts,
+                sf_rows,
                 grid_of(),
             )
 
-    n_out = N // 2 if chain.pair else N
-    if chain.out_fmt == "mxfp8":
+    if chain.quant:
         # the fused requantization: the codes and the 128x4 scale bytes of the bf16-rounded chain, written by the epilogue
         if out is not None:
             raise ValueError(
                 "grouped_gemm_mxfp8: the fused requantization allocates its two outputs"
             )
-        codes = torch.empty(Tk, n_out, dtype=torch.uint8, device=a.device)
+        codes = _grouped_out(
+            "grouped_gemm_mxfp8", None, Tk, n_out, torch.uint8, a.device
+        )
         sf = torch.empty(sf_numel(sf_rows, n_out), dtype=torch.uint8, device=a.device)
         if Tk:
-            kernel(*args(codes, sf))
+            kernel_of()(
+                *args(codes, sf)
+            )  # the host rules above come before the JIT build
         return codes.view(torch.float8_e4m3fn), sf
-    out_dtype = _OUT[chain.out_fmt]
-    if out is None:
-        out = torch.empty(Tk, n_out, dtype=out_dtype, device=a.device)
-    if (
-        tuple(out.shape) != (Tk, n_out)
-        or out.dtype != out_dtype
-        or out.stride(1) != 1
-        or out.stride(0) % 8
-    ):
-        raise ValueError(
-            "grouped_gemm_mxfp8: out must be a 16-byte-aligned row-major [Tk_pad, n_out] of the chain's dtype"
-        )
+    out = _grouped_out(
+        "grouped_gemm_mxfp8", out, Tk, n_out, _OUT[chain.out_fmt], a.device
+    )
     if Tk:
-        kernel(*args(out))
+        kernel_of()(*args(out))
     return out
 
 
@@ -456,72 +455,21 @@ def permute_plan_padded(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(counts [E] int32, dest [T, k] int32, src [Tk_pad] int32)``: the bf16 classes' deterministic permutation
     (expert order, then token-slot order) with the group offsets rounded up to 128 rows; ``src`` has
-    ``padded_rows_bound`` rows and ``-1`` in every padding slot."""
-    from .api import PLAN_MULTI_MIN_N
-    from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
-
-    T, k = experts.shape
-    n = T * k
-    dev = experts.device
-    flat = experts.reshape(-1)
-    if not flat.is_contiguous() or flat.dtype != torch.int32:
-        raise TypeError(
-            "permute_plan_padded: experts must be a contiguous int32 [T, k]"
-        )
-    dest = torch.empty(n, dtype=torch.int32, device=dev)
-    src = torch.full((padded_rows_bound(T, k, E),), -1, dtype=torch.int32, device=dev)
-    counts = torch.empty(E, dtype=torch.int32, device=dev)
-    if n == 0:
-        counts.zero_()
-        return counts, dest.view(T, k), src
-    if n >= PLAN_MULTI_MIN_N:
-        nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
-        hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
-        get_compiled_plan_multi(GROUP_ALIGN, False, GROUP_ALIGN)(
-            flat, counts, dest, src, dest, dest, hist_blk, n, E, nb
-        )
-    else:
-        get_compiled_plan(GROUP_ALIGN, False, GROUP_ALIGN)(
-            flat, counts, dest, src, dest, dest, n, E
-        )
-    return counts, dest.view(T, k), src
+    ``padded_rows_bound`` rows and ``-1`` in every padding slot (the shared plan's padded form)."""
+    counts, dest, src = permute_plan(experts, E, align=GROUP_ALIGN)
+    return counts, dest, src
 
 
 def permute_plan_dual_padded(
     experts: torch.Tensor, E: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``(counts [E], dest [T, k], src [Tk], dest_pad [T, k], pos_pad [Tk])``: the dense plan (:func:`.api.permute_plan`)
-    plus the positions with the groups padded to 128 rows (``dest_pad[i]``) and the padded position of every dense row
-    (``pos_pad[p]``): the dense packing's row map (the rows dense, the scale factors at the padded positions)."""
-    from .api import PLAN_MULTI_MIN_N
-    from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
-
-    T, k = experts.shape
-    n = T * k
-    dev = experts.device
-    flat = experts.reshape(-1)
-    if not flat.is_contiguous() or flat.dtype != torch.int32:
-        raise TypeError(
-            "permute_plan_dual_padded: experts must be a contiguous int32 [T, k]"
-        )
-    dest = torch.empty(n, dtype=torch.int32, device=dev)
-    src = torch.empty(n, dtype=torch.int32, device=dev)
-    dest_pad = torch.empty(n, dtype=torch.int32, device=dev)
-    pos_pad = torch.empty(n, dtype=torch.int32, device=dev)
-    counts = torch.empty(E, dtype=torch.int32, device=dev)
-    if n == 0:
-        counts.zero_()
-    elif n >= PLAN_MULTI_MIN_N:
-        nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
-        hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
-        get_compiled_plan_multi(1, True, GROUP_ALIGN)(
-            flat, counts, dest, src, dest_pad, pos_pad, hist_blk, n, E, nb
-        )
-    else:
-        get_compiled_plan(1, True, GROUP_ALIGN)(
-            flat, counts, dest, src, dest_pad, pos_pad, n, E
-        )
-    return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
+    """``(counts [E], dest [T, k], src [Tk], dest_pad [T, k], pos_pad [Tk])``: the dense plan plus the positions with the
+    groups padded to 128 rows (``dest_pad[i]``) and the padded position of every dense row (``pos_pad[p]``): the dense
+    packing's row map (the rows dense, the scale factors at the padded positions; the shared plan's dual form)."""
+    counts, dest, src, dest_pad, pos_pad = permute_plan(
+        experts, E, dual=True, pad_align=GROUP_ALIGN
+    )
+    return counts, dest, src, dest_pad, pos_pad
 
 
 # ----------------------------------------------------------------------------- the op
@@ -540,6 +488,7 @@ def fused_moe_mxfp8(
     requant: str = "fused",
     plan: Optional[Tuple[torch.Tensor, ...]] = None,
     path: Optional[str] = None,
+    w_round: bool = False,
 ) -> Any:
     """The MXFP8 x MXFP8 MoE FFN for pre-routed tokens: ``x`` a bf16 ``[T, H]`` (quantized here per token by the
     ``mxfp8.quant`` class) or the quantized pack ``(xq [T, H] e4m3, xsf [T, H / 32] uint8 / UE8M0)`` taken as given;
@@ -553,8 +502,9 @@ def fused_moe_mxfp8(
     dual plan's ``(counts, dest, src, dest_pad, pos_pad)`` from ``route_plan`` (the same integers as the plans here, one
     launch with the routing); its form must match the packing. ``return_intermediates``: the live buffers (``counts``,
     ``dest``, ``src``, ``xq``, ``xsf``, ``x_perm`` / ``x_perm_sf``, ``a``, ``aq`` / ``a_sf``, ``y``; the dense packing adds
-    ``dest_pad`` / ``pos_pad`` and the row counts ``Tk_a`` / ``Tk_sf``), the records used, the packing and the bodies."""
-    from .combine import get_compiled_combine, warps_per_token
+    ``dest_pad`` / ``pos_pad`` and the row counts ``Tk_a`` / ``Tk_sf``), the records used, the packing and the bodies.
+    ``w_round``: the f32 weights enter the fold as their bf16 rounding, by the combine kernel (the pre-routed packed-word
+    convention), as in the bf16 op."""
     from .mx_permute import get_compiled_scatter_mx
     from .permute import warps_per_row
     from .schedule_mxfp8 import GEMM2_CHAIN, default_configs_mx, packing_for
@@ -574,44 +524,26 @@ def fused_moe_mxfp8(
     else:
         xq, xsf = x
         dev, T = xq.device, xq.shape[0]
-    if (
-        xq.dtype != torch.float8_e4m3fn
-        or tuple(xq.shape) != (T, H)
-        or not xq.is_contiguous()
-    ):
-        raise TypeError(f"fused_moe_mxfp8: xq must be a contiguous e4m3 [T, {H}]")
+    if xq.dtype != torch.float8_e4m3fn or tuple(xq.shape) != (T, H):
+        raise TypeError(f"fused_moe_mxfp8: xq must be an e4m3 [T, {H}]")
     xsf8 = _bytes(xsf, "xsf")
     if tuple(xsf8.shape) != (T, H // BLOCK) or not xsf8.is_contiguous():
         raise TypeError(
             f"fused_moe_mxfp8: xsf must be the token-major [T, {H // BLOCK}] UE8M0 scales of the activation pack, got {tuple(xsf8.shape)}"
         )
-    k = token_selected_experts.shape[1]
+    # the shared fused-entry rules (the rows' alignment at the class's scale block, the ids and weights, the output)
+    T, H, k, experts, scales, out = _check_fused_inputs(
+        "fused_moe_mxfp8",
+        xq,
+        token_selected_experts,
+        token_final_scales,
+        out,
+        H,
+        torch.float8_e4m3fn,
+        BLOCK,
+        "e4m3",
+    )
     check_shape_mxfp8(H, I, E, k)
-    if (
-        tuple(token_selected_experts.shape) != (T, k)
-        or token_selected_experts.dtype != torch.int32
-    ):
-        raise TypeError(
-            "fused_moe_mxfp8: token_selected_experts must be an int32 [T, k]"
-        )
-    if (
-        tuple(token_final_scales.shape) != (T, k)
-        or token_final_scales.dtype != torch.float32
-    ):
-        raise TypeError("fused_moe_mxfp8: token_final_scales must be a float32 [T, k]")
-    experts = token_selected_experts.contiguous()
-    scales = token_final_scales.contiguous()
-    if out is None:
-        out = torch.empty(T, H, dtype=torch.bfloat16, device=dev)
-    if (
-        tuple(out.shape) != (T, H)
-        or out.dtype != torch.bfloat16
-        or out.stride(1) != 1
-        or out.stride(0) % 8
-    ):
-        raise ValueError(
-            "fused_moe_mxfp8: out must be a row-major, 16-byte-aligned bf16 [T, H]"
-        )
     in_fmt = in_fmt or mx_class_of(dev)
     if in_fmt not in MX_CLASSES:
         raise ValueError(f"fused_moe_mxfp8: unknown instruction class {in_fmt!r}")
@@ -697,9 +629,7 @@ def fused_moe_mxfp8(
         y = grouped_gemm_mxfp8(
             aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt, dense_a=True
         )  # [Tk_a, H] bf16
-        get_compiled_combine(
-            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev))
-        )(y, dest, scales, out, T, H)
+        combine_rows(y, dest, scales, out, k, w_round)
         if return_intermediates:
             return out, dict(
                 counts=counts,
@@ -760,9 +690,7 @@ def fused_moe_mxfp8(
     y = grouped_gemm_mxfp8(
         aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt
     )  # [Tk_pad, H] bf16
-    get_compiled_combine(k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev)))(
-        y, dest, scales, out, T, H
-    )
+    combine_rows(y, dest, scales, out, k, w_round)
     if return_intermediates:
         return out, dict(
             counts=counts,
