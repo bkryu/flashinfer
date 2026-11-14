@@ -352,6 +352,7 @@ def record_cost(
     *,
     epi_warpgroups: int = _EPI_WARPGROUPS,
     overrides: Optional[dict] = None,
+    fill_fmt: Optional[str] = None,
 ) -> float:
     """The shared contract's cost of one grouped record at the launch's shape ``(rows per expert, n_active x N, K)``, the key
     every class's ``rank_grouped_*`` sorts by: the dense estimate with the MoE ranking's constant overrides
@@ -359,7 +360,8 @@ def record_cost(
     dispatcher's constants untouched), times the pair term and the swapped records' tiles term, plus the exposed epilogue
     chain (over the body's ``epi_warpgroups``) and the token box's exposed fill; in SM cycles (a launch's fixed cost is the
     same for both bodies on every measured part, so it is no term). The class-specific arguments are keyword-only: a class
-    that does not pass them gets the shared defaults."""
+    that does not pass them gets the shared defaults. ``fill_fmt``: the token rows' element format for the fill term where it
+    differs from the class's (the mixed classes' e4m3 tokens against the e2m1 weights the class is named by)."""
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import estimate_cycles
@@ -384,7 +386,7 @@ def record_cost(
     return (
         est * pair_term(cfg, rows) * tiles_term(cfg, rows)
         + exposed_epilogue_cycles(cfg, rows, nodes, pair, epi_warpgroups)
-        + zero_fill_cycles(cfg, rows, K, family, in_fmt)
+        + zero_fill_cycles(cfg, rows, K, family, fill_fmt or in_fmt)
     )
 
 

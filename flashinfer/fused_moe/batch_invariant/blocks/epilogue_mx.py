@@ -76,6 +76,7 @@ from ....batch_invariant.quantization.mx_spec import (
 from ....batch_invariant.fp_interface.exact import f32_bits
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
 from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS
+from ..spec_mxfp4w8a import MX_CLASSES as MX_MIXED_CLASSES
 from ..spec_mxfp8 import MX_CLASSES
 from .epilogue import (
     GROUP,
@@ -143,8 +144,9 @@ class MxChain(GroupedEpilogueBlock):
     format (``bf16`` / ``f16`` / ``f32``: the bf16 chain's conversion through the shared loops; ``mxfp8``: the fused
     requantization of the bf16-rounded chain, the codes and the 128x4 block scales through the loops of this module) and
     the instruction class the operands run on (``in_fmt``: the operand block's key, not part of the chain's name -- the
-    compiled object carries it separately). The accumulators are dequantised by the instruction's block scales, so the
-    chain takes no scale operands. ``describe()`` names the chain as the bf16 classes name theirs."""
+    compiled object carries it separately; the MXFP8 classes' or the mixed MXFP4-weight x MXFP8-activation classes', whose
+    GEMM1 requantises the same way). The accumulators are dequantised by the instruction's block scales, so the chain takes
+    no scale operands. ``describe()`` names the chain as the bf16 classes name theirs."""
 
     kind: str = "plain"
     act: str = "silu"
@@ -154,7 +156,7 @@ class MxChain(GroupedEpilogueBlock):
 
     def __post_init__(self):
         assert self.kind in KINDS and self.out_fmt in MX_OUT_FMTS, self
-        assert self.in_fmt in MX_CLASSES, self
+        assert self.in_fmt in MX_CLASSES or self.in_fmt in MX_MIXED_CLASSES, self
         assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
         if self.kind == "glu" and self.out_fmt not in ("bf16", OUT_FMT):
             raise AssertionError(

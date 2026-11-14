@@ -30,11 +30,13 @@ from ....batch_invariant import jit
 from ....gemm.batch_invariant.blocks.operands import ALIGN, IN_DT, OUT_DT
 from ....gemm.batch_invariant.generator import TILES_N, Knobs
 from ....gemm.batch_invariant.spec import (
+    A_ELEM_BITS_OF,
+    B_ELEM_BITS_OF,
     BLOCK_SCALED,
-    ELEM_BITS_OF,
     SF_ATOM_KBLOCKS,
     SF_ATOM_ROWS,
     SF_VEC,
+    k_granule,
 )
 from .epilogue import (
     GROUP,
@@ -96,8 +98,9 @@ def _is_block_scaled(chain: GroupedEpilogueBlock) -> bool:
 
 def blockscaled_k_align(in_fmt: str) -> int:
     """The K alignment of a block-scaled format's operands: whole scale blocks of whole 16-byte rows (two NVFP4 blocks of 16
-    per 16 bytes, one MX block of 32 e4m3 elements)."""
-    return max(ALIGN[in_fmt], SF_VEC[in_fmt])
+    per 16 bytes, one MX block of 32 e4m3 elements) and whole K granules of the dense class (the sm_100 mixed class's e2m1
+    weight is unpacked by the TMA in 128-element runs: ``spec.k_granule``)."""
+    return max(ALIGN[in_fmt], SF_VEC[in_fmt], k_granule(in_fmt))
 
 
 def kernel_name(
@@ -202,16 +205,24 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
         )  # the padded rows (pts, scale factors)
         sym_r = cute.sym_int(32)
         sym_n = cute.sym_int(32, divisibility=8)
-        if ELEM_BITS_OF[chain.in_fmt] == 4:
-            # the byte-packed 4-bit operands (two elements per byte, K / 2 bytes per row)
-            elem_dt, sym_kd, sdiv = cutlass.Uint8, cute.sym_int(32, divisibility=16), 16
-        else:
-            # the 8-bit element formats as given: K in whole scale blocks, 16-byte rows
-            elem_dt, sym_kd, sdiv = (
-                in_dt,
-                cute.sym_int(32, divisibility=blockscaled_k_align(chain.in_fmt)),
-                al,
-            )
+        k_al = blockscaled_k_align(chain.in_fmt)
+
+        def operand_fake(bits: int):
+            """The element type, the symbolic K extent and the stride divisibility of an operand of ``bits`` per element: the
+            byte-packed 4-bit operands (two elements per byte, K / 2 bytes per row, K in whole 16-byte rows of both operands),
+            the 8-bit formats as given (K in whole scale blocks and K granules, 16-byte rows)."""
+            if bits == 4:
+                return (
+                    cutlass.Uint8,
+                    cute.sym_int(32, divisibility=max(16, k_al // 2)),
+                    max(16, k_al // 2),
+                )
+            return in_dt, cute.sym_int(32, divisibility=k_al), al
+
+        # the token operand (A: the rows) and the weight operand (B) at their own element widths (the one-format classes
+        # share one; the mixed classes' tokens are e4m3 and their weights byte-packed e2m1)
+        a_dt, sym_kd, a_div = operand_fake(A_ELEM_BITS_OF[chain.in_fmt])
+        b_dt, sym_kd_b, b_div = operand_fake(B_ELEM_BITS_OF[chain.in_fmt])
 
         def flat(div):
             return cute.runtime.make_fake_tensor(
@@ -223,12 +234,12 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
 
         def packed3(sym_rows):
             return cute.runtime.make_fake_tensor(
-                elem_dt,
+                a_dt,
                 (sym_rows, sym_kd, 1),
                 (
-                    cute.sym_int64(divisibility=sdiv),
+                    cute.sym_int64(divisibility=a_div),
                     1,
-                    cute.sym_int64(divisibility=sdiv),
+                    cute.sym_int64(divisibility=a_div),
                 ),
                 assumed_align=16,
             )
@@ -236,9 +247,9 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
         f["a"] = packed3(sym_m)
         f["rows"] = packed3(sym_r)
         f["b"] = cute.runtime.make_fake_tensor(
-            elem_dt,
-            (sym_n, sym_kd, sym_e),
-            (cute.sym_int64(divisibility=sdiv), 1, cute.sym_int64(divisibility=sdiv)),
+            b_dt,
+            (sym_n, sym_kd_b, sym_e),
+            (cute.sym_int64(divisibility=b_div), 1, cute.sym_int64(divisibility=b_div)),
             assumed_align=16,
         )
         f["sfa"], f["sfb"] = flat(SF_BUFFER_DIVISIBILITY), flat(SF_BUFFER_DIVISIBILITY)

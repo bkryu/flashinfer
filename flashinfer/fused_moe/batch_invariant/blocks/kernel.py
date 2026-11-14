@@ -293,7 +293,7 @@ class GroupedBlockGemm:
         aux=None,
     ):
         ops = self.operands
-        if cutlass.const_expr(a.element_type != b.element_type):
+        if cutlass.const_expr(not ops.mixed and a.element_type != b.element_type):
             raise TypeError(
                 f"A and B must have one type: {a.element_type} != {b.element_type}"
             )
@@ -302,8 +302,8 @@ class GroupedBlockGemm:
         self.xch_layout = self.chain.smem_layout(self.epi_warpgroups)
         sfa_t = sfb_t = None
         if cutlass.const_expr(ops.block_scaled):
-            a = ops.view_elems(a)
-            b = ops.view_elems(b)
+            a = ops.view_tokens(a)
+            b = ops.view_weights(b)
             sfa_t = ops.sf_view_rows(sfa, rows_sf, a.shape[1])  # the scale rows: padded
             sfb_t = ops.sf_view_experts(sfb, b.shape[0], b.shape[1], b.shape[2])
             # the A ring ends inside the sm_100 instructions' descriptor window (the plan's bound; None on the sm_107 plans)
@@ -559,15 +559,17 @@ class GroupedBlockGemm:
                 build_group_tables(counts, E, cluster_rows, s_off, s_pre)
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
-        # --- operand staging: smem rings (A, B swizzled; the scale factors plain), multicast masks, partitions
+        # --- operand staging: smem rings (A, B swizzled, at the plan's container types; the scale factors plain), multicast
+        # masks, partitions
+        a_smem_dtype, b_smem_dtype = ops.smem_dtypes(st)
         sA = smem.allocate_tensor(
-            element_type=st.a_dtype,
+            element_type=a_smem_dtype,
             layout=a_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
         )
         sB = smem.allocate_tensor(
-            element_type=st.b_dtype,
+            element_type=b_smem_dtype,
             layout=b_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=b_smem_layout_staged.inner,
