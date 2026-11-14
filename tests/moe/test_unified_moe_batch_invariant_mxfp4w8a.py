@@ -2676,8 +2676,14 @@ def test_routing_constants_are_read_from_the_cache_under_graph_capture():
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         graph.replay()
         torch.cuda.synchronize()
-    names = [e.name for e in prof.events() if e.device_type.name == "CUDA"]
-    assert names and not any("fill" in n.lower() for n in names), names
+    names = [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    fills = [n for n in names if "Fill" in n or "fill" in n]
+    assert len(fills) == 1, (
+        names
+    )  # the one constant first met inside the capture, none for the cached bias and scale
+    assert torch.equal(bits(out), eager)
 
 
 @needs_device
