@@ -43,6 +43,7 @@ from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
 from flashinfer.gemm.batch_invariant import tuning
 from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
+    SWAP_K_BLOCK,
     Knobs,
     enumerate_space,
     knob_product,
@@ -721,6 +722,151 @@ def test_pdl_variant_is_a_placement(M, N, K):
         assert torch.equal(bits(out), ref)
 
 
+def test_fingerprint_refuses_what_the_operator_refuses():
+    """The receipt exists for the weights the operator accepts: K a multiple of the class's granule (128 on the SM100 class,
+    32 on SM107), N a multiple of 8."""
+    with pytest.raises(ValueError, match="multiple of 128"):
+        bi.fingerprint(
+            "mm_mxfp8_mxfp4",
+            N=4096,
+            K=4096 + 64,
+            out_dtype=torch.bfloat16,
+            arch="sm_100",
+        )
+    with pytest.raises(ValueError, match="multiple of 32"):
+        bi.fingerprint(
+            "mm_mxfp8_mxfp4",
+            N=4096,
+            K=4096 + 16,
+            out_dtype=torch.bfloat16,
+            arch="sm_107",
+        )
+    with pytest.raises(ValueError, match="multiple of 8"):
+        bi.fingerprint(
+            "mm_mxfp8_mxfp4", N=4092, K=4096, out_dtype=torch.bfloat16, arch="sm_100"
+        )
+    for N, K in ((0, 128), (128, 0)):
+        with pytest.raises(ValueError, match="must be positive"):
+            bi.fingerprint(
+                "mm_mxfp8_mxfp4", N=N, K=K, out_dtype=torch.bfloat16, arch="sm_100"
+            )
+    assert bi.fingerprint(
+        "mm_mxfp8_mxfp4", N=4096, K=4096 + 64, out_dtype=torch.bfloat16, arch="sm_107"
+    )
+
+
+def test_unsupported_errors_advise_no_fallback():
+    """The operator runs the class under both values of ``batch_invariant``, so its errors state the contract and never
+    advise calling without the flag (the mode's other classes do)."""
+    a = torch.zeros(8, 256, dtype=torch.float8_e4m3fn)
+    b = torch.zeros(128, 64, dtype=torch.uint8)
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as e:
+        flashinfer.mm_mxfp8_mxfp4(
+            a, b, torch.zeros(1, dtype=torch.uint8), torch.zeros(1, dtype=torch.uint8)
+        )
+    msg = str(e.value)
+    assert "mm_mxfp8_mxfp4" in msg and "both values of batch_invariant" in msg
+    assert (
+        "regular backends" not in msg and "call without batch_invariant=True" not in msg
+    )
+
+
+@needs_device
+def test_invalid_weight_dtype_reports_the_mixed_class():
+    """A weight of another dtype on a supported device is refused under the mixed class's name with the operator's own
+    hint (the packing check is shared with the fp4 class, whose name must not appear)."""
+    a = torch.zeros(8, 256, dtype=torch.float8_e4m3fn, device="cuda")
+    b = torch.zeros(128, 64, dtype=torch.bfloat16, device="cuda")
+    sf = torch.zeros(1, dtype=torch.uint8, device="cuda")
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as e:
+        flashinfer.mm_mxfp8_mxfp4(a, b, sf, sf)
+    msg = str(e.value)
+    assert "gemm.mxfp4w8a" in msg and "packed fp4" in msg
+    assert "regular backends" not in msg and "`gemm.fp4`" not in msg
+
+
+@needs_device
+def test_forced_configuration_must_be_a_member_of_the_enumerated_space():
+    """``config=`` takes a record of the enumerated space: a well-formed record outside the knob product (a swizzle no
+    record carries) is refused with the membership error even where the body could run it; the grid size is a launch
+    parameter, so a member at another grid size runs and gives the class's bits."""
+    from flashinfer.gemm.batch_invariant.generator import SWIZZLES
+
+    M, N, K = 64, 2048, 4096
+    a, sfa = adv_mx8(M, K, 61)
+    b, sfb = weight(N, K, 62)
+    alpha = alpha_t(0.37)
+    fmt = device_fmt()
+    space = enumerate_space(M, N, K, b_major="k", in_fmt=fmt)
+    ref = bits(mm(a, b, sfa, sfb, alpha, config=space[0], in_fmt=fmt)).clone()
+    outside = dataclasses.replace(space[0], swizzle_size=max(SWIZZLES) * 2)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
+        mm(a, b, sfa, sfb, alpha, config=outside, in_fmt=fmt)
+    sized = dataclasses.replace(space[0], grid_clusters=4)
+    assert torch.equal(bits(mm(a, b, sfa, sfb, alpha, config=sized, in_fmt=fmt)), ref)
+
+
+@needs_device
+def test_default_alpha_is_visible_to_a_call_on_another_stream():
+    """``alpha=None`` takes the device's cached 1.0, filled and synchronised at its first use: a call on an independent
+    stream right after that first use (which queued behind other work) reads the filled scalar, not the allocation's
+    stale bytes."""
+    from flashinfer.gemm.batch_invariant import api as bi_api
+
+    M, N, K = 64, 2048, 4096
+    a, sfa = adv_mx8(M, K, 41)
+    b, sfb = weight(N, K, 42)
+    ref = bits(mm(a, b, sfa, sfb, alpha_t(1.0))).clone()
+    torch.cuda.synchronize()
+    bi_api._ONES.pop(
+        torch.cuda.current_device(), None
+    )  # the next ``alpha=None`` call is the first use again
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    busy = torch.randn(4096, 4096, device="cuda")
+    with torch.cuda.stream(s1):
+        for _ in range(8):
+            busy = torch.mm(
+                busy, busy
+            )  # keeps s1 busy: the cached scalar's fill queues behind this work
+        first = mm(a, b, sfa, sfb, None)
+    with torch.cuda.stream(
+        s2
+    ):  # independent of s1 (no wait): must still see the filled scalar
+        second = mm(a, b, sfa, sfb, None)
+    torch.cuda.synchronize()
+    assert torch.equal(bits(first), ref)
+    assert torch.equal(bits(second), ref)
+
+
+@needs_device
+def test_pdl_reads_alpha_after_the_dependency_wait():
+    """Under ``enable_pdl`` every input the preceding grid may have written is read after the dependency wait, the scalar
+    alpha included: a chain whose alpha is an element of the preceding dependent-launch GEMM's fp32 output (zeroed before
+    each chain, so an early read would see 0) gives the bits of the plain launch on the completed inputs."""
+    M, N, K = 64, 2048, 4096
+    a, sfa = adv_mx8(M, K, 51)
+    b, sfb = weight(N, K, 52)
+    a2, sfa2 = adv_mx8(M, K, 53)
+    b2, sfb2 = weight(N, K, 54)
+    alpha0 = alpha_t(2.0**-6)
+    prod = mm(a, b, sfa, sfb, alpha0, out_dtype=torch.float32, enable_pdl=False)
+    torch.cuda.synchronize()
+    alpha_ref = prod[0, :1].clone()
+    assert alpha_ref.item() != 0.0
+    ref = bits(mm(a2, b2, sfa2, sfb2, alpha_ref, enable_pdl=False)).clone()
+    out1 = torch.empty(M, N, dtype=torch.float32, device="cuda")
+    for _ in range(4):
+        out1.zero_()
+        mm(
+            a, b, sfa, sfb, alpha0, out_dtype=torch.float32, out=out1, enable_pdl=True
+        )  # writes alpha's element last
+        out2 = mm(
+            a2, b2, sfa2, sfb2, out1[0, :1], enable_pdl=True
+        )  # its alpha is the preceding grid's output
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out2), ref)
+
+
 @needs_device
 def test_batch_invariance_along_rows():
     """R2: a row's bits do not depend on the number of rows (the dispatcher's M-dependent picks included: the swapped decode
@@ -1091,6 +1237,8 @@ def test_exact_single_product_step():
             Knobs((256, 128), (2, 1), True, True, "n", 2),
             Knobs((128, 64), (1, 2), False, True, "m", 1),
         ]
+        # the class's own swapped record: the SM107 class stages its swapped records at 256 elements
+        swapped_fmt = dataclasses.replace(swapped, k_block=SWAP_K_BLOCK.get(fmt, 0))
         for ea, eb in (
             (127, 127),
             (127 - 30, 127 + 20),
@@ -1137,7 +1285,7 @@ def test_exact_single_product_step():
                     alpha_t(1.0),
                     out_dtype=torch.float32,
                     in_fmt=fmt,
-                    config=swapped,
+                    config=swapped_fmt,
                 )
                 assert torch.equal(bits(o), bits(outs[0][rows])), (fmt, ea, eb, r0)
 
