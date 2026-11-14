@@ -40,7 +40,7 @@ def space():
 def swap_space():
     """The swapped decode space's records in their Lean form (the stage width is a lowering choice, not a field of the
     record, so the two instruction classes' lists print as one), in enumeration order."""
-    from .blocks.compile_mxfp4w8a import swapped_knobs_mx
+    from .schedule_mxfp4w8a import swapped_knobs_mx
 
     ks = [k.lean() for k in swapped_knobs_mx("mxfp4w8a")]
     assert ks == [k.lean() for k in swapped_knobs_mx("mxfp4w8a_k64")]

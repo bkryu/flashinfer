@@ -145,14 +145,16 @@ def test_backend_serves_the_pair_and_never_a_default_candidate():
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     }
-    # the mixed pair is still refused and named as pending
+    # an unserved pair is refused naming the served ones (the mixed MXFP4 x MXFP8 pair is served: its own suite)
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
-    mixed = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    w4a16 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
     with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
-        BatchInvariantFp4Config.prepare_activations(torch.zeros(2, 64), quant=mixed)
-    assert "MXFP4 x MXFP4" in str(excinfo.value) and "NVFP4 x NVFP4" in str(
-        excinfo.value
+        BatchInvariantFp4Config.prepare_activations(torch.zeros(2, 64), quant=w4a16)
+    assert (
+        "MXFP4 x MXFP4" in str(excinfo.value)
+        and "NVFP4 x NVFP4" in str(excinfo.value)
+        and "MXFP4 x MXFP8" in str(excinfo.value)
     )
     x, sf = BatchInvariantFp4Config.prepare_activations(torch.zeros(2, 64), quant=_MX)
     assert x.dtype == torch.bfloat16 and sf is None

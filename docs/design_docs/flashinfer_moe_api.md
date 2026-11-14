@@ -889,6 +889,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `batch_invariant_bf16` | `BatchInvariantBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp4` | `BatchInvariantFp4Config` | `MXFP4×MXFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `batch_invariant_fp4` | `BatchInvariantFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp4` | `BatchInvariantFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp8_block` | `BatchInvariantFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp8_per_tensor` | `BatchInvariantFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |

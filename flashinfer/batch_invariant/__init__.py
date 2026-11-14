@@ -431,6 +431,56 @@ def _moe_mxfp4_fingerprint(
     )
 
 
+def _moe_mxfp4w8a_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    arch=None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The mixed MXFP4-weight x MXFP8-activation MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the
+    MXFP4 x MXFP8 pair): the dimensions of :func:`_moe_class_terms` under the same bounds plus the architecture (the
+    instruction class of the dense mixed GEMM: the SM107 step folds 64 elements, the SM100 / SM103 one 32 and reads the
+    e2m1 weight in 128-element runs, so H and I are multiples of 128 there; ``arch`` as for ``mm_mxfp8_mxfp4``, the current
+    device by default)."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp4w8a import granule_of
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp4w8a import (
+        BLOCK,
+        spec_fingerprint_mxfp4w8a,
+    )
+
+    from ..gemm.batch_invariant.schedule import mx_class_for
+
+    fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "fused_moe_mxfp4w8a"))
+    gran = granule_of(fmt)
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % gran:
+            raise ValueError(
+                f"fingerprint('fused_moe_mxfp4w8a'): {dim} {value} must be a positive multiple of {gran} on the {fmt} "
+                f"class (whole UE8M0 scale blocks of {BLOCK}; whole 128-element runs of the e2m1 weight on SM100 / SM103)"
+            )
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_mxfp4w8a",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
+    return spec_fingerprint_mxfp4w8a(
+        H, I, top_k, num_experts, rm, name, params, gated, fmt
+    )
+
+
 def _megamoe_bf16_fingerprint(
     hidden: int,
     intermediate: int,
@@ -599,6 +649,14 @@ CLASSES: Dict[str, ClassInfo] = {
     ),
     # the MXFP4 x MXFP4 pair of the same backend (UE8M0 block scales on both operands: no global or per-token scale, no
     # static-intermediate class)
+    # the unified MoE layer with `BatchInvariantFp4Config` (the MXFP4 x MXFP8 pair): the bf16 classes' dimensions plus the
+    # architecture (the instruction class of the dense mixed MXFP4 x MXFP8 GEMM, as for mm_mxfp8_mxfp4)
+    "fused_moe_mxfp4w8a": ClassInfo(
+        "moe.mxfp4w8a",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_mxfp4w8a_fingerprint,
+        ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
+    ),
     "fused_moe_mxfp4": ClassInfo(
         "moe.mxfp4",
         ("H", "I", "top_k", "num_experts"),
