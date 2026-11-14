@@ -123,6 +123,9 @@ class BlockScaledPlan:
     SF_VEC = SF_VEC["mxfp8"]  # elements per block scale
     INST_K = 32  # the instruction's K
     TMEM_COLS = TMEM_COLS  # the TMEM budget planned against
+    #: the sm_100 instructions' shared-memory descriptors address the first 256 KB of the CTA's shared memory: every operand
+    #: ring a UMMA reads ends below it (the grouped bodies' plan rule; the sm_107 plan lifts it)
+    UMMA_SMEM_ADDR_MAX: Optional[int] = 1 << 18
     TMEM_ALLOC_ARCH = TMEM_ARCH  # the allocator's architecture: "sm_100" allows powers of two to 512, "sm_107" also the whole 576
     S2T_BROADCAST = False  # the smem -> TMEM scale-factor copy's source partition (see s2t_copy_and_partition)
     #: The smem container of each operand (None: the operand's own dtype, packed). The sm_100 / sm_103 ``kind::mxf8f6f4``
@@ -180,9 +183,18 @@ class BlockScaledPlan:
     def tmem_alloc_cols(self, need: int) -> int:
         return max(32, _pow2ceil(need))
 
-    def __init__(self, knobs: Knobs, c_dtype, c_layout, chunks: int = 1):
+    def __init__(
+        self,
+        knobs: Knobs,
+        c_dtype,
+        c_layout,
+        chunks: int = 1,
+        k_blocks: Optional[int] = None,
+    ):
         """``chunks``: the class's chunk count; with ``knobs.cta_chunks`` the CTA folds all of them (``self.cta_chunks``) and
-        the TMEM holds the running sum next to the accumulator stages (``sum_stage``)."""
+        the TMEM holds the running sum next to the accumulator stages (``sum_stage``). ``k_blocks``: the instruction K steps
+        per smem stage (the lowering's inner radix; default the record's k-block, else the format's one 128-byte atom of K)
+        -- a placement of the same fold (the grouped swapped decode body stages two atoms)."""
         assert knobs.well_formed(self.IN_FMT) and knobs.use_tma_store, knobs
         self.knobs = knobs
         self.chunks = chunks
@@ -190,8 +202,9 @@ class BlockScaledPlan:
             chunks if (knobs.cta_chunks and chunks > 1) else 1
         )  # chunks folded inside the CTA (1: none)
         self.block = MainloopBlock(
-            self.IN_FMT, k_block_override=knobs.k_block
-        )  # the record's k-block (the lowering's inner radix); the block's overrides are named, never positional
+            self.IN_FMT, inner_steps=k_blocks, k_block_override=knobs.k_block
+        )  # the caller's steps per stage, else the record's k-block (the lowering's inner radix); the block's overrides are
+        # named, never positional
         self.a_dtype, self.b_dtype = self.A_DT, self.B_DT
         # the smem containers (the hooks above): the operand's own dtype unless the instruction reads an unpacked one
         self.a_smem_dtype = self.A_SMEM_DT or self.A_DT
@@ -383,6 +396,9 @@ class BlockScaledPlanSM107(BlockScaledPlan):
 
     IN_FMT = "mxfp8_k64"
     INST_K = 64
+    UMMA_SMEM_ADDR_MAX = (
+        None  # the sm_107 instructions address the part's whole shared memory
+    )
     TMEM_COLS = TMEM_COLS_SM107
     TMEM_ALLOC_ARCH = (
         "sm_107"  # the allocator accepts the non-power-of-two 576 on sm_107 only
