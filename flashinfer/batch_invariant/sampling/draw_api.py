@@ -271,9 +271,11 @@ def _entry(
     enable_pdl,
     config,
     sm_count,
+    temperature=None,
+    return_logprob: bool = False,
 ):
     """The public entries' common body: the operator's key resolution and validation, the draw, the output
-    dtype rule (the indices' dtype with ``indices``)."""
+    dtype rule (the indices' dtype with ``indices``); the outputs ``samples[, logp][, valid]``."""
     name = "logits" if from_logits else "probs"
     N = _check_input(x, name)
     if indices is not None:
@@ -291,7 +293,9 @@ def _entry(
         seeds,
         offs,
         from_logits=from_logits,
+        temperature=temperature,
         indices=indices,
+        return_logprob=return_logprob,
         enable_pdl=_pdl(enable_pdl, x.device),
         config=config,
         sm_count=sm_count,
@@ -301,7 +305,12 @@ def _entry(
         samples = samples.to(
             indices.dtype
         )  # the operator's contract: the output takes the indices' dtype
-    return (samples, res["valid"]) if return_valid else samples
+    outs = [samples]
+    if return_logprob:
+        outs.append(res["logp"])
+    if return_valid:
+        outs.append(res["valid"])
+    return outs[0] if len(outs) == 1 else tuple(outs)
 
 
 def sampling_from_probs_batch_invariant(
@@ -352,14 +361,22 @@ def sampling_from_logits_batch_invariant(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     *,
+    temperature: Optional[Union[float, torch.Tensor]] = None,
+    return_logprob: bool = False,
     enable_pdl: Optional[bool] = None,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
-) -> torch.Tensor:
-    """``flashinfer.sampling.sampling_from_logits(logits, indices, generator=, seed=, offset=, batch_invariant=True)``:
-    the class ``sample.icdf.v1`` over the ``lse.row`` weights ``e_j = ex2.approx.ftz((x_j - m) log2(e))`` of the row (no
-    temperature: the entry has none), without materialising the probabilities. The same draw as
+):
+    """``flashinfer.sampling.sampling_from_logits(logits, indices, generator=, seed=, offset=, batch_invariant=True,
+    temperature=, return_logprob=)``: the class ``sample.icdf.v1`` over the ``lse.row`` weights ``e_j =
+    ex2.approx.ftz((x_j - m) c)`` of the row, ``c = log2(e) / temperature`` (``None``, a positive scalar or one per row,
+    as :func:`softmax` takes it), without materialising the probabilities. The same draw as
     :func:`sampling_from_probs_batch_invariant`; a row of ``-inf`` logits (or with a NaN) is invalid and draws ``-1``.
+
+    ``return_logprob`` adds the drawn token's natural log-probability under the full distribution at the given
+    temperature (fp32, the samples' shape, NaN for an invalid row): ``lse.row``'s ``log_probs(logits, samples,
+    temperature)`` bit for bit -- the value a trainer re-scoring the token computes. Returns the samples alone, or the
+    pair ``(samples, logp)``.
 
     Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class; it never
     falls back."""
@@ -374,4 +391,6 @@ def sampling_from_logits_batch_invariant(
         enable_pdl,
         config,
         sm_count,
+        temperature=temperature,
+        return_logprob=return_logprob,
     )

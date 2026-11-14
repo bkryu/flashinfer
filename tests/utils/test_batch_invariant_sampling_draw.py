@@ -189,6 +189,16 @@ def test_fingerprints_are_pinned():
     fl = bi.fingerprint("sampling_from_logits", N=300, dtype="bf16")
     assert fl.startswith("sample-icdf-") and fl != D.spec_fingerprint(300)
     assert fl == D.spec_fingerprint(300, from_logits=True, in_fmt="bf16")
+    # the logits form with a temperature in the scale (the public entry's `temperature`): another receipt per vocabulary
+    flT = bi.fingerprint("sampling_from_logits", N=300, dtype="bf16", temperature=True)
+    assert flT == "sample-icdf-14716b3a5bf29c2c" and flT != fl
+    assert flT == D.spec_fingerprint(
+        300, from_logits=True, in_fmt="bf16", temperature=True
+    )
+    assert (
+        bi.fingerprint("sampling_from_logits", N=300, dtype="bf16", temperature=False)
+        == fl
+    )
     assert D.spec_fingerprint(301) != D.spec_fingerprint(300)
     assert (
         D.SELECT_RULE
@@ -883,6 +893,24 @@ def test_logits_match_exact_model_and_logprob(dtype, N):
         x, seed=s, offset=o, batch_invariant=True
     )
     assert tok.dtype == torch.int32 and torch.equal(tok.cpu().long(), ref0["samples"])
+    # the public entry's temperature (per row, and a scalar) and return_logprob: the generic entry's draw at the
+    # dispatcher's pick, the log-probability log_probs' at the token (the trainer's value, full distribution)
+    got = logits_draw(x, s, o, temperature=temps, return_logprob=True)
+    tok_t, lp_t = flashinfer.sampling.sampling_from_logits(
+        x,
+        seed=s,
+        offset=o,
+        batch_invariant=True,
+        temperature=temps,
+        return_logprob=True,
+    )
+    assert torch.equal(tok_t, got["samples"]) and same(lp_t, got["logp"])
+    assert same(lp_t, flashinfer.sampling.log_probs(x, tok_t.long(), temps))
+    assert torch.equal(tok_t.cpu().long(), ref["samples"])
+    tok_s = flashinfer.sampling.sampling_from_logits(
+        x, seed=s, offset=o, batch_invariant=True, temperature=0.37
+    )
+    assert torch.equal(tok_s, logits_draw(x, s, o, temperature=0.37)["samples"])
 
 
 @needs_device
@@ -1385,6 +1413,10 @@ def test_default_path_is_the_operator_kernel(monkeypatch):
         flashinfer.sampling.sampling_from_logits(lg, seed=seed, offset=off),
         mod.sampling_from_logits(lg, None, True, None, seed, off),
     )
+    # the temperature and the log-probability exist under the flag only: the default path refuses them
+    for kw in ({"temperature": 0.7}, {"return_logprob": True}):
+        with pytest.raises(ValueError, match="batch_invariant=True"):
+            flashinfer.sampling.sampling_from_logits(lg, seed=seed, offset=off, **kw)
     with pytest.raises(AssertionError, match="without the flag"):
         flashinfer.sampling.sampling_from_probs(
             probs, seed=seed, offset=off, batch_invariant=True

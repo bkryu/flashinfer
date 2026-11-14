@@ -28,6 +28,7 @@ from flashinfer.batch_invariant.sampling import spec as S
 from flashinfer.batch_invariant.sampling.api import (
     LSE_ROW_ARCHS,
     log_probs_batch_invariant,
+    log_softmax_batch_invariant,
     lse_row,
     softmax_batch_invariant,
 )
@@ -155,6 +156,47 @@ def test_fingerprints_are_pinned():
     assert bi.fingerprint("log_probs", N=300, dtype="bf16", temperature=False) == (
         bi.fingerprint("softmax", N=300, dtype="bf16", temperature=False)
     )
+    # the 16-bit log-softmax output member (log_softmax(..., out_dtype=<the input dtype>)): its own receipt per input
+    # format and temperature form; the fp32 row's receipt is the class fingerprint, unchanged; at f32 the conversion is the
+    # identity and the receipt the plain one; another dtype is refused
+    assert (
+        bi.fingerprint(
+            "log_softmax", N=300, dtype="bf16", temperature=False, out_dtype="bf16"
+        )
+        == "lse-row-aaa8b78ac92ebc0f"
+    )
+    assert (
+        bi.fingerprint(
+            "log_softmax",
+            N=300,
+            dtype=torch.float16,
+            temperature=False,
+            out_dtype=torch.float16,
+        )
+        == "lse-row-743ba80ecd3dcd41"
+    )
+    assert (
+        bi.fingerprint(
+            "log_softmax", N=300, dtype="bf16", temperature=True, out_dtype="bf16"
+        )
+        == "lse-row-7c1eccd36b16bf4b"
+    )
+    assert bi.fingerprint(
+        "log_softmax", N=300, dtype="bf16", temperature=False, out_dtype="f32"
+    ) == bi.fingerprint("log_softmax", N=300, dtype="bf16", temperature=False)
+    assert bi.fingerprint(
+        "log_softmax", N=300, dtype="f32", temperature=False, out_dtype="f32"
+    ) == bi.fingerprint("softmax", N=300, dtype="f32", temperature=False)
+    assert S.spec_fingerprint(300, "f32", logprobs_cvt=True) == S.spec_fingerprint(
+        300, "f32"
+    )
+    assert S.LOG_SOFTMAX_CVT.name == "lc" and S.LOG_SOFTMAX_CVT.row_output
+    with pytest.raises(ValueError):
+        bi.fingerprint(
+            "log_softmax", N=300, dtype="bf16", temperature=False, out_dtype="f16"
+        )
+    with pytest.raises(ValueError):
+        S.Mode(logprobs_cvt=True)
     assert S.spec_fingerprint(301, "bf16") != S.spec_fingerprint(300, "bf16")
     # the hash is linear in the term DAG: a production vocabulary is a receipt, not a cost
     assert (
@@ -235,10 +277,15 @@ def test_symbolic_oracle(dtype, N):
         ex = R.exact_rows(x, temp, rows=range(3), token_ids=ids)
         ref = R.lse_reference(x, temp, ids)
         got = run_all(x, temp, ids)
-        for k in ("probs", "logprobs", "lse", "logp", "m", "s"):
+        for k in ("probs", "logprobs", "logprobs_cvt", "lse", "logp", "m", "s"):
             assert same(ref[k], ex[k]), f"vectorised model {k} != symbolic spec"
         assert same(got["probs"], ex["probs"]) and same(got["logp"], ex["logp"])
         assert same(got["lse2"], ex["lse"])
+        if (
+            dtype != torch.float32
+        ):  # the 16-bit log-softmax output member against the symbolic spec
+            lp16 = flashinfer.sampling.log_softmax(x, temp, out_dtype=dtype)
+            assert same(lp16, ex["logprobs_cvt"]), "GPU logprobs_cvt != symbolic spec"
 
 
 def _config_sample(N, dtype):
@@ -588,6 +635,62 @@ def test_sanity_against_torch(dtype):
         lp, lpt[torch.arange(8, device="cuda"), ids], rtol=1e-5, atol=2e-5
     )
     assert torch.allclose(lse, torch.logsumexp(xs, dim=-1), rtol=1e-6, atol=2e-5)
+    # the 16-bit output member: torch's RNE conversion of the class's fp32 row, bit for bit; close to torch's row
+    lpf = flashinfer.sampling.log_softmax(x, temps, batch_invariant=True)
+    if dtype != torch.float32:
+        lp16 = flashinfer.sampling.log_softmax(
+            x, temps, batch_invariant=True, out_dtype=dtype
+        )
+        assert lp16.dtype == dtype and same(lp16, lpf.to(dtype))
+        assert torch.allclose(lp16.float(), lpt, rtol=2e-2, atol=2e-2)
+        other = torch.float16 if dtype == torch.bfloat16 else torch.bfloat16
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="out_dtype"):
+            flashinfer.sampling.log_softmax(x, temps, out_dtype=other)
+    else:
+        assert same(
+            flashinfer.sampling.log_softmax(x, temps, out_dtype=torch.float32), lpf
+        )
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="out_dtype"):
+            flashinfer.sampling.log_softmax(x, temps, out_dtype=torch.bfloat16)
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "dtype,N",
+    [(torch.bfloat16, 1000), (torch.float16, 4097)],
+    ids=["bf16-1000", "f16-4097"],
+)
+def test_log_softmax_16bit_output_member(dtype, N):
+    """The 16-bit log-softmax output member (``out_dtype`` the input dtype): bit for bit the exact CPU model under the three
+    temperature forms, the same bits from every configuration kind (R3), a row alone equals the row inside a batch (R2),
+    and the member is torch's RNE conversion of the fp32 row (the fp32 member is untouched by it)."""
+    M = 37
+    x = logits(M, N, dtype)
+    temps = (torch.rand(M, device="cuda") * 1.5 + 0.25).to(dtype)
+    for temp in (None, 0.37, temps):
+        got = flashinfer.sampling.log_softmax(
+            x, temp, batch_invariant=True, out_dtype=dtype
+        )
+        ref = R.lse_reference(x, temp)
+        assert same(got, ref["logprobs_cvt"]), f"temperature {temp!r}"
+        assert same(
+            got,
+            flashinfer.sampling.log_softmax(x, temp, batch_invariant=True).to(dtype),
+        )
+    ref16 = flashinfer.sampling.log_softmax(
+        x, temps, batch_invariant=True, out_dtype=dtype
+    )
+    for cfg in _config_sample(4097, dtype):  # one member of each kind
+        got = log_softmax_batch_invariant(x, temps, out_dtype=dtype, config=cfg)
+        assert same(got, ref16), f"config {cfg.describe()} differs"
+    for i in (0, 17, 36):
+        one = flashinfer.sampling.log_softmax(
+            x[i : i + 1].clone(),
+            temps[i : i + 1],
+            batch_invariant=True,
+            out_dtype=dtype,
+        )
+        assert same(one[0], ref16[i]), f"row {i} differs between M=1 and M={M}"
 
 
 def test_space_members_are_bounded_in_loads_per_thread():

@@ -1175,8 +1175,9 @@ def log_softmax(
     *,
     enable_pdl: Optional[bool] = None,
     batch_invariant: bool = False,
+    out_dtype: Optional[torch.dtype] = None,
 ):
-    r"""The log-softmax row of ``logits / temperature`` in fp32, with a batch-invariant dataflow: the row every
+    r"""The log-softmax row of ``logits / temperature`` in fp32 (or in the input's 16-bit dtype with ``out_dtype``), with a batch-invariant dataflow: the row every
     deterministic sampling path forms before gathering a token's log-probability (the top-k log-probabilities, the
     ranks, the full-row consumers), the same bits whatever the batch, its padding, the row's position or the SM count,
     and run-to-run deterministic.
@@ -1208,11 +1209,19 @@ def log_softmax(
         guarantees above). ``False`` (the default) runs the operator's regular kernel for this entry, which
         today is the same class: a future release may route it to a faster kernel without the invariance
         contract, so callers that need the contract pass ``True`` explicitly.
+    out_dtype : Optional[torch.dtype]
+        ``None`` (default) or ``torch.float32``: the fp32 row. The input's own 16-bit dtype (``torch.bfloat16`` for
+        bfloat16 logits, ``torch.float16`` for float16 logits): the same fp32 row converted once (round to nearest
+        even) to it -- bit for bit ``log_softmax(logits, temperature).to(logits.dtype)`` without the fp32 round trip,
+        the shape of ``aten::_log_softmax`` on 16-bit inputs that the trainers' batch-invariant modes override. A
+        different member of the class with its own receipt: ``fingerprint("log_softmax", N=, dtype=, temperature=,
+        out_dtype=)``. Any other dtype raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`.
 
     Returns
     -------
     logprobs : torch.Tensor
-        float32 tensor of shape ``logits.shape`` with the natural log-probabilities of every element.
+        float32 tensor of shape ``logits.shape`` with the natural log-probabilities of every element (the input dtype
+        with ``out_dtype`` set to it).
 
     Raises
     ------
@@ -1224,7 +1233,9 @@ def log_softmax(
         raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
     from .batch_invariant.sampling.api import log_softmax_batch_invariant
 
-    return log_softmax_batch_invariant(logits, temperature, enable_pdl)
+    return log_softmax_batch_invariant(
+        logits, temperature, enable_pdl, out_dtype=out_dtype
+    )
 
 
 @flashinfer_api(trace=sampling_from_logits_trace)
@@ -1238,7 +1249,9 @@ def sampling_from_logits(
     offset: Optional[Union[int, torch.Tensor]] = None,
     *,
     batch_invariant: bool = False,
-) -> torch.Tensor:
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    return_logprob: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for category sampling from logits. It's equivalent to sampling
     from the probabilities obtained by applying softmax to :attr:`logits`.
 
@@ -1316,13 +1329,26 @@ def sampling_from_logits(
         outside the source rows makes its output row invalid: token ``-1``). Anything the class does
         not cover raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+    temperature : Optional[Union[torch.Tensor, float]]
+        Only with ``batch_invariant=True`` (``ValueError`` otherwise: the operator's kernel takes none). ``None`` (no
+        scaling), a positive scalar, or a tensor with one positive value per output row (float16 / bfloat16 / float32 /
+        float64, the last rounded to float32) of shape ``(batch_size,)``, applied inside the class's chain
+        (``c = log2(e) / temperature``) exactly as :func:`softmax` and :func:`log_probs` apply it, so the draw is from
+        ``softmax(logits / temperature)`` and the returned log-probability is that distribution's. A scalar is
+        validated on the host; a tensor's values are not (a ``0`` yields an invalid row).
+    return_logprob : bool
+        Only with ``batch_invariant=True``. Also return the drawn token's natural log-probability under the full
+        distribution at the given temperature (fp32, shape ``(batch_size,)``, NaN for an invalid row): bit for bit
+        :func:`log_probs` ``(logits, samples, temperature)`` -- the value a trainer re-scoring the token computes, so
+        the rollout's and the trainer's log-probabilities are the same bits with no second pass over the row.
 
     Returns
     -------
     samples: torch.Tensor
         Sampled categories, shape (batch_size,). It's equivalent to sampling from
         :attr:`logits` after applying softmax. Under ``batch_invariant=True`` a row whose weights do
-        not sum to a positive finite number (a row of ``-inf`` logits, or with a NaN) draws ``-1``.
+        not sum to a positive finite number (a row of ``-inf`` logits, or with a NaN) draws ``-1``, and with
+        ``return_logprob`` the pair ``(samples, logp)`` is returned.
 
     Examples
     --------
@@ -1350,7 +1376,18 @@ def sampling_from_logits(
         )
 
         return sampling_from_logits_batch_invariant(
-            logits, indices, generator, seed, offset
+            logits,
+            indices,
+            generator,
+            seed,
+            offset,
+            temperature=temperature,
+            return_logprob=return_logprob,
+        )
+    if temperature is not None or return_logprob:
+        raise ValueError(
+            "temperature and return_logprob are available under batch_invariant=True only (the operator's kernel "
+            "takes neither)"
         )
     return get_sampling_module().sampling_from_logits(
         logits, indices, deterministic, generator, seed, offset

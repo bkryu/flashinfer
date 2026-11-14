@@ -8,7 +8,8 @@ FlashInfer's argument forms (temperature ``None``, a scalar or a per-row tensor 
 ``logits.shape[:-1]`` or ``(rows,)``; a scalar is validated on the host, a tensor's values are not validated on the
 device -- a check would need a synchronisation and would break CUDA-graph capture -- so they must be positive and
 finite: a ``0`` yields a NaN row).
-:func:`log_softmax_batch_invariant` is :func:`flashinfer.sampling.log_softmax`: the fp32 log-softmax row.
+:func:`log_softmax_batch_invariant` is :func:`flashinfer.sampling.log_softmax`: the fp32 log-softmax row, or with
+``out_dtype`` the input's 16-bit dtype the row converted once to it (the 16-bit output member, its own fingerprint).
 :func:`log_probs_batch_invariant` is :func:`flashinfer.sampling.log_probs`: the natural log-probability of one or ``K``
 token ids per row in fp32, and with ``return_lse`` the row's log-sum-exp (the same launch). Every unsupported input
 raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
@@ -32,7 +33,16 @@ from .schedule import (
     device_sm_count,
     max_vec_elems,
 )
-from .spec import LOG_SOFTMAX, LOGP, LOGP_LSE, SOFTMAX, SOFTMAX_F32, Mode, scale_value
+from .spec import (
+    LOG_SOFTMAX,
+    LOG_SOFTMAX_CVT,
+    LOGP,
+    LOGP_LSE,
+    SOFTMAX,
+    SOFTMAX_F32,
+    Mode,
+    scale_value,
+)
 
 CLASS = "lse.row"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
@@ -137,7 +147,8 @@ def lse_row(
     sm_count: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """One launch of the class for the outputs ``mode`` names: ``"probs"`` (the softmax row in the input dtype, or in
-    fp32 for ``probs_f32``), ``"logprobs"`` (the log-softmax row, fp32), ``"lse"`` (fp32 per row) and ``"logp"`` (fp32:
+    fp32 for ``probs_f32``), ``"logprobs"`` (the log-softmax row, fp32, or in the input dtype for ``logprobs_cvt``),
+    ``"lse"`` (fp32 per row) and ``"logp"`` (fp32:
     the log-probability of ``token_ids``, one id per row of shape ``logits.shape[:-1]`` or ``K`` ids per row of shape
     ``logits.shape[:-1] + (K,)``, NaN for an id outside ``[0, N)``). Bitwise identical for every ``config`` in
     :func:`schedule.all_valid_configs`, every batch composition and every ``sm_count``."""
@@ -181,7 +192,7 @@ def lse_row(
         y = torch.empty(
             (M, N),
             dtype=logits.dtype
-            if (mode.probs and not mode.probs_f32)
+            if ((mode.probs and not mode.probs_f32) or mode.logprobs_cvt)
             else torch.float32,
             device=dev,
         )
@@ -288,20 +299,34 @@ def log_softmax_batch_invariant(
     temperature: Optional[Union[float, torch.Tensor]] = None,
     enable_pdl: Optional[bool] = None,
     *,
+    out_dtype: Optional[torch.dtype] = None,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
 ) -> torch.Tensor:
-    """``flashinfer.sampling.log_softmax(logits, temperature, enable_pdl)``: the class ``lse.row``.
+    """``flashinfer.sampling.log_softmax(logits, temperature, enable_pdl, out_dtype=)``: the class ``lse.row``.
 
     The natural log-softmax row of ``logits / temperature`` in fp32, shape ``logits.shape``: ``logp_j = ((x_j - m) c -
     lg2(s)) ln2`` from the same two trees as the softmax; :func:`log_probs_batch_invariant` is this row gathered at the
-    token ids.
+    token ids. ``out_dtype`` the input's 16-bit dtype returns the row converted once (``cvt.rn``) to it -- the 16-bit
+    output member (``spec.LOG_SOFTMAX_CVT``, its own fingerprint: ``fingerprint("log_softmax", ..., out_dtype=)``), the
+    trainers' ``aten::_log_softmax(bf16) -> bf16`` shape, bit for bit torch's RNE conversion of the fp32 row; ``None`` /
+    ``torch.float32`` the fp32 row.
 
-    Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class; it
-    never falls back."""
+    Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class (dtype,
+    device, architecture, an ``out_dtype`` that is neither the input dtype nor fp32); it never falls back."""
     _check_logits(logits)
+    if out_dtype is None or out_dtype == torch.float32:
+        mode = LOG_SOFTMAX
+    elif out_dtype == logits.dtype:
+        mode = LOG_SOFTMAX_CVT
+    else:
+        raise unsupported(
+            CLASS,
+            f"out_dtype {out_dtype} for {logits.dtype} logits",
+            "the input dtype (the 16-bit output member) or torch.float32 (out_dtype=None)",
+        )
     return lse_row(
-        LOG_SOFTMAX,
+        mode,
         logits,
         temperature,
         enable_pdl=_pdl(enable_pdl, logits.device),
