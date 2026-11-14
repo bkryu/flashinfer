@@ -143,36 +143,42 @@ class ScatterFp4Kernel:
                 t = i // Int32(self.k)
                 p = mDest[i]
                 ps = mDestSf[i]
-                if cutlass.const_expr(not self.no_pts):
-                    if (lane == 0) & (part == 0):
-                        if cutlass.const_expr(self.unit_pts):
-                            mPtsp[ps] = Float32(1.0)
+                # a dropped slot (an expert id outside [0, E)) has no position: the plan marks it -1 and nothing is
+                # written for it (the slot's row stays outside the live rows; a warp-uniform choice)
+                live = p >= Int32(0)
+                p = cutlass.max(p, Int32(0))
+                ps = cutlass.max(ps, Int32(0))
+                if live:
+                    if cutlass.const_expr(not self.no_pts):
+                        if (lane == 0) & (part == 0):
+                            if cutlass.const_expr(self.unit_pts):
+                                mPtsp[ps] = Float32(1.0)
+                            else:
+                                mPtsp[ps] = mPts[t]
+                    row_x = mX[(t, None)]
+                    row_p = mXp[(p, None)]
+                    for jj in cutlass.range(0, n_mine, 1):
+                        j = (jj * wpr + part) * Int32(LANES) + lane
+                        cute.copy(atom, cute.local_tile(row_x, (16,), (j,)), frag)
+                        cute.copy(atom, frag, cute.local_tile(row_p, (16,), (j,)))
+                    for jj in cutlass.range(0, n_sf, 1):
+                        gg = (jj * wpr + part) * Int32(LANES) + lane
+                        if cutlass.const_expr(self.sf_src == "linear"):
+                            # the row's bytes 4gg .. 4gg + 3 assembled little-endian into the atom's 4-byte group (zero
+                            # past the row's blocks)
+                            base = t.to(Int64) * nb.to(Int64) + Int64(4) * gg.to(Int64)
+                            word = Uint32(0)
+                            for c in cutlass.range_constexpr(4):
+                                col = Int32(4) * gg + Int32(c)
+                                if col < nb:
+                                    word = word | (
+                                        mSf[base + Int64(c)].to(Uint32) << Uint32(8 * c)
+                                    )
+                            dst32[_sf_group_offset(ps, gg, pcols) // 4] = word
                         else:
-                            mPtsp[ps] = mPts[t]
-                row_x = mX[(t, None)]
-                row_p = mXp[(p, None)]
-                for jj in cutlass.range(0, n_mine, 1):
-                    j = (jj * wpr + part) * Int32(LANES) + lane
-                    cute.copy(atom, cute.local_tile(row_x, (16,), (j,)), frag)
-                    cute.copy(atom, frag, cute.local_tile(row_p, (16,), (j,)))
-                for jj in cutlass.range(0, n_sf, 1):
-                    gg = (jj * wpr + part) * Int32(LANES) + lane
-                    if cutlass.const_expr(self.sf_src == "linear"):
-                        # the row's bytes 4gg .. 4gg + 3 assembled little-endian into the atom's 4-byte group (zero past the
-                        # row's blocks)
-                        base = t.to(Int64) * nb.to(Int64) + Int64(4) * gg.to(Int64)
-                        word = Uint32(0)
-                        for c in cutlass.range_constexpr(4):
-                            col = Int32(4) * gg + Int32(c)
-                            if col < nb:
-                                word = word | (
-                                    mSf[base + Int64(c)].to(Uint32) << Uint32(8 * c)
-                                )
-                        dst32[_sf_group_offset(ps, gg, pcols) // 4] = word
-                    else:
-                        dst32[_sf_group_offset(ps, gg, pcols) // 4] = src32[
-                            _sf_group_offset(t, gg, pcols) // 4
-                        ]
+                            dst32[_sf_group_offset(ps, gg, pcols) // 4] = src32[
+                                _sf_group_offset(t, gg, pcols) // 4
+                            ]
         cute.arch.griddepcontrol_launch_dependents()
 
 
@@ -238,14 +244,18 @@ class ScatterSfKernel:
             i = w + r * stride
             t = i // Int32(self.k)
             p = mDest[i]
-            if cutlass.const_expr(not self.no_pts):
-                if lane == 0:
-                    mPtsp[p] = mPts[t]
-            for jj in cutlass.range(0, n_mine, 1):
-                g = jj * LANES + lane
-                dst32[_sf_group_offset(p, g, pcols) // 4] = src32[
-                    _sf_group_offset(t, g, pcols) // 4
-                ]
+            # a row without a padded position (the plan marks it -1: a dropped slot's share of the buffer) stores nothing
+            live = p >= Int32(0)
+            p = cutlass.max(p, Int32(0))
+            if live:
+                if cutlass.const_expr(not self.no_pts):
+                    if lane == 0:
+                        mPtsp[p] = mPts[t]
+                for jj in cutlass.range(0, n_mine, 1):
+                    g = jj * LANES + lane
+                    dst32[_sf_group_offset(p, g, pcols) // 4] = src32[
+                        _sf_group_offset(t, g, pcols) // 4
+                    ]
         cute.arch.griddepcontrol_launch_dependents()
 
 

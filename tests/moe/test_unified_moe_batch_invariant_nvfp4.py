@@ -2417,3 +2417,235 @@ def test_static_class_through_the_layer_batch_invariance_graph_replay_and_pack_c
     with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
         layer(_logits_pack(x, logits), per_token)
     assert "intermediate" in str(excinfo.value)
+
+
+# ----------------------------------------------------------------------------- dropped slots
+
+
+def _guarded(n: int, dtype=torch.uint8, guard: int = 1 << 20, byte: int = 0xAB):
+    """A tensor of ``n`` elements inside a sentinel-filled allocation with ``guard`` bytes before and after it, and the whole
+    allocation (to check that no byte outside the live rows, and nothing outside the buffer, was written)."""
+    es = torch.tensor([], dtype=dtype).element_size()
+    big = torch.empty(guard + n * es + guard, dtype=torch.uint8, device="cuda").fill_(
+        byte
+    )
+    return big[guard : guard + n * es].view(dtype), big
+
+
+def _guards_untouched(
+    big: torch.Tensor, guard: int = 1 << 20, byte: int = 0xAB
+) -> bool:
+    return bool((big[:guard] == byte).all()) and bool((big[-guard:] == byte).all())
+
+
+@needs_device
+def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
+    """A pre-routed expert id outside ``[0, E)`` (``-1``, ``E``, ``2^30``: a framework's dropped slot) is dropped by the op as
+    by the bf16 one: the plan does not count it (``dest -1``, ``dest_pad -1``, ``pos_pad -1`` past the live rows), the scatter
+    and the two fused quantizers write nothing for it (nothing outside the live rows, nothing outside the buffers: sentinel
+    guards around every destination), the GEMMs never touch it, and the combine folds the remaining slots in slot order with
+    ``+0`` in its place, so the output equals the class's composition with those slots at a valid id and weight ``+0``; a token
+    whose slots are all dropped gives a zero row; the other tokens keep their bits; the combine oracle over the op's own
+    intermediates gives the kernel's bits. Both plan forms, both packings; with every slot dropped the GEMMs launch without a
+    tile on the dense and on the swapped records."""
+    from flashinfer.batch_invariant.quantization.nvfp4_schedule import (
+        padded_sf_cols,
+        sf_numel,
+    )
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant.api import PLAN_MULTI_MIN_N, permute_plan
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        DENSE_TAIL,
+        TE_GS_INV,
+        _gs_inv,
+        _part,
+        fused_moe_nvfp4,
+        padded_rows_bound,
+        permute_plan_dual,
+        quantize_activations,
+        quantize_rows_mapped,
+        quantize_scatter_rows,
+    )
+    from flashinfer.fused_moe.batch_invariant.permute import warps_per_row
+    from flashinfer.fused_moe.batch_invariant.permute_nvfp4 import (
+        get_compiled_scatter_fp4,
+        get_compiled_scatter_sf,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        default_configs_nvfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+
+    k, H, I, E = 8, 256, 128, 64
+    bad = (-1, E, 1 << 30)
+    chain = activation_of(_SWIGLU)
+    sm_count, family = _part(torch.device("cuda"))
+    for T in (96, PLAN_MULTI_MIN_N // k + 3):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=21)
+        W_pack, layer = _weights(w1, w2), _layer(k, E, I)
+        W = _weights_of(W_pack)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids_bad = ids.clone()
+        rows = torch.randperm(T, generator=torch.Generator().manual_seed(T))[: T // 4]
+        for j, t in enumerate(rows.tolist()):
+            ids_bad[t, j % k] = bad[j % 3]
+            ids_bad[t, (j + 3) % k] = bad[(j + 1) % 3]
+        ids_bad[rows[0]] = torch.tensor(
+            [bad[i % 3] for i in range(k)], dtype=torch.int32
+        )
+        dropped = (ids_bad < 0) | (ids_bad >= E)
+        n_valid = int((~dropped).sum())
+        counts, dest, src = permute_plan(ids_bad.cuda(), E)
+        assert int(counts.sum()) == n_valid
+        assert torch.equal(dest.cpu().view(-1) < 0, dropped.view(-1))
+        assert torch.all(src[n_valid:] == -1) and torch.all(src[:n_valid] >= 0)
+        counts_d, dest_d, src_d, dest_pad, pos_pad = permute_plan_dual(
+            ids_bad.cuda(), E
+        )
+        assert torch.equal(counts_d, counts) and torch.equal(dest_d, dest)
+        assert torch.equal(dest_pad.cpu().view(-1) < 0, dropped.view(-1))
+        assert torch.all(pos_pad[n_valid:] == -1) and torch.all(pos_pad[:n_valid] >= 0)
+        # the scatter and the fused quantizers on sentinel-guarded destinations: nothing outside the live rows / positions
+        x4, sf, pts = _quantized(x)
+        Tk, Tk_pad = T * k, padded_rows_bound(T, k, E)
+        Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
+        pcols_h, pcols_i = padded_sf_cols(H), padded_sf_cols(I)
+        live_pad = torch.zeros(Tk_sf, dtype=torch.bool, device="cuda")
+        live_pad[pos_pad[:n_valid].long()] = True
+        wpr = warps_per_row(Tk, H // 32, sm_count)
+        for fused in (False, True):
+            x_perm4, big4 = _guarded(Tk_a * (H // 2))
+            x_perm_sf, bigsf = _guarded(sf_numel(Tk_sf, H))
+            x_perm_pts, bigpts = _guarded(Tk_sf, torch.float32)
+            x_perm4 = x_perm4.view(Tk_a, H // 2)
+            if fused:
+                quantize_scatter_rows(
+                    x,
+                    _gs_inv(TE_GS_INV, x.device),
+                    dest.reshape(-1),
+                    dest_pad.reshape(-1),
+                    k,
+                    (x_perm4, x_perm_sf, x_perm_pts),
+                )
+            else:
+                get_compiled_scatter_fp4(k, wpr, "128x4", False)(
+                    x4,
+                    sf,
+                    pts,
+                    dest.reshape(-1),
+                    dest_pad.reshape(-1),
+                    x_perm4,
+                    x_perm_sf,
+                    x_perm_pts,
+                    Tk,
+                    H // 2,
+                    pcols_h,
+                )
+            torch.cuda.synchronize()
+            assert (
+                _guards_untouched(big4)
+                and _guards_untouched(bigsf)
+                and _guards_untouched(bigpts)
+            ), fused
+            assert bool((x_perm4[n_valid:] == 0xAB).all()), (
+                fused
+            )  # the dropped slots' rows and the tail: never written
+            tok = (src[:n_valid] // k).long()
+            assert torch.equal(x_perm4[:n_valid], x4[tok]), fused
+            assert bool(
+                (x_perm_pts.view(torch.uint8).view(Tk_sf, 4)[~live_pad] == 0xAB).all()
+            ), fused
+            assert torch.equal(x_perm_pts[pos_pad[:n_valid].long()], pts[tok]), fused
+        # the intermediate's two spellings (the row-mapped quantizer; the quantizer + the scale re-tiling)
+        a = (
+            (torch.randn(Tk, I, generator=torch.Generator().manual_seed(T + 1)) * 0.5)
+            .to(torch.bfloat16)
+            .cuda()
+        )
+        gsi = _gs_inv(TE_GS_INV, a.device)
+        a4_m, big_a4 = _guarded(Tk * (I // 2))
+        a_sf_m, big_asf = _guarded(sf_numel(Tk_sf, I))
+        a_pts_m, big_apts = _guarded(Tk_sf, torch.float32)
+        quantize_rows_mapped(a, gsi, pos_pad, (a4_m.view(Tk, I // 2), a_sf_m, a_pts_m))
+        torch.cuda.synchronize()
+        assert (
+            _guards_untouched(big_a4)
+            and _guards_untouched(big_asf)
+            and _guards_untouched(big_apts)
+        )
+        assert bool((a_pts_m.view(torch.uint8).view(Tk_sf, 4)[~live_pad] == 0xAB).all())
+        a4_q, a_sf_q, a_pts_q = quantize_activations(a, gsi)
+        assert torch.equal(
+            a4_m.view(Tk, I // 2), a4_q
+        )  # the codes stay in place for every row, mapped or not
+        a_sf_s, big_s = _guarded(sf_numel(Tk_sf, I))
+        a_pts_s, big_p = _guarded(Tk_sf, torch.float32)
+        get_compiled_scatter_sf(1)(
+            a_sf_q, a_pts_q, pos_pad, a_sf_s, a_pts_s, Tk, pcols_i
+        )
+        torch.cuda.synchronize()
+        assert _guards_untouched(big_s) and _guards_untouched(big_p)
+        assert torch.equal(a_pts_s[live_pad], a_pts_m[live_pad]) and bool(
+            (a_pts_s.view(torch.uint8).view(Tk_sf, 4)[~live_pad] == 0xAB).all()
+        )
+        assert torch.equal(
+            a_sf_s, a_sf_m
+        )  # the same bytes at the padded positions, the same sentinel elsewhere
+        # the op: the dropped slots are +0 in the combine; the composition with weight 0 at a valid id gives the bits
+        out = layer(_routed_pack(x, ids_bad.cuda(), wts.cuda()), W_pack)
+        ids_ref = torch.where(dropped, torch.zeros_like(ids), ids)
+        wts_ref = torch.where(dropped, torch.zeros_like(wts), wts)
+        ref = _reference_ffn(
+            _quantized(x),
+            ids_ref.cuda(),
+            wts_ref,
+            W,
+            chain,
+            expert_classes(H, I, family),
+        )
+        assert torch.equal(bits(out.cpu()), bits(ref)), T
+        assert torch.all(out[rows[0]] == 0)
+        for path in ("dense", "padded"):
+            out_api, im = fused_moe_nvfp4(
+                x, ids_bad.cuda(), wts.cuda(), W, path=path, return_intermediates=True
+            )
+            assert torch.equal(bits(out_api), bits(out)), path
+            assert torch.equal(
+                bits(out_api.cpu()), bits(R.combine_cpu(im["y"], im["dest"], wts))
+            ), path
+        whole = (~dropped.any(dim=1)).cuda()
+        ref_whole = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W_pack)
+        assert torch.equal(bits(out[whole]), bits(ref_whole[whole]))
+    # every slot dropped: zero counts, the grouped GEMMs launch without a tile, the zero row of every token
+    T, k, E = 37, 4, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=44)
+    W = _weights_of(_weights(w1, w2))
+    ids_none = torch.full((T, k), -1, dtype=torch.int32, device="cuda")
+    wts_any = torch.rand(T, k, device="cuda")
+    out, im = fused_moe_nvfp4(x, ids_none, wts_any, W, return_intermediates=True)
+    torch.cuda.synchronize()
+    assert (
+        torch.all(out == 0)
+        and int(im["counts"].sum()) == 0
+        and torch.all(im["dest"] == -1)
+    )
+    for swap in (False, True):
+        c1, c2 = default_configs_nvfp4(
+            T,
+            k,
+            H,
+            I,
+            E,
+            expert_classes(H, I, family),
+            W.chain1,
+            W.chain2,
+            sm_count,
+            family,
+            swap=swap,
+        )
+        assert c1.swap_ab == swap and c2.swap_ab == swap
+        out2 = fused_moe_nvfp4(x, ids_none, wts_any, W, config1=c1, config2=c2)
+        torch.cuda.synchronize()
+        assert torch.all(out2 == 0), swap
+    assert torch.all(fused_moe_nvfp4(x, ids_none, wts_any, W, path="padded") == 0)

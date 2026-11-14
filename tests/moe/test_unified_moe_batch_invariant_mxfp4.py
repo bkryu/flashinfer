@@ -1002,3 +1002,162 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     nv = _layer(k, E, I, quant=_NVFP4)
     with pytest.raises(BatchInvariantUnsupportedError, match="another pair"):
         nv(_logits_pack(x, logits), W)
+
+
+# ----------------------------------------------------------------------------- dropped slots
+
+
+@needs_device
+def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
+    """A pre-routed expert id outside ``[0, E)`` (``-1``, ``E``, ``2^30``) is a dropped slot for this pair as for the others:
+    the plan marks it (``dest`` / ``dest_pad`` -1, ``pos_pad`` -1 past the live rows), the scatter of the codes and the
+    scale re-tiling write nothing for it (nothing outside the live rows or the buffers: sentinel guards), and the combine
+    folds ``+0`` in its place: the output equals the composition with those slots at a valid id and weight 0, a token whose
+    slots are all dropped gives a zero row, the other tokens keep their bits, the combine oracle over the op's intermediates
+    gives the bits; both plan forms, both packings; every slot dropped on the dense and the swapped records."""
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant.api import PLAN_MULTI_MIN_N, permute_plan
+    from flashinfer.fused_moe.batch_invariant.api_mxfp4 import (
+        _placeholder,
+        fused_moe_mxfp4,
+        mx_sf_cols,
+        mx_sf_numel,
+    )
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        DENSE_TAIL,
+        _part,
+        padded_rows_bound,
+        permute_plan_dual,
+    )
+    from flashinfer.fused_moe.batch_invariant.permute import warps_per_row
+    from flashinfer.fused_moe.batch_invariant.permute_nvfp4 import (
+        get_compiled_scatter_fp4,
+        get_compiled_scatter_sf,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp4 import (
+        default_configs_mxfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp4 import expert_classes_mx
+    from tests.moe.test_unified_moe_batch_invariant_nvfp4 import (
+        _guarded,
+        _guards_untouched,
+    )
+
+    k, H, I, E = 8, 256, 128, 64
+    bad = (-1, E, 1 << 30)
+    chain = activation_of(_SWIGLU)
+    sm_count, family = _part(torch.device("cuda"))
+    for T in (96, PLAN_MULTI_MIN_N // k + 3):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=21)
+        W_pack, layer = _weights(w1, w2), _layer(k, E, I)
+        W = _weights_of(W_pack)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids_bad = ids.clone()
+        rows = torch.randperm(T, generator=torch.Generator().manual_seed(T))[: T // 4]
+        for j, t in enumerate(rows.tolist()):
+            ids_bad[t, j % k] = bad[j % 3]
+            ids_bad[t, (j + 3) % k] = bad[(j + 1) % 3]
+        ids_bad[rows[0]] = torch.tensor(
+            [bad[i % 3] for i in range(k)], dtype=torch.int32
+        )
+        dropped = (ids_bad < 0) | (ids_bad >= E)
+        n_valid = int((~dropped).sum())
+        counts, dest, src = permute_plan(ids_bad.cuda(), E)
+        assert int(counts.sum()) == n_valid and torch.equal(
+            dest.cpu().view(-1) < 0, dropped.view(-1)
+        )
+        _, _, _, dest_pad, pos_pad = permute_plan_dual(ids_bad.cuda(), E)
+        assert torch.equal(dest_pad.cpu().view(-1) < 0, dropped.view(-1))
+        assert torch.all(pos_pad[n_valid:] == -1) and torch.all(pos_pad[:n_valid] >= 0)
+        x4, sf = _quantized(x)
+        Tk, Tk_pad = T * k, padded_rows_bound(T, k, E)
+        Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
+        unit = _placeholder(x.device)
+        x_perm4, big4 = _guarded(Tk_a * (H // 2))
+        x_perm_sf, bigsf = _guarded(mx_sf_numel(Tk_sf, H))
+        x_perm4 = x_perm4.view(Tk_a, H // 2)
+        get_compiled_scatter_fp4(
+            k, warps_per_row(Tk, H // 32, sm_count), "128x4", False, True, MX_BLOCK
+        )(
+            x4,
+            sf,
+            unit,
+            dest.reshape(-1),
+            dest_pad.reshape(-1),
+            x_perm4,
+            x_perm_sf,
+            unit,
+            Tk,
+            H // 2,
+            mx_sf_cols(H),
+        )
+        torch.cuda.synchronize()
+        assert _guards_untouched(big4) and _guards_untouched(bigsf)
+        assert bool((x_perm4[n_valid:] == 0xAB).all())
+        assert torch.equal(x_perm4[:n_valid], x4[(src[:n_valid] // k).long()])
+        a_sf_q = torch.randint(
+            0, 255, (mx_sf_numel(Tk, I),), dtype=torch.uint8, device="cuda"
+        )
+        a_sf_s, big_s = _guarded(mx_sf_numel(Tk_sf, I))
+        get_compiled_scatter_sf(1, True)(
+            a_sf_q, unit, pos_pad, a_sf_s, unit, Tk, mx_sf_cols(I)
+        )
+        torch.cuda.synchronize()
+        assert _guards_untouched(big_s)
+        # the op
+        out = layer(_routed_pack(x, ids_bad.cuda(), wts.cuda()), W_pack)
+        ids_ref = torch.where(dropped, torch.zeros_like(ids), ids)
+        wts_ref = torch.where(dropped, torch.zeros_like(wts), wts)
+        ref = _reference_ffn(
+            _quantized(x, check=False),
+            ids_ref.cuda(),
+            wts_ref,
+            W,
+            chain,
+            expert_classes_mx(family),
+        )
+        assert torch.equal(bits(out.cpu()), bits(ref)), T
+        assert torch.all(out[rows[0]] == 0)
+        for path in ("dense", "padded"):
+            out_api, im = fused_moe_mxfp4(
+                x, ids_bad.cuda(), wts.cuda(), W, path=path, return_intermediates=True
+            )
+            assert torch.equal(bits(out_api), bits(out)), path
+            assert torch.equal(
+                bits(out_api.cpu()), bits(R.combine_cpu(im["y"], im["dest"], wts))
+            ), path
+        whole = (~dropped.any(dim=1)).cuda()
+        ref_whole = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W_pack)
+        assert torch.equal(bits(out[whole]), bits(ref_whole[whole]))
+    T, k, E = 37, 4, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=44)
+    W = _weights_of(_weights(w1, w2))
+    ids_none = torch.full((T, k), -1, dtype=torch.int32, device="cuda")
+    wts_any = torch.rand(T, k, device="cuda")
+    out, im = fused_moe_mxfp4(x, ids_none, wts_any, W, return_intermediates=True)
+    torch.cuda.synchronize()
+    assert (
+        torch.all(out == 0)
+        and int(im["counts"].sum()) == 0
+        and torch.all(im["dest"] == -1)
+    )
+    for swap in (False, True):
+        c1, c2 = default_configs_mxfp4(
+            T,
+            k,
+            H,
+            I,
+            E,
+            expert_classes_mx(family),
+            W.chain1,
+            W.chain2,
+            sm_count,
+            family,
+            swap=swap,
+        )
+        assert c1.swap_ab == swap and c2.swap_ab == swap
+        assert torch.all(
+            fused_moe_mxfp4(x, ids_none, wts_any, W, config1=c1, config2=c2) == 0
+        ), swap
+    assert torch.all(fused_moe_mxfp4(x, ids_none, wts_any, W, path="padded") == 0)
