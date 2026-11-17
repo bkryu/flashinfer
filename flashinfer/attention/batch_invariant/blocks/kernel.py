@@ -40,7 +40,7 @@ from ..plan import (
     F_TILE_LO,
 )
 from .correction import correction_loop, correction_loop_q2, fold_group
-from .mma import mma_loop, mma_loop_q2
+from .mma import mma_loop, mma_loop_q2, qk_head
 from .operands import (
     ACC_DTYPE,
     BAR_CORRECTION,
@@ -51,7 +51,7 @@ from .operands import (
     TmaSetup,
     shared_storage_struct,
 )
-from .producer import load_loop, load_loop_q2
+from .producer import load_head, load_loop, load_loop_q2
 from .softmax import softmax_loop
 
 
@@ -400,7 +400,37 @@ class AttentionKernel:
                         mDesc[(ub, F_TILE_HI)],
                     )
             if cutlass.const_expr(not st.q2):
+                if cutlass.const_expr(st.qk_ahead == 1):
+                    # one S stage: a unit's Q and K_0 are issued by its predecessor's tail (producer.load_loop), the CTA's first unit's here
+                    if bidx < num_units:
+                        q_prod, kv_prod = load_head(
+                            st,
+                            atom_q,
+                            tQ,
+                            atom_q_rep,
+                            tQr,
+                            atom_k,
+                            tK,
+                            sQ_view,
+                            sQ_rep_view,
+                            sKV_view,
+                            q_prod,
+                            kv_prod,
+                            mKvIndptr,
+                            mKvIndices,
+                            mDesc[(bidx, F_REQ)],
+                            mDesc[(bidx, F_QBASE)] + mDesc[(bidx, F_QTOK0)],
+                            mDesc[(bidx, F_KVHEAD)],
+                            mDesc[(bidx, F_ROWS)],
+                            mDesc[(bidx, F_TILE_LO)],
+                        )
                 for u in range(bidx, num_units, grid_size):
+                    un = (
+                        u + grid_size
+                    )  # the next unit of this CTA (its own fields when there is none: the tail is then skipped)
+                    has_next = un < num_units
+                    if not has_next:
+                        un = u
                     q_prod, kv_prod = load_loop(
                         st,
                         atom_q,
@@ -424,6 +454,12 @@ class AttentionKernel:
                         mDesc[(u, F_ROWS)],
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
+                        has_next,
+                        mDesc[(un, F_REQ)],
+                        mDesc[(un, F_QBASE)] + mDesc[(un, F_QTOK0)],
+                        mDesc[(un, F_KVHEAD)],
+                        mDesc[(un, F_ROWS)],
+                        mDesc[(un, F_TILE_LO)],
                     )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:
@@ -499,7 +535,31 @@ class AttentionKernel:
                         mDesc[(ua, F_KVLEN)],
                     )
             if cutlass.const_expr(not st.q2):
+                qs = Int32(
+                    0
+                )  # the current unit's Q stage (one S stage: set by qk_head, a unit ahead)
+                if cutlass.const_expr(st.qk_ahead == 1):
+                    # one S stage: a unit's QK(0) is issued by its predecessor's tail (mma.mma_loop), the CTA's first unit's here
+                    if bidx < num_units:
+                        q_cons, kv_cons, s_prod, qks_tiled_mma, qs = qk_head(
+                            st,
+                            qks_tiled_mma,
+                            qk_low,
+                            tStS_slots,
+                            tSrQ,
+                            tSrK,
+                            q_cons,
+                            kv_cons,
+                            s_prod,
+                            mDesc[(bidx, F_TILE_HI)] - mDesc[(bidx, F_TILE_LO)],
+                        )
                 for u in range(bidx, num_units, grid_size):
+                    un = (
+                        u + grid_size
+                    )  # the next unit of this CTA (its own fields when there is none: the tail is then skipped)
+                    has_next = un < num_units
+                    if not has_next:
+                        un = u
                     (
                         q_cons,
                         kv_cons,
@@ -508,6 +568,7 @@ class AttentionKernel:
                         o_prod,
                         qks_tiled_mma,
                         pv_tiled_mma,
+                        qs,
                     ) = mma_loop(
                         st,
                         qks_tiled_mma,
@@ -527,9 +588,12 @@ class AttentionKernel:
                         s_prod,
                         p_cons,
                         o_prod,
+                        qs,
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
                         mDesc[(u, F_KVLEN)],
+                        has_next,
+                        mDesc[(un, F_TILE_HI)] - mDesc[(un, F_TILE_LO)],
                     )
             cute.arch.griddepcontrol_launch_dependents()
         if (
