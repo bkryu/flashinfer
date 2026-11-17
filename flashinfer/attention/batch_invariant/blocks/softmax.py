@@ -42,7 +42,7 @@ from ....batch_invariant import canon
 from ....batch_invariant.fp_interface.cute import CuteF32, fmax3
 
 
-from .classprobe import exp16_pair_word, tile_max_step
+from .classprobe import ex2bf16_pair_word, exp16_pair_word, tile_max_step
 from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
 
 _NEG_INF = float("-inf")
@@ -59,7 +59,7 @@ class _RegLoader:
         return self.vals[key[0]]
 
 
-def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype, exp16: bool = False, rP_w=None):
+def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype, exp16: int = 0, rP_w=None):
     """The slice's exponentials, their bf16 conversion and the rowsum tree's subtree over the slice, emitted in KEY order as a stream:
     for every pair of keys ``p = EX2(fma(s, c, nms))`` (the two fmas as one ``fma.rn.f32x2``), the pair's bf16 words, and the
     pair's ``add`` -- the first level of the engine's adjacent pairwise tree (``canon._pairwise``: low index first, level by level) --
@@ -68,12 +68,16 @@ def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype, exp16: bool = False, rP_
     and at most ``log2(keys)`` partial sums, so the P words can take the registers of the scores they came from; emitting every
     exponential before the first conversion kept all of them live next to the P block and cost the register allocator a copy of
     most of them per tile. ``ss[i]`` is the score of key ``i`` of the slice (register ``i``). Plain Python: trace-time structure.
-    ``exp16``: the pair's exponentials as one ``ex2.approx.f16x2`` (classprobe), its bf16 word written to ``rP_w[i / 2]``."""
+    ``exp16``: the pair's exponentials as one ``ex2.approx.f16x2`` (1) or ``ex2.approx.ftz.bf16x2`` (3) (classprobe), the bf16 word
+    written to ``rP_w[i / 2]``."""
     assert len(ss) % 2 == 0 and len(ss) & (len(ss) - 1) == 0, len(ss)
     stack = []  # (level, partial sum) of the completed subtrees, highest level first
     for i in range(0, len(ss), 2):
         x0, x1 = fp.fma2((ss[i], ss[i + 1]), (c, c), (nms, nms))
-        if exp16:
+        if exp16 == 3:
+            p0, p1, w = ex2bf16_pair_word(x0, x1)
+            rP_w[i // 2] = w
+        elif exp16:
             p0, p1, w = exp16_pair_word(x0, x1)
             rP_w[i // 2] = w
         else:
@@ -407,7 +411,15 @@ def unit_loop(
             ps = [None] * kpt
             for i in cutlass.range_constexpr(0, kpt, 2):
                 x0, x1 = CuteF32.fma2((ss[i], ss[i + 1]), (c, c), (nms, nms))
-                if cutlass.const_expr(E16):
+                if cutlass.const_expr(E16 == 3):
+                    p0, p1, w = ex2bf16_pair_word(x0, x1)
+                    ps[i] = p0
+                    ps[i + 1] = p1
+                    if cutlass.const_expr(rep):
+                        rPq[i // 2] = w
+                    else:
+                        rP[i // 2] = w
+                elif cutlass.const_expr(E16):
                     p0, p1, w = exp16_pair_word(x0, x1)
                     ps[i] = p0
                     ps[i + 1] = p1

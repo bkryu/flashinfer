@@ -8,8 +8,10 @@ order: the variants keep R1-R4 only because the per-row decision and the per-key
 * lazy rescale (``lazy = L > 0``, in log2 units): the running maximum moves to the tile maximum only when the alpha argument
   ``add(mul(m, c), mul(m', nc))`` -- the spec's own term -- is below ``-L``; otherwise the row keeps ``m``, ``alpha = 1`` (the
   correction skips its O pass) and the exponentials use the stale maximum, so ``P`` reaches at most ``2^L``.
-* fp16 exponentials (``exp16``): ``p = widen(ex2_f16(cvt_f16(x)))`` for ``x = fma(s, c, mul(m', nc))``, two keys per ``ex2.approx.f16x2``;
+* fp16 exponentials (``exp16 = 1``): ``p = widen(ex2_f16(cvt_f16(x)))`` for ``x = fma(s, c, mul(m', nc))``, two keys per ``ex2.approx.f16x2``;
   the widening is exact, the row sum tree and the bf16 ``P`` word are formed from the widened values exactly as in the fp32 class.
+* bf16 exponentials (``exp16 = 3``): ``p = widen(ex2_bf16(cvt_bf16(x)))`` (``ex2.approx.ftz.bf16x2``): the ``P`` word is the exponential's
+  own output, the row sum tree takes the exact widening; the coarsest member (the argument carries 8 bits).
 """
 
 from __future__ import annotations
@@ -100,6 +102,66 @@ def exp16_pair_word(x0: Float32, x1: Float32, *, loc=None, ip=None):
             mov.b64 {$0, $1}, w;
             cvt.rn.bf16x2.f32 pw, $1, $0;
             mov.b32 $2, pw;
+        }
+        """,
+        "=f,=f,=f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [2], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def ex2bf16_pair(x0: Float32, x1: Float32, *, loc=None, ip=None):
+    """``(p0, p1) = widen(ex2.approx.ftz.bf16x2(cvt.rn.bf16x2.f32(x0, x1)))``: the widening (``add.f32x2.bf16x2.f32x2`` with ``+0``) is exact."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [Float32(x0).ir_value(loc=loc, ip=ip), Float32(x1).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 h, e, z;
+            .reg .b64 zz, w;
+            cvt.rn.bf16x2.f32 h, $3, $2;
+            ex2.approx.ftz.bf16x2 e, h;
+            mov.b32 z, 0;
+            mov.b64 zz, {z, z};
+            add.f32x2.bf16x2.f32x2 w, e, zz;
+            mov.b64 {$0, $1}, w;
+        }
+        """,
+        "=f,=f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def ex2bf16_pair_word(x0: Float32, x1: Float32, *, loc=None, ip=None):
+    """``ex2bf16_pair`` plus the bf16 pair itself as the P word (``p0`` in the low half; the bits of a ``Float32`` register)."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32()]),
+        [Float32(x0).ir_value(loc=loc, ip=ip), Float32(x1).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 h, e, z;
+            .reg .b64 zz, w;
+            cvt.rn.bf16x2.f32 h, $4, $3;
+            ex2.approx.ftz.bf16x2 e, h;
+            mov.b32 z, 0;
+            mov.b64 zz, {z, z};
+            add.f32x2.bf16x2.f32x2 w, e, zz;
+            mov.b64 {$0, $1}, w;
+            mov.b32 $2, e;
         }
         """,
         "=f,=f,=f,f,f",

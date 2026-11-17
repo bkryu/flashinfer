@@ -104,7 +104,7 @@ class AttentionKernel:
         hw_rowmax: bool = False,
         cap: int = 0,
         lazy: int = 0,
-        exp16: bool = False,
+        exp16: int = 0,
     ):
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,

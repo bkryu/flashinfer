@@ -74,7 +74,7 @@ class SwapsKernel:
         ragged: bool = False,
         cap: int = 0,
         lazy: int = 0,
-        exp16: bool = False,
+        exp16: int = 0,
     ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)

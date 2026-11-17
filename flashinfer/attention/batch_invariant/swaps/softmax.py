@@ -30,7 +30,7 @@ from cutlass.cute.nvgpu import tcgen05
 from ....batch_invariant import canon
 from ....batch_invariant.fp_interface.cute import CuteF32
 from .. import spec
-from ..blocks.classprobe import exp16_pair, tile_max_step
+from ..blocks.classprobe import ex2bf16_pair, exp16_pair, tile_max_step
 from ..blocks.operands import ACC_DTYPE, IN_DTYPE
 from .operands import BAR_SOFTMAX
 
@@ -267,7 +267,9 @@ def unit_loop(
             x0, x1 = CuteF32.fma2(
                 (rS[reg_of[n]], rS[reg_of[n + 1]]), (c, c), (nms[n], nms[n + 1])
             )
-            if cutlass.const_expr(st.exp16):  # the probe's fp16 packed exponentials (classprobe)
+            if cutlass.const_expr(st.exp16 == 3):  # the probe's bf16 packed exponentials (classprobe)
+                ps[n], ps[n + 1] = ex2bf16_pair(x0, x1)
+            elif cutlass.const_expr(st.exp16):  # the probe's fp16 packed exponentials
                 ps[n], ps[n + 1] = exp16_pair(x0, x1)
             else:
                 ps[n] = CuteF32.ex2(x0)

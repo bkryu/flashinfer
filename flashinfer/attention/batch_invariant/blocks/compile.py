@@ -37,7 +37,7 @@ def kernel_name(
     hw_rowmax: bool = False,
     cap: int = 0,
     lazy: int = 0,
-    exp16: bool = False,
+    exp16: int = 0,
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_d{D}_g{g}_p{page}_s{kv_slots}_w{n_wg}"
@@ -46,7 +46,7 @@ def kernel_name(
         + ("_hwm" if hw_rowmax else "")
         + (f"_c{cap >> 10}" if cap else "")
         + (f"_lz{lazy}" if lazy else "")
-        + ("_e16" if exp16 else "")
+        + (("_e16" if exp16 == 1 else f"_e16m{exp16}") if exp16 else "")
     )
 
 
@@ -62,7 +62,7 @@ def get_compiled_attention(
     hw_rowmax: bool = False,
     cap: int = 0,
     lazy: int = 0,
-    exp16: bool = False,
+    exp16: int = 0,
 ):
     """``hw_rowmax``: the softmax's row maximum from the TMEM load (``engine.hw_row_max_enabled``); part of the kernel's name.
     ``cap``: the shared-memory capacity the smem plan is checked against (the execution device's; the current device's when 0)."""

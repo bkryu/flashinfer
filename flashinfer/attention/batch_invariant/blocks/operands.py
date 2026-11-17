@@ -187,7 +187,7 @@ class StaticPlan:
         hw_rowmax: bool = False,
         cap: int = 0,
         lazy: int = 0,
-        exp16: bool = False,
+        exp16: int = 0,
     ):
         """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
         have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""

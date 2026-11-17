@@ -222,7 +222,7 @@ class SwapsPlan:
         ragged: bool = False,
         cap: int = 0,
         lazy: int = 0,
-        exp16: bool = False,
+        exp16: int = 0,
     ):
         assert D in (64, 128, 256) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
         self.lazy, self.exp16 = lazy, exp16  # the probe variants of the softmax term (blocks/classprobe.py); 0 / False = the class

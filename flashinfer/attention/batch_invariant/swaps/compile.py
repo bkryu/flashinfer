@@ -27,14 +27,14 @@ def kernel_name(
     ragged: bool = False,
     cap: int = 0,
     lazy: int = 0,
-    exp16: bool = False,
+    exp16: int = 0,
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_swaps_d{D}_g{g}_p{page}_n{n_pad}"
         + ("_rg" if ragged else "")
         + (f"_c{cap >> 10}" if cap else "")
         + (f"_lz{lazy}" if lazy else "")
-        + ("_e16" if exp16 else "")
+        + (("_e16" if exp16 == 1 else f"_e16m{exp16}") if exp16 else "")
     )
 
 
@@ -47,7 +47,7 @@ def get_compiled_swaps(
     ragged: bool = False,
     cap: int = 0,
     lazy: int = 0,
-    exp16: bool = False,
+    exp16: int = 0,
 ):
     """``cap``: the shared-memory capacity the ring is sized for (the execution device's; the current device's when 0): part of
     the kernel's identity in this process's cache and on disk."""

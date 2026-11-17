@@ -125,8 +125,6 @@ def class_probe_forced() -> dict:
         k, v = item.split("=")
         out[k.strip()] = int(v)
     assert set(out) <= {"lazy", "exp16"}, out
-    if "exp16" in out:
-        out["exp16"] = bool(out["exp16"])
     return out
 
 
@@ -153,7 +151,7 @@ class AttnConfig:
     # the probe variants of the softmax TERM (class changes behind CLASS_PROBE_ENV; blocks/classprobe.py): lazy = the rescale threshold in
     # log2 units (0 = the exact class), exp16 = fp16 packed exponentials
     lazy: int = 0
-    exp16: bool = False
+    exp16: int = 0  # 0 = the class, 1 = fp16 exponentials, 3 = bf16 exponentials
 
     def __post_init__(self):
         for k, v in class_probe_forced().items():
@@ -167,7 +165,7 @@ class AttnConfig:
             + ("_sw" if self.small == "swap" else "")
             + ("_q2" if self.q2 else "")
             + (f"_lz{self.lazy}" if self.lazy else "")
-            + ("_e16" if self.exp16 else "")
+            + (("_e16" if self.exp16 == 1 else f"_e16m{self.exp16}") if self.exp16 else "")
         )
 
     def well_formed(self, D: int = 128) -> bool:
@@ -182,6 +180,7 @@ class AttnConfig:
             and self.small in ("rep", "swap")
             and (not self.q2 or (self.softmax_wgs == 2 and D in (64, 128)))
             and self.lazy >= 0
+            and self.exp16 in (0, 1, 3)
             and (not (self.lazy or self.exp16) or class_probe_enabled())
         )
 
