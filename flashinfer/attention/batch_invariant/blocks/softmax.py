@@ -405,7 +405,7 @@ def unit_loop(
                 cute.recast_ptr(rPq.iterator, dtype=IN_DTYPE), cute.make_layout((kpt,))
             )
         E16 = st.exp16  # the probe's fp16 packed exponentials (classprobe): the bf16 P words from the widened pair
-        if cutlass.const_expr(not rep and not st.q2):
+        if cutlass.const_expr(not rep and st.streamed):
             r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, IN_DTYPE, E16, rP)
         else:
             ps = [None] * kpt
