@@ -42,7 +42,7 @@ from ....batch_invariant import canon
 from ....batch_invariant.fp_interface.cute import CuteF32, fmax3
 
 
-from .. import spec
+from .classprobe import exp16_pair_word, tile_max_step
 from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
 
 _NEG_INF = float("-inf")
@@ -59,7 +59,7 @@ class _RegLoader:
         return self.vals[key[0]]
 
 
-def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype):
+def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype, exp16: bool = False, rP_w=None):
     """The slice's exponentials, their bf16 conversion and the rowsum tree's subtree over the slice, emitted in KEY order as a stream:
     for every pair of keys ``p = EX2(fma(s, c, nms))`` (the two fmas as one ``fma.rn.f32x2``), the pair's bf16 words, and the
     pair's ``add`` -- the first level of the engine's adjacent pairwise tree (``canon._pairwise``: low index first, level by level) --
@@ -67,15 +67,20 @@ def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype):
     tree, the same operand order). Written this way the live values at any point are the unprocessed scores, the finished P words
     and at most ``log2(keys)`` partial sums, so the P words can take the registers of the scores they came from; emitting every
     exponential before the first conversion kept all of them live next to the P block and cost the register allocator a copy of
-    most of them per tile. ``ss[i]`` is the score of key ``i`` of the slice (register ``i``). Plain Python: trace-time structure."""
+    most of them per tile. ``ss[i]`` is the score of key ``i`` of the slice (register ``i``). Plain Python: trace-time structure.
+    ``exp16``: the pair's exponentials as one ``ex2.approx.f16x2`` (classprobe), its bf16 word written to ``rP_w[i / 2]``."""
     assert len(ss) % 2 == 0 and len(ss) & (len(ss) - 1) == 0, len(ss)
     stack = []  # (level, partial sum) of the completed subtrees, highest level first
     for i in range(0, len(ss), 2):
         x0, x1 = fp.fma2((ss[i], ss[i + 1]), (c, c), (nms, nms))
-        p0 = fp.ex2(x0)
-        p1 = fp.ex2(x1)
-        rP_e[i] = p0.to(in_dtype)
-        rP_e[i + 1] = p1.to(in_dtype)
+        if exp16:
+            p0, p1, w = exp16_pair_word(x0, x1)
+            rP_w[i // 2] = w
+        else:
+            p0 = fp.ex2(x0)
+            p1 = fp.ex2(x1)
+            rP_e[i] = p0.to(in_dtype)
+            rP_e[i + 1] = p1.to(in_dtype)
         v = fp.add(p0, p1)
         level = 1
         while stack and stack[-1][0] == level:
@@ -374,17 +379,9 @@ def unit_loop(
                 )  # the same value as the rowmax plan (max is exact and order-free)
         if chunk_first:
             m = neg_inf
-        null = m_t == neg_inf  # no visible key for this row: a null step
-        m_new = CuteF32.fmaxc(m, m_t)
-        m_base = m_new
-        if null:
-            m_base = Float32(0.0)
-        nms = CuteF32.mul(m_base, nc)
-        alpha = spec.alpha_term(
-            CuteF32, m, m_base, c, nc
-        )  # EX2(add(mul(m, c), mul(m_new, nc)))
-        if null:
-            alpha = Float32(1.0)
+        # m' = fmax(m, m_t), alpha = EX2(add(mul(m, c), mul(m', nc))), the exponentials' offset mul(m', nc); a tile with no visible key is
+        # a null step (alpha = 1, m untouched). AttnConfig.lazy: the probe's lazy-rescale variant of the same step (classprobe)
+        m_new, alpha, nms = tile_max_step(m, m_t, c, nc, st.lazy)
         m = m_new
         # ---- alpha to the correction warpgroup at once (its O rescale overlaps the exponentials)
         sth = stats_prod.acquire_and_advance()
@@ -403,21 +400,32 @@ def unit_loop(
             rPq_e = cute.make_tensor(
                 cute.recast_ptr(rPq.iterator, dtype=IN_DTYPE), cute.make_layout((kpt,))
             )
+        E16 = st.exp16  # the probe's fp16 packed exponentials (classprobe): the bf16 P words from the widened pair
         if cutlass.const_expr(not rep and not st.q2):
-            r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, IN_DTYPE)
+            r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, IN_DTYPE, E16, rP)
         else:
             ps = [None] * kpt
             for i in cutlass.range_constexpr(0, kpt, 2):
                 x0, x1 = CuteF32.fma2((ss[i], ss[i + 1]), (c, c), (nms, nms))
-                ps[i] = CuteF32.ex2(x0)
-                ps[i + 1] = CuteF32.ex2(x1)
+                if cutlass.const_expr(E16):
+                    p0, p1, w = exp16_pair_word(x0, x1)
+                    ps[i] = p0
+                    ps[i + 1] = p1
+                    if cutlass.const_expr(rep):  # the P fragment whose 32-bit words the packed bf16 pairs take
+                        rPq[i // 2] = w
+                    else:
+                        rP[i // 2] = w
+                else:
+                    ps[i] = CuteF32.ex2(x0)
+                    ps[i + 1] = CuteF32.ex2(x1)
             r_s = packed_pairwise_add(ps, CuteF32)
-            if cutlass.const_expr(rep):
-                for i in cutlass.range_constexpr(kpt):
-                    rPq_e[i] = ps[i].to(IN_DTYPE)
-            else:
-                for i in cutlass.range_constexpr(kpt):
-                    rP_e[i] = ps[i].to(IN_DTYPE)
+            if cutlass.const_expr(not E16):
+                if cutlass.const_expr(rep):
+                    for i in cutlass.range_constexpr(kpt):
+                        rPq_e[i] = ps[i].to(IN_DTYPE)
+                else:
+                    for i in cutlass.range_constexpr(kpt):
+                        rP_e[i] = ps[i].to(IN_DTYPE)
         # ---- (m', r_slice) to the correction warpgroup, which owns the l chain and the merges
         sth = stats_prod.acquire_and_advance()
         s_m[(sth.index, row)] = m_new

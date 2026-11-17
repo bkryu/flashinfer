@@ -66,10 +66,19 @@ class SwapsKernel:
     runtime arguments. Every unit must have at most ``n_pad`` live rows (the API selects ``n_pad`` per launch)."""
 
     def __init__(
-        self, D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
+        self,
+        D: int,
+        g: int,
+        page: int,
+        n_pad: int,
+        ragged: bool = False,
+        cap: int = 0,
+        lazy: int = 0,
+        exp16: bool = False,
     ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
+        self.lazy, self.exp16 = lazy, exp16  # the probe variants of the softmax term (blocks/classprobe.py)
 
     @cute.jit
     def __call__(
@@ -91,7 +100,9 @@ class SwapsKernel:
         grid: Int32,
         stream: cuda.CUstream,
     ):
-        st = SwapsPlan(self.D, self.g, self.page, self.n_pad, self.ragged, self.cap)
+        st = SwapsPlan(
+            self.D, self.g, self.page, self.n_pad, self.ragged, self.cap, self.lazy, self.exp16
+        )
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)
 
