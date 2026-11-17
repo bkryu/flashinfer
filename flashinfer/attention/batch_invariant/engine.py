@@ -108,6 +108,28 @@ def hw_row_max_enabled(device=None, D: int = 128) -> bool:
     return int(major) == 10 and int(minor) >= 3
 
 
+CLASS_PROBE_ENV = "FLASHINFER_BI_ATTN_CLASS_PROBE"  # "1": ``well_formed`` accepts the probe variants of the softmax term
+CLASS_PROBE_FORCE_ENV = "FLASHINFER_BI_ATTN_CLASS_PROBE_FORCE"  # "lazy=8,exp16=1": every AttnConfig takes these variant fields
+
+
+def class_probe_enabled() -> bool:
+    return os.environ.get(CLASS_PROBE_ENV, "0") == "1" or bool(
+        os.environ.get(CLASS_PROBE_FORCE_ENV, "")
+    )
+
+
+def class_probe_forced() -> dict:
+    """The variant fields every configuration is forced to (``{}`` when not forcing): the probe's way of running the suite's
+    determinism / invariance / agreement tests against a variant."""
+    spec = os.environ.get(CLASS_PROBE_FORCE_ENV, "")
+    out: dict = {}
+    for item in filter(None, spec.split(",")):
+        k, v = item.split("=")
+        out[k.strip()] = int(v)
+    assert set(out) <= {"lazy", "exp16"}, out
+    return out
+
+
 @dataclass(frozen=True)
 class AttnConfig:
     """A configuration of the kernel: every member of the space computes the class (R3)."""
@@ -128,6 +150,14 @@ class AttnConfig:
     q2: bool = False  # with softmax_wgs = 2: the paired placement -- two Q tiles per unit, warpgroup k owns Q tile k (whole rows), one
     # K / V stream for both; D = 64 and D = 128 (blocks/operands.py: both tiles' S and O_c in TMEM, O_m in smem; at D = 128 P over S,
     # which fits 328 KB parts only)
+    # the probe variants of the softmax TERM (class changes behind CLASS_PROBE_ENV; blocks/classprobe.py): lazy = the rescale threshold in
+    # log2 units (0 = the exact class), exp16 = fp16 packed exponentials
+    lazy: int = 0
+    exp16: int = 0  # 0 = the class, 1 = fp16 exponentials, 3 = bf16 exponentials
+
+    def __post_init__(self):
+        for k, v in class_probe_forced().items():
+            object.__setattr__(self, k, v)
 
     def describe(self) -> str:
         return (
@@ -136,6 +166,12 @@ class AttnConfig:
             + ({"auto": "", "fixup": "_fx", "inkernel": "_ik"}[self.merge])
             + ("_sw" if self.small == "swap" else "")
             + ("_q2" if self.q2 else "")
+            + (f"_lz{self.lazy}" if self.lazy else "")
+            + (
+                ("_e16" if self.exp16 == 1 else f"_e16m{self.exp16}")
+                if self.exp16
+                else ""
+            )
         )
 
     def well_formed(self, D: int = 128) -> bool:
@@ -149,6 +185,9 @@ class AttnConfig:
             and self.merge in ("auto", "fixup", "inkernel")
             and self.small in ("rep", "swap")
             and (not self.q2 or (self.softmax_wgs == 2 and D in (64, 128)))
+            and self.lazy >= 0
+            and self.exp16 in (0, 1, 3)
+            and (not (self.lazy or self.exp16) or class_probe_enabled())
         )
 
     def lean(self) -> str:
@@ -689,7 +728,15 @@ def _run_attention_validated(
         pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
         kernel = get_compiled_swaps(
-            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl
+            D,
+            g,
+            page,
+            n_pad,
+            ragged,
+            arch_smem_cap(q.device),
+            pdl,
+            config.lazy,
+            config.exp16,
         )
         kernel(
             q_view,
@@ -721,7 +768,17 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap
+                D,
+                g,
+                page,
+                DEFAULT_RING[D],
+                1,
+                False,
+                ragged,
+                hwm,
+                cap,
+                config.lazy,
+                config.exp16,
             )
         else:
             kernel = get_compiled_attention(
@@ -734,6 +791,8 @@ def _run_attention_validated(
                 ragged,
                 hwm,
                 cap,
+                config.lazy,
+                config.exp16,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(

@@ -214,9 +214,21 @@ class SwapsPlan:
     """Tiled MMAs, tilers, smem / TMEM layouts, stage counts and the producer views of the swapped body."""
 
     def __init__(
-        self, D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
+        self,
+        D: int,
+        g: int,
+        page: int,
+        n_pad: int,
+        ragged: bool = False,
+        cap: int = 0,
+        lazy: int = 0,
+        exp16: int = 0,
     ):
         assert D in (64, 128, 256) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
+        self.lazy, self.exp16 = (
+            lazy,
+            exp16,
+        )  # the probe variants of the softmax term (blocks/classprobe.py); 0 / False = the class
         assert page >= 1 and (
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page

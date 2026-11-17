@@ -27,12 +27,16 @@ def kernel_name(
     ragged: bool = False,
     cap: int = 0,
     pdl: bool = False,
+    lazy: int = 0,
+    exp16: int = 0,
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_swaps_d{D}_g{g}_p{page}_n{n_pad}"
         + ("_rg" if ragged else "")
         + (f"_c{cap >> 10}" if cap else "")
         + ("_pdl" if pdl else "")
+        + (f"_lz{lazy}" if lazy else "")
+        + (("_e16" if exp16 == 1 else f"_e16m{exp16}") if exp16 else "")
     )
 
 
@@ -45,6 +49,8 @@ def get_compiled_swaps(
     ragged: bool = False,
     cap: int = 0,
     pdl: bool = False,
+    lazy: int = 0,
+    exp16: int = 0,
 ):
     """``cap``: the shared-memory capacity the ring is sized for (the execution device's; the current device's when 0): part of
     the kernel's identity in this process's cache and on disk; ``pdl``: launched as a programmatic dependent (its load warp waits
@@ -52,7 +58,7 @@ def get_compiled_swaps(
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()
-    name = kernel_name(D, g, page, n_pad, ragged, cap, pdl)
+    name = kernel_name(D, g, page, n_pad, ragged, cap, pdl, lazy, exp16)
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
@@ -113,7 +119,7 @@ def get_compiled_swaps(
             i32, (s_nidx,), (1,), assumed_align=4
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        k = SwapsKernel(D, g, page, n_pad, ragged, cap, pdl)
+        k = SwapsKernel(D, g, page, n_pad, ragged, cap, pdl, lazy, exp16)
         return cute.compile(
             k,
             q_fake,

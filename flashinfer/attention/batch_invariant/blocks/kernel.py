@@ -103,6 +103,8 @@ class AttentionKernel:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        lazy: int = 0,
+        exp16: int = 0,
     ):
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
@@ -115,6 +117,10 @@ class AttentionKernel:
         )
         self.hw_rowmax = hw_rowmax
         self.cap = cap
+        self.lazy, self.exp16 = (
+            lazy,
+            exp16,
+        )  # the probe variants of the softmax term (blocks/classprobe.py)
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit
@@ -151,6 +157,8 @@ class AttentionKernel:
             self.ragged,
             self.hw_rowmax,
             self.cap,
+            self.lazy,
+            self.exp16,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)

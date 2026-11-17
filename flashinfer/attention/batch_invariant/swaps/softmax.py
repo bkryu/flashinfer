@@ -30,6 +30,7 @@ from cutlass.cute.nvgpu import tcgen05
 from ....batch_invariant import canon
 from ....batch_invariant.fp_interface.cute import CuteF32
 from .. import spec
+from ..blocks.classprobe import ex2bf16_pair, exp16_pair, tile_max_step
 from ..blocks.operands import ACC_DTYPE, IN_DTYPE
 from .operands import BAR_SOFTMAX
 
@@ -243,18 +244,10 @@ def unit_loop(
             m_old = m[n]
             if chunk_first:
                 m_old = neg_inf
-            null = m_t[n] == neg_inf  # no visible key for this row: a null step
-            m_new = CuteF32.fmaxc(m_old, m_t[n])
-            m_base = m_new
-            if null:
-                m_base = Float32(0.0)
-            a = spec.alpha_term(
-                CuteF32, m_old, m_base, c, nc
-            )  # EX2(add(mul(m, c), mul(m_new, nc)))
-            if null:
-                a = Float32(1.0)
+            # the row body's tile step (classprobe.tile_max_step: the same fp32 operations in the same order, R4)
+            m_new, a, nm = tile_max_step(m_old, m_t[n], c, nc, st.lazy)
             alpha.append(a)
-            nms.append(CuteF32.mul(m_base, nc))
+            nms.append(nm)
             m[n] = m_new
         # ---- m' to the other warpgroup for the next tile (when there is one): lane n publishes row n
         if n_t + 1 < N:
@@ -274,8 +267,15 @@ def unit_loop(
             x0, x1 = CuteF32.fma2(
                 (rS[reg_of[n]], rS[reg_of[n + 1]]), (c, c), (nms[n], nms[n + 1])
             )
-            ps[n] = CuteF32.ex2(x0)
-            ps[n + 1] = CuteF32.ex2(x1)
+            if cutlass.const_expr(
+                st.exp16 == 3
+            ):  # the probe's bf16 packed exponentials (classprobe)
+                ps[n], ps[n + 1] = ex2bf16_pair(x0, x1)
+            elif cutlass.const_expr(st.exp16):  # the probe's fp16 packed exponentials
+                ps[n], ps[n + 1] = exp16_pair(x0, x1)
+            else:
+                ps[n] = CuteF32.ex2(x0)
+                ps[n + 1] = CuteF32.ex2(x1)
         # ---- the row sums over the warp's keys (the lane plan); the correction adds the four warp partials in warp order
         sth = stats_prod.acquire_and_advance()
         rws = warp_reduce_rows(plan_sum, ps, CuteF32.add, peers)
