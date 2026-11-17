@@ -113,7 +113,9 @@ CLASS_PROBE_FORCE_ENV = "FLASHINFER_BI_ATTN_CLASS_PROBE_FORCE"  # "lazy=8,exp16=
 
 
 def class_probe_enabled() -> bool:
-    return os.environ.get(CLASS_PROBE_ENV, "0") == "1" or bool(os.environ.get(CLASS_PROBE_FORCE_ENV, ""))
+    return os.environ.get(CLASS_PROBE_ENV, "0") == "1" or bool(
+        os.environ.get(CLASS_PROBE_FORCE_ENV, "")
+    )
 
 
 def class_probe_forced() -> dict:
@@ -165,7 +167,11 @@ class AttnConfig:
             + ("_sw" if self.small == "swap" else "")
             + ("_q2" if self.q2 else "")
             + (f"_lz{self.lazy}" if self.lazy else "")
-            + (("_e16" if self.exp16 == 1 else f"_e16m{self.exp16}") if self.exp16 else "")
+            + (
+                ("_e16" if self.exp16 == 1 else f"_e16m{self.exp16}")
+                if self.exp16
+                else ""
+            )
         )
 
     def well_formed(self, D: int = 128) -> bool:
@@ -713,7 +719,14 @@ def _run_attention_validated(
 
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
         kernel = get_compiled_swaps(
-            D, g, page, n_pad, ragged, arch_smem_cap(q.device), config.lazy, config.exp16
+            D,
+            g,
+            page,
+            n_pad,
+            ragged,
+            arch_smem_cap(q.device),
+            config.lazy,
+            config.exp16,
         )
         kernel(
             q_view,

@@ -69,7 +69,9 @@ def get_compiled_attention(
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()
-    name = kernel_name(D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, lazy, exp16)
+    name = kernel_name(
+        D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, lazy, exp16
+    )
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32

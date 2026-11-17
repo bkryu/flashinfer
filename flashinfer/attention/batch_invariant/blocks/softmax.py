@@ -71,7 +71,7 @@ def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype, exp16: int = 0, rP_w=Non
     ``exp16``: the pair's exponentials as one ``ex2.approx.f16x2`` (1) or ``ex2.approx.ftz.bf16x2`` (3) (classprobe), the bf16 word
     written to ``rP_w[i / 2]``."""
     assert len(ss) % 2 == 0 and len(ss) & (len(ss) - 1) == 0, len(ss)
-    stack = []  # (level, partial sum) of the completed subtrees, highest level first
+    stack: list = []  # (level, partial sum) of the completed subtrees, highest level first
     for i in range(0, len(ss), 2):
         x0, x1 = fp.fma2((ss[i], ss[i + 1]), (c, c), (nms, nms))
         if exp16 == 3:
@@ -423,7 +423,9 @@ def unit_loop(
                     p0, p1, w = exp16_pair_word(x0, x1)
                     ps[i] = p0
                     ps[i + 1] = p1
-                    if cutlass.const_expr(rep):  # the P fragment whose 32-bit words the packed bf16 pairs take
+                    if cutlass.const_expr(
+                        rep
+                    ):  # the P fragment whose 32-bit words the packed bf16 pairs take
                         rPq[i // 2] = w
                     else:
                         rP[i // 2] = w

@@ -78,7 +78,10 @@ class SwapsKernel:
     ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
-        self.lazy, self.exp16 = lazy, exp16  # the probe variants of the softmax term (blocks/classprobe.py)
+        self.lazy, self.exp16 = (
+            lazy,
+            exp16,
+        )  # the probe variants of the softmax term (blocks/classprobe.py)
 
     @cute.jit
     def __call__(
@@ -101,7 +104,14 @@ class SwapsKernel:
         stream: cuda.CUstream,
     ):
         st = SwapsPlan(
-            self.D, self.g, self.page, self.n_pad, self.ragged, self.cap, self.lazy, self.exp16
+            self.D,
+            self.g,
+            self.page,
+            self.n_pad,
+            self.ragged,
+            self.cap,
+            self.lazy,
+            self.exp16,
         )
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)

@@ -267,7 +267,9 @@ def unit_loop(
             x0, x1 = CuteF32.fma2(
                 (rS[reg_of[n]], rS[reg_of[n + 1]]), (c, c), (nms[n], nms[n + 1])
             )
-            if cutlass.const_expr(st.exp16 == 3):  # the probe's bf16 packed exponentials (classprobe)
+            if cutlass.const_expr(
+                st.exp16 == 3
+            ):  # the probe's bf16 packed exponentials (classprobe)
                 ps[n], ps[n + 1] = ex2bf16_pair(x0, x1)
             elif cutlass.const_expr(st.exp16):  # the probe's fp16 packed exponentials
                 ps[n], ps[n + 1] = exp16_pair(x0, x1)

@@ -117,7 +117,10 @@ class AttentionKernel:
         )
         self.hw_rowmax = hw_rowmax
         self.cap = cap
-        self.lazy, self.exp16 = lazy, exp16  # the probe variants of the softmax term (blocks/classprobe.py)
+        self.lazy, self.exp16 = (
+            lazy,
+            exp16,
+        )  # the probe variants of the softmax term (blocks/classprobe.py)
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit
