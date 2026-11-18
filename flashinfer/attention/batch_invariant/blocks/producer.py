@@ -4,9 +4,6 @@
 next unit's Q is prefetched), then the page boxes of K and of V of every tile of the unit into the smem
 ring, in the order the MMA warp consumes them: K one tile ahead of V (``K_0, K_1, V_0, K_2, V_1, ...``),
 because the MMA warp issues QK(n + 1) before PV(n) so that the softmax of tile n overlaps the next QK.
-With one S stage the next unit's Q and K_0 go in before this unit's last V (``load_head``, the MMA warp's
-``qk_head``: ``..., K_{N-1}, V_{N-2}, Q', K'_0, V_{N-1}, K'_1, V'_0, ...``), so the first fold of a unit never
-waits behind the last fold of the one before it.
 The order carries no arithmetic; absent pages (past the request's page count) load a clamped valid
 page whose rows the MMA warp zeroes / the softmax masks.
 
@@ -104,72 +101,6 @@ def issue_tile(
 
 
 @cute.jit
-def k_partition(
-    st, atom_k: cute.CopyAtom, tK: cute.Tensor, sKV_view: cute.Tensor, kv_ptr0: Int32
-):
-    """The TMA partition of K (or V, with its atom and tensor) for one request: under ``st.ragged`` the pool is one page of
-    ``total_kv`` tokens and the domain is shifted by the request's token offset ``kv_ptr0``, so box i of the shifted domain holds the
-    request's keys ``[i box_rows, (i + 1) box_rows)``."""
-    if cutlass.const_expr(st.ragged):
-        tK = cute.domain_offset((0, kv_ptr0, 0, 0), tK)
-    gK = cute.zipped_divide(
-        tK, (HALF, st.box_rows, 1, 1)
-    )  # ((64, rows, 1, 1), (halves, P/rows, Hkv, pages))
-    sKVg = cute.group_modes(sKV_view, 0, 4)  # ((64, rows, 1, 1), boxes, halves, slots)
-    tKsK, tKgK = cpasync.tma_partition(atom_k, 0, cute.make_layout(1), sKVg, gK)
-    return tKgK, tKsK
-
-
-@cute.jit
-def load_head(
-    st,
-    atom_q: cute.CopyAtom,
-    tQ: cute.Tensor,
-    atom_q_rep: cute.CopyAtom,
-    tQr: cute.Tensor,
-    atom_k: cute.CopyAtom,
-    tK: cute.Tensor,
-    sQ_view: cute.Tensor,
-    sQ_rep_view: cute.Tensor,
-    sKV_view: cute.Tensor,
-    q_prod,
-    kv_prod,
-    mKvIndptr: cute.Tensor,
-    mKvIndices: cute.Tensor,
-    req: Int32,
-    tok_abs: Int32,
-    kv_head: Int32,
-    rows_valid: Int32,
-    tile_lo: Int32,
-):
-    """A unit's Q (its stage armed with the bytes its load pattern moves) and the K tile of its first fold -- the loads the MMA warp's
-    ``qk_head`` consumes; issued by the previous unit's tail ahead of that unit's last V, or by the role's prologue for the CTA's
-    first unit."""
-    kv_ptr0 = mKvIndptr[req]
-    n_pages = mKvIndptr[req + 1] - kv_ptr0
-    qh = q_prod.acquire_and_advance(expected_tx=q_tx_bytes(st, rows_valid))
-    load_q_tile(
-        st,
-        atom_q,
-        tQ,
-        atom_q_rep,
-        tQr,
-        sQ_view,
-        sQ_rep_view,
-        qh,
-        qh.index,
-        tok_abs,
-        kv_head,
-        rows_valid,
-    )
-    tKgK, tKsK = k_partition(st, atom_k, tK, sKV_view, kv_ptr0)
-    kv_prod = issue_tile(
-        st, tile_lo, kv_prod, atom_k, tKgK, tKsK, mKvIndices, kv_ptr0, n_pages, kv_head
-    )
-    return q_prod, kv_prod
-
-
-@cute.jit
 def load_loop(
     st,
     atom_q: cute.CopyAtom,
@@ -193,54 +124,75 @@ def load_loop(
     rows_valid: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
-    has_next,
-    next_req: Int32,
-    next_tok_abs: Int32,
-    next_kv_head: Int32,
-    next_rows_valid: Int32,
-    next_tile_lo: Int32,
 ):
-    """One unit's loads in the MMA warp's consumption order. With one S stage (``st.qk_ahead == 1``) the unit's Q and K_0 were issued
-    by its predecessor's tail (``load_head``), and this unit's tail issues the next unit's (``has_next`` and the ``next_*`` fields)
-    before its own last V; with two S stages the unit is self-contained."""
     LA = st.qk_ahead  # K tiles issued ahead of V: 1 (the MMA issues QK(n+1), PV(n)) or 2 (PV(n), QK(n+2))
     kv_ptr0 = mKvIndptr[req]
     n_pages = mKvIndptr[req + 1] - kv_ptr0
-    tKgK, tKsK = k_partition(st, atom_k, tK, sKV_view, kv_ptr0)
-    tVgV, tVsV = k_partition(st, atom_v, tV, sKV_view, kv_ptr0)
+    # Q: the tile's tokens start at the packed row tok_abs; the offset is applied to the TMA tensor's domain
+    tQ_off = cute.domain_offset((0, 0, tok_abs), tQ)
+    gQ = cute.zipped_divide(tQ_off, st.q_box)  # ((64, g, tpt), (halves, Hq/g, rest))
+    tQsQ, tQgQ = cpasync.tma_partition(
+        atom_q, 0, cute.make_layout(1), cute.group_modes(sQ_view, 0, 3), gQ
+    )  # smem ((box), halves, stages)
+    # the replicated load (units of <= 32 live rows): the first 32 rows into every 32-row quadrant
+    tQr_off = cute.domain_offset((0, 0, tok_abs), tQr)
+    gQr = cute.zipped_divide(
+        tQr_off, st.q_box_rep
+    )  # ((64, g, 32/g), (halves, Hq/g, rest))
+    tQsQr, tQgQr = cpasync.tma_partition(
+        atom_q_rep, 0, cute.make_layout(1), cute.group_modes(sQ_rep_view, 0, 3), gQr
+    )  # smem ((box), quadrants, halves, stages)
+    if cutlass.const_expr(st.ragged):
+        # the ragged pool: shift the K / V domains by the request's token offset, so the boxes below address the request's own keys
+        # (box i of the shifted domain = its keys [i box_rows, (i + 1) box_rows))
+        tK = cute.domain_offset((0, kv_ptr0, 0, 0), tK)
+        tV = cute.domain_offset((0, kv_ptr0, 0, 0), tV)
+    gK = cute.zipped_divide(
+        tK, (HALF, st.box_rows, 1, 1)
+    )  # ((64, rows, 1, 1), (halves, P/rows, Hkv, pages))
+    gV = cute.zipped_divide(tV, (HALF, st.box_rows, 1, 1))
+    sKVg = cute.group_modes(sKV_view, 0, 4)  # ((64, rows, 1, 1), boxes, halves, slots)
+    tKsK, tKgK = cpasync.tma_partition(atom_k, 0, cute.make_layout(1), sKVg, gK)
+    tVsV, tVgV = cpasync.tma_partition(atom_v, 0, cute.make_layout(1), sKVg, gV)
+    # the transaction count of this unit's Q load: the replicated boxes move 4 x rep_rows rows, the full-tile box rows_per_tile rows
+    # (both equal 128 rows only when g divides 32); armed per acquire so that the barrier completes for every GQA group
+    q_tx = Int32(st.q_bytes_full)
+    if cutlass.const_expr(st.rep_ok):
+        if rows_valid <= st.rep_rows:
+            q_tx = Int32(st.q_bytes_rep)
+    qh = q_prod.acquire_and_advance(expected_tx=q_tx)
+    if cutlass.const_expr(st.rep_ok):
+        if rows_valid <= st.rep_rows:
+            for quad in cutlass.range_constexpr(Q_ROWS // REP_ROWS):
+                for half in cutlass.range_constexpr(st.halves):
+                    cute.copy(
+                        atom_q_rep,
+                        tQgQr[(None, (half, kv_head, 0))],
+                        tQsQr[(None, quad, half, qh.index)],
+                        tma_bar_ptr=qh.barrier,
+                    )
+        else:
+            for half in cutlass.range_constexpr(st.halves):
+                cute.copy(
+                    atom_q,
+                    tQgQ[(None, (half, kv_head, 0))],
+                    tQsQ[(None, half, qh.index)],
+                    tma_bar_ptr=qh.barrier,
+                )
+    else:
+        for half in cutlass.range_constexpr(st.halves):
+            cute.copy(
+                atom_q,
+                tQgQ[(None, (half, kv_head, 0))],
+                tQsQ[(None, half, qh.index)],
+                tma_bar_ptr=qh.barrier,
+            )
     N = tile_hi - tile_lo
+    # the ring is consumed in the MMA warp's order: K_0 [K_1] then, per tile n, (K_{n+1}, V_n) with QK one tile ahead or (V_n, K_{n+2}) with two
+    kv_prod = issue_tile(
+        st, tile_lo, kv_prod, atom_k, tKgK, tKsK, mKvIndices, kv_ptr0, n_pages, kv_head
+    )
     if cutlass.const_expr(LA == 2):
-        # Q: the tile's tokens start at the packed row tok_abs; the transaction count is the bytes the unit's pattern moves (the
-        # replicated boxes move 4 x rep_rows rows, the full-tile box rows_per_tile rows), armed per acquire so that the barrier completes
-        # for every GQA group
-        qh = q_prod.acquire_and_advance(expected_tx=q_tx_bytes(st, rows_valid))
-        load_q_tile(
-            st,
-            atom_q,
-            tQ,
-            atom_q_rep,
-            tQr,
-            sQ_view,
-            sQ_rep_view,
-            qh,
-            qh.index,
-            tok_abs,
-            kv_head,
-            rows_valid,
-        )
-        # the ring is consumed in the MMA warp's order: K_0, K_1 then, per tile n, (V_n, K_{n+2})
-        kv_prod = issue_tile(
-            st,
-            tile_lo,
-            kv_prod,
-            atom_k,
-            tKgK,
-            tKsK,
-            mKvIndices,
-            kv_ptr0,
-            n_pages,
-            kv_head,
-        )
         if N > 1:
             kv_prod = issue_tile(
                 st,
@@ -281,8 +233,6 @@ def load_loop(
                     kv_head,
                 )
     else:
-        # the ring is consumed in the MMA warp's order: [K_0 by load_head] then, per tile n, K_{n+1}, V_n -- with the next unit's Q and K_0
-        # between K_{N-1} / V_{N-2} and V_{N-1} (mma.mma_loop's tail)
         for n in range(N):
             if n + 1 < N:
                 kv_prod = issue_tile(
@@ -296,28 +246,6 @@ def load_loop(
                     kv_ptr0,
                     n_pages,
                     kv_head,
-                )
-            if (n + 1 == N) & has_next:
-                q_prod, kv_prod = load_head(
-                    st,
-                    atom_q,
-                    tQ,
-                    atom_q_rep,
-                    tQr,
-                    atom_k,
-                    tK,
-                    sQ_view,
-                    sQ_rep_view,
-                    sKV_view,
-                    q_prod,
-                    kv_prod,
-                    mKvIndptr,
-                    mKvIndices,
-                    next_req,
-                    next_tok_abs,
-                    next_kv_head,
-                    next_rows_valid,
-                    next_tile_lo,
                 )
             kv_prod = issue_tile(
                 st,

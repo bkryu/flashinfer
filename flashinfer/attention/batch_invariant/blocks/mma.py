@@ -9,14 +9,11 @@
   ``mul(O, alpha)`` of the spec's step to the TMEM accumulator for every later tile).
 
 Issue order per unit (a placement): with one S stage, QK(0) then per tile n: QK(n + 1), PV(n) -- QK one tile ahead so
-the softmax of tile n overlaps the tensor core -- and the NEXT unit's QK(0) before this unit's last PV (``qk_head``): the S stage
-is free once the softmax copied the last S out, Q and K(0) of the next unit are in smem (the load warp issues them a unit ahead, in
-the same ring order), so the next unit's softmax starts while this unit's last PV and the correction's epilogue run; the next
-unit's PV(0) still acquires the accumulator stage the epilogue releases after reading it. With two S stages (``st.s_stages == 2``,
-P written over its own S stage), QK(0), QK(1) then per tile n: PV(n), QK(n + 2) into the stage PV(n) has just consumed -- the tensor
-core executes a CTA's MMAs in order, so QK(n + 2) overwrites P(n) only after PV(n) has read it, and the softmax always finds its
-next S ready. Either way tile n's PV consumes tile n's P after the correction applied tile n's alpha, and the accumulator is reset
-at every chunk start.
+the softmax of tile n overlaps the tensor core; with two S stages (``st.s_stages == 2``, P written over its own S stage),
+QK(0), QK(1) then per tile n: PV(n), QK(n + 2) into the stage PV(n) has just consumed -- the tensor core executes a CTA's
+MMAs in order, so QK(n + 2) overwrites P(n) only after PV(n) has read it, and the softmax always finds its next S ready.
+Either way tile n's PV consumes tile n's P after the correction applied tile n's alpha, and the accumulator is reset at
+every chunk start.
 
 Before the PV of a tile that reaches past the request's live length, the V rows beyond it are zeroed
 in smem (through the SW128 swizzle: 16-byte granule ``^= row % 8``), so the fold's identity step holds
@@ -178,33 +175,6 @@ def chunk_blk(t: Int32, TPC: cutlass.Constexpr, tile_lo: Int32):
 
 
 @cute.jit
-def qk_head(
-    st,
-    qk_mma: cute.TiledMma,
-    low,
-    tStS,
-    tSrQ: cute.Tensor,
-    tSrK: cute.Tensor,
-    q_cons,
-    kv_cons,
-    s_prod,
-    n_tiles: Int32,
-):
-    """A unit's first fold with one S stage: wait for its Q stage (the load warp's TMA), issue QK(0) from it, and release the stage at
-    once when the unit has a single tile (its last QK). Issued by the previous unit's tail ahead of that unit's last PV, or by the
-    role's prologue for the CTA's first unit. Returns the stage index the unit's later QKs read Q from; the stage is released by
-    whoever issues the unit's last QK (``q_cons.release`` on the consumer's current stage, then ``advance``)."""
-    qs = q_cons.wait().index
-    kv_cons, s_prod, qk_mma = qk_tile(
-        st, qk_mma, low, tStS, tSrQ, tSrK, qs, kv_cons, s_prod
-    )
-    if n_tiles == 1:
-        q_cons.release()
-        q_cons.advance()
-    return q_cons, kv_cons, s_prod, qk_mma, qs
-
-
-@cute.jit
 def mma_loop(
     st,
     qk_mma: cute.TiledMma,
@@ -224,35 +194,29 @@ def mma_loop(
     s_prod,
     p_cons,
     o_prod,
-    qs: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
     kv_len: Int32,
-    has_next,
-    next_tiles: Int32,
 ):
-    """``tStS`` is the tuple of the S accumulator's per-slot views of stage 0 (one view = the whole S at D <= 128). With one S stage
-    (``st.qk_ahead == 1``) this unit's QK(0) has been issued already (``qk_head``: ``qs`` is its Q stage) and the tail issues the next
-    unit's (``has_next``; ``next_tiles`` its tile count) before this unit's last PV; the returned ``qs`` is the next unit's stage. With
-    two S stages the unit is self-contained (``qs`` passes through)."""
+    """``tStS`` is the tuple of the S accumulator's per-slot views of stage 0 (one view = the whole S at D <= 128)."""
     TPC = st.tpc
     zeros8 = cute.make_rmem_tensor(cute.make_layout((8,)), IN_DTYPE)
     zeros8.fill(0.0)
+    qh = q_cons.wait_and_advance()
+    qs = qh.index
     N = tile_hi - tile_lo
+    # the Q stage is released right after the unit's LAST QK is issued (the release is a tcgen05.commit: the stage is free once those MMAs
+    # complete), so the load warp fetches the next unit's Q while this unit's last PVs and epilogue run -- with one Q stage (D = 256) the
+    # fetch would otherwise sit between two units in full (a placement: the order of the issue and the release, no value involved)
+    kv_cons, s_prod, qk_mma = qk_tile(
+        st, qk_mma, qk_low, tStS, tSrQ, tSrK, qs, kv_cons, s_prod
+    )  # QK(0)
+    if N == 1:
+        qh.release()
     if cutlass.const_expr(st.qk_ahead == 2):
-        qh = q_cons.wait_and_advance()
-        q_stage = qh.index
-        # the Q stage is released right after the unit's LAST QK is issued (the release is a tcgen05.commit: the stage is free once those
-        # MMAs complete), so the load warp fetches the next unit's Q while this unit's last PVs and epilogue run -- with one Q stage (D = 256)
-        # the fetch would otherwise sit between two units in full (a placement: the order of the issue and the release, no value involved)
-        kv_cons, s_prod, qk_mma = qk_tile(
-            st, qk_mma, qk_low, tStS, tSrQ, tSrK, q_stage, kv_cons, s_prod
-        )  # QK(0)
-        if N == 1:
-            qh.release()
         if N > 1:
             kv_cons, s_prod, qk_mma = qk_tile(
-                st, qk_mma, qk_low, tStS, tSrQ, tSrK, q_stage, kv_cons, s_prod
+                st, qk_mma, qk_low, tStS, tSrQ, tSrK, qs, kv_cons, s_prod
             )  # QK(1)
             if N == 2:
                 qh.release()
@@ -277,16 +241,11 @@ def mma_loop(
             )
             if n + 2 < N:
                 kv_cons, s_prod, qk_mma = qk_tile(
-                    st, qk_mma, qk_low, tStS, tSrQ, tSrK, q_stage, kv_cons, s_prod
+                    st, qk_mma, qk_low, tStS, tSrQ, tSrK, qs, kv_cons, s_prod
                 )
                 if n + 3 == N:
                     qh.release()
     else:
-        # one S stage: QK(0) is in flight (qk_head); per tile QK(n + 1) then PV(n). The Q stage is released right after the unit's last
-        # QK is issued (the release is a tcgen05.commit: the stage is free once those MMAs complete). Before the last PV the tail issues
-        # the next unit's QK(0): the S stage is free once the softmax copied S(N - 1) out, its Q and K(0) are in smem (the load warp's
-        # ring order), and the tensor core executes a CTA's MMAs in order -- the next unit's softmax starts under this unit's last PV
-        # and the correction's epilogue (a placement: the order of independent folds, no value involved)
         for n in range(N):
             t = tile_lo + n
             if n + 1 < N:
@@ -294,21 +253,7 @@ def mma_loop(
                     st, qk_mma, qk_low, tStS, tSrQ, tSrK, qs, kv_cons, s_prod
                 )
                 if n + 2 == N:
-                    q_cons.release()
-                    q_cons.advance()
-            if (n + 1 == N) & has_next:
-                q_cons, kv_cons, s_prod, qk_mma, qs = qk_head(
-                    st,
-                    qk_mma,
-                    qk_low,
-                    tStS,
-                    tSrQ,
-                    tSrK,
-                    q_cons,
-                    kv_cons,
-                    s_prod,
-                    next_tiles,
-                )
+                    qh.release()
             kv_cons, p_cons, o_prod, pv_mma = pv_tile(
                 st,
                 pv_mma,
@@ -326,7 +271,7 @@ def mma_loop(
                 p_cons,
                 o_prod,
             )
-    return q_cons, kv_cons, s_prod, p_cons, o_prod, qk_mma, pv_mma, qs
+    return q_cons, kv_cons, s_prod, p_cons, o_prod, qk_mma, pv_mma
 
 
 @cute.jit
