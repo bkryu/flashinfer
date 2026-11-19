@@ -1792,6 +1792,7 @@ class BlockScaledGemm:
                     acc_pipeline,
                     alpha,
                     st.cta_chunks,
+                    cc=st.cta_chunks > 1,  # the in-CTA chunk fold (static flag; the count is static here)
                 )
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
