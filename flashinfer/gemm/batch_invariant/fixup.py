@@ -78,7 +78,7 @@ class SplitKFixup:
                     if n < N:
                         acc = CuteF32.const(0.0)
                         if cutlass.const_expr(self.dyn):
-                            for c in cutlass.range(0, mW.shape[2], 1, unroll=1):
+                            for c in cutlass.range(0, mW.shape[2], 1, unroll=8):
                                 acc = CuteF32.add(acc, mW[m, n, c])
                         else:
                             for c in cutlass.range_constexpr(self.C):

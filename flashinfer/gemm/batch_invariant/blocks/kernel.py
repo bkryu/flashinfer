@@ -482,12 +482,12 @@ class DynScaledBlockGemm(ScaledBlockGemm):
         a: cute.Tensor,
         b: cute.Tensor,
         c: cute.Tensor,
+        a_scale: cute.Tensor,
+        b_scale: cute.Tensor,
         max_active_clusters: cutlass.Int32,
         swizzle: cutlass.Int32,
         raster_m: cutlass.Int32,
         stream: cuda.CUstream,
-        a_scale: cute.Tensor,
-        b_scale: cute.Tensor,
     ):
         self._launch(
             a, b, c, max_active_clusters, stream, a_scale, b_scale, None, swizzle, raster_m

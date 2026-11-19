@@ -214,14 +214,24 @@ def get_compiled_gemm(
         sb_fake = cute.runtime.make_fake_tensor(
             cutlass.Float32, (1,), (1,), assumed_align=4
         )
+        if dyn:
+            return cute.compile(
+                DynScaledBlockGemm(cfg, in_fmt, body_out, chunks, dyn=dyn),
+                a_fake,
+                b_fake,
+                c_fake,
+                sa_fake,
+                sb_fake,
+                *gsr,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
         return cute.compile(
-            (DynScaledBlockGemm if dyn else ScaledBlockGemm)(
-                cfg, in_fmt, body_out, chunks, dyn=dyn
-            ),
+            ScaledBlockGemm(cfg, in_fmt, body_out, chunks),
             a_fake,
             b_fake,
             c_fake,
-            *gsr,
+            grid,
             stream_fake,
             sa_fake,
             sb_fake,
