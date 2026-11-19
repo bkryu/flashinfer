@@ -81,7 +81,7 @@ def kernel_name(
     name (``_gdyn``, ``CL``, the knobs' raster / swizzle at their defaults) and a ``_dyn<tags>`` suffix marks the object."""
     knobs = dyn_record(cfg, dyn)
     return jit.sanitize_symbol_name(
-        f"{in_fmt}_{out_fmt}_b{b_major}_C{'L' if 'chunks' in dyn else chunks}_{knobs.describe()}"
+        f"{in_fmt}_{out_fmt}_b{b_major}_C{'L' if ('chunks' in dyn and chunks > 1) else chunks}_{knobs.describe()}"
         f"_g{'dyn' if 'grid' in dyn else clusters}"
         + ("_bL" if batched else "")
         + ("_bias" if bias else "")
@@ -139,8 +139,9 @@ def get_compiled_gemm(
             cute.sym_int(32, divisibility=al),
         )
         L = (
-            cute.sym_int(32) if (batched or "chunks" in dyn) else chunks
-        )  # the batch extent is dynamic for the batched kernel (and under the study's dynamic chunk count)
+            cute.sym_int(32) if (batched or ("chunks" in dyn and chunks > 1)) else chunks
+        )  # the batch extent is dynamic for the batched kernel (and, under the study's dynamic chunk count, for the
+        # split classes' objects: one object per body for every C >= 2; the unsplit class keeps L = 1)
         Lc = 1 if in_cta else L
         a_fake = cute.runtime.make_fake_tensor(
             in_dt,
