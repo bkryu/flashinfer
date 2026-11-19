@@ -45,6 +45,14 @@ from .operands import (
     build_grid,
 )
 from .producer import tma_producer_loop
+from .scheduler_dyn import DynTileScheduler, build_grid_dyn
+
+#: study/variant-reduction: the compile-time axes a body may take as runtime arguments instead -- "sched" (raster order and
+#: swizzle size: `scheduler_dyn`), "grid" (the persistent grid in clusters), "chunks" (the split class's chunk count: the
+#: operands' L extent, read from the tensor). The static path (an empty set) is the production body, untouched.
+DYN_AXES = ("sched", "grid", "chunks")
+SW_PLACEHOLDER = 1  # compile-time values of the dynamic Int32 arguments: never compiled in
+RASTER_PLACEHOLDER = 1
 
 
 class BlockGemm:
@@ -57,9 +65,18 @@ class BlockGemm:
     scaled = False
     biased = False
 
-    def __init__(self, knobs: Knobs, in_fmt: str, out_fmt: str, chunks: int = 1):
+    def __init__(
+        self, knobs: Knobs, in_fmt: str, out_fmt: str, chunks: int = 1, dyn=()
+    ):
         self.knobs = knobs
         self.in_fmt = in_fmt
+        self.dyn = frozenset(dyn)
+        assert self.dyn <= set(DYN_AXES), self.dyn
+        self.sched = (
+            DynTileScheduler
+            if "sched" in self.dyn
+            else tile_scheduler.StaticPersistentTileScheduler
+        )
         self.chunks = chunks if knobs.cta_chunks else 1
         assert self.chunks == 1 or chunks > 1, (knobs, chunks)
         self.cluster_shape_mn = knobs.cluster_shape_mn
@@ -84,7 +101,19 @@ class BlockGemm:
         self._launch(a, b, c, max_active_clusters, stream, None, None, None)
 
     # host side (trace time)
-    def _launch(self, a, b, c, max_active_clusters, stream, a_scale, b_scale, bias):
+    def _launch(
+        self,
+        a,
+        b,
+        c,
+        max_active_clusters,
+        stream,
+        a_scale,
+        b_scale,
+        bias,
+        swizzle=None,
+        raster_m=None,
+    ):
         if cutlass.const_expr(a.element_type != b.element_type):
             raise TypeError(
                 f"A and B must have one type: {a.element_type} != {b.element_type}"
@@ -110,7 +139,12 @@ class BlockGemm:
         assert st.mma_tiler[2] == self.block.k_block, (st.mma_tiler, self.block.k_block)
         tma = TmaSetup(st, a, b, c)
         self.num_tma_load_bytes = tma.tx_bytes
-        params, grid = build_grid(st, c, max_active_clusters)
+        if cutlass.const_expr("sched" in self.dyn):
+            params, grid = build_grid_dyn(st, c, max_active_clusters, swizzle, raster_m)
+        else:
+            params, grid = build_grid(st, c, max_active_clusters)
+        # the in-CTA chunk count: the operands' L extent when dynamic ("chunks"), else the plan's static count
+        n_chunks = a.shape[2] if "chunks" in self.dyn else None
         self.kernel(
             st.tiled_mma,
             tma.atom_a,
@@ -128,6 +162,7 @@ class BlockGemm:
             a_scale,
             b_scale,
             bias,
+            n_chunks,
         ).launch(
             grid=grid,
             block=[THREADS, 1, 1],
@@ -151,12 +186,15 @@ class BlockGemm:
         b_smem_layout_staged: cute.ComposedLayout,
         c_smem_layout_staged,
         epi_tile: cute.Tile,
-        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+        tile_sched_params,
         a_scale: Optional[cute.Tensor],
         b_scale: Optional[cute.Tensor],
         mBias: Optional[cute.Tensor],
+        n_chunks,
     ):
         st = self.st
+        cc = st.cta_chunks > 1  # the in-CTA chunk fold (static); its count is the plan's, or the operands' L extent
+        chunk_count = n_chunks if "chunks" in self.dyn else st.cta_chunks
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         alpha = None
         if cutlass.const_expr(self.scaled):
@@ -299,7 +337,7 @@ class BlockGemm:
 
         # --- roles
         if warp_idx == TMA_WARP:
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+            tile_sched = self.sched.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             tma_producer_loop(
@@ -315,13 +353,14 @@ class BlockGemm:
                 tBsB,
                 a_full_mcast_mask,
                 b_full_mcast_mask,
-                st.cta_chunks,
+                chunk_count,
+                cc,
             )
         if warp_idx == MMA_WARP:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+            tile_sched = self.sched.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             mma_loop(
@@ -336,7 +375,8 @@ class BlockGemm:
                 tCrA,
                 tCrB,
                 tCtAcc_base,
-                st.cta_chunks,
+                chunk_count,
+                cc,
             )
         sC = smem.allocate_tensor(
             element_type=st.c_dtype,
@@ -349,7 +389,7 @@ class BlockGemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+            tile_sched = self.sched.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             epilogue_loop(
@@ -366,9 +406,10 @@ class BlockGemm:
                 epi_tile,
                 acc_pipeline,
                 alpha,
-                st.cta_chunks,
+                chunk_count,
                 mBias,
                 tCcC,
+                cc,
             )
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
@@ -411,3 +452,59 @@ class BiasBlockGemm(BlockGemm):
         stream: cuda.CUstream,
     ):
         self._launch(a, b, c, max_active_clusters, stream, None, None, bias)
+
+
+# ----------------------------------------------------------------------------- the dynamic entry points (study)
+
+
+class DynBlockGemm(BlockGemm):
+    """``BlockGemm`` whose persistent grid, swizzle size and raster order are Int32 arguments (``dyn`` names which of them
+    the body reads: the others keep the knobs' static values)."""
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        swizzle: cutlass.Int32,
+        raster_m: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._launch(a, b, c, max_active_clusters, stream, None, None, None, swizzle, raster_m)
+
+
+class DynScaledBlockGemm(ScaledBlockGemm):
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        swizzle: cutlass.Int32,
+        raster_m: cutlass.Int32,
+        stream: cuda.CUstream,
+        a_scale: cute.Tensor,
+        b_scale: cute.Tensor,
+    ):
+        self._launch(
+            a, b, c, max_active_clusters, stream, a_scale, b_scale, None, swizzle, raster_m
+        )
+
+
+class DynBiasBlockGemm(BiasBlockGemm):
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        bias: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        swizzle: cutlass.Int32,
+        raster_m: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._launch(a, b, c, max_active_clusters, stream, None, None, bias, swizzle, raster_m)

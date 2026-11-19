@@ -29,8 +29,10 @@ MAX_GRID_Y = 65535  # the hardware's grid.y limit; rows beyond it are strided ov
 
 
 class SplitKFixup:
-    def __init__(self, C: int, out_dtype, chain: EpilogueChain):
-        self.C, self.out_dtype, self.chain = C, out_dtype, chain
+    def __init__(self, C: int, out_dtype, chain: EpilogueChain, dyn: bool = False):
+        """``dyn`` (study): the chunk count is the workspace's L extent at runtime (a rolled loop in chunk order), ``C`` then a
+        placeholder."""
+        self.C, self.out_dtype, self.chain, self.dyn = C, out_dtype, chain, dyn
 
     @cute.jit
     def __call__(
@@ -75,8 +77,12 @@ class SplitKFixup:
                     n = n0 + j
                     if n < N:
                         acc = CuteF32.const(0.0)
-                        for c in cutlass.range_constexpr(self.C):
-                            acc = CuteF32.add(acc, mW[m, n, c])
+                        if cutlass.const_expr(self.dyn):
+                            for c in cutlass.range(0, mW.shape[2], 1, unroll=1):
+                                acc = CuteF32.add(acc, mW[m, n, c])
+                        else:
+                            for c in cutlass.range_constexpr(self.C):
+                                acc = CuteF32.add(acc, mW[m, n, c])
                         # the chain once, after the chunk fold: the fp32 ops, then the single conversion
                         bias = None
                         if cutlass.const_expr(self.chain.biased):
@@ -161,26 +167,29 @@ def get_fixup(
     scaled: bool = False,
     bias: bool = False,
     alpha_given: bool = False,
+    dyn: bool = False,
 ):
     """One fixup kernel per chunk count, output format and chain; M and N are runtime arguments. ``scaled``: the fp8
-    classes' chain (two per-tensor scales); ``alpha_given``: the 4-bit classes' chain (one scalar)."""
+    classes' chain (two per-tensor scales); ``alpha_given``: the 4-bit classes' chain (one scalar). ``dyn`` (study): one
+    kernel for every chunk count (the workspace's L extent is dynamic)."""
     assert not (scaled and bias) and not (alpha_given and (scaled or bias)), (
         "one chain per class"
     )
     out_dt = get_cutlass_dtype(out_dtype_name)
     chain = EpilogueChain.for_class(out_dtype_name, scaled or alpha_given, bias)
     name = jit.sanitize_symbol_name(
-        f"splitk_fixup_C{C}_{out_dtype_name}"
+        f"splitk_fixup_C{'L' if dyn else C}_{out_dtype_name}"
         + ("_scaled" if scaled else "")
         + ("_alpha" if alpha_given else "")
         + ("_bias" if bias else "")
+        + ("_dynC" if dyn else "")
     )
 
     def compile_fn():
         sym_m, sym_n = cute.sym_int(64), cute.sym_int(32, divisibility=4)
         w_fake = cute.runtime.make_fake_tensor(
             Float32,
-            (sym_m, sym_n, C),
+            (sym_m, sym_n, cute.sym_int(32) if dyn else C),
             (cute.sym_int64(divisibility=4), 1, cute.sym_int64(divisibility=4)),
             assumed_align=16,
         )
@@ -196,7 +205,7 @@ def get_fixup(
                 get_cutlass_dtype("bf16"), (sym_n,), (1,), assumed_align=16
             )
             return cute.compile(
-                SplitKFixupBias(C, out_dt, chain),
+                SplitKFixupBias(C, out_dt, chain, dyn),
                 w_fake,
                 y_fake,
                 bias_fake,
@@ -211,7 +220,7 @@ def get_fixup(
                 Float32, (1,), (1,), assumed_align=4
             )
             return cute.compile(
-                SplitKFixupAlpha(C, out_dt, chain),
+                SplitKFixupAlpha(C, out_dt, chain, dyn),
                 w_fake,
                 y_fake,
                 alpha_fake,
@@ -229,7 +238,7 @@ def get_fixup(
                 Float32, (1,), (1,), assumed_align=4
             )
             return cute.compile(
-                SplitKFixupScaled(C, out_dt, chain),
+                SplitKFixupScaled(C, out_dt, chain, dyn),
                 w_fake,
                 y_fake,
                 sa_fake,
@@ -241,7 +250,7 @@ def get_fixup(
                 options="--enable-tvm-ffi",
             )
         return cute.compile(
-            SplitKFixup(C, out_dt, chain),
+            SplitKFixup(C, out_dt, chain, dyn),
             w_fake,
             y_fake,
             Int32(1),

@@ -479,6 +479,17 @@ def _accepts_mx(config: Knobs, M: int, N: int, K: int, C: int, in_fmt: str) -> b
     ) and _accepts(config, M, N, K, "k", C, in_fmt)
 
 
+#: study/variant-reduction: the compile-time axes the launched dense / block-scaled kernels take as runtime arguments
+#: ("grid", "sched", "chunks"; `blocks.kernel.DYN_AXES`). Empty = the production (static) objects. A process-wide switch for
+#: the study's bench only; the bits never depend on it.
+DYN_AXES: frozenset = frozenset()
+
+
+def set_dyn_axes(axes) -> None:
+    global DYN_AXES
+    DYN_AXES = frozenset(axes)
+
+
 # the compiled kernels by (device index, record, the launch's other compile parameters): the persistent grid is the
 # device's co-resident cluster count for the record, so once that count is final the handle is a function of the key
 _KERNELS: Dict[tuple, Any] = {}
@@ -529,7 +540,7 @@ def _run(
     the whole fold, in the epilogue of a direct store or in the fixup of the workspace split, whose partials stay
     bias-free). ``out_fresh`` says the entry allocated ``out`` in this call: a fresh buffer aliases no live tensor, so its
     aliasing check is skipped (every caller-provided buffer is checked)."""
-    from .blocks.compile import get_compiled_gemm
+    from .blocks.compile import dyn_record, get_compiled_gemm, launch_args
     from .fixup import MAX_GRID_Y, get_fixup
 
     if not _accepts(config, M, N, K, b_major, C, in_fmt):
@@ -542,15 +553,19 @@ def _run(
     scaled = is_scaled(in_fmt)
     direct = C == 1 or config.cta_chunks
     biased = bias is not None and direct
+    dyn = DYN_AXES
+    cfg_c = dyn_record(config, dyn) if dyn else config  # the object's record (the dynamic axes normalised)
     kernel = _kernel(
         a.device,
-        config,
-        ("gemm", b_major, C, in_fmt, out_fmt, False, biased),
+        cfg_c,
+        ("gemm", b_major, C, in_fmt, out_fmt, False, biased, dyn),
         lambda clusters, fam: get_compiled_gemm(
-            config, b_major, C, clusters, in_fmt, out_fmt, family=fam, bias=biased
+            cfg_c, b_major, C, clusters, in_fmt, out_fmt, family=fam, bias=biased, dyn=dyn
         ),
     )
     extra = (scales if scaled else ()) + ((bias,) if bias is not None else ())
+    if dyn:
+        extra = extra + launch_args(config, persistent_clusters(a.device, config), dyn)
     # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk (1 for the unsplit class and the in-CTA
     # fold's output); every stride handed over is a multiple of the declared 16-byte alignment, the size-1 l stride included
     Kc = K // C
@@ -577,9 +592,12 @@ def _run(
         writes = [(ws, "the workspace")] + ([] if out_fresh else [(out, "the output")])
         _require_disjoint(cls, writes, reads)
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
-    kernel(a3, b3, ws)  # the unscaled, unbiased body: raw fp32 partials
+    dyn_tail = launch_args(config, persistent_clusters(a.device, config), dyn) if dyn else ()
+    kernel(a3, b3, ws, *dyn_tail)  # the unscaled, unbiased body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)
-    get_fixup(C, out_fmt, scaled, bias is not None)(ws, out, *extra, M, N, rows)
+    get_fixup(C, out_fmt, scaled, bias is not None, dyn="chunks" in dyn)(
+        ws, out, *(extra[: len(extra) - len(dyn_tail)] if dyn else extra), M, N, rows
+    )
     return out
 
 
@@ -983,6 +1001,7 @@ def _launch_bmm_fp8(
     if C == 1:
         from .blocks.compile import get_compiled_gemm
 
+        assert not DYN_AXES, "the study's dynamic axes are not wired for the batched fp8 launch (use mm_fp8)"
         if not _accepts(config, M, N, K, b_major, 1, in_fmt):
             raise unsupported(
                 cls,
@@ -1264,10 +1283,14 @@ def _run_mx(
     record (the weights as the kernel's A, the tokens as its B, the output transposed: the block-scaled step is symmetric
     in its two operands) and the workspace split with the dense module's fixup (the fp32 partials folded in chunk order
     from +0, then the chain)."""
+    from .blocks.compile import dyn_record, launch_args
     from .blocks.compile_blockscaled import get_compiled_blockscaled
     from .blocks.compile_blockscaled_mixed import get_compiled_blockscaled_mixed
     from .fixup import MAX_GRID_Y, get_fixup
 
+    dyn = DYN_AXES - {"chunks"}  # the block-scaled body takes "sched" and "grid" at runtime (study); its chunk count stays static
+    cfg_c = dyn_record(config, dyn) if dyn else config
+    dyn_tail = launch_args(config, persistent_clusters(a.device, config), dyn) if dyn else ()
     if not _accepts_mx(config, M, N, K, C, in_fmt):
         raise unsupported(
             cls,
@@ -1276,6 +1299,7 @@ def _run_mx(
         )
     if in_fmt in MX_MIXED_FMTS:
         # the mixed classes' kernels compile as a programmatic dependent launch on request (a placement)
+        assert not dyn, "the study's dynamic axes are wired for the mxfp8 / fp4 classes only"
         kernel = _kernel(
             a.device,
             config,
@@ -1292,10 +1316,10 @@ def _run_mx(
             )
         kernel = _kernel(
             a.device,
-            config,
-            ("mx", C, in_fmt, out_fmt),
+            cfg_c,
+            ("mx", C, in_fmt, out_fmt, dyn),
             lambda clusters, fam: get_compiled_blockscaled(
-                config, C, clusters, in_fmt, out_fmt, family=fam
+                cfg_c, C, clusters, in_fmt, out_fmt, family=fam, dyn=dyn
             ),
         )
     # each operand's K extent in its own units (bytes for a 4-bit operand: the mixed classes' weight, both operands of the
@@ -1323,6 +1347,7 @@ def _run_mx(
             sfa,
             out.as_strided((N, M, 1), (1, out.stride(0), M * N)),
             *extra,
+            *dyn_tail,
         )
         return out
     # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk of the split views (1 for the unsplit class,
@@ -1339,7 +1364,7 @@ def _run_mx(
         if not out_fresh:
             _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
-        kernel(a3, b3, sfa, sfb, c3, *extra)  # the chain in the epilogue
+        kernel(a3, b3, sfa, sfb, c3, *extra, *dyn_tail)  # the chain in the epilogue
         return out
     # the fixed-chunk split with the partials in an fp32 workspace, folded in chunk order by the fixup kernel (the chain
     # applied there, once)
@@ -1354,10 +1379,10 @@ def _run_mx(
     if config.swap_ab:
         # the swapped record of a split class (the mixed classes): the exchanged operands' chunk partials P_c^T into the
         # workspace's (N, M, C) view (the kernel's M contiguous), then the same fixup over the (M, N, C) view
-        kernel(b3, a3, sfb, sfa, ws.permute(2, 1, 0))
+        kernel(b3, a3, sfb, sfa, ws.permute(2, 1, 0), *dyn_tail)
     else:
         kernel(
-            a3, b3, sfa, sfb, ws.permute(1, 2, 0)
+            a3, b3, sfa, sfb, ws.permute(1, 2, 0), *dyn_tail
         )  # the unscaled body: raw fp32 partials
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     rows = min(M, MAX_GRID_Y)

@@ -22,7 +22,15 @@ import cutlass.cute as cute
 from ....batch_invariant import jit
 from ..generator import Knobs
 from ..spec import ALPHA_GIVEN, SF_ATOM_KBLOCKS, SF_ATOM_ROWS
-from .blockscaled import PLANS, BlockScaledGemm, ScaledBlockScaledGemm
+from .blockscaled import (
+    PLANS,
+    BlockScaledGemm,
+    DynBlockScaledGemm,
+    DynScaledBlockScaledGemm,
+    ScaledBlockScaledGemm,
+)
+from .compile import DYN_TAG, GRID_PLACEHOLDER, dyn_record
+from .kernel import RASTER_PLACEHOLDER, SW_PLACEHOLDER
 from .operands import ALIGN, OUT_DT
 
 MODULE = "batch_invariant_gemm_blockscaled"
@@ -38,14 +46,17 @@ def kernel_name(
     in_fmt: str,
     out_fmt: str,
     enable_pdl: bool = False,
+    dyn=frozenset(),
 ) -> str:
     """``clusters`` is the compiled persistent grid in clusters (the knobs' own ``grid_clusters`` when set, else the launch
     device's co-resident count), keyed once as ``_g<clusters>``; the knobs' ``describe()`` carries the in-cluster split
-    factor, the swapped decode record and the in-CTA chunk fold; the dependent-launch variant is keyed ``_pdl``."""
-    knobs = dataclasses.replace(cfg, grid_clusters=0)
+    factor, the swapped decode record and the in-CTA chunk fold; the dependent-launch variant is keyed ``_pdl``. ``dyn``
+    (study): as for the dense module's name."""
+    knobs = dyn_record(cfg, dyn)
     return jit.sanitize_symbol_name(
-        f"{in_fmt}_{out_fmt}_bk_C{chunks}_{knobs.describe()}_g{clusters}"
+        f"{in_fmt}_{out_fmt}_bk_C{chunks}_{knobs.describe()}_g{'dyn' if 'grid' in dyn else clusters}"
         + ("_pdl" if enable_pdl else "")
+        + (f"_dyn{''.join(DYN_TAG[d] for d in sorted(dyn))}" if dyn else "")
     )
 
 
@@ -57,6 +68,7 @@ def get_compiled_blockscaled(
     in_fmt: str,
     out_fmt: str = "bf16",
     family: str = "",
+    dyn=frozenset(),
 ):
     """``kernel(a3, b3, sfa, sfb, c3)`` for the format's class (``mxfp8`` / ``nvfp4`` / ``mxfp4``: the sm_100 / sm_103
     instructions; ``mxfp8_k64`` / ``nvfp4_k128`` / ``mxfp4_k128``: the sm_107 ones), ``kernel(a3, b3, sfa, sfb, c3, alpha)``
@@ -65,7 +77,7 @@ def get_compiled_blockscaled(
     C)`` operand views, the output with L = 1) -- convert in the epilogue; the fixed-chunk split (batch index = K chunk)
     stores fp32 partials that the dense module's fixup folds and converts. ``clusters`` and ``family`` are part of the cache
     key as for the dense kernels (``blocks/compile.py``): placements, never the bits."""
-    return compile_blockscaled(cfg, chunks, clusters, in_fmt, out_fmt, MODULE)
+    return compile_blockscaled(cfg, chunks, clusters, in_fmt, out_fmt, MODULE, dyn=dyn)
 
 
 def compile_blockscaled(
@@ -77,6 +89,7 @@ def compile_blockscaled(
     module: str,
     plan_cls=None,
     enable_pdl: bool = False,
+    dyn=frozenset(),
 ):
     """The compile closure behind :func:`get_compiled_blockscaled`, in cache module ``module`` with the record's plan class
     (default: the format's in ``PLANS``; the mixed classes pass their own, the swapped records' with the operand formats
@@ -112,7 +125,14 @@ def compile_blockscaled(
     Lc = 1 if in_cta else L
     grid = cfg.grid_clusters or clusters
     assert grid > 0, (cfg, clusters)
-    name = kernel_name(cfg, chunks, grid, in_fmt, out_fmt, enable_pdl)
+    dyn = frozenset(dyn)
+    name = kernel_name(cfg, chunks, grid, in_fmt, out_fmt, enable_pdl, dyn)
+    cfg = dyn_record(cfg, dyn) if dyn else cfg
+    gsr = (
+        (GRID_PLACEHOLDER if "grid" in dyn else grid, SW_PLACEHOLDER, RASTER_PLACEHOLDER)
+        if dyn
+        else (grid,)
+    )
 
     def compile_fn():
         # K elements per row, a multiple of 16 (K is a multiple of 32: one whole scale block); the row and chunk strides
@@ -168,8 +188,8 @@ def compile_blockscaled(
                 cutlass.Float32, (1,), (1,), assumed_align=4
             )
             return cute.compile(
-                ScaledBlockScaledGemm(
-                    cfg, in_fmt, body_out, L, plan_cls=plan_cls, enable_pdl=enable_pdl
+                (DynScaledBlockScaledGemm if dyn else ScaledBlockScaledGemm)(
+                    cfg, in_fmt, body_out, L, plan_cls=plan_cls, enable_pdl=enable_pdl, dyn=dyn
                 ),
                 a_fake,
                 b_fake,
@@ -177,20 +197,20 @@ def compile_blockscaled(
                 sfb_fake,
                 c_fake,
                 alpha_fake,
-                grid,
+                *gsr,
                 stream_fake,
                 options="--enable-tvm-ffi",
             )
         return cute.compile(
-            BlockScaledGemm(
-                cfg, in_fmt, body_out, L, plan_cls=plan_cls, enable_pdl=enable_pdl
+            (DynBlockScaledGemm if dyn else BlockScaledGemm)(
+                cfg, in_fmt, body_out, L, plan_cls=plan_cls, enable_pdl=enable_pdl, dyn=dyn
             ),
             a_fake,
             b_fake,
             sfa_fake,
             sfb_fake,
             c_fake,
-            grid,
+            *gsr,
             stream_fake,
             options="--enable-tvm-ffi",
         )

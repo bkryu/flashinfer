@@ -18,7 +18,16 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..generator import Knobs
-from .kernel import BiasBlockGemm, BlockGemm, ScaledBlockGemm
+from .kernel import (
+    RASTER_PLACEHOLDER,
+    SW_PLACEHOLDER,
+    BiasBlockGemm,
+    BlockGemm,
+    DynBiasBlockGemm,
+    DynBlockGemm,
+    DynScaledBlockGemm,
+    ScaledBlockGemm,
+)
 from .operands import ALIGN, IN_DT, OUT_DT, can_implement  # noqa: F401  (re-exported)
 
 MODULE = "batch_invariant_gemm"
@@ -31,6 +40,31 @@ def max_active_clusters(cfg: Knobs, sm_count: int) -> int:
     return sm_count // (cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1])
 
 
+GRID_PLACEHOLDER = 1  # the compile-time value of the dynamic grid argument (study): never compiled in
+DYN_TAG = {"grid": "G", "sched": "S", "chunks": "C"}
+
+
+def dyn_record(cfg: Knobs, dyn=frozenset()) -> Knobs:
+    """The record a dynamic object is compiled for: the knobs the body still reads statically (raster order and swizzle
+    size dropped under "sched", the grid always), so records differing only in the dynamic axes share one object."""
+    rep = {"grid_clusters": 0}
+    if "sched" in dyn:
+        rep.update(raster_along="m", swizzle_size=1)
+    return dataclasses.replace(cfg, **rep)
+
+
+def launch_args(cfg: Knobs, clusters: int, dyn=frozenset()) -> tuple:
+    """The trailing Int32 arguments of a dynamic object's call: (grid in clusters, swizzle size, raster-along-m flag); empty
+    for the static object."""
+    if not dyn:
+        return ()
+    return (
+        int(cfg.grid_clusters or clusters),
+        int(cfg.swizzle_size),
+        1 if cfg.raster_along == "m" else 0,
+    )
+
+
 def kernel_name(
     cfg: Knobs,
     b_major: str,
@@ -40,14 +74,18 @@ def kernel_name(
     out_fmt: str = "bf16",
     batched: bool = False,
     bias: bool = False,
+    dyn=frozenset(),
 ) -> str:
     """``clusters`` is the compiled persistent grid in clusters (the knobs' own ``grid_clusters`` when set, else the
-    launch device's co-resident count), keyed once as ``_g<clusters>``."""
-    knobs = dataclasses.replace(cfg, grid_clusters=0)
+    launch device's co-resident count), keyed once as ``_g<clusters>``. ``dyn`` (study): the axes taken at runtime leave the
+    name (``_gdyn``, ``CL``, the knobs' raster / swizzle at their defaults) and a ``_dyn<tags>`` suffix marks the object."""
+    knobs = dyn_record(cfg, dyn)
     return jit.sanitize_symbol_name(
-        f"{in_fmt}_{out_fmt}_b{b_major}_C{chunks}_{knobs.describe()}_g{clusters}"
+        f"{in_fmt}_{out_fmt}_b{b_major}_C{'L' if 'chunks' in dyn else chunks}_{knobs.describe()}"
+        f"_g{'dyn' if 'grid' in dyn else clusters}"
         + ("_bL" if batched else "")
         + ("_bias" if bias else "")
+        + (f"_dyn{''.join(DYN_TAG[d] for d in sorted(dyn))}" if dyn else "")
     )
 
 
@@ -62,6 +100,7 @@ def get_compiled_gemm(
     batched: bool = False,
     family: str = "",
     bias: bool = False,
+    dyn=frozenset(),
 ):
     """bf16: ``kernel(a3, b3, c3)``; fp8: ``kernel(a3, b3, c3, a_scale, b_scale)`` with 1-element fp32 scales, for the
     direct stores: the unsplit class and the in-CTA chunk fold, whose chain multiplies by their product. The unsplit class
@@ -88,8 +127,10 @@ def get_compiled_gemm(
     # only the output's rows (its alignment); the typed checks require the same, so a K-major fp8 weight with N a multiple
     # of 8 but not 16 is a shape of the class
     nal = al if b_major == "n" else oal
+    dyn = frozenset(dyn)
     grid = cfg.grid_clusters or clusters
-    name = kernel_name(cfg, b_major, chunks, grid, in_fmt, out_fmt, batched, bias)
+    name = kernel_name(cfg, b_major, chunks, grid, in_fmt, out_fmt, batched, bias, dyn)
+    cfg = dyn_record(cfg, dyn) if dyn else cfg
 
     def compile_fn():
         sym_m, sym_n, sym_kc = (
@@ -98,8 +139,8 @@ def get_compiled_gemm(
             cute.sym_int(32, divisibility=al),
         )
         L = (
-            cute.sym_int(32) if batched else chunks
-        )  # the batch extent is dynamic for the batched kernel
+            cute.sym_int(32) if (batched or "chunks" in dyn) else chunks
+        )  # the batch extent is dynamic for the batched kernel (and under the study's dynamic chunk count)
         Lc = 1 if in_cta else L
         a_fake = cute.runtime.make_fake_tensor(
             in_dt,
@@ -131,27 +172,38 @@ def get_compiled_gemm(
         grid = cfg.grid_clusters or clusters
         assert grid > 0, (cfg, clusters)
         body_out = out_fmt if direct else "f32"
+        # the dynamic objects take (grid, swizzle, raster flag) as Int32 arguments after the stream's predecessors; the values
+        # here are placeholders (the launch passes the record's)
+        gsr = (
+            (GRID_PLACEHOLDER if "grid" in dyn else grid, SW_PLACEHOLDER, RASTER_PLACEHOLDER)
+            if dyn
+            else (grid,)
+        )
         if bias:
             bias_fake = cute.runtime.make_fake_tensor(
                 in_dt, (sym_n,), (1,), assumed_align=16
             )
             return cute.compile(
-                BiasBlockGemm(cfg, in_fmt, body_out, chunks),
+                (DynBiasBlockGemm if dyn else BiasBlockGemm)(
+                    cfg, in_fmt, body_out, chunks, dyn=dyn
+                ),
                 a_fake,
                 b_fake,
                 c_fake,
                 bias_fake,
-                grid,
+                *gsr,
                 stream_fake,
                 options="--enable-tvm-ffi",
             )
         if not scaled:
             return cute.compile(
-                BlockGemm(cfg, in_fmt, body_out, chunks),
+                (DynBlockGemm if dyn else BlockGemm)(
+                    cfg, in_fmt, body_out, chunks, dyn=dyn
+                ),
                 a_fake,
                 b_fake,
                 c_fake,
-                grid,
+                *gsr,
                 stream_fake,
                 options="--enable-tvm-ffi",
             )
@@ -162,11 +214,13 @@ def get_compiled_gemm(
             cutlass.Float32, (1,), (1,), assumed_align=4
         )
         return cute.compile(
-            ScaledBlockGemm(cfg, in_fmt, body_out, chunks),
+            (DynScaledBlockGemm if dyn else ScaledBlockGemm)(
+                cfg, in_fmt, body_out, chunks, dyn=dyn
+            ),
             a_fake,
             b_fake,
             c_fake,
-            grid,
+            *gsr,
             stream_fake,
             sa_fake,
             sb_fake,

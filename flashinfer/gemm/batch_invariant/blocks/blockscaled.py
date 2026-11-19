@@ -83,6 +83,7 @@ from .operands import (
     TMEM_ARCH,
     build_grid,
 )
+from .scheduler_dyn import DynTileScheduler, build_grid_dyn  # the study's dynamic axes ("sched", "grid")
 
 E8M0_DTYPE = cutlass.Float8E8M0FNU  # the MX block scale
 E4M3_DTYPE = cutlass.Float8E4M3FN  # the NVFP4 block scale (and the MXFP8 element)
@@ -1268,6 +1269,7 @@ class BlockScaledGemm:
         chunks: int = 1,
         plan_cls=None,
         enable_pdl: bool = False,
+        dyn=(),
     ):
         """``chunks``: the operands' batch extent L (1, or the split class's chunk count: the K chunk is the batch index of
         the workspace split AND of the in-CTA chunk fold, whose C has L = 1 and whose CTA folds the chunks itself).
@@ -1277,6 +1279,13 @@ class BlockScaledGemm:
         load and releases its dependents once its loads are issued; the arithmetic is untouched (a placement)."""
         self.knobs = knobs
         self.enable_pdl = enable_pdl
+        self.dyn = frozenset(dyn)
+        assert self.dyn <= {"sched", "grid"}, self.dyn
+        self.sched = (
+            DynTileScheduler
+            if "sched" in self.dyn
+            else tile_scheduler.StaticPersistentTileScheduler
+        )
         self.in_fmt = in_fmt
         self.plan_cls = plan_cls or PLANS[in_fmt]
         assert in_fmt == self.plan_cls.IN_FMT, (in_fmt, self.plan_cls.IN_FMT)
@@ -1301,7 +1310,19 @@ class BlockScaledGemm:
         self._launch(a, b, sfa, sfb, c, max_active_clusters, stream, None)
 
     # host side (trace time)
-    def _launch(self, a, b, sfa, sfb, c, max_active_clusters, stream, alpha):
+    def _launch(
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        c,
+        max_active_clusters,
+        stream,
+        alpha,
+        swizzle=None,
+        raster_m=None,
+    ):
         plan_cls = self.plan_cls
         # the API's byte-packed 4-bit operands as fp4 tensors of the logical K, per operand (the mixed classes pack one)
         if cutlass.const_expr(plan_cls.A_DT.width == 4):
@@ -1330,11 +1351,17 @@ class BlockScaledGemm:
         assert st.mma_tiler[2] == self.block.k_block, (st.mma_tiler, self.block.k_block)
         tma = BlockScaledTmaSetup(st, a, b, sfa_t, sfb_t, c)
         self.num_tma_load_bytes = tma.tx_bytes
-        params, grid = build_grid(st, c, max_active_clusters)
+        if cutlass.const_expr("sched" in self.dyn):
+            params, grid = build_grid_dyn(st, c, max_active_clusters, swizzle, raster_m)
+        else:
+            params, grid = build_grid(st, c, max_active_clusters)
         cluster = (*self.cluster_shape_mn, 1)
         if cutlass.const_expr(st.cluster_k > 1):
             # one tile per cluster: as many persistent "clusters" as tiles; the physical cluster is the K group
-            params, grid1 = build_grid(st, c, 1 << 24)
+            if cutlass.const_expr("sched" in self.dyn):
+                params, grid1 = build_grid_dyn(st, c, 1 << 24, swizzle, raster_m)
+            else:
+                params, grid1 = build_grid(st, c, 1 << 24)
             grid, cluster = (st.cluster_k, 1, grid1[2]), (st.cluster_k, 1, 1)
         self.kernel(
             st.tiled_mma,
@@ -1393,7 +1420,7 @@ class BlockScaledGemm:
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged,
         epi_tile: cute.Tile,
-        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+        tile_sched_params,
         alpha_t: Optional[cute.Tensor],
         tiled_mma_bkeep: Optional[cute.TiledMma] = None,
         tiled_mma_breuse: Optional[cute.TiledMma] = None,
@@ -1649,7 +1676,7 @@ class BlockScaledGemm:
 
         # --- roles
         if warp_idx == TMA_WARP:
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+            tile_sched = self.sched.create(
                 tile_sched_params, sched_bidx, sched_grid
             )
             blockscaled_producer_loop(
@@ -1693,7 +1720,7 @@ class BlockScaledGemm:
                 ),
                 tCtSFB_layout,
             )
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+            tile_sched = self.sched.create(
                 tile_sched_params, sched_bidx, sched_grid
             )
             blockscaled_mma_loop(
@@ -1728,7 +1755,7 @@ class BlockScaledGemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+            tile_sched = self.sched.create(
                 tile_sched_params, sched_bidx, sched_grid
             )
             if cutlass.const_expr(C > 1):
@@ -1793,3 +1820,44 @@ class ScaledBlockScaledGemm(BlockScaledGemm):
         stream: cuda.CUstream,
     ):
         self._launch(a, b, sfa, sfb, c, max_active_clusters, stream, alpha)
+
+
+# ----------------------------------------------------------------------------- the dynamic entry points (study)
+
+
+class DynBlockScaledGemm(BlockScaledGemm):
+    """``BlockScaledGemm`` whose persistent grid, swizzle size and raster order are Int32 arguments (``dyn`` names which of
+    them the body reads)."""
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        sfa: cute.Tensor,
+        sfb: cute.Tensor,
+        c: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        swizzle: cutlass.Int32,
+        raster_m: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._launch(a, b, sfa, sfb, c, max_active_clusters, stream, None, swizzle, raster_m)
+
+
+class DynScaledBlockScaledGemm(ScaledBlockScaledGemm):
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        sfa: cute.Tensor,
+        sfb: cute.Tensor,
+        c: cute.Tensor,
+        alpha: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        swizzle: cutlass.Int32,
+        raster_m: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._launch(a, b, sfa, sfb, c, max_active_clusters, stream, alpha, swizzle, raster_m)
