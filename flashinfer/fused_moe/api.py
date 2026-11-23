@@ -3730,7 +3730,7 @@ class BatchInvariantFp4Config:
     ``cvt_bf16(act(mul(g, s)) * mul(u, s))``, ``s = mul(alpha1[e], pts[token])``, the bf16 intermediate quantized per token
     by the same class, GEMM2 with ``cvt_bf16(mul(acc, mul(alpha2[e], pts2)))``, the slot-order combine. The instruction
     class of each expert weight shape is the dense 4-bit class rule's (the sm_107 K = 128 step on SM107, the K = 64 step
-    elsewhere), so the architecture is a dimension of ``fingerprint("fused_moe_nvfp4", ...)``. Both pairs' activation chains
+    elsewhere), so the architecture family is a dimension of ``fingerprint("fused_moe_nvfp4", ...)`` (SM100 and SM103 are one family). Both pairs' activation chains
     compute their exponential and divisions with the part's SFU (``ex2.approx.ftz`` / ``rcp.approx.ftz``): deterministic and
     batch-invariant per part, the bits a property of the part (the verification standard is in the mode's README); the ReLU
     family and PowLU have no such step and are the declared sequences.
@@ -3757,7 +3757,7 @@ class BatchInvariantFp4Config:
     (``mxfp4.quant``), GEMM1 as the dense MXFP4 GEMM class per expert with the bf16 class's chain on the raw accumulators (the
     block scales are applied inside the instruction), the bf16 intermediate quantized by the same class, GEMM2 with
     ``cvt_bf16(acc)``, the slot-order combine; the instruction class is the part's (the sm_107 K = 128 step on SM107), so the
-    architecture is a dimension of ``fingerprint("fused_moe_mxfp4", ...)``. Weights: the canonical bf16 layouts above,
+    architecture family is a dimension of ``fingerprint("fused_moe_mxfp4", ...)`` (SM100 and SM103 are one family). Weights: the canonical bf16 layouts above,
     quantized per expert by the MXFP4 quantizer (128x4 swizzled UE8M0 scales), ``H`` and ``I`` multiples of 32. Activations:
     bf16 rows as given, or packed fp4 ``uint8 [num_tokens, H / 2]`` with ``hidden_states_scale`` (the 128x4 swizzled scales of
     ``mxfp4_quantize(..., batch_invariant=True)`` or the linear ``[num_tokens, H / 32]`` layout) and no ``per_token_scale``
@@ -3797,13 +3797,40 @@ class BatchInvariantFp4Config:
         rows interleaved first for a gated activation), the 128x4 swizzled block scales and the alphas
         (``1 / global scale``); ``intermediate`` / ``intermediate_scales`` select the static-intermediate class and its
         per-expert scales (see the class docstring). MXFP4 x MXFP4: every expert quantized to MXFP4 (one UE8M0 scale per 32
-        elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of this pair."""
+        elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of this pair. A supplied
+        ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must agree with the weights' geometry, and
+        ``intermediate_scales`` need ``intermediate="static"``: a contradiction is refused with the mode's error before any
+        view is built."""
+        from ..batch_invariant.support import unsupported
         from .batch_invariant.api_fp4 import MoEWeightsFp4
         from .batch_invariant.runner_fp4 import PAIRS
         from .batch_invariant.spec import activation_of
 
         pair = _fp4_pair(quant)
         chain = activation_of(activation if activation is not None else SwiGLU())
+        if w1.dim() != 3 or w2.dim() != 3:
+            raise TypeError(
+                "BatchInvariantFp4Config.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
+            )
+        E, N1, H = w1.shape
+        for name, given, actual in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, N1 // 2 if chain.gated else N1),
+        ):
+            if given is not None and int(given) != actual:
+                raise unsupported(
+                    PAIRS[pair].cls,
+                    f"{name} {given} with weights of {name} {actual} (w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}, "
+                    f"{'gated' if chain.gated else 'ungated'} activation)",
+                    "dimensions that agree with the weights' geometry (or none)",
+                )
+        if intermediate_scales is not None and intermediate != "static":
+            raise unsupported(
+                PAIRS[pair].cls,
+                f"intermediate_scales with intermediate={intermediate!r}",
+                "intermediate scales with intermediate='static' alone (the per-token class derives its scales from the rows)",
+            )
         w1 = w1.to(device=device) if device is not None else w1
         w2 = w2.to(device=device) if device is not None else w2
         return MoEWeightsFp4.prepare(

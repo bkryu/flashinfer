@@ -196,7 +196,8 @@ def check_shape_fp4(
 
 
 def _scale_vector(t, name: str, E: int, device: torch.device) -> torch.Tensor:
-    """A per-expert vector of ``E`` multipliers as a contiguous fp32 ``[E]``: finite, positive, normal values (their
+    """A per-expert vector of ``E`` multipliers as a contiguous fp32 ``[E]``, a copy of the caller's values (the view's
+    tensors never alias the caller's: its reciprocal is formed once beside it): finite, positive, normal values (their
     reciprocals are factors of the class's chains); one element broadcasts to the experts."""
     v = torch.as_tensor(t, dtype=torch.float32, device=device)
     if v.numel() == 1:
@@ -205,7 +206,7 @@ def _scale_vector(t, name: str, E: int, device: torch.device) -> torch.Tensor:
         raise ValueError(
             f"{NV_CLASS}: {name} must hold one fp32 multiplier per expert ({E}), got shape {tuple(v.shape)}"
         )
-    v = v.reshape(E).contiguous()
+    v = v.reshape(E).clone(memory_format=torch.contiguous_format)
     tiny = torch.finfo(torch.float32).tiny
     if not bool(torch.isfinite(v).all()) or not bool((v >= tiny).all()):
         raise ValueError(
@@ -215,15 +216,12 @@ def _scale_vector(t, name: str, E: int, device: torch.device) -> torch.Tensor:
 
 
 def fp4_global_scale(w: torch.Tensor) -> torch.Tensor:
-    """FlashInfer's per-tensor global scale of a weight: ``448 * 6 / amax(w)`` (a 1-element f32 tensor)."""
-    amax = (
-        w.detach()
-        .to(torch.float32)
-        .abs()
-        .amax()
-        .clamp_min(torch.finfo(torch.float32).tiny)
+    """FlashInfer's per-tensor global scale of a weight: ``448 * 6 / amax(w)``, one for an all-zero tensor (the convention of
+    the package's weight preparation; a 1-element f32 tensor)."""
+    amax = w.detach().to(torch.float32).abs().amax().reshape(1)
+    return torch.where(amax > 0, E4M3_MAX * E2M1_MAX / amax, torch.ones_like(amax)).to(
+        torch.float32
     )
-    return (E4M3_MAX * E2M1_MAX / amax).reshape(1).to(torch.float32)
 
 
 @dataclass
@@ -286,6 +284,12 @@ class MoEWeightsFp4:
                 if intermediate_scales is not None
                 else f"intermediate={intermediate!r}",
                 "the intermediate quantized per 32-element block by the class itself (the static class is the NVFP4 pair's)",
+            )
+        if intermediate_scales is not None and intermediate != "static":
+            raise unsupported(
+                pair.cls,
+                f"intermediate_scales with intermediate={intermediate!r}",
+                "intermediate scales with intermediate='static' alone (the per-token class derives its scales from the rows)",
             )
         act = act if act is not None else ("silu" if gated else "relu2")
         if act not in (S.ACTS if gated else S.UNGATED_ACTS):
@@ -545,6 +549,7 @@ def grouped_gemm_fp4(
     aux: Optional[torch.Tensor] = None,
     src: Optional[torch.Tensor] = None,
     k_div: int = 1,
+    sf_layout: Optional[str] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a4[p] @ w4[e(p)].T, ...)`` on the expert segments ``counts`` (int32 ``[E]``, group order = expert order),
     the block scales of both operands applied inside the instruction. Padded packing (default): ``a4 [rows, K/2]`` uint8 with
@@ -558,7 +563,8 @@ def grouped_gemm_fp4(
     rows past the live rows: ``DENSE_TAIL``). The gather record (``config.gather_a``): ``a4 [T, K/2]`` the unpermuted token
     rows, ``a_sf`` their scale factors (the flat 128x4 buffer of the ``T`` rows, or the linear ``[T, K/block]`` bytes), ``pts
     [T]`` (or one entry: the unit scale), ``src [>= Tk]`` int32 the plan's slot of every dense row (``src[p] // k_div`` its
-    token), ``out`` given (it sizes the dense rows); no permuted tensor, the same bits."""
+    token), ``out`` given (it sizes the dense rows); no permuted tensor, the same bits. ``sf_layout`` names the gather record's
+    scale layout where the shape does not (:func:`gather_sf_layout`)."""
     from .api import _check_grouped_chain, _check_grouped_operands, _grouped_out
     from .blocks.compile import (
         can_implement_grouped_blockscaled,
@@ -572,7 +578,7 @@ def grouped_gemm_fp4(
     if config.gather_a:
         return _grouped_gemm_fp4_gather(
             pair, a4, a_sf, w4, w_sf, counts, config, chain, in_fmt,
-            pts, alpha, out, out_sf, aux, src, k_div,
+            pts, alpha, out, out_sf, aux, src, k_div, sf_layout,
         )  # fmt: skip
     if src is not None:
         raise ValueError(f"{name}: src belongs to the gather record (config.gather_a)")
@@ -684,13 +690,44 @@ def grouped_gemm_fp4(
     return out
 
 
-def gather_sf_layout(a_sf: torch.Tensor, T: int, K: int, block: int = 16) -> str:
-    """The layout of a gather record's scale operand: the row-major linear bytes ``[T, K / block]`` or the flat 128x4 buffer."""
-    return (
-        "linear"
-        if a_sf.dim() == 2 and tuple(a_sf.shape) == (T, K // block)
-        else "128x4"
-    )
+#: The layouts of a pre-quantized input's scale factors: the 128x4 swizzled buffer of the mode's quantizers, the row-major bytes.
+SF_LAYOUTS = ("128x4", "linear")
+
+
+def sf_layouts_collide(T: int, K: int, block: int) -> bool:
+    """Whether the linear ``[T, K / block]`` layout and the 128x4 swizzled buffer of ``T`` rows have one shape: the quantizers
+    return the buffer as ``(rows padded to 128, scale columns padded to 4)``, so a tensor of that shape names no layout."""
+    return T % GROUP_ALIGN == 0 and (K // block) % 4 == 0
+
+
+def gather_sf_layout(
+    a_sf: torch.Tensor,
+    T: int,
+    K: int,
+    block: int = 16,
+    layout: Optional[str] = None,
+    cls: str = NV_CLASS,
+) -> str:
+    """The layout of a scale operand of ``T`` rows of ``K`` elements: ``layout`` names it (``"128x4"`` / ``"linear"``); otherwise
+    the shape does where it can -- a tensor that is not a 2-D ``[T, K / block]`` is the flat 128x4 buffer, a 2-D ``[T, K / block]``
+    tensor the linear layout, unless the swizzled buffer has that shape too (:func:`sf_layouts_collide`), which is refused: the
+    caller names the layout (``QuantConfig(swizzled_scale_factors=...)`` through the layer, ``sf_layout`` on the op) or flattens
+    the quantizer's buffer."""
+    if layout is not None:
+        if layout not in SF_LAYOUTS:
+            raise ValueError(f"sf_layout must be one of {SF_LAYOUTS}, not {layout!r}")
+        return layout
+    if a_sf.dim() != 2 or tuple(a_sf.shape) != (T, K // block):
+        return "128x4"
+    if sf_layouts_collide(T, K, block):
+        raise unsupported(
+            cls,
+            f"scale factors of shape {tuple(a_sf.shape)} for {T} rows without a named layout",
+            "the layout named by the caller: the quantizer's 128x4 buffer flattened, or QuantConfig(swizzled_scale_factors="
+            "True / False) through the layer and sf_layout='128x4' / 'linear' on the op (at a row count that is a multiple "
+            "of 128 the swizzled buffer and the linear layout have the same shape)",
+        )
+    return "linear"
 
 
 def gather_form_ok(K: int, sf_src: str, block: int = 16) -> bool:
@@ -700,7 +737,7 @@ def gather_form_ok(K: int, sf_src: str, block: int = 16) -> bool:
 
 
 def _grouped_gemm_fp4_gather(
-    pair, a4, a_sf, w4, w_sf, counts, config, chain, in_fmt, pts, alpha, out, out_sf, aux, src, k_div
+    pair, a4, a_sf, w4, w_sf, counts, config, chain, in_fmt, pts, alpha, out, out_sf, aux, src, k_div, sf_layout=None
 ) -> torch.Tensor:  # fmt: skip
     """The gather record of :func:`grouped_gemm_fp4` (its operand rules, the token rows in place of the permuted rows; the
     swapped body)."""
@@ -734,7 +771,7 @@ def _grouped_gemm_fp4_gather(
         raise ValueError(
             f"{name}: src must be a contiguous int32 [>= Tk] and k_div >= 1"
         )
-    sf_src = gather_sf_layout(a_sf, T, K, pair.block)
+    sf_src = gather_sf_layout(a_sf, T, K, pair.block, sf_layout, pair.cls)
     if a_sf.dtype != torch.uint8 or (
         sf_src == "128x4" and a_sf.numel() < pair.sf_numel(T, K)
     ):
@@ -866,22 +903,37 @@ _DUMMY_SF: Dict[str, torch.Tensor] = {}
 _UNIT: Dict[str, torch.Tensor] = {}
 
 
+def _const(cache: Dict, key, fill, device: torch.device) -> torch.Tensor:
+    """A constant operand of the kernels, cached per device: built on the host (``fill(cpu)``) and copied with a blocking copy,
+    so its bytes are on the device before the call returns and any stream may read it -- a captured call too (no node in the
+    graph). First met under CUDA graph capture it is a device fill (``fill(device)``): a graph-pool allocation whose fill runs
+    only at replay, so it serves that capture alone and is not cached (as the bf16 op's ``_const``)."""
+    t = cache.get(key)
+    if t is None:
+        if torch.cuda.is_current_stream_capturing():
+            return fill(device)
+        t = cache[key] = fill(torch.device("cpu")).to(device)
+    return t
+
+
 def _dummy_sf(device: torch.device) -> torch.Tensor:
     """A 512-byte placeholder for an unread scale-byte operand (one atom: the kernels' alignment assumption), per device."""
-    key = str(torch.device(device))
-    t = _DUMMY_SF.get(key)
-    if t is None:
-        t = _DUMMY_SF[key] = torch.zeros(512, dtype=torch.uint8, device=device)
-    return t
+    return _const(
+        _DUMMY_SF,
+        str(torch.device(device)),
+        lambda d: torch.zeros(512, dtype=torch.uint8, device=d),
+        device,
+    )
 
 
 def _placeholder(device: torch.device) -> torch.Tensor:
     """A one-element fp32 tensor for the scatter kernels' unread per-token-scale operands, per device (no fill per call)."""
-    key = str(torch.device(device))
-    t = _UNIT.get(key)
-    if t is None:
-        t = _UNIT[key] = torch.ones(1, dtype=torch.float32, device=device)
-    return t
+    return _const(
+        _UNIT,
+        str(torch.device(device)),
+        lambda d: torch.ones(1, dtype=torch.float32, device=d),
+        device,
+    )
 
 
 def route_plan_dual(
@@ -911,15 +963,17 @@ def route_plan_dual(
 
 
 def _gs_inv(gs_inv: Union[float, torch.Tensor], device: torch.device) -> torch.Tensor:
+    """The recipe's inverse base scale as a one-element fp32 tensor on ``device``: a tensor as given; a number from the
+    per-device cache (:func:`_const`: never a tensor first made under CUDA graph capture)."""
     if isinstance(gs_inv, torch.Tensor):
         return gs_inv.to(device=device, dtype=torch.float32).reshape(1)
-    key = (str(torch.device(device)), float(gs_inv))
-    t = _GS_INV.get(key)
-    if t is None:
-        t = _GS_INV[key] = torch.full(
-            (1,), float(gs_inv), dtype=torch.float32, device=device
-        )
-    return t
+    v = float(gs_inv)
+    return _const(
+        _GS_INV,
+        (str(torch.device(device)), v),
+        lambda d: torch.full((1,), v, dtype=torch.float32, device=d),
+        device,
+    )
 
 
 def quantize_activations(
@@ -1049,7 +1103,7 @@ def _part(device: torch.device) -> Tuple[int, str]:
 
 
 def _input(
-    w: MoEWeightsFp4, x, gs_inv, dev_hint=None
+    w: MoEWeightsFp4, x, gs_inv, dev_hint=None, sf_layout: Optional[str] = None
 ) -> Tuple[
     int,
     torch.device,
@@ -1063,7 +1117,8 @@ def _input(
     """The op's input forms: bf16 rows, or the pair's pre-quantized pack -- NVFP4 ``(x4, x_sf, x_pts or None)``, MXFP4 ``(x4,
     x_sf)``. Returns ``(T, device, x_rows, x4, x_sf, x_pts, sf_src, unit_pts)``: a bf16 input keeps its rows (``x4`` None where
     the dense path quantizes straight into the grouped layout); a pack's scale factors are the class's flat 128x4 buffer or the
-    row-major ``[T, H / block]`` bytes (``sf_src``); ``unit_pts``: the NVFP4 per-tensor pack without per-token scales."""
+    row-major ``[T, H / block]`` bytes (``sf_src``: ``sf_layout`` as given, else from the shape where it names one layout);
+    ``unit_pts``: the NVFP4 per-tensor pack without per-token scales."""
     pair, H = w.pair, w.hidden_size
     op = f"fused_moe_{pair.name}"
     if isinstance(x, torch.Tensor):
@@ -1078,7 +1133,14 @@ def _input(
             )
         if x.shape[1] != H:
             raise ValueError(f"{op}: x has H = {x.shape[1]}, the weights H = {H}")
-        return x.shape[0], x.device, x.contiguous(), None, None, None, "128x4", False
+        x = x.contiguous()
+        if x.data_ptr() % 16:
+            raise unsupported(
+                pair.cls,
+                "bf16 rows at a storage offset that is not a multiple of 16 bytes",
+                "16-byte aligned rows (the kernels' vector loads and TMA boxes)",
+            )
+        return x.shape[0], x.device, x, None, None, None, "128x4", False
     if pair.scaled:
         x4, x_sf, x_pts = x
     else:
@@ -1087,7 +1149,7 @@ def _input(
         x4, x_sf = x[0], x[1]
         x_pts = None
     T = x4.shape[0]
-    sf_src = gather_sf_layout(x_sf, T, H, pair.block)
+    sf_src = gather_sf_layout(x_sf, T, H, pair.block, sf_layout, pair.cls)
     x_sf = x_sf.contiguous().reshape(-1)
     unit_pts = x_pts is None
     if (
@@ -1106,10 +1168,20 @@ def _input(
             f"[T, H/{pair.block}] bytes"
             + (", x_pts [T] f32 or None)" if pair.scaled else ")")
         )
+    if x4.data_ptr() % 16 or x_sf.data_ptr() % 16:
+        raise unsupported(
+            pair.cls,
+            "packed codes or scale bytes at a storage offset that is not a multiple of 16 bytes",
+            "16-byte aligned codes and scale bytes (the kernels' vector loads and TMA boxes)",
+        )
     if pair.scaled and unit_pts:
         x_pts = _gs_inv(
             1.0, x4.device
         )  # a placeholder the unit-scale scatter never reads
+    elif pair.scaled:
+        x_pts = (
+            x_pts.contiguous()
+        )  # a strided per-token scale is read as given by the scatter: a placement
     return T, x4.device, None, x4, x_sf, x_pts, sf_src, unit_pts
 
 
@@ -1131,6 +1203,7 @@ def fused_moe_fp4(
     ] = None,
     round_scales: bool = False,
     gather: Optional[bool] = None,
+    sf_layout: Optional[str] = None,
 ):
     """The fp4 MoE FFN for pre-routed tokens: ``x`` bf16 ``[T, H]`` (quantized here by the pair's class; ``gs_inv`` the NVFP4
     recipe's inverse base scale) or the pair's quantized pack (NVFP4 ``(x4 [T, H/2] uint8, x_sf, x_pts [T] f32 or None: unit
@@ -1144,7 +1217,9 @@ def fused_moe_fp4(
     the dense path). ``plan``: the dense packing's precomputed plan, the outputs of :func:`route_plan_dual` after the ids and
     weights (one launch saved). ``gather``: GEMM1's swapped records in their gather form (the body reads the token rows through
     the plan's map: no scatter launch, no permuted tensor) -- False excludes it, True forces it, None (the default) applies the
-    structural rule (:func:`~.schedule_fp4.gather_form_rule`); an explicit ``config1`` selects the form itself (``gather_a``)."""
+    structural rule (:func:`~.schedule_fp4.gather_form_rule`); an explicit ``config1`` selects the form itself (``gather_a``).
+    ``sf_layout`` names a pack's scale layout (``"128x4"`` / ``"linear"``); without it the shape must name one
+    (:func:`gather_sf_layout`: a 2-D ``[T, H / block]`` tensor at a row count that is a multiple of 128 is refused)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import warps_per_row
     from .permute_nvfp4 import (
@@ -1160,7 +1235,9 @@ def fused_moe_fp4(
     if path not in PATHS:
         raise ValueError(f"{op}: path must be one of {PATHS}, not {path!r}")
     H, I, E = w.hidden_size, w.intermediate_size, w.num_experts
-    T, dev, x_rows, x4, x_sf, x_pts, sf_src, unit_pts = _input(w, x, gs_inv)
+    T, dev, x_rows, x4, x_sf, x_pts, sf_src, unit_pts = _input(
+        w, x, gs_inv, sf_layout=sf_layout
+    )
     k = token_selected_experts.shape[1]
     check_shape_fp4(pair, H, I, E, k, w.gated)
     if (
@@ -1339,7 +1416,9 @@ def fused_moe_fp4(
             g_a, g_sf, g_pts = x_perm4, x_perm_sf, x_perm_pts
         g_src = src if gather1 else None
         a4 = torch.empty(Tk_a, I // 2, dtype=torch.uint8, device=dev)
-        a_sf_pad = torch.empty(pair.sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
+        # zero-filled: the writers (the static epilogue, the quantizers' re-tiling) store a row's real scale columns only, and
+        # GEMM2's scale boxes read the padded columns of a row's last 4-byte group against the zero-filled tail of its k-tile
+        a_sf_pad = torch.zeros(pair.sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
         a = a_sf = a_pts = a_pts_pad = None
         if static:
             # the static class: GEMM1's epilogue writes the intermediate's codes (dense rows) and scale bytes (the padded
@@ -1347,7 +1426,7 @@ def fused_moe_fp4(
             grouped_gemm_fp4(
                 g_a, g_sf, w.w1, w.w1_sf, counts, config1, chain1, in1,
                 pts=g_pts, alpha=alpha1, out=a4, dense_a=True, rows_sf=Tk_sf, out_sf=a_sf_pad, aux=w.gs2,
-                src=g_src, k_div=k,
+                src=g_src, k_div=k, sf_layout=sf_src,
             )  # fmt: skip
             a_pts_pad = (
                 x_perm_pts  # GEMM2's row-scale operand is unread by the static chain
@@ -1358,7 +1437,7 @@ def fused_moe_fp4(
             a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
             grouped_gemm_fp4(
                 g_a, g_sf, w.w1, w.w1_sf, counts, config1, chain1, in1,
-                pts=g_pts, alpha=alpha1, out=a, dense_a=True, rows_sf=Tk_sf, src=g_src, k_div=k,
+                pts=g_pts, alpha=alpha1, out=a, dense_a=True, rows_sf=Tk_sf, src=g_src, k_div=k, sf_layout=sf_src,
             )  # fmt: skip
             # the class's second pass over the live rows: the codes stay dense; the scale factors (and the row scales) are
             # re-tiled to the padded positions for GEMM2's atom-aligned scale boxes (a byte move)
@@ -1521,5 +1600,8 @@ __all__ = [
     "quantize_rows_mx",
     "quantize_scatter_rows",
     "route_plan_dual",
+    "sf_layouts_collide",
+    "gather_sf_layout",
+    "SF_LAYOUTS",
     "sm_count_of",
 ]

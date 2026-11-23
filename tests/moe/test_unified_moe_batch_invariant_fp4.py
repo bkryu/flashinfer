@@ -299,6 +299,56 @@ def test_unserved_quant_pair_is_refused_and_names_the_served_pairs():
 
 
 @each_pair
+def test_prepare_weights_rejects_dimensions_that_disagree_with_the_weights(pair):
+    """A supplied ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must be the weights' own, for the gated
+    geometry (``I`` = half of w1's rows) and the ungated one (``I`` = w1's rows), and ``intermediate_scales`` need
+    ``intermediate="static"`` (the per-token class would silently drop them): the mode's error before any view is built,
+    naming the dimension; the consistent call and the call without dimensions give the view (on a device)."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    quant = _QUANT[pair]
+    E, I, H = 4, 32, 64
+    w1 = torch.randn(E, 2 * I, H).to(torch.bfloat16)
+    w2 = torch.randn(E, H, I).to(torch.bfloat16)
+    w1u = torch.randn(E, I, H).to(torch.bfloat16)
+    for w1_, act, kw in (
+        (w1, _SWIGLU, dict(num_local_experts=E + 1)),
+        (w1, _SWIGLU, dict(hidden_size=H // 2)),
+        (w1, _SWIGLU, dict(intermediate_size=2 * I)),
+        (w1u, ReLU2(), dict(intermediate_size=I // 2)),
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+            BatchInvariantFp4Config.prepare_weights(
+                w1_, w2, quant=quant, activation=act, **kw
+            )
+        assert next(iter(kw)) in str(excinfo.value) and pair.cls in str(excinfo.value)
+    with pytest.raises(TypeError):
+        BatchInvariantFp4Config.prepare_weights(w1[0], w2, quant=quant)
+    with pytest.raises(BatchInvariantUnsupportedError, match="intermediate_scales"):
+        BatchInvariantFp4Config.prepare_weights(
+            w1, w2, quant=quant, intermediate_scales=torch.ones(E)
+        )
+    if pair.scaled:
+        with pytest.raises(BatchInvariantUnsupportedError, match="intermediate_scales"):
+            MoEWeightsFp4.prepare(pair, w1, w2, intermediate_scales=torch.ones(E))
+    if not _supported:
+        return
+    w1, w2, w1u = w1.cuda(), w2.cuda(), w1u.cuda()
+    view = BatchInvariantFp4Config.prepare_weights(
+        w1, w2, quant=quant, num_local_experts=E, hidden_size=H, intermediate_size=I
+    )
+    assert view["gemm1_weights"].shape == (E, 2 * I, H // 2) and view["gated"]
+    assert torch.equal(
+        BatchInvariantFp4Config.prepare_weights(w1, w2, quant=quant)["gemm2_weights"],
+        view["gemm2_weights"],
+    )
+    view_u = BatchInvariantFp4Config.prepare_weights(
+        w1u, w2, quant=quant, intermediate_size=I, activation=ReLU2()
+    )
+    assert not view_u["gated"] and view_u["gemm1_weights"].shape == (E, I, H // 2)
+
+
+@each_pair
 def test_fingerprint_dimensions_and_classes(pair):
     """``fingerprint("fused_moe_<pair>", ...)`` takes the geometry, the routing method, the activation and the architecture
     (the instruction class); the classes differ from the bf16 ones and the other pair's, between activations, between the
@@ -1268,6 +1318,114 @@ def test_both_packings_and_the_prequantized_pack_forms_give_the_bits(pair):
 
 @needs_device
 @each_pair
+def test_quantizer_scale_buffer_as_returned_at_row_counts_that_are_multiples_of_128(
+    pair,
+):
+    """The public quantizers (``nvfp4_quantize(..., per_token_activation=True, batch_invariant=True)``,
+    ``mxfp4_quantize(..., batch_invariant=True)``) return the 128x4 scale buffer 2-D, rows padded to 128 and columns to 4: at a
+    row count that is a multiple of 128 it has the linear layout's shape ``[T, H / block]``. Through the layer, the buffer as
+    returned and flattened both give the bf16-input path's bits under ``QuantConfig(swizzled_scale_factors=True)``, the linear
+    layout under ``swizzled_scale_factors=False``, at ``T`` in {127, 128, 129, 256, 384}; without the flag the shape names the
+    layout where it can (127, 129; the flat buffer everywhere) and the colliding shape is refused, by the layer and by the op,
+    which takes ``sf_layout`` instead."""
+    from flashinfer import mxfp4_quantize, nvfp4_quantize
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        TE_GS_INV,
+        fused_moe_fp4,
+        sf_layouts_collide,
+    )
+
+    k, H, I, E = 4, 512, 256, 16
+    base = _NVFP4_PTS if pair.scaled else _MX
+    layers = {
+        flag: _layer(
+            k, E, I, quant=dataclasses.replace(base, swizzled_scale_factors=flag)
+        )
+        for flag in (None, True, False)
+    }
+    plain = _layer(k, E, I, quant=_QUANT[pair])
+    mode = RoutingInputMode.UnpackedPrecomputed
+
+    def pack(q, scale, p, ids, weights):
+        return MoEActivationPack(
+            q, scale, topk_ids=ids, topk_weights=weights, routing_input_mode=mode, per_token_scale=p
+        )  # fmt: skip
+
+    for T in (127, 128, 129, 256, 384):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=T)
+        W_pack = _weights(w1, w2, quant=_QUANT[pair])
+        W = _weights_of(W_pack)
+        ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids, weights = ids.cuda(), weights.cuda()
+        ref = bits(plain(_routed_pack(x, ids, weights), W_pack))
+        if pair.scaled:
+            x4, sf, pts = nvfp4_quantize(
+                x, TE_GS_INV, per_token_activation=True, batch_invariant=True
+            )
+        else:
+            x4, sf = mxfp4_quantize(x, batch_invariant=True)
+            pts = None
+        assert sf.dim() == 2 and sf.shape[0] == -(-T // 128) * 128
+        flat = sf.reshape(-1)
+        linear = _unswizzle(pair, flat.cpu(), T, H).cuda()
+        assert tuple(linear.shape) == (T, H // pair.block)
+        collide = sf_layouts_collide(T, H, pair.block)
+        assert collide == (T % 128 == 0) and (
+            collide == (tuple(sf.shape) == tuple(linear.shape))
+        )
+        # the named layouts: the buffer as returned and flattened, the linear rows
+        for scale in (sf, flat):
+            assert torch.equal(
+                bits(layers[True](pack(x4, scale, pts, ids, weights), W_pack)), ref
+            ), T
+        assert torch.equal(
+            bits(layers[False](pack(x4, linear, pts, ids, weights), W_pack)), ref
+        ), T
+        # unnamed: the flat buffer always, the 2-D forms where the shape names the layout
+        assert torch.equal(
+            bits(layers[None](pack(x4, flat, pts, ids, weights), W_pack)), ref
+        ), T
+        op_pack = _pack(pair, x4, sf, pts)
+        if collide:
+            for scale in (sf, linear):
+                with pytest.raises(
+                    BatchInvariantUnsupportedError, match="swizzled_scale_factors"
+                ):
+                    layers[None](pack(x4, scale, pts, ids, weights), W_pack)
+            with pytest.raises(BatchInvariantUnsupportedError, match="sf_layout"):
+                fused_moe_fp4(op_pack, ids, weights, W)
+            with pytest.raises(BatchInvariantUnsupportedError, match="sf_layout"):
+                fused_moe_fp4(_pack(pair, x4, linear, pts), ids, weights, W)
+        else:
+            assert torch.equal(
+                bits(layers[None](pack(x4, sf, pts, ids, weights), W_pack)), ref
+            ), T
+            assert torch.equal(
+                bits(layers[None](pack(x4, linear, pts, ids, weights), W_pack)), ref
+            ), T
+            assert torch.equal(bits(fused_moe_fp4(op_pack, ids, weights, W)), ref), T
+        # the op with the layout named
+        assert torch.equal(
+            bits(fused_moe_fp4(op_pack, ids, weights, W, sf_layout="128x4")), ref
+        ), T
+        assert torch.equal(
+            bits(
+                fused_moe_fp4(
+                    _pack(pair, x4, linear, pts), ids, weights, W, sf_layout="linear"
+                )
+            ),
+            ref,
+        ), T
+        assert torch.equal(
+            bits(fused_moe_fp4(_pack(pair, x4, flat, pts), ids, weights, W)), ref
+        ), T
+    with pytest.raises(ValueError, match="sf_layout"):
+        fused_moe_fp4(_pack(pair, x4, flat, pts), ids, weights, W, sf_layout="rows")
+
+
+@needs_device
+@each_pair
 def test_swapped_gather_record_gives_the_box_forms_bits_on_every_pack_form(pair):
     """The swapped records' gather form (the body reads the token rows and their scale factors through the plan's map: no scatter
     launch, no permuted tensor) is a placement: the box form's bits for the bf16 input, the pre-quantized pack with the 128x4 and
@@ -1444,6 +1602,52 @@ def test_pdl_chain_alternating_inputs_give_each_call_its_own_bits(pair, body):
 
 
 @needs_device
+@pytest.mark.parametrize("which", ["nvfp4", "nvfp4_static", "mxfp4"])
+def test_op_constants_first_made_under_graph_capture_are_not_cached(which):
+    """The op's cached constants (the recipe's inverse base scale, the unread scale-byte and per-token placeholders) first
+    materialised while a CUDA graph is being captured are graph-pool allocations whose fill runs only at replay: they serve
+    that capture alone and are never cached, so an eager call after the capture and before any replay gives the bits of an
+    eager call before it, and the replay gives them too; through the layer, both pairs and the static class."""
+    from flashinfer.fused_moe.batch_invariant import api_fp4
+
+    T, k, H, I, E = 48, 4, 256, 128, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=61)
+    if which == "mxfp4":
+        layer, W = _layer(k, E, I, quant=_MX), _weights(w1, w2, quant=_MX)
+    elif which == "nvfp4":
+        layer, W = _layer(k, E, I), _weights(w1, w2)
+    else:
+        layer = _layer(k, E, I, backend=BatchInvariantFp4Config(intermediate="static"))
+        W = MoEWeightPack({})
+        W.prepare_for(
+            KEY,
+            BatchInvariantFp4Config.prepare_weights(
+                w1, w2, activation=_SWIGLU, intermediate="static"
+            ),
+        )
+    act = _logits_pack(x, logits)
+    ref = bits(layer(act, W))  # eager: the compile, the winner, the constants cached
+    torch.cuda.synchronize()
+    caches = (api_fp4._GS_INV, api_fp4._DUMMY_SF, api_fp4._UNIT)
+    for c in caches:
+        c.clear()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out_g = layer(act, W)
+    torch.cuda.synchronize()
+    assert not any(caches)  # nothing made under capture is served to later calls
+    out_e = layer(act, W)  # eager, before any replay
+    assert torch.equal(bits(out_e), ref)
+    out_g.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out_g), ref)
+    assert torch.equal(bits(layer(act, W)), ref)
+
+
+@needs_device
 @each_pair
 def test_packed_f32_weights_are_rounded_by_the_combine(pair):
     """The packed pre-routed form takes f32 weights that are not bf16 values and rounds them in the combine (the packed word's
@@ -1465,6 +1669,41 @@ def test_packed_f32_weights_are_rounded_by_the_combine(pair):
     out_unpacked = layer(_routed_pack(x, ids.cuda(), raw.to(torch.bfloat16)), W)
     assert torch.equal(bits(out_raw), bits(out_rounded))
     assert torch.equal(bits(out_raw), bits(out_unpacked))
+
+
+@needs_device
+@each_pair
+def test_rounding_flag_is_bound_to_the_pack_not_the_runner(pair):
+    """The packed form's weight rounding is a property of the packed inputs (the bf16 runner's rule): two packs of different
+    forms packed in turn -- the packed form with f32 weights that are not bf16 values, then the unpacked form with the same
+    weights -- forwarded in either order give the bits of their single-pack runs (the packed one rounds, the unpacked one does
+    not), and the autotuner's plain input lists read as unrounded."""
+    T, k, H, I, E = 97, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=63)
+    layer = _layer(k, E, I, quant=_QUANT[pair])
+    W = _weights(w1, w2, quant=_QUANT[pair])
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    raw = (weights.float() * (1.0 + 2.0**-12)).cuda()
+    assert not torch.equal(raw.to(torch.bfloat16).float(), raw)
+    packed_act = _routed_pack(x, ids.cuda(), raw, packed=True)
+    unpacked_act = _routed_pack(x, ids.cuda(), raw)
+    ref_packed = bits(layer(packed_act, W))
+    ref_unpacked = bits(layer(unpacked_act, W))
+    assert not torch.equal(ref_packed, ref_unpacked)  # the rounding is real work
+    runner = layer.runners[0]
+    for first, second in ((packed_act, unpacked_act), (unpacked_act, packed_act)):
+        in1 = runner.pack_inputs(first, W)
+        in2 = runner.pack_inputs(second, W)
+        out1 = bits(runner.forward(in1))
+        out2 = bits(runner.forward(in2))
+        assert torch.equal(out1, ref_packed if first is packed_act else ref_unpacked)
+        assert torch.equal(out2, ref_packed if second is packed_act else ref_unpacked)
+    assert runner.pack_inputs(packed_act, W).w_round is True
+    assert runner.pack_inputs(unpacked_act, W).w_round is False
+    plain = list(
+        runner.pack_inputs(packed_act, W)
+    )  # the autotuner's profiling lists carry no attribute
+    assert torch.equal(bits(runner.forward(plain)), ref_unpacked)
 
 
 @needs_device
@@ -1954,6 +2193,99 @@ def test_poisoned_intermediates_do_not_reach_the_bits(pair, body, act):
         _quantized(x, pair=pair), ids, weights, W, chain, W.classes(_family())
     )
     assert torch.equal(ref, bits(comp.cpu()))
+
+
+@needs_device
+@pytest.mark.parametrize("I", [32, 96, 160])
+@pytest.mark.parametrize("which", ["nvfp4_static", "nvfp4", "mxfp4"])
+def test_narrow_intermediate_scale_tails_under_a_poisoned_allocator(which, I):
+    """At ``I % 64 == 32`` the intermediate's scale rows end in a 4-byte group with two padded columns that no writer stores
+    (the static epilogue and the quantizers' re-tiling store a row's real columns), and GEMM2's scale boxes read them against
+    the zero-filled tail of the k-tile: with the caching allocator's blocks pre-filled with e4m3 / bf16 NaN patterns, the
+    output of each class through the layer is finite and equals a clean run's bits (the per-token classes also their
+    composition)."""
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    T, k, H, E = 64, 4, 256, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=70 + I)
+    if which == "mxfp4":
+        pair = MXFP4
+        layer, W = _layer(k, E, I, quant=_MX), _weights(w1, w2, quant=_MX)
+    elif which == "nvfp4":
+        pair = NVFP4
+        layer, W = _layer(k, E, I), _weights(w1, w2)
+    else:
+        pair = NVFP4
+        layer = _layer(k, E, I, backend=BatchInvariantFp4Config(intermediate="static"))
+        W = MoEWeightPack({})
+        W.prepare_for(
+            KEY,
+            BatchInvariantFp4Config.prepare_weights(
+                w1, w2, activation=_SWIGLU, intermediate="static"
+            ),
+        )
+    act = _logits_pack(x, logits)
+    layer(act, W)  # the compile and the winner, outside the poisoned runs
+    _poison_allocator(0x00)
+    ref = layer(act, W)
+    assert torch.isfinite(ref.float()).all()
+    for byte in (0xFF, 0x7F):
+        _poison_allocator(byte)
+        out = layer(act, W)
+        assert torch.isfinite(out.float()).all(), (which, I, hex(byte))
+        assert torch.equal(bits(out), bits(ref)), (which, I, hex(byte))
+    if which != "nvfp4_static":
+        ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        comp = _reference_ffn(
+            _quantized(x, pair=pair),
+            ids.cuda(),
+            weights.cuda(),
+            _weights_of(W),
+            activation_of(_SWIGLU),
+            _weights_of(W).classes(_family()),
+        )
+        assert torch.equal(bits(ref.cpu()), bits(comp.cpu()))
+
+
+@needs_device
+def test_all_zero_nvfp4_expert_gives_finite_zero_rows():
+    """An all-zero expert weight takes the unit global scale (FlashInfer's weight-preparation convention: ``448 * 6 / amax``,
+    one for an all-zero tensor), so its alpha, codes and block scales are finite: a token whose slots all land on an expert
+    with zero fc1 and fc2, zero fc1 alone or zero fc2 alone gives a finite zero row; a mixed routing equals the class's
+    composition on the same bytes."""
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import fp4_global_scale
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    T, k, H, I, E = 32, 2, 256, 128, 4
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=81)
+    w1[1].zero_(), w2[1].zero_()  # both GEMMs zero
+    w1[2].zero_()  # fc1 zero: a zero intermediate
+    w2[3].zero_()  # fc2 zero
+    assert torch.equal(fp4_global_scale(torch.zeros(8, 32)), torch.ones(1))
+    assert torch.isfinite(fp4_global_scale(w1[0])).all()
+    W = _weights(w1, w2)
+    w = _weights_of(W)
+    assert torch.isfinite(w.w1_alpha).all() and torch.isfinite(w.w2_alpha).all()
+    assert bool(w.w1_alpha[1] == 1.0) and bool(w.w2_alpha[1] == 1.0)
+    layer = _layer(k, E, I)
+    weights = torch.full((T, k), 0.5, device="cuda")
+    for e in (1, 2, 3):
+        ids = torch.full((T, k), e, dtype=torch.int32, device="cuda")
+        out = layer(_routed_pack(x, ids, weights), W)
+        assert torch.isfinite(out.float()).all(), e
+        assert torch.equal(out.float(), torch.zeros(T, H, device="cuda")), e
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    out = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W)
+    assert torch.isfinite(out.float()).all()
+    comp = _reference_ffn(
+        _quantized(x),
+        ids.cuda(),
+        wts.cuda(),
+        w,
+        activation_of(_SWIGLU),
+        w.classes(_family()),
+    )
+    assert torch.equal(bits(out.cpu()), bits(comp.cpu()))
 
 
 @needs_device
@@ -2480,6 +2812,49 @@ def test_static_class_ladder(T, k, H, I, E, act, seed):
 
 
 @needs_device
+def test_prepared_static_scales_are_copies_of_the_callers_tensor():
+    """The static class's per-expert scales in the weight view are a copy of ``intermediate_scales`` (as the other prepared
+    tensors are): a caller's in-place change after ``prepare_weights`` changes neither the view (its scale and its reciprocal
+    stay the pair prepare formed) nor the output's bits."""
+    T, k, H, I, E = 32, 4, 256, 128, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=91)
+    gs2 = torch.full((E,), 2.0, device="cuda")
+    view = BatchInvariantFp4Config.prepare_weights(
+        w1, w2, activation=_SWIGLU, intermediate="static", intermediate_scales=gs2
+    )
+    assert view["intermediate_scale"].data_ptr() != gs2.data_ptr()
+    assert torch.equal(view["intermediate_scale"], gs2) and torch.equal(
+        view["intermediate_inv_scale"], torch.full((E,), 0.5, device="cuda")
+    )
+    W = MoEWeightPack({})
+    W.prepare_for(KEY, view)
+    layer = _layer(k, E, I, backend=BatchInvariantFp4Config(intermediate="static"))
+    act = _logits_pack(x, logits)
+    ref = bits(layer(act, W))
+    gs2.fill_(0.25)
+    torch.cuda.synchronize()
+    assert torch.equal(view["intermediate_scale"], torch.full((E,), 2.0, device="cuda"))
+    assert torch.equal(bits(layer(act, W)), ref)
+    # the same values given afresh prepare the same view and bits; the changed values another class member's
+    view2 = BatchInvariantFp4Config.prepare_weights(
+        w1,
+        w2,
+        activation=_SWIGLU,
+        intermediate="static",
+        intermediate_scales=torch.full((E,), 2.0, device="cuda"),
+    )
+    W2 = MoEWeightPack({})
+    W2.prepare_for(KEY, view2)
+    assert torch.equal(bits(layer(act, W2)), ref)
+    view3 = BatchInvariantFp4Config.prepare_weights(
+        w1, w2, activation=_SWIGLU, intermediate="static", intermediate_scales=gs2
+    )
+    W3 = MoEWeightPack({})
+    W3.prepare_for(KEY, view3)
+    assert not torch.equal(bits(layer(act, W3)), ref)
+
+
+@needs_device
 def test_static_class_takes_any_positive_scale_and_unit_default():
     """The static scales are per-expert inputs (any positive value); the default is one, the open backends' unified-layer
     value."""
@@ -2571,14 +2946,72 @@ def test_static_class_through_the_layer_batch_invariance_graph_replay_and_pack_c
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(bits(out), bits(full))
-    # the per-token class's output differs (another quantization of the intermediate), and its pack is refused by this layer
+    # the per-token class's output differs (another quantization of the intermediate); its pack is declined by this layer's
+    # only candidate (no candidate serves it) and refused by the runner with the class named
     per_token = _weights(w1, w2)
     assert not torch.equal(
         bits(_layer(k, E, I)(_logits_pack(x, logits), per_token)), bits(full)
     )
-    with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+    with pytest.raises(NotImplementedError):
         layer(_logits_pack(x, logits), per_token)
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+        layer.runners[0].pack_inputs(_logits_pack(x, logits), per_token)
     assert "intermediate" in str(excinfo.value)
+
+
+@needs_device
+def test_both_intermediate_classes_as_candidates_serve_their_own_views():
+    """A layer with both fp4 candidates (the per-token and the static class): a static weight view is served by the static
+    candidate and a per-token view by the per-token one, each with its single-candidate layer's bits -- the other candidate
+    declines the pack in the layer's candidate filter instead of aborting the selection; the runners driven directly refuse
+    the other class's view with the mode's error."""
+    T, k, H, I, E = 40, 4, 256, 128, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=77)
+    both = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E, top_k=k, method=RoutingMethodType.Renormalize
+            ),
+            quant=_NVFP4,
+            experts=ExpertConfig(intermediate_size=I),
+            activation=_SWIGLU,
+            backend=BackendOptions(
+                (
+                    BatchInvariantFp4Config(),
+                    BatchInvariantFp4Config(intermediate="static"),
+                )
+            ),
+            execution=ExecutionConfig(enable_pdl=False),
+        ),
+        device=torch.device("cuda"),
+    )
+    assert [r._intermediate for r in both.runners] == ["per_token", "static"]
+    W_pt = _weights(w1, w2)
+    W_st = MoEWeightPack({})
+    W_st.prepare_for(
+        KEY,
+        BatchInvariantFp4Config.prepare_weights(
+            w1, w2, activation=_SWIGLU, intermediate="static"
+        ),
+    )
+    act = _logits_pack(x, logits)
+    ref_pt = bits(_layer(k, E, I)(act, W_pt))
+    ref_st = bits(
+        _layer(k, E, I, backend=BatchInvariantFp4Config(intermediate="static"))(
+            act, W_st
+        )
+    )
+    assert not torch.equal(ref_pt, ref_st)
+    assert both._eligible_runners(act, W_pt) == (0,) and both._eligible_runners(
+        act, W_st
+    ) == (1,)
+    assert torch.equal(bits(both(act, W_st)), ref_st)
+    assert torch.equal(bits(both(act, W_pt)), ref_pt)
+    assert torch.equal(bits(both(act, W_st)), ref_st)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="intermediate"):
+        both.runners[0].pack_inputs(act, W_st)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="intermediate"):
+        both.runners[1].pack_inputs(act, W_pt)
 
 
 @needs_device
@@ -2778,6 +3211,99 @@ def _guards_untouched(
 
 
 # ----------------------------------------------------------------------------- dropped slots
+
+
+@needs_device
+@each_pair
+def test_misaligned_inputs_are_refused_with_the_alignment_named(pair):
+    """bf16 rows, packed codes or scale bytes whose storage offset is not a multiple of 16 bytes (the kernels' vector loads
+    and TMA boxes) are refused by the layer and by the op with the mode's error naming the alignment, before any kernel
+    (not an assertion, not the binding's error); a strided per-token scale is a placement the op takes as given."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import fused_moe_fp4
+
+    T, k, H, I, E = 40, 4, 256, 128, 8
+    quant = _NVFP4_PTS if pair.scaled else _MX
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=5)
+    layer = _layer(k, E, I, quant=quant)
+    W_pack = _weights(w1, w2, quant=_QUANT[pair])
+    W = _weights_of(W_pack)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    x4, sf, pts = _quantized(x, pair=pair)
+    ref = bits(fused_moe_fp4(_pack(pair, x4, sf, pts), ids, weights, W))
+
+    def misaligned(t: torch.Tensor, off: int) -> torch.Tensor:
+        es, n = t.element_size(), t.numel()
+        big = torch.empty(n * es + 16, dtype=torch.uint8, device="cuda")
+        v = big[off : off + n * es].view(t.dtype).view(t.shape)
+        v.copy_(t)
+        assert v.data_ptr() % 16 == off and v.is_contiguous()
+        return v
+
+    def pack(q, s=None, p=None):
+        return MoEActivationPack(
+            q, s, topk_ids=ids, topk_weights=weights,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed, per_token_scale=p,
+        )  # fmt: skip
+
+    for act, op_in in (
+        (pack(misaligned(x, 2)), misaligned(x, 2)),
+        (pack(misaligned(x4, 1), sf, pts), _pack(pair, misaligned(x4, 1), sf, pts)),
+        (pack(x4, misaligned(sf, 1), pts), _pack(pair, x4, misaligned(sf, 1), pts)),
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError, match="16 bytes"):
+            layer(act, W_pack)
+        with pytest.raises(BatchInvariantUnsupportedError, match="16 bytes"):
+            fused_moe_fp4(op_in, ids, weights, W)
+    # the aligned forms run
+    assert torch.equal(bits(layer(pack(x4, sf, pts), W_pack)), ref)
+    if pair.scaled:
+        big = torch.zeros(2 * T, device="cuda")
+        big[::2] = pts
+        strided = big[::2]
+        assert not strided.is_contiguous()
+        for gather in (None, False, True):
+            out = fused_moe_fp4((x4, sf, strided), ids, weights, W, gather=gather)
+            assert torch.equal(bits(out), ref), gather
+
+
+@needs_device
+@each_pair
+def test_prerouted_layer_builds_under_a_routing_term_the_logits_mode_refuses(pair):
+    """Llama4 with ``top_k = 4`` (the from-logits method is the top-1 rule) and a DeepSeekV3 group shape outside the rule
+    build on the fp4 backend as on the bf16 one: the pre-routed modes never consult the term, so both pre-routed forms give
+    the Renormalize-configured layer's bits on the same ids and bf16 weights, and the from-logits call raises the mode's error
+    naming the term."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    T, k, H, I, E = 24, 4, 256, 128, 16
+    quant = _QUANT[pair]
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=9)
+    W = _weights(w1, w2, quant=quant)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wb = ids.cuda(), weights.cuda().to(torch.bfloat16)
+    ref = bits(_layer(k, E, I, quant=quant)(_routed_pack(x, ids, wb), W))
+    for method, kw, what in (
+        (RoutingMethodType.Llama4, {}, "top_k"),
+        (RoutingMethodType.DeepSeekV3, dict(n_group=3, topk_group=2), "n_group"),
+    ):
+        layer = MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(num_experts=E, top_k=k, method=method, **kw),
+                quant=quant,
+                experts=ExpertConfig(intermediate_size=I),
+                backend=BackendOptions((BatchInvariantFp4Config(),)),
+                execution=ExecutionConfig(enable_pdl=False),
+            ),
+            device=torch.device("cuda"),
+        )
+        for packed in (False, True):
+            out = layer(_routed_pack(x, ids, wb, packed=packed), W)
+            assert torch.equal(bits(out), ref), (method, packed)
+        with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+            layer(_logits_pack(x, logits), W)
+        assert what in str(excinfo.value) and pair.cls in str(excinfo.value)
 
 
 @needs_device
