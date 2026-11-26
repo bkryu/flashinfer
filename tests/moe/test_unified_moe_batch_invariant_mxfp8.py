@@ -462,34 +462,47 @@ def test_swapped_k_block_is_a_shape_rule():
         )
 
 
-def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch):
-    """The MX chains run the backend's swapped body (:mod:`blocks.swap`), which reads the plan's group counts under the
-    chain's trigger rule (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own wait, the body's own
-    wait before the tables is the margin) and whose builder asserts the shipped placement is one of them; the gather form
-    runs the one-atom stage; a k-block is whole instruction steps of the class."""
-    from flashinfer.fused_moe.batch_invariant import pdl
+def test_swapped_body_builds_for_the_mx_chains_and_the_kernels_trigger_at_the_shared_sites():
+    """The MX chains run the backend's swapped body (:mod:`blocks.swap`): it builds for both instruction classes with the
+    fused requantization, takes a k-block of whole instruction steps (the gather form runs the one-atom stage: no k-block
+    with it); the trigger placement is the shared module constant (:mod:`pdl`: the persistent bodies' ``TRIGGER`` and the
+    one-wave kernels' ``TRIGGER_SMALL``, the dependents launching at completion), the MX scatter triggers at the one-wave
+    site right after its wait and the bodies at the shared early / late sites; no body-local trigger constant remains."""
+    import inspect
+
+    from flashinfer.fused_moe.batch_invariant import mx_permute, pdl
+    from flashinfer.fused_moe.batch_invariant.blocks import kernel, swap
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
     from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
-    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
-        GEMM2_CHAIN,
-        swapped_knobs_mx,
-    )
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
 
     cfg = swapped_knobs_mx()[0]
-    assert pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS
     for fmt in ("mxfp8", "mxfp8_k64"):
         ch = MxChain("glu", "silu", "mxfp8", (), fmt)
         SwappedGroupedGemm(cfg, ch)
         assert SwappedGroupedGemm(cfg, ch, k_block=256).k_block == 256
         with pytest.raises(AssertionError):
             SwappedGroupedGemm(cfg, ch, k_block=48)
-        # the gather form (the token rows read through the plan's map) runs the one-atom stage: no k-block with it
         assert SwappedGroupedGemm(cfg, ch, gather=True).gather
         with pytest.raises(AssertionError):
             SwappedGroupedGemm(cfg, ch, gather=True, k_block=256)
-    monkeypatch.setattr(pdl, "TRIGGER", "early")
-    with pytest.raises(AssertionError):
-        SwappedGroupedGemm(cfg, GEMM2_CHAIN)
+        assert SwappedGroupedGemm(
+            cfg, ch, gather=True, plan_in_kernel=True
+        ).plan_in_kernel
+        with pytest.raises(AssertionError):
+            SwappedGroupedGemm(
+                cfg, ch, plan_in_kernel=True
+            )  # the decode form is the gather record's
+    assert pdl.TRIGGER == "none" and pdl.TRIGGER_SMALL == "none"
+    scatter = inspect.getsource(mx_permute.ScatterMxKernel.kernel)
+    assert scatter.index("griddepcontrol_wait()") < scatter.index(
+        "pdl.trigger_one_wave()"
+    )
+    for mod in (swap, kernel):
+        src = inspect.getsource(mod)
+        assert "pdl.trigger_early()" in src and "pdl.trigger_late()" in src
+        assert "BOX_FORM_TRIGGERS" not in src
+    assert not hasattr(pdl, "BOX_FORM_TRIGGERS")
 
 
 def test_mx_classes_run_on_the_unified_bodies():
@@ -1409,13 +1422,17 @@ def _poison_allocator(byte: int):
     ids=["fused", "standalone", "dense", "swapped"],
 )
 @pytest.mark.parametrize("gated", [False, True], ids=["relu2", "silu"])
-def test_poisoned_intermediates_do_not_reach_the_bits(requant, path, swap, gated):
+def test_poisoned_intermediates_do_not_reach_the_bits(
+    requant, path, swap, gated, monkeypatch
+):
     """Unspecified bytes and timing never reach the output: the op's intermediates (``x_perm`` and its scales with their
     padding rows or tail rows, GEMM1's output or its fused codes and scales, GEMM2's output, the output itself) come from
-    ``torch.empty``; with the caching allocator's blocks filled with NaN patterns before every call and a bandwidth-bound
-    kernel running on a side stream of the same device during the call, both requantization spellings, both packings and
-    both bodies (the padded body and the swapped decode body on the dense packing) give the bits of a clean run, each
-    other's bits and the layer's, ``RLK_STRESS_ITERS`` times (default 20) at a shape whose GEMM2 K is one k-tile."""
+    ``torch.empty``; with the caching allocator's blocks filled with NaN patterns before every call, every ``torch.empty``
+    of the call filled with the pattern as well (so the check does not depend on which blocks the allocator hands out) and
+    a bandwidth-bound kernel running on a side stream of the same device during the call, both requantization spellings,
+    both packings and both bodies (the padded body and the swapped decode body on the dense packing) give the bits of a
+    clean run, each other's bits and the layer's, ``FLASHINFER_BI_STRESS_ITERS`` times (default 20) at a shape whose
+    GEMM2 K is one k-tile."""
     from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
     from flashinfer.fused_moe.batch_invariant.api import route
     from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import default_configs_mx
@@ -1441,7 +1458,18 @@ def test_poisoned_intermediates_do_not_reach_the_bits(requant, path, swap, gated
     assert torch.equal(bits(run()), ref)
     side = torch.cuda.Stream()
     junk = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
-    for i in range(int(os.environ.get("RLK_STRESS_ITERS", "20"))):
+    empty = torch.empty
+    byte = 0x00
+
+    def poisoned_empty(*args, **kwargs):
+        # every uninitialised device allocation of the run starts with the byte, whichever block the allocator hands out
+        t = empty(*args, **kwargs)
+        if t.is_cuda and t.numel():
+            t.flatten().view(torch.uint8).fill_(byte)
+        return t
+
+    monkeypatch.setattr(torch, "empty", poisoned_empty)
+    for i in range(int(os.environ.get("FLASHINFER_BI_STRESS_ITERS", "20"))):
         for byte in (0x7F, 0xFF, 0x00):
             _poison_allocator(byte)
             with torch.cuda.stream(side):
