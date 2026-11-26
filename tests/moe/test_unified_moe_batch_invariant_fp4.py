@@ -917,6 +917,25 @@ def test_mx_pair_refuses_the_per_token_flag_and_the_static_class(_MX):
         BatchInvariantFp4Config.prepare_weights(
             w1, w2, quant=_MX, intermediate_scales=torch.ones(2)
         )
+    if _MX.pair == _MIXED.pair:
+        # the MXFP8 pack has one layout: the swizzled flag names a layout the pair does not take (refused at support)
+        runner = BatchInvariantFp4Runner(
+            _config(
+                8,
+                64,
+                256,
+                quant=QuantConfig(
+                    weight=_MX.weight,
+                    activation=_MX.activation,
+                    swizzled_scale_factors=True,
+                ),
+            ),
+            torch.device("cpu"),
+        )
+        with pytest.raises(
+            BatchInvariantUnsupportedError, match="swizzled_scale_factors=True"
+        ):
+            runner._check_support()
 
 
 # ----------------------------------------------------------------------------- GPU
@@ -2026,6 +2045,7 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(pair, T):
     for t in tactics:
         out = runner.forward(runner.pack_inputs(pack, W), tactic=t)
         assert torch.equal(bits(out), ref), t
+    layer.reset_winner()
     with autotune(True):
         assert torch.equal(bits(layer(pack, W)), ref)
     assert torch.equal(bits(layer(pack, W)), ref)
@@ -3086,6 +3106,7 @@ def test_static_class_through_the_layer_batch_invariance_graph_replay_and_pack_c
     perm = torch.randperm(T, generator=torch.Generator().manual_seed(44)).cuda()
     out_p = layer(_logits_pack(x[perm].contiguous(), logits[perm].contiguous()), pack)
     assert torch.equal(bits(out_p), bits(full[perm]))
+    layer.reset_winner()
     with autotune(True):
         assert torch.equal(bits(layer(_logits_pack(x, logits), pack)), bits(full))
     assert torch.equal(bits(layer(_logits_pack(x, logits), pack)), bits(full))
@@ -4838,6 +4859,7 @@ def test_tuned_gather_winner_replayed_on_a_linear_pack_takes_the_box_form(pair):
         assert torch.equal(bits(out), ref), t
     # tuned on the 128x4 pack: the cached winner pinned to each gather record (the autotuner's own pick is timing's)
     # replays on the linear pack of the same layer
+    layer.reset_winner()
     with autotune(True):
         assert torch.equal(bits(layer(act128, W_pack)), ref)
     (key, (winner, tactic)), *rest = layer._winners.items()
@@ -5332,12 +5354,19 @@ def test_layer_forward_captured_in_every_dispatcher_form(pair):
     zero-fills are counted and pinned)."""
     from flashinfer.fused_moe.batch_invariant.schedule_fp4 import gather_form_rule
 
-    k, H, I, E = 4, 256, 128, 16
+    # the fp4 pairs' ranking leads with the swapped records at a small decode shape; the mixed pair's does at a large
+    # model's decode shape (its swapped body's prologue term keeps the grouped records at the small one)
+    k, H, I, E = (8, 2048, 768, 128) if pair.mixed else (4, 256, 128, 16)
+    cases = (
+        (("decode", 16, 31), ("mid", 512, 32))
+        if pair.mixed
+        else (("decode", 4, 31), ("mid", 200, 32))
+    )
     quant = _QUANT[pair]
     layer = _layer(k, E, I, quant=quant)
     W = None
     forms = set()
-    for name, T, seed in (("decode", 4, 31), ("mid", 200, 32)):
+    for name, T, seed in cases:
         x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed)
         if W is None:
             W = _weights(w1, w2, quant=quant)
@@ -5371,13 +5400,16 @@ def test_layer_forward_captured_in_every_dispatcher_form(pair):
                 assert torch.equal(bits(out), ref), (pair.name, name, mode, form)
             assert _fills(g.replay) == eager_fills, (pair.name, name, mode, form)
             assert torch.equal(bits(layer(act, W)), ref)
-    # the forms the dispatcher picks at these shapes: the decode records swapped, the mid records grouped
-    assert any(n == "decode" and "swapped" in f for n, f in forms), forms
-    assert any(n == "mid" and "swapped" not in f for n, f in forms), forms
-    if pair.mixed:
-        assert ("decode", "dense+swapped") in forms and ("mid", "padded") in forms, (
-            forms
-        )
+    # the forms the dispatcher picks at these shapes where the sm_107 ranking places them: the decode records swapped,
+    # the mid records grouped (another part's ranking is recorded, not asserted)
+    if _family() == "sm_107":
+        assert any(n == "decode" and "swapped" in f for n, f in forms), forms
+        assert any(n == "mid" and "swapped" not in f for n, f in forms), forms
+        if pair.mixed:
+            assert ("decode", "dense+swapped") in forms and (
+                "mid",
+                "padded",
+            ) in forms, forms
 
 
 @needs_device

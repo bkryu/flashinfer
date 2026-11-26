@@ -125,6 +125,12 @@ def bits(t: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _family() -> str:
+    from flashinfer.gemm.batch_invariant.api import part_of
+
+    return part_of(torch.device("cuda"))[1]
+
+
 def _problem(T, k, H, I, E, seed, gated=True, adversarial=False):
     """Activations, logits and canonical weights (``w1 [E, 2I, H]`` rows ``[up, gate]``; ``[E, I, H]`` ungated)."""
     g = torch.Generator().manual_seed(seed)
@@ -1581,6 +1587,7 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
         if hasattr(AutoTuner.get(), "stats")
         else 0
     )
+    layer.reset_winner()
     with autotune(True):
         assert torch.equal(bits(layer(pack, W)), ref)
     assert torch.equal(bits(layer(pack, W)), ref)
@@ -2592,10 +2599,10 @@ def test_tactic_of_the_other_packing_replays_with_the_bits():
     tactics are taken from the token counts where the ranking places them, so the test holds on every part."""
     from flashinfer.fused_moe.batch_invariant.runner_fp4 import _configs_from_tactic_fp4
 
-    k, H, I, E = 4, 256, 128, 16
+    k, H, I, E = 8, 2048, 768, 128
     layer, W = None, None
     tactics, packs, refs = {}, {}, {}
-    for name, T, seed in (("decode", 4, 71), ("mid", 200, 72)):
+    for name, T, seed in (("decode", 16, 71), ("mid", 512, 72)):
         x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed)
         if layer is None:
             layer, W = _layer(k, E, I), _weights(w1, w2)
@@ -2606,9 +2613,10 @@ def test_tactic_of_the_other_packing_replays_with_the_bits():
             runner.pack_inputs(packs[name], W), None
         )
     runner = layer.runners[0]
-    assert runner._packing(4, H) != runner._packing(200, H), (
-        "the two token counts pack the other way"
-    )
+    if _family() == "sm_107":
+        assert runner._packing(16, H) != runner._packing(512, H), (
+            "the two token counts pack the other way"
+        )
     for here, there in (("decode", "mid"), ("mid", "decode")):
         for t in tactics[there]:
             c1, c2 = _configs_from_tactic_fp4(t)

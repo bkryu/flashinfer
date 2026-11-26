@@ -1336,6 +1336,7 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
         if hasattr(AutoTuner.get(), "stats")
         else 0
     )
+    layer.reset_winner()
     with autotune(True):
         assert torch.equal(bits(layer(pack, W)), ref)
     assert torch.equal(bits(layer(pack, W)), ref)
@@ -3790,6 +3791,12 @@ def test_in_kernel_plan_bounds_are_the_host_rule():
     assert not r._plan_in_kernel(PLAN_MAX_SLOTS // 8 + 1, 2048)
 
 
+def _family() -> str:
+    from flashinfer.gemm.batch_invariant.api import part_of
+
+    return part_of(torch.device("cuda"))[1]
+
+
 def _fills(fn) -> int:
     """The fill launches among the CUDA kernels of ``fn()`` (the profiler's view): a zero-fill or a host copy a form takes."""
     from torch.profiler import ProfilerActivity, profile
@@ -3822,7 +3829,7 @@ def test_layer_forward_captured_in_every_dispatcher_form():
     decode form (the in-kernel plan of GEMM1's gather record), the gather form with the plan launch (the slots past the
     in-kernel plan's bound), the box form of the swapped records (a hidden size whose scale rows are not whole 4-byte
     groups, with the fused requantization's one conditional zero-fill of its pad columns) and the grouped records on the
-    padded packing at a mid token count. Each captures (no host sync, no host-side read), replays the eager bits, two replays
+    padded packing at a larger token count. Each captures (no host sync, no host-side read), replays the eager bits, two replays
     agree, and the replay's fill launches are the eager call's and the form's own (the constants host-built outside the
     capture: no fill of a constant, no host copy inside the graph)."""
     from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
@@ -3834,7 +3841,7 @@ def test_layer_forward_captured_in_every_dispatcher_form():
         ("decode", 4, 4, 256, 128, 16, 0),
         ("gather", 40, 4, 256, 128, 256, 0),
         ("box", 4, 4, 160, 96, 16, 1),
-        ("grouped", 200, 4, 256, 128, 16, 0),
+        ("grouped", 512, 4, 256, 128, 16, 0),
     ):
         x, logits, w1, w2 = _problem(T, k, H, I, E, seed=50 + T)
         xq, xsf = _quant(x)
@@ -3860,7 +3867,14 @@ def test_layer_forward_captured_in_every_dispatcher_form():
                 form = "box"
             else:
                 form = "grouped"
-            assert form == name, (name, mode, form, r1[0].describe(), r2[0].describe())
+            if _family() == "sm_107":
+                assert form == name, (
+                    name,
+                    mode,
+                    form,
+                    r1[0].describe(),
+                    r2[0].describe(),
+                )
             seen[(name, mode)] = form
             eager_fills = _fills(lambda: layer(act, W))
             assert eager_fills == fills, (name, mode, eager_fills)
@@ -3897,9 +3911,10 @@ def test_tuned_tactic_captured_in_a_graph_replays_while_the_other_packing_runs_e
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(bits(out), ref)
-    x2, logits2, _, _ = _problem(200, k, H, I, E, seed=62)
+    x2, logits2, _, _ = _problem(512, k, H, I, E, seed=62)
     other = _logits_pack(_quant(x2), logits2)
-    assert layer.runners[0]._packing(4, H) != layer.runners[0]._packing(200, H)
+    if _family() == "sm_107":
+        assert layer.runners[0]._packing(4, H) != layer.runners[0]._packing(512, H)
     ref_other = bits(layer(other, W))
     with autotune(True):
         assert torch.equal(bits(layer(other, W)), ref_other)
