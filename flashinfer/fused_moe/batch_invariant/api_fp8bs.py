@@ -754,9 +754,9 @@ def _grouped_fp8bs_launch(
     if config.swap_ab:
         h.kernel(a.unsqueeze(-1), sfa_v, w3, w_sf, out_k, counts, grid)
     elif quant:
-        h.kernel(a.unsqueeze(-1), w3, sfa_v, w_sf, out_k, sfo_k, counts, Tk, grid)
+        h.kernel(a.unsqueeze(-1), w3, sfa_v, w_sf, out_k, sfo_k, counts, Tk, grid, h.raster)  # fmt: skip
     else:
-        h.kernel(a.unsqueeze(-1), w3, sfa_v, w_sf, out_k, counts, Tk, grid)
+        h.kernel(a.unsqueeze(-1), w3, sfa_v, w_sf, out_k, counts, Tk, grid, h.raster)
 
 
 def check_aligned(block: int, x: torch.Tensor, sx: Optional[torch.Tensor]) -> None:

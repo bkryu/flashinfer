@@ -684,7 +684,7 @@ def _mx_launch(
     elif kind == "swapped":
         h.kernel(a3, a_sf8, w3, w_sf8, *outs, counts, grid)
     else:
-        h.kernel(a3, w3, a_sf8, w_sf8, *outs, counts, sf_rows, grid)
+        h.kernel(a3, w3, a_sf8, w_sf8, *outs, counts, sf_rows, grid, h.raster)
 
 
 def _quant_sf_buffer(sf_rows: int, n_out: int, device: torch.device) -> torch.Tensor:

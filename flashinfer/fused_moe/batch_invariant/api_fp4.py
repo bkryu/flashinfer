@@ -818,21 +818,23 @@ def _fp4_launch(
         head = (a3, sfa, w3, wsf, out)
     else:
         head = (a3, w3, sfa, wsf, out)
+    # the grouped body's raster order is a launch argument; the swapped body's is in its object
+    tail = (grid, h.raster) if kind == "grouped" else (grid,)
     if not pair.scaled:
         if kind == "grouped":
-            h.kernel(*head, counts, rows_sf, grid)
+            h.kernel(*head, counts, rows_sf, *tail)
         else:
-            h.kernel(*head, counts, grid)
+            h.kernel(*head, counts, *tail)
     elif static:
         if out_sf is None:
             out_sf = _dummy_sf(
                 a4.device
             )  # GEMM2 of the static class: the scale-byte operand is unread
         h.kernel(
-            *head, out_sf.reshape(-1), counts, _vec(alpha), _vec(pts), _vec(aux), grid
+            *head, out_sf.reshape(-1), counts, _vec(alpha), _vec(pts), _vec(aux), *tail
         )
     else:
-        h.kernel(*head, counts, _vec(alpha), _vec(pts), grid)
+        h.kernel(*head, counts, _vec(alpha), _vec(pts), *tail)
 
 
 def grouped_gemm_fp4(

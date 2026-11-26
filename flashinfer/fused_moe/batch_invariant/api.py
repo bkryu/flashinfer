@@ -351,11 +351,13 @@ _k = LazyNames(_load_kernels)
 
 
 class LaunchHandle(NamedTuple):
-    """What a grouped launch needs besides its tensors: the compiled kernel and the device's co-resident cluster count for
-    the record (the persistent grid is their minimum with the launch's tile bound, a function of the shape alone)."""
+    """What a grouped launch needs besides its tensors: the compiled kernel, the device's co-resident cluster count for
+    the record (the persistent grid is their minimum with the launch's tile bound, a function of the shape alone) and the
+    record's raster-order argument (the grouped body's; the swapped bodies' constant is in their object)."""
 
     kernel: Any
     clusters: int
+    raster: int
 
 
 # the launch handles by (device index, record, what else selects the compiled object)
@@ -386,7 +388,11 @@ def launch_handle(
     k = (index, config, *key)
     h = _HANDLES.get(k)
     if h is None:
-        h = LaunchHandle(build(*args), persistent_clusters(device, config))
+        from .blocks.compile import raster_arg
+
+        h = LaunchHandle(
+            build(*args), persistent_clusters(device, config), raster_arg(config)
+        )
         if (
             config.grid_clusters
             or (index, config.cluster_m * config.cluster_n) in _CO_RESIDENT
@@ -436,7 +442,10 @@ def _grouped_launch(
         a = a[:Tk]
     if grid is None:
         grid = min(h.clusters, _k.launch_tile_bound(config, Tk, E, N))
-    h.kernel(a.unsqueeze(-1), w3, out, counts, grid)
+    if config.swap_ab:
+        h.kernel(a.unsqueeze(-1), w3, out, counts, grid)
+    else:
+        h.kernel(a.unsqueeze(-1), w3, out, counts, grid, h.raster)
 
 
 def _gather_launch(

@@ -360,16 +360,12 @@ def _grouped_fp8_launch(
     h = launch_handle(a.device, config, ("body", chain), _body_kernel, config, chain)
     if not config.swap_ab and Tk != a.shape[0]:
         a = a[:Tk]
-    h.kernel(
-        a.unsqueeze(-1),
-        w3,
-        out_k,
-        counts,
-        _scale_vector(s_w),
-        _scale_vector(s_a),
-        _scale_vector(inv),
-        min(h.clusters, _k.launch_tile_bound(config, Tk, E, N)),
-    )
+    grid = min(h.clusters, _k.launch_tile_bound(config, Tk, E, N))
+    scales = (_scale_vector(s_w), _scale_vector(s_a), _scale_vector(inv))
+    if config.swap_ab:
+        h.kernel(a.unsqueeze(-1), w3, out_k, counts, *scales, grid)
+    else:
+        h.kernel(a.unsqueeze(-1), w3, out_k, counts, *scales, grid, h.raster)
 
 
 def fused_moe_fp8(

@@ -559,7 +559,10 @@ def test_one_body_per_form_serves_both_formats():
     with pytest.raises(AssertionError):
         SwappedGroupedGemm(swapped_knobs("e4m3")[0], fp8, gather=True)
     # the object names carry the format; one JIT module, no format-specific body in its closure
-    assert C.kernel_name(dense, bf16) == "grouped_bf16_swiglu_bf16_" + dense.describe()
+    assert (
+        C.kernel_name(dense, bf16)
+        == "grouped_bf16_swiglu_bf16_" + dense.describe_object()
+    )
     assert C.kernel_name(dense, fp8).startswith("grouped_e4m3_glu_silu_w8a8_e4m3_")
     assert C.swapped_kernel_name(swapped_knobs("e4m3")[0], GEMM2_CHAIN).startswith(
         "swapped_e4m3_plain_silu_w8a8_bf16_"

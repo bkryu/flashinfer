@@ -3404,3 +3404,82 @@ def test_forward_memoises_the_pick_and_the_launch_handles():
         config2=c2,
     )
     assert torch.equal(bits(out), ref)
+
+
+def test_grouped_raster_argument_is_validated_and_names_one_object():
+    """The grouped body's raster order is a launch argument: the two raster placements of a record name one compiled object
+    (``kernel_name`` without the raster and grid tokens: ``Knobs.describe_object`` of the object record), ``object_record``
+    keeps every other knob, and a raster value outside the record space is a host error before any launch; the swapped
+    records keep the raster in their object name (one raster, no twin)."""
+    import dataclasses
+    import re
+
+    from flashinfer.fused_moe.batch_invariant.blocks import compile as C
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    rm = Knobs((128, 128), (1, 2), False, True, "m", 1)
+    rn = dataclasses.replace(rm, raster_along="n")
+    assert C.object_record(rm) == C.object_record(rn) == rm
+    assert C.object_record(dataclasses.replace(rn, grid_clusters=7)) == rm
+    for chain in ("swiglu", "plain", "relu2"):
+        a, b = C.kernel_name(rm, chain), C.kernel_name(rn, chain)
+        assert a == b and re.search(r"_r[mn](_|$)|_g\d", a) is None, a
+        assert a.startswith("grouped_bf16_") and "_mma128x128_cl1x2_1cta_tma" in a
+    other = dataclasses.replace(rm, mma_tiler_mn=(128, 256))
+    assert C.kernel_name(other, "plain") != C.kernel_name(rm, "plain")
+    assert C.raster_arg(rm) == 1 and C.raster_arg(rn) == 0
+    with pytest.raises(ValueError, match="raster"):
+        C.raster_arg(dataclasses.replace(rm, raster_along="k"))
+    sw = Knobs((128, 16), (1, 1), False, True, "m", 1, swap_ab=True)
+    assert "_rm_" in C.swapped_kernel_name(sw, "plain")
+
+
+@needs_device
+def test_raster_placements_share_one_compiled_object_and_the_bits():
+    """The two raster placements of a grouped record launch ONE compiled object (one ``jit.build_and_load`` name without the
+    raster token) with bit-identical outputs, through the grouped GEMM entry and through the fused op with the twins as
+    GEMM1's and GEMM2's records; a swapped record's object is its own."""
+    import dataclasses
+    import re
+
+    import flashinfer.batch_invariant.jit as J
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.blocks import compile as C
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    names = []
+    orig = J.build_and_load
+
+    def recording(module, kernel, compile_fn):
+        names.append(kernel)
+        return orig(module, kernel, compile_fn)
+
+    J.build_and_load = recording
+    try:
+        C._compiled_grouped.cache_clear()
+        api.clear_kernel_cache()
+        T, k, H, I, E = 300, 4, 256, 128, 16
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=91, adversarial=True)
+        w = api.MoEWeights.prepare(w1, w2)
+        ids, wts = api.route(logits, k)
+        base = Knobs((128, 128), (1, 2), False, True, "m", 1)
+        twin = dataclasses.replace(base, raster_along="n")
+        assert C.get_compiled_grouped(base, w.chain1) is C.get_compiled_grouped(
+            twin, w.chain1
+        )
+        ref = bits(api.fused_moe(x, ids, wts, w, config1=base, config2=base))
+        for c1, c2 in ((twin, base), (base, twin), (twin, twin)):
+            assert torch.equal(
+                bits(api.fused_moe(x, ids, wts, w, config1=c1, config2=c2)), ref
+            ), (c1.describe(), c2.describe())
+        counts, dest, src = api.permute_plan(ids, E)
+        x_perm = api.gather_rows(x, src, k, T * k, 0, "bf16")[1]
+        a_m = api.grouped_gemm(x_perm, w.w1i, counts, base, w.chain1)
+        a_n = api.grouped_gemm(x_perm, w.w1i, counts, twin, w.chain1)
+        assert torch.equal(bits(a_m), bits(a_n))
+        grouped = [n for n in names if n.startswith("grouped_bf16_")]
+        assert len(set(grouped)) == 2 and all(
+            re.search(r"_r[mn](_|$)", n) is None for n in grouped
+        ), names
+    finally:
+        J.build_and_load = orig
