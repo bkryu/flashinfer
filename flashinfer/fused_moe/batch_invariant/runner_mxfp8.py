@@ -8,13 +8,15 @@ The runner serves the classes ``moe.mxfp8.<act>`` (MXFP8 experts and activations
 on SM100 / SM103 / SM107, through the dense MXFP8 class of the part (the SM107 instruction folds 64 elements per step, the
 SM100 / SM103 one 32: a dimension of the specification). It takes the layer's canonical MXFP8 activation pack (e4m3
 ``hidden_states_q [T, H]`` with the token-major UE8M0 ``hidden_states_scale [T, H / 32]``, as ``TrtllmFp8BlockConfig`` /
-``CutlassMxfp8Config`` / this config's ``prepare_activations`` produce it) and every routing input mode through the
-shared flow of :class:`.runner.BatchInvariantMoeRunnerBase`. The combine is the slot-order fp32 fold (``use_fused_finalize``
-is ignored, ``do_finalize=True`` only), the tactics are the ranked grouped-GEMM records of the dense MX heuristic over both
-record spaces -- the padded body's and the swapped decode body's (the weights on the MMA's M side, the group's tokens a
-narrow tile; `schedule_mxfp8`) -- any tactic gives the same bits, and the packing of the expanded rows follows the first
-picks (the dense packing when either is a swapped record, else the padded one: a placement decided by the token count, so
-the routing-and-plan launch takes the matching form). An unsupported configuration raises
+``CutlassMxfp8Config`` / this config's ``prepare_activations`` produce it: the linear layout alone, taken as given and
+never reshaped -- a swizzled buffer, ``QuantConfig(swizzled_scale_factors=True)`` and a per-token scale are refused) and
+every routing input mode through the shared flow of :class:`.runner.BatchInvariantMoeRunnerBase`. The combine is the
+slot-order fp32 fold (``use_fused_finalize`` is ignored, ``do_finalize=True`` only), the tactics are the ranked
+grouped-GEMM records of the dense MX heuristic over both record spaces -- the padded body's and the swapped decode body's
+(the weights on the MMA's M side, the group's tokens a narrow tile; `schedule_mxfp8`) -- any tactic gives the same bits,
+and the packing of the expanded rows follows the records (the dense packing when either is a swapped record, else the
+padded one: a placement; the routing-and-plan launch takes the first picks' form at the token count, and a tactic of the
+other packing recomputes the plan). An unsupported configuration raises
 :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 """
 
@@ -51,6 +53,18 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         super().__init__(config, device)
         self._in_fmt: Optional[str] = None
 
+    # ---- support ---------------------------------------------------------------------------------------------------
+    def _check_support(self) -> None:
+        # the pack's layout flag first (a rule of the configuration alone, before the device is consulted): the pack's
+        # scales are the token-major rows, so the flag names a layout the class does not take
+        if self.config.quant.swizzled_scale_factors is True:
+            raise unsupported(
+                self.CLASS,
+                "QuantConfig(swizzled_scale_factors=True)",
+                "the token-major linear scale layout of the canonical MXFP8 pack (swizzled_scale_factors unset or False)",
+            )
+        super()._check_support()
+
     def _build(self) -> None:
         super()._build()
         from .api_mxfp8 import mx_class_of
@@ -76,8 +90,10 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         )
 
     def _act_tensors(self, act: MoEActivationPack) -> List[torch.Tensor]:
-        """The pair's activation pack: the e4m3 rows and their token-major UE8M0 scales (uint8 or ``float8_e8m0fnu``, the
-        linear layout), and the class's shape rule on the configuration at this hidden size."""
+        """The pair's activation pack: the e4m3 rows and their token-major UE8M0 scales (uint8 or ``float8_e8m0fnu``) in
+        the linear ``[T, H / 32]`` shape, taken as given (a flattened or swizzled buffer is refused, never reshaped into
+        rows; the empty pack takes any empty scale tensor), both 16-byte aligned; and the class's shape rule on the
+        configuration at this hidden size."""
         from .api_mxfp8 import check_shape_mxfp8
 
         x = act.hidden_states_q
@@ -88,7 +104,6 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         sf = act.hidden_states_scale
         if sf is None:
             raise unsupported(self.CLASS, "no hidden_states_scale", self.SCALE_RULE)
-        x = x.contiguous()
         T, H = x.shape
         if sf.dtype not in (torch.uint8, torch.float8_e8m0fnu):
             raise unsupported(
@@ -98,14 +113,24 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
             )
         if H % BLOCK:
             raise unsupported(self.CLASS, f"hidden size {H}", self.ROW_RULE)
-        sf = (
-            sf.view(torch.uint8).reshape(T, -1 if T else H // BLOCK).contiguous()
-        )  # the zero-token pack has no inferable column count
-        if sf.shape[1] != H // BLOCK:
+        sf = sf.view(torch.uint8)
+        if T == 0 and sf.numel() == 0:
+            sf = sf.reshape(
+                0, H // BLOCK
+            )  # the empty pack: no scale byte, whatever its shape
+        if tuple(sf.shape) != (T, H // BLOCK):
             raise unsupported(
                 self.CLASS,
-                f"hidden_states_scale of {sf.shape[1]} columns",
-                f"{H // BLOCK} token-major UE8M0 scales per row (the linear layout; a swizzled buffer is not this pack)",
+                f"hidden_states_scale of shape {tuple(sf.shape)} for {T} rows of {H}",
+                f"the token-major [{T}, {H // BLOCK}] UE8M0 scales (the linear layout of the canonical MXFP8 pack; a "
+                "swizzled or flattened buffer is not reshaped into rows)",
+            )
+        x, sf = x.contiguous(), sf.contiguous()
+        if x.data_ptr() % 16 or sf.data_ptr() % 16:
+            raise unsupported(
+                self.CLASS,
+                "hidden_states_q or hidden_states_scale at a storage offset that is not a multiple of 16 bytes",
+                "16-byte aligned rows and scale bytes (the kernels' vector loads and TMA boxes)",
             )
         cfg = self.config
         check_shape_mxfp8(

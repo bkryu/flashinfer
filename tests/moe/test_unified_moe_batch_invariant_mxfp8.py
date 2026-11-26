@@ -21,6 +21,7 @@ bf16 chains, the plain GEMM2 conversion), the shape rules and the dispatcher's m
 
 from __future__ import annotations
 
+import dataclasses
 import os
 
 import pytest
@@ -3155,3 +3156,148 @@ def test_weight_view_names_its_pair_and_a_view_without_it_is_declined():
         with pytest.raises(BatchInvariantUnsupportedError, match="quant"):
             MoEWeightsMXFP8.from_view(other.get_view(KEY))
     assert torch.equal(bits(layer(act, pack)), ref)
+
+
+def test_pack_contract_flags_and_shards_are_refused_at_support():
+    """The configuration's rules the pack contract states, refused at the support check before any device is consulted:
+    ``QuantConfig(swizzled_scale_factors=True)`` names a layout the class does not take (the pack's scales are the
+    token-major rows), ``per_token_scale=True`` a scale the pack has none of (the layer's shared rule), an expert-parallel
+    shard is refused by name in the class's terms, fused shared experts by the layer's rule; the runner declares neither."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    assert BatchInvariantMxfp8Runner.supports_per_token_scale is False
+    assert BatchInvariantMxfp8Runner.supports_expert_parallelism is False
+    with pytest.raises(
+        BatchInvariantUnsupportedError, match="swizzled_scale_factors"
+    ) as e:
+        _runner(
+            dataclasses.replace(_QUANT, swizzled_scale_factors=True)
+        )._check_support()
+    assert "moe.mxfp8" in str(e.value) and "linear" in str(e.value)
+    _runner(
+        dataclasses.replace(_QUANT, swizzled_scale_factors=False)
+    )  # the linear layout named: constructs
+    with pytest.raises(
+        (NotImplementedError, BatchInvariantUnsupportedError), match="per_token_scale"
+    ):
+        _runner(dataclasses.replace(_QUANT, per_token_scale=True))._check_support()
+    with pytest.raises(BatchInvariantUnsupportedError) as e:
+        _runner(local_expert_offset=4, local_num_experts=4)._check_support()
+    assert "moe.mxfp8" in str(e.value) and "expert-parallel" in str(e.value)
+    with pytest.raises(NotImplementedError, match="shared experts"):
+        _runner(
+            method=RoutingMethodType.DeepSeekV3, num_fused_shared_experts=1
+        )._check_support()  # the configuration admits a shared expert under DeepSeekV3; the runner refuses it
+
+
+def _misaligned(t: torch.Tensor, off: int) -> torch.Tensor:
+    """``t``'s bytes at a storage offset of ``off`` bytes (contiguous, the same shape and dtype)."""
+    es, n = t.element_size(), t.numel()
+    big = torch.empty(n * es + 16, dtype=torch.uint8, device="cuda")
+    v = big[off : off + n * es].view(t.dtype).view(t.shape)
+    v.copy_(t)
+    assert v.data_ptr() % 16 == off and v.is_contiguous()
+    return v
+
+
+@needs_device
+def test_misaligned_inputs_are_refused_with_the_alignment_named():
+    """Quantized rows or scale bytes whose storage offset is not a multiple of 16 bytes (the kernels' vector loads and TMA
+    boxes) are refused by the layer and by the op with the mode's error naming the alignment, before any kernel; the
+    aligned pack runs."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import (
+        MoEWeightsMXFP8,
+        fused_moe_mxfp8,
+    )
+
+    T, k, H, I, E = 40, 4, 256, 128, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=5)
+    layer, W_pack = _layer(k, E, I), _weights(w1, w2)
+    W = MoEWeightsMXFP8.from_view(W_pack.get_view(KEY))
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    xq, xsf = _quant(x)
+    ref = bits(fused_moe_mxfp8((xq, xsf), ids, wts, W))
+
+    def pack(q, s):
+        return MoEActivationPack(
+            q, s, topk_ids=ids, topk_weights=wts,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        )  # fmt: skip
+
+    for q, s in ((_misaligned(xq, 8), xsf), (xq, _misaligned(xsf, 4))):
+        with pytest.raises(BatchInvariantUnsupportedError, match="16 bytes"):
+            layer(pack(q, s), W_pack)
+        with pytest.raises(BatchInvariantUnsupportedError, match="16 bytes"):
+            fused_moe_mxfp8((q, s), ids, wts, W)
+    assert torch.equal(bits(layer(pack(xq, xsf), W_pack)), ref)
+
+
+@needs_device
+def test_scale_rows_of_another_shape_are_refused_and_the_empty_pack_runs():
+    """The pack's scales are the token-major ``[T, H / 32]`` rows, taken as given: the quantizer's 128x4 buffer flattened
+    (one byte count with the rows at a row count that is a multiple of 128 and ``H`` a multiple of 128: never reshaped
+    into rows), rows of another column count and a 3-D tensor are refused by the layer with the mode's error naming the
+    layout and by the op, before any kernel; a 2-D ``[T, H / 32]`` tensor is the pack by contract (the swizzled buffer of
+    that shape is read as rows: the layout is the caller's declaration). The empty pack (``T = 0``) of any empty scale
+    shape gives the empty ``[0, H]`` output through the layer (from logits and pre-routed) and the op."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import (
+        MoEWeightsMXFP8,
+        fused_moe_mxfp8,
+        sf_numel,
+    )
+    import flashinfer
+
+    T, k, H, I, E = 128, 2, 512, 64, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=734)
+    layer, W_pack = _layer(k, E, I), _weights(w1, w2)
+    W = MoEWeightsMXFP8.from_view(W_pack.get_view(KEY))
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    xq, xsf = _quant(x)
+    cols = H // BLOCK
+    _, sw = flashinfer.mxfp8_quantize(
+        x, is_sf_swizzled_layout=True, batch_invariant=True
+    )
+    flat = sw.view(torch.uint8).reshape(-1)
+    assert flat.numel() == sf_numel(T, H) == T * cols  # the colliding byte count
+    ref = bits(fused_moe_mxfp8((xq, xsf), ids, wts, W))
+
+    def pack(s):
+        return MoEActivationPack(
+            xq, s, topk_ids=ids, topk_weights=wts,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        )  # fmt: skip
+
+    for bad in (
+        flat,
+        xsf[:, : cols - 1].contiguous(),
+        torch.zeros(T, cols + 4, dtype=torch.uint8, device="cuda"),
+        xsf.reshape(T, 4, cols // 4),
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError, match="linear") as e:
+            layer(pack(bad), W_pack)
+        assert str(tuple(bad.shape)) in str(e.value)
+        with pytest.raises(TypeError, match="token-major"):
+            fused_moe_mxfp8((xq, bad), ids, wts, W)
+    assert torch.equal(bits(layer(pack(xsf), W_pack)), ref)
+    assert torch.equal(
+        bits(layer(pack(xsf.view(torch.float8_e8m0fnu)), W_pack)), ref
+    )  # the UE8M0-typed rows: the same pack
+    # the empty pack: any empty scale tensor
+    x0 = torch.empty(0, H, dtype=torch.float8_e4m3fn, device="cuda")
+    for sf0 in (
+        torch.empty(0, cols, dtype=torch.uint8, device="cuda"),
+        torch.empty(0, dtype=torch.uint8, device="cuda"),
+        torch.empty(0, 5, dtype=torch.uint8, device="cuda"),
+    ):
+        out = fused_moe_mxfp8((x0, sf0), ids[:0], wts[:0], W)
+        assert out.shape == (0, H) and out.dtype == torch.bfloat16
+        act = MoEActivationPack(
+            x0, sf0, topk_ids=ids[:0], topk_weights=wts[:0],
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        )  # fmt: skip
+        assert layer(act, W_pack).shape == (0, H)
+        assert layer(_logits_pack((x0, sf0), logits[:0]), W_pack).shape == (0, H)

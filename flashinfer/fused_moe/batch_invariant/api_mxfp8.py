@@ -813,9 +813,14 @@ def fused_moe_mxfp8(
     if xq.dtype != torch.float8_e4m3fn or tuple(xq.shape) != (T, H):
         raise TypeError(f"fused_moe_mxfp8: xq must be an e4m3 [T, {H}]")
     xsf8 = _bytes(xsf, "xsf")
+    if T == 0 and xsf8.numel() == 0:
+        xsf8 = xsf8.reshape(
+            0, H // BLOCK
+        )  # the empty pack: no scale byte, whatever its shape
     if tuple(xsf8.shape) != (T, H // BLOCK) or not xsf8.is_contiguous():
         raise TypeError(
-            f"fused_moe_mxfp8: xsf must be the token-major [T, {H // BLOCK}] UE8M0 scales of the activation pack, got {tuple(xsf8.shape)}"
+            f"fused_moe_mxfp8: xsf must be the token-major [T, {H // BLOCK}] UE8M0 scales of the activation pack (the "
+            f"linear layout; a swizzled or flattened buffer is not reshaped into rows), got {tuple(xsf8.shape)}"
         )
     # the shared fused-entry rules (the rows' alignment at the class's scale block, the ids and weights, the output)
     T, H, k, experts, scales, out = _check_fused_inputs(
@@ -829,6 +834,12 @@ def fused_moe_mxfp8(
         BLOCK,
         "e4m3",
     )
+    if xq.data_ptr() % 16 or xsf8.data_ptr() % 16:
+        raise unsupported(
+            CLASS,
+            "quantized rows or scale bytes at a storage offset that is not a multiple of 16 bytes",
+            "16-byte aligned rows and scale bytes (the kernels' vector loads and TMA boxes)",
+        )
     check_shape_mxfp8(H, I, E, k)
     in_fmt = in_fmt or mx_class_of(dev)
     if in_fmt not in MX_CLASSES:
