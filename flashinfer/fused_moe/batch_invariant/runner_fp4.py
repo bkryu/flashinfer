@@ -151,7 +151,14 @@ def _tactic_fp4(c1, c2) -> tuple:
 
 
 def _configs_from_tactic_fp4(t: tuple):
+    """The two records of a tactic tuple; a tuple of another length (a tactic persisted under another tag) is refused by
+    name, never split at the wrong field."""
     from ...gemm.batch_invariant.generator import Knobs
+
+    if len(t) != 2 * TACTIC_FIELDS:
+        raise ValueError(
+            f"the fp4 MoE backend's tactic is {2 * TACTIC_FIELDS} scalars ({TACTIC_FIELDS} per record), got {len(t)}"
+        )
 
     def one(v):
         return Knobs(
@@ -174,6 +181,7 @@ class BatchInvariantFp4Runner(MoERunner):
     the routed scale constant and the part at build, the intermediate's class from the backend config."""
 
     backend_key = BACKEND_KEY
+    TACTIC_TAG = "moe.fp4-v2"  # v2: the tactic carries the k-block
     supported_quant_variants = tuple(PAIRS)
     supported_output_formats = (QuantFormat.BF16,)
     supported_routing_modes = (
@@ -766,11 +774,13 @@ class BatchInvariantFp4Runner(MoERunner):
         return [_tactic_fp4(c1, c2) for c1 in r1 for c2 in r2]
 
     def _cache_key_extras(self) -> tuple:
+        """The autotuner cache key's extras: the pair, the intermediate class, the mixed pair's instruction class and the
+        tactic's versioned tag last (a tuple persisted under another tag never reaches the decoder)."""
         return super()._cache_key_extras() + (
-            "moe.fp4-v2",
             self.pair.name,
             self._intermediate,
             self._in_fmt or "",
+            self.TACTIC_TAG,
         )
 
     # ---- launch ----------------------------------------------------------------------------------------------------

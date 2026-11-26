@@ -4137,6 +4137,28 @@ def test_tactic_and_plan_lengths_follow_the_record_and_plan_builders():
     assert api_fp4.route is api_fp4.__dict__["route"] and "route" in api_fp4.__all__
 
 
+def test_tactic_cache_key_carries_the_tag_and_an_older_tuple_is_refused():
+    """The fp4 runner's autotuner cache key ends with the tactic's versioned tag (``TACTIC_TAG``, as the shared runner
+    base's keys do), so a tactic persisted under an earlier tag is never read back; a tuple of another length (an earlier
+    tag's eight scalars per record) is refused by the decoder naming the expected length, never split at the wrong field."""
+    from flashinfer.fused_moe.batch_invariant import runner_fp4
+
+    r = _runner(_NVFP4)
+    extras = r._cache_key_extras()
+    assert extras[-1] == runner_fp4.BatchInvariantFp4Runner.TACTIC_TAG == "moe.fp4-v2"
+    assert extras[-4:-1] == (NVFP4.name, "per_token", "")
+    assert _runner(_MIXED)._cache_key_extras()[-4:-1] == (
+        MXFP4W8A.name,
+        "per_token",
+        "",
+    )
+    older = tuple(range(16))
+    with pytest.raises(ValueError, match="18 scalars"):
+        runner_fp4._configs_from_tactic_fp4(older)
+    with pytest.raises(ValueError, match="got 17"):
+        runner_fp4._configs_from_tactic_fp4(tuple(range(17)))
+
+
 def test_prepare_activations_follows_the_served_pairs_table(monkeypatch):
     """``BatchInvariantFp4Config.prepare_activations`` is the served pair's own form from the ``PAIRS`` table (both served
     pairs: bf16 rows as given, no scale), so a pair added to the table brings its form with it and an unserved pair is
