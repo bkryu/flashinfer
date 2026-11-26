@@ -349,11 +349,11 @@ def grouped_gemm_mxfp8(
     dense_a: bool = False,
     sf_rows: Optional[int] = None,
     k_block: Optional[int] = None,
-    grid: Optional[int] = None,
     src: Optional[torch.Tensor] = None,
     k_div: int = 1,
     rows: Optional[int] = None,
     in_kernel: Optional[Tuple[torch.Tensor, int, torch.Tensor]] = None,
+    n_live: Optional[int] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` with the UE8M0 block scales applied inside the block-scaled step, on the padded
     expert segments ``counts`` (int32 ``[E]``; the rows of group ``e`` start at the exclusive prefix of the counts rounded
@@ -372,7 +372,10 @@ def grouped_gemm_mxfp8(
     rows, ``a_sf`` their token-major ``[T, K / 32]`` scale bytes (the activation pack's layout), ``src [>= Tk]`` int32 the
     plan's slot of every dense row (``src[p] // k_div`` its token), ``rows`` the dense rows of the output (the live rows and
     the tail); the body reads the rows itself (no scatter launch), the fused requantization's scale bytes land at the padded
-    positions of ``sf_rows`` rows as in the box form."""
+    positions of ``sf_rows`` rows as in the box form. ``n_live``: the live rows at most (the routing's slots) -- on the dense
+    packing the scale rows must then cover the padded positions of that many rows (:func:`padded_rows_bound`), the
+    positions the body reads and the fused requantization writes; the gather record takes it (``src`` and the output cover
+    the slots)."""
     from .blocks.compile import get_compiled_grouped, get_compiled_swapped
     from .schedule_mxfp8 import (
         can_implement_grouped_mxfp8,
@@ -395,8 +398,8 @@ def grouped_gemm_mxfp8(
             k_div,
             rows,
             sf_rows,
-            grid,
             in_kernel,
+            n_live,
         )
     if src is not None or rows is not None or in_kernel is not None:
         raise ValueError(
@@ -429,6 +432,11 @@ def grouped_gemm_mxfp8(
             raise ValueError(
                 "grouped_gemm_mxfp8: the dense packing's scale rows are whole 128-row atoms covering the rows"
             )
+        if n_live is not None and sf_rows < padded_rows_bound(n_live, 1, E):
+            raise ValueError(
+                "grouped_gemm_mxfp8: the dense packing's scale rows must cover the padded positions of the live rows "
+                f"(at least padded_rows_bound({n_live}, 1, {E}) = {padded_rows_bound(n_live, 1, E)} rows)"
+            )
     else:
         if sf_rows is not None and sf_rows != Tk:
             raise ValueError(
@@ -447,9 +455,7 @@ def grouped_gemm_mxfp8(
 
     def grid_of():
         # the persistent grid clipped to the launch's tile bound from the static sizes (``a``'s rows bound the live rows): which
-        # CTA computes a tile, never the bits; ``grid`` overrides
-        if grid is not None:
-            return grid
+        # CTA computes a tile, never the bits
         return launch_grid(a.device, config, a.shape[0], E, N)
 
     if config.swap_ab:
@@ -583,12 +589,13 @@ def _grouped_gemm_mxfp8_gather(
     k_div,
     rows,
     sf_rows,
-    grid,
     in_kernel=None,
+    n_live=None,
 ):
     """The gather record of :func:`grouped_gemm_mxfp8` (its operand rules, the token rows in place of the permuted rows);
     ``in_kernel = (ids, n_slots, dest)``: the decode form, the plan built by the kernel from the ids (``src`` unread, ``counts``
-    and ``dest`` written by it)."""
+    and ``dest`` written by it). The live rows are at most ``n_live`` (the launch form; the decode form's ``n_slots``): ``src``
+    and the output cover them, the scale rows their padded positions."""
     from .blocks.compile import get_compiled_swapped
     from .schedule_mxfp8 import can_implement_swapped_mxfp8
 
@@ -609,17 +616,23 @@ def _grouped_gemm_mxfp8_gather(
         raise ValueError(
             "grouped_gemm_mxfp8: the gather record reads the token rows through the plan's map: src and rows"
         )
-    if in_kernel is None and (
-        src.dtype != torch.int32
-        or src.dim() != 1
-        or not src.is_contiguous()
-        or k_div < 1
-        or rows < 0
-    ):
-        raise ValueError(
-            "grouped_gemm_mxfp8: src must be a contiguous int32 [>= Tk], k_div >= 1 and rows >= 0"
-        )
-    if in_kernel is not None:
+    if in_kernel is None:
+        if n_live is None:
+            raise ValueError(
+                "grouped_gemm_mxfp8: the gather record takes n_live, the routing's slots (the live rows at most)"
+            )
+        if (
+            src.dtype != torch.int32
+            or src.dim() != 1
+            or not src.is_contiguous()
+            or k_div < 1
+            or src.numel() < n_live
+            or rows < n_live
+        ):
+            raise ValueError(
+                "grouped_gemm_mxfp8: src must be a contiguous int32 [>= n_live], k_div >= 1 and rows >= n_live"
+            )
+    else:
         ids, n_slots, dest = in_kernel
         if (
             ids.dtype != torch.int32
@@ -628,13 +641,15 @@ def _grouped_gemm_mxfp8_gather(
             or dest.dtype != torch.int32
             or dest.numel() < n_slots
             or ids.numel() < n_slots
+            or rows < n_slots
             or counts.dtype != torch.int32
             or not decode_form_ok(n_slots, 1, counts.numel(), K)
         ):
             raise ValueError(
                 "grouped_gemm_mxfp8: the in-kernel plan takes contiguous int32 ids [>= n_slots] and dest [>= n_slots], "
-                f"int32 counts [E] with at most {PLAN_MAX_SLOTS} slots and {PLAN_MAX_E} experts"
+                f"int32 counts [E], rows >= n_slots, at most {PLAN_MAX_SLOTS} slots and {PLAN_MAX_E} experts"
             )
+        n_live = n_slots
     a_sf8 = _bytes(a_sf, "a_sf")
     if a_sf8.numel() != T * (K // BLOCK) or not a_sf8.is_contiguous():
         raise ValueError(
@@ -649,9 +664,16 @@ def _grouped_gemm_mxfp8_gather(
         raise ValueError(
             "grouped_gemm_mxfp8: w_sf must hold E consecutive 128x4 swizzled scale buffers of (N, K)"
         )
-    if sf_rows is None or sf_rows % GROUP_ALIGN or sf_rows < rows:
+    if (
+        sf_rows is None
+        or sf_rows % GROUP_ALIGN
+        or sf_rows < rows
+        or sf_rows < padded_rows_bound(n_live, 1, E)
+    ):
         raise ValueError(
-            "grouped_gemm_mxfp8: the gather record takes the dense packing's scale rows (whole 128-row atoms covering the rows)"
+            "grouped_gemm_mxfp8: the gather record takes the dense packing's scale rows (whole 128-row atoms covering the "
+            f"rows and the padded positions of the live rows: at least padded_rows_bound({n_live}, 1, {E}) = "
+            f"{padded_rows_bound(n_live, 1, E)})"
         )
     in_fmt = in_fmt or mx_class_of(a.device)
     if in_fmt not in MX_CLASSES:
@@ -664,7 +686,7 @@ def _grouped_gemm_mxfp8_gather(
             f"grouped_gemm_mxfp8: gather record {config.describe()} does not implement ({N}, {K}, {E}, {chain.describe()}, {in_fmt})"
         )
     n_out = _check_grouped_chain("grouped_gemm_mxfp8", N, chain)
-    grid_n = grid if grid is not None else launch_grid(a.device, config, rows, E, N)
+    grid_n = launch_grid(a.device, config, rows, E, N)
     kernel_of = lambda: get_compiled_swapped(  # noqa: E731
         config, chain, sf_src="linear", plan_in_kernel=in_kernel is not None
     )
@@ -960,6 +982,7 @@ def fused_moe_mxfp8(
                 k_div=k,
                 rows=Tk_a,
                 in_kernel=(experts.reshape(-1), Tk, dest),
+                n_live=Tk,
             )
             dest = dest.view(T, k)
             if return_intermediates:
@@ -987,6 +1010,7 @@ def fused_moe_mxfp8(
                 src=src,
                 k_div=k,
                 rows=Tk_a,
+                n_live=Tk,
             )
         else:
             x_perm = torch.empty(Tk_a, H, dtype=torch.float8_e4m3fn, device=dev)
@@ -1014,9 +1038,19 @@ def fused_moe_mxfp8(
                 in_fmt,
                 dense_a=True,
                 sf_rows=Tk_sf,
+                n_live=Tk,
             )
         y = grouped_gemm_mxfp8(
-            aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt, dense_a=True
+            aq,
+            a_sf,
+            w.w2,
+            w.w2_sf,
+            counts,
+            config2,
+            GEMM2_CHAIN,
+            in_fmt,
+            dense_a=True,
+            n_live=Tk,
         )  # [Tk_a, H] bf16
         combine_rows(y, dest, scales, out, k, w_round)
         if return_intermediates:

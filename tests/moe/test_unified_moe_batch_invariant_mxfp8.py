@@ -3384,3 +3384,66 @@ def test_narrow_intermediate_scale_tails_under_a_poisoned_allocator(I, monkeypat
             out = run()
             assert torch.isfinite(out.float()).all(), (name, I, hex(byte))
             assert torch.equal(bits(out), bits(ref[name])), (name, I, hex(byte))
+
+
+def test_grouped_gemm_refuses_scale_rows_below_the_padded_bound_before_any_launch():
+    """On the dense packing the fused requantization writes a row's scale bytes at its padded position and the swapped body
+    reads the token rows' scales there, so the scale rows must cover the padded positions of the live rows (the host bound
+    ``padded_rows_bound(n_live, 1, E)``), not the rows alone: the box form with ``n_live``, and the gather record (which
+    takes ``n_live`` and whose ``src`` and output cover the slots) and the decode form (its output covers the slots) are
+    refused on the host with the bound named, before any record or kernel is consulted. Device-free: CPU tensors, the
+    instruction class given."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import (
+        DENSE_TAIL,
+        MoEWeightsMXFP8,
+        grouped_gemm_mxfp8,
+        padded_rows_bound,
+        sf_numel,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import swapped_knobs_mx
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    E, N, K, n_live = 8, 256, 256, 16
+    rows = n_live + DENSE_TAIL
+    a = torch.zeros(rows, K, dtype=torch.float8_e4m3fn)
+    w = torch.zeros(E, N, K, dtype=torch.float8_e4m3fn)
+    w_sf = torch.zeros(E, sf_numel(N, K), dtype=torch.uint8)
+    cnt = torch.zeros(E, dtype=torch.int32)
+    W = MoEWeightsMXFP8.__new__(MoEWeightsMXFP8)
+    W.gated, W.act, W.params = True, "silu", ()
+    bound = padded_rows_bound(n_live, 1, E)
+    short = -(-rows // 128) * 128  # covers the rows, not the padded positions
+    assert short < bound and bound == 1152
+    box, dense = swapped_knobs_mx()[0], Knobs((128, 128), (1, 1), False, True, "m", 1)
+    for cfg in (box, dense):
+        sf = torch.zeros(sf_numel(short, K), dtype=torch.uint8)
+        with pytest.raises(ValueError, match="padded positions"):
+            grouped_gemm_mxfp8(
+                a, sf, w, w_sf, cnt, cfg, W.chain1_quant, "mxfp8_k64",
+                dense_a=True, sf_rows=short, n_live=n_live,
+            )  # fmt: skip
+    gather = dataclasses.replace(box, gather_a=True)
+    x = torch.zeros(4, K, dtype=torch.float8_e4m3fn)
+    xsf = torch.zeros(4, K // 32, dtype=torch.uint8)
+    src = torch.zeros(n_live, dtype=torch.int32)
+    ok = dict(dense_a=True, src=src, k_div=4, rows=rows, sf_rows=bound)
+
+    def call(**kw):
+        grouped_gemm_mxfp8(
+            x, xsf, w, w_sf, cnt, gather, W.chain1_quant, "mxfp8_k64", **dict(ok, **kw)
+        )
+
+    with pytest.raises(ValueError, match="n_live"):
+        call()
+    with pytest.raises(ValueError, match="src"):
+        call(src=src[:8], n_live=n_live)
+    with pytest.raises(ValueError, match="rows >= n_live"):
+        call(rows=8, n_live=n_live)
+    with pytest.raises(ValueError, match="padded positions"):
+        call(sf_rows=short, n_live=n_live)
+    ids = torch.zeros(n_live, dtype=torch.int32)
+    dest = torch.zeros(n_live, dtype=torch.int32)
+    with pytest.raises(ValueError, match="rows >= n_slots"):
+        call(src=None, rows=8, in_kernel=(ids, n_live, dest))
+    with pytest.raises(ValueError, match="padded positions"):
+        call(src=None, sf_rows=short, in_kernel=(ids, n_live, dest))
