@@ -3697,3 +3697,50 @@ def test_graphs_captured_at_two_token_counts_and_two_routing_modes_replay_interl
     torch.cuda.synchronize()
     for key in order:
         assert torch.equal(bits(graphs[key][1]), ref[key]), key
+
+
+def test_pack_layout_and_tactic_fields_are_pinned():
+    """The packed inputs are ``[xq, xsf, ids, wts, w1, w1_sf, w2, w2_sf, out]`` followed by the plan (three tensors in the
+    padded form, five in the dual one, none in the decode form): the head counts the base runner slices by, the weight
+    tensors in the order the view reader rebuilds them; the tactic is the base runner's seven scalars per record (the
+    swapped flag included) and round-trips both record kinds; the plan form follows the first picks' packing."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import MoEWeightsMXFP8
+    from flashinfer.fused_moe.batch_invariant.runner import (
+        _TACTIC_FIELDS,
+        _configs_from_tactic,
+        _tactic,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        grouped_knobs_mx,
+        swapped_knobs_mx,
+    )
+
+    r = _runner(k=8, E=128, I=768)
+    assert (r.N_ACT_TENSORS, r.N_WEIGHT_TENSORS) == (2, 4)
+    assert r.N_ACT_TENSORS + 2 + r.N_WEIGHT_TENSORS + 1 == 9
+    W = MoEWeightsMXFP8(
+        torch.zeros(1, dtype=torch.float8_e4m3fn),
+        torch.zeros(2, dtype=torch.uint8),
+        torch.zeros(3, dtype=torch.float8_e4m3fn),
+        torch.zeros(4, dtype=torch.uint8),
+    )
+    ts = r._weight_tensors(W)
+    assert all(t is u for t, u in zip(ts, (W.w1, W.w1_sf, W.w2, W.w2_sf), strict=True))
+    a = r._activation()
+    W2 = r._weights_from_tensors(a, ts)
+    assert (W2.w1, W2.w1_sf, W2.w2, W2.w2_sf) == (W.w1, W.w1_sf, W.w2, W.w2_sf)
+    assert (W2.gated, W2.act, W2.params) == (a.gated, a.act, a.params)
+    dense, box = grouped_knobs_mx()[0], swapped_knobs_mx()[0]
+    for c1, c2 in ((dense, dense), (box, dense), (box, box)):
+        t = _tactic(c1, c2)
+        assert len(t) == 2 * _TACTIC_FIELDS and _TACTIC_FIELDS == 7
+        assert all(isinstance(v, (int, str)) for v in t)
+        assert _configs_from_tactic(t) == (c1, c2)
+    r._part = (204, "sm_107")  # the ranking's part, as the build sets it
+    assert r._plan_form(16384, 2048) == dict(
+        align=128
+    )  # a prefill's rows per expert: the padded body
+    assert r._plan_form(1, 2048) == dict(
+        dual=True, pad_align=128
+    )  # one row per expert: the swapped records
+    assert r._plan_in_kernel(1, 2048) and not r._plan_in_kernel(16384, 2048)
