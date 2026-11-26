@@ -45,10 +45,16 @@ from .schedule_mxfp8 import (
 )
 from .spec_mxfp4w8a import MX_CLASSES
 
+#: The bodies' acceptance at the mixed classes: the MX dispatcher's (:mod:`.schedule_mxfp8`), under the pair's names.
+can_implement_grouped_mxfp4w8a = can_implement_grouped_mxfp8
+can_implement_swapped_mxfp4w8a = can_implement_swapped_mxfp8
+
 __all__ = [
     "GEMM2_CHAIN",
     "all_valid_configs_mx",
     "all_valid_configs_mx_swapped",
+    "can_implement_grouped_mxfp4w8a",
+    "can_implement_swapped_mxfp4w8a",
     "default_configs_mx",
     "grouped_knobs_mx",
     "packing_for",
