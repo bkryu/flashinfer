@@ -2545,3 +2545,77 @@ def test_decode_tactics_include_the_swapped_records_and_agree():
     assert torch.equal(
         bits(layer(_routed_pack((_quant(x)), ids.cuda(), weights.cuda()), W)), ref
     )
+
+
+@needs_device
+def test_misaligned_pack_is_refused_with_the_alignment_named():
+    """The e4m3 rows or the UE8M0 scale bytes of the pack at a storage offset that is not a multiple of 16 bytes are refused
+    by the layer and by the op with the mode's error naming the alignment, before any kernel (the shared MXFP8 pack rule
+    through the fp4 backend's runner); the aligned pack runs, and TRTLLM-Gen's e4m3-typed scale carrier is the same pack."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant import api_mxfp4w8a as F
+
+    T, k, H, I, E = 40, 4, 256, 128, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=5)
+    xq, xsf = _quant(x)
+    layer, W = _layer(k, E, I), _weights(w1, w2)
+    Wq = MoEWeightsFp4.from_view(W.get_view(KEY))
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    ref = bits(layer(_routed_pack((xq, xsf), ids, weights), W))
+
+    def misaligned(t: torch.Tensor, off: int) -> torch.Tensor:
+        es, n = t.element_size(), t.numel()
+        big = torch.empty(n * es + 16, dtype=torch.uint8, device="cuda")
+        v = big[off : off + n * es].view(t.dtype).view(t.shape)
+        v.copy_(t)
+        assert v.data_ptr() % 16 == off and v.is_contiguous()
+        return v
+
+    for q, sf in ((misaligned(xq, 2), xsf), (xq, misaligned(xsf, 1))):
+        with pytest.raises(BatchInvariantUnsupportedError, match="16 bytes"):
+            layer(_routed_pack((q, sf), ids, weights), W)
+        with pytest.raises(BatchInvariantUnsupportedError, match="16 bytes"):
+            F.fused_moe_mxfp4w8a((q, sf), ids, weights, Wq)
+    assert torch.equal(bits(layer(_routed_pack((xq, xsf), ids, weights), W)), ref)
+    carrier = xsf.view(
+        torch.float8_e4m3fn
+    )  # TrtllmFp4Config's typing of the UE8M0 bytes for this pair
+    assert torch.equal(bits(layer(_routed_pack((xq, carrier), ids, weights), W)), ref)
+
+
+@needs_device
+def test_tactic_of_the_other_packing_replays_with_the_bits():
+    """A cached autotune winner may replay at a token count whose first picks pack the other way (the layer keys its winners
+    by token bucket): the runner takes the records' own packing and keeps the plan the records can read (the dual plan feeds
+    both bodies) or drops it (the op computes its own: the same integers); the bits are the eager call's either way. The
+    tactics are taken from the token counts where the ranking places them, so the test holds on every part."""
+    from flashinfer.fused_moe.batch_invariant.runner_fp4 import _configs_from_tactic_fp4
+
+    k, H, I, E = 4, 256, 128, 16
+    layer, W = None, None
+    tactics, packs, refs = {}, {}, {}
+    for name, T, seed in (("decode", 4, 71), ("mid", 200, 72)):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed)
+        if layer is None:
+            layer, W = _layer(k, E, I), _weights(w1, w2)
+        runner = layer.runners[0]
+        packs[name] = _logits_pack(_quant(x), logits)
+        refs[name] = bits(layer(packs[name], W))
+        tactics[name] = runner.get_valid_tactics(
+            runner.pack_inputs(packs[name], W), None
+        )
+    runner = layer.runners[0]
+    assert runner._packing(4, H) != runner._packing(200, H), (
+        "the two token counts pack the other way"
+    )
+    for here, there in (("decode", "mid"), ("mid", "decode")):
+        for t in tactics[there]:
+            c1, c2 = _configs_from_tactic_fp4(t)
+            inputs = runner.pack_inputs(packs[here], W)
+            out = runner.forward(inputs, tactic=t)
+            assert torch.equal(bits(out), refs[here]), (
+                here,
+                c1.describe(),
+                c2.describe(),
+            )
