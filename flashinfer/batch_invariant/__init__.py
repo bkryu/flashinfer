@@ -443,9 +443,11 @@ def _moe_fp8bs_fingerprint(
 ) -> str:
     """The block-scale fp8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8BlockConfig`` under
     ``QuantConfig(DeepSeekFp8, DeepSeekFp8)``: the dimensions of :func:`_moe_class_terms` (the routing method with
-    ``DeepSeekV3``'s groups, the activation with its scalars and gating) and the scale block size
-    (``deepseek_fp8_block_size``: 128 for ``moe.e4m3bs.<act>``, 32 for ``moe.e4m3bs32.<act>``, a dimension of the class);
-    the block scales, like the operands, are inputs."""
+    ``DeepSeekV3``'s groups, the activation with its scalars and gating) under the class's complete shape rule (the
+    layer's: a shape the runner refuses has no receipt) and the scale block size (``deepseek_fp8_block_size``: 128 for
+    ``moe.e4m3bs.<act>``, 32 for ``moe.e4m3bs32.<act>``, a dimension of the class); the block scales, like the operands,
+    are inputs, and the fp8 instruction folds the same 32 elements on every part, so there is no architecture dimension."""
+    from flashinfer.fused_moe.batch_invariant.api_fp8bs import check_shape_fp8bs
     from flashinfer.fused_moe.batch_invariant.spec_fp8bs import (
         BLOCK,
         check_block,
@@ -469,16 +471,10 @@ def _moe_fp8bs_fingerprint(
         n_group,
         topk_group,
     )
+    block = check_block(int(deepseek_fp8_block_size))
+    check_shape_fp8bs(H, I, num_experts, top_k, block)
     return spec_fingerprint_fp8bs(
-        H,
-        I,
-        top_k,
-        num_experts,
-        rm,
-        name,
-        params,
-        gated,
-        block=check_block(int(deepseek_fp8_block_size)),
+        H, I, top_k, num_experts, rm, name, params, gated, block=block
     )
 
 

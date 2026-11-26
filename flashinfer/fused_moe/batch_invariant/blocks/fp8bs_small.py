@@ -8,7 +8,7 @@ of the activations' block scales to the expanded rows (``sf_perm[kb, p] = sf[kb,
 Quantizer placement: a warp pass covers two blocks (sixteen lanes per block, eight consecutive elements per lane: one 16-byte
 load, one 8-byte store); ``wpr`` warps share a row and take its block pairs round-robin (a placement: every block's amax is
 the plan's tree ``[(8, reg), (16, lane)]`` through ``canon.init_state`` / ``canon.run`` whichever warp holds it). ``K`` and
-the row strides are runtime arguments; a kernel is compiled per (input dtype, warps per row, PDL trigger placement). Nothing
+the row strides are runtime arguments; a kernel is compiled per (input dtype, warps per row, PDL, block). Nothing
 here decides a numeric order: the reduction is the engine's plan, the chains are :mod:`..spec_fp8bs`'s, the conversion the
 declared ``cvt.rn.satfinite.e4m3x2.f32``.
 """
@@ -40,7 +40,6 @@ WARPS = 8  # warps per CTA
 LANES = 32
 V = 8  # elements per lane: one 16-byte load of 16-bit values, one block per sixteen lanes
 LANES_PER_BLOCK = BLOCK // V
-TRIGGERS = ("none", "late", "early")
 SCATTER_THREADS = 256
 SCALE_BLOCKS_PER_THREAD = (
     8  # block columns per thread of the scale gather, their loads issued together
@@ -75,22 +74,10 @@ class BSQuantKernel:
     """``codes[m, k] = cvt_e4m3(mul(x[m, k], inv(m, k // block)))``, ``s[m, k // block]`` for rows of 16-bit values; ``block``
     128 (sixteen lanes per block, two blocks per warp pass) or 32 (four lanes per block, eight blocks per pass)."""
 
-    def __init__(
-        self,
-        dtype: cutlass.Numeric,
-        wpr: int,
-        trigger: str = "none",
-        block: int = BLOCK,
-    ):
+    def __init__(self, dtype: cutlass.Numeric, wpr: int, block: int = BLOCK):
         assert dtype.width == 16, dtype
         assert wpr >= 1 and wpr & (wpr - 1) == 0 and wpr <= 8, wpr
-        assert trigger in TRIGGERS, trigger
-        self.dtype, self.wpr, self.trigger, self.block = (
-            dtype,
-            wpr,
-            trigger,
-            check_block(block),
-        )
+        self.dtype, self.wpr, self.block = dtype, wpr, check_block(block)
         self.lpb, self.bpp = lanes_per_block(block), blocks_per_pass(block)
         self.red = block_reduction(leaf_x=None, block=block)
         self.plan = canon.plan(self.red, block_amax_placement(V, block))
@@ -128,11 +115,8 @@ class BSQuantKernel:
         bidx, _, _ = cute.arch.block_idx()
         if cutlass.const_expr(enable_pdl):
             cute.arch.griddepcontrol_wait()
-            if cutlass.const_expr(self.trigger == "early"):
-                cute.arch.griddepcontrol_launch_dependents()
+            pdl.trigger_one_wave()  # the one-wave kernels' shared site, right after the wait
         self.rows(mX, mY, mS, M, K, bidx * WARPS + tidx // LANES)
-        if cutlass.const_expr(enable_pdl and self.trigger == "late"):
-            cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def rows(
@@ -208,7 +192,7 @@ class PlanQuantKernel:
     def __init__(self, dtype: cutlass.Numeric, wpr: int, block: int = BLOCK):
         from ..permute import PlanKernel
 
-        self.quant = BSQuantKernel(dtype, wpr, "none", block)
+        self.quant = BSQuantKernel(dtype, wpr, block)
         self.plan = PlanKernel(threads=self.THREADS)
 
     @cute.jit
@@ -257,61 +241,6 @@ class PlanQuantKernel:
             self.plan.cta(mExp, mCounts, mDest, mSrc, mDest, mDest, n, E, bidx, tidx)
         else:
             self.quant.rows(mX, mY, mS, M, K, (bidx - E) * WARPS + tidx // LANES)
-
-
-class GatherScalesKernel:
-    """``sf_perm[kb, p] = sf[kb, src[p] // k]`` for ``p < Tk``, ``kb < KB``; ``sf`` is read through its own strides (the ``(KB, T)``
-    view of either scale layout), ``sf_perm`` is the contiguous ``(KB, Tk)`` MN-major tensor. Thread = expanded row, so a
-    warp's stores of one block column are one contiguous line (the reads gather one 4-byte value per token); a thread handles
-    ``SCALE_BLOCKS_PER_THREAD`` block columns with their loads in flight together and the grid's second dimension covers the
-    rest (the launch is latency-bound: a serial walk over the block columns cost one memory round trip each)."""
-
-    def __init__(self, k: int):
-        self.k = k
-
-    @cute.jit
-    def __call__(
-        self,
-        mS: cute.Tensor,
-        mSrc: cute.Tensor,
-        mSp: cute.Tensor,
-        Tk: Int32,
-        KB: Int32,
-        stream,
-    ):
-        self.kernel(mS, mSrc, mSp, Tk, KB).launch(
-            grid=[
-                cute.ceil_div(Tk, SCATTER_THREADS),
-                cute.ceil_div(KB, SCALE_BLOCKS_PER_THREAD),
-                1,
-            ],
-            block=[SCATTER_THREADS, 1, 1],
-            stream=stream,
-            use_pdl=True,
-        )
-
-    @cute.kernel
-    def kernel(
-        self, mS: cute.Tensor, mSrc: cute.Tensor, mSp: cute.Tensor, Tk: Int32, KB: Int32
-    ):
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, bidy, _ = cute.arch.block_idx()
-        cute.arch.griddepcontrol_wait()
-        p_raw = bidx * SCATTER_THREADS + tidx
-        valid = p_raw < Tk
-        p = cutlass.min(p_raw, Tk - Int32(1))
-        t = mSrc[p] // Int32(self.k)
-        kb0 = bidy * SCALE_BLOCKS_PER_THREAD
-        vals = []
-        for j in cutlass.range_constexpr(SCALE_BLOCKS_PER_THREAD):
-            # the thread's block columns, their loads all in flight
-            vals.append(mS[(cutlass.min(kb0 + j, KB - Int32(1)), t)])
-        for j in cutlass.range_constexpr(SCALE_BLOCKS_PER_THREAD):
-            kb = kb0 + j
-            if valid:
-                if kb < KB:
-                    mSp[(kb, p)] = vals[j]
-        pdl.trigger_one_wave()
 
 
 class GatherRowsScalesKernel:
@@ -392,7 +321,7 @@ class GatherRowsScalesKernel:
                 if valid & (j < n_vec):
                     cute.copy(atom, frag, cute.local_tile(row_p, (16,), (jc,)))
         else:
-            # the scale columns (``GatherScalesKernel``'s body, its two grid dimensions linearised)
+            # the scale columns (thread = expanded row, its block columns' loads issued together)
             b = bidx - n_rows_blocks
             n_pb = cute.ceil_div(Tk, GATHER_WARPS * GATHER_LANES)
             bx = b % n_pb
@@ -419,22 +348,14 @@ class GatherRowsScalesKernel:
 
 
 def quant_kernel_name(
-    dtype_str: str,
-    wpr: int,
-    trigger: str = "none",
-    enable_pdl: bool = True,
-    block: int = BLOCK,
+    dtype_str: str, wpr: int, enable_pdl: bool = True, block: int = BLOCK
 ) -> str:
-    """The standalone quantizer's name: the input dtype, the warps per row (a placement), the PDL trigger placement, PDL and
-    the block size where it is not the 128-wide class's; never M or K."""
+    """The standalone quantizer's name: the input dtype, the warps per row (a placement), PDL and the block size where it is
+    not the 128-wide class's; never M or K (the trigger placement is the module constant of :mod:`..pdl`)."""
     return jit.sanitize_symbol_name(
-        f"fp8bs_quant_{dtype_str}_w{wpr}_t{trigger}_pdl{int(enable_pdl)}"
+        f"fp8bs_quant_{dtype_str}_w{wpr}_pdl{int(enable_pdl)}"
         + (f"_b{block}" if check_block(block) != BLOCK else "")
     )
-
-
-def gather_scales_name(k: int) -> str:
-    return jit.sanitize_symbol_name(f"moe_gather_scales_k{k}")
 
 
 def gather_rows_scales_name(k: int, wpr: int) -> str:
@@ -445,16 +366,12 @@ def gather_rows_scales_name(k: int, wpr: int) -> str:
 
 @functools.cache
 def get_compiled_fp8bs_quant(
-    dtype_str: str,
-    wpr: int,
-    trigger: str = "none",
-    enable_pdl: bool = True,
-    block: int = BLOCK,
+    dtype_str: str, wpr: int, enable_pdl: bool = True, block: int = BLOCK
 ):
     """``kernel(x [M, K] 16-bit, codes [M, K] u8, s (M, KB) f32 with free strides, M, K)``; one kernel per (dtype, warps per row,
-    trigger, block), in the MoE classes' module."""
+    PDL, block), in the MoE classes' module."""
     dtype = get_cutlass_dtype(dtype_str)
-    name = quant_kernel_name(dtype_str, wpr, trigger, enable_pdl, block)
+    name = quant_kernel_name(dtype_str, wpr, enable_pdl, block)
 
     def compile_fn():
         sym_m, sym_k, sym_kb = (
@@ -479,7 +396,7 @@ def get_compiled_fp8bs_quant(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            BSQuantKernel(dtype, wpr, trigger, block),
+            BSQuantKernel(dtype, wpr, block),
             x,
             y,
             s,
@@ -603,39 +520,3 @@ def get_compiled_gather_rows_scales(k: int, wpr: int = 1):
         )
 
     return jit.build_and_load(MODULE, gather_rows_scales_name(k, wpr), compile_fn)
-
-
-@functools.cache
-def get_compiled_gather_scales(k: int):
-    """``kernel(sf (KB, T) f32 any strides, src [>= Tk] i32, sf_perm (KB, Tk) f32, Tk, KB)``."""
-
-    def compile_fn():
-        sym_kb, sym_t, sym_n, sym_tk = (
-            cute.sym_int(32),
-            cute.sym_int(32),
-            cute.sym_int(32),
-            cute.sym_int(32),
-        )
-        s_fake = cute.runtime.make_fake_tensor(
-            Float32,
-            (sym_kb, sym_t),
-            (cute.sym_int64(), cute.sym_int64()),
-            assumed_align=4,
-        )
-        src_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
-        sp_fake = cute.runtime.make_fake_tensor(
-            Float32, (sym_kb, sym_tk), (cute.sym_int64(), 1), assumed_align=4
-        )
-        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        return cute.compile(
-            GatherScalesKernel(k),
-            s_fake,
-            src_fake,
-            sp_fake,
-            Int32(1),
-            Int32(1),
-            stream_fake,
-            options="--enable-tvm-ffi",
-        )
-
-    return jit.build_and_load(MODULE, gather_scales_name(k), compile_fn)

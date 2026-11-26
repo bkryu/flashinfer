@@ -6,14 +6,15 @@
 blocks) and ``moe.e4m3bs32.<act>`` (32-wide) on SM100 / SM103 / SM107.
 
 The surface is TRTLLM-Gen's block-fp8 one under the DeepSeek pair: e4m3 activations with their fp32 block scales
-(``hidden_states_scale [H / block, T]``, as ``TrtllmFp8BlockConfig.prepare_activations`` hands them; the ``[T, H / block]``
-layout is taken too), the weights prepared from the bf16 experts per block (or FlashInfer's DeepSeek weight view taken as
-given), every routing input mode and every typed activation of the layer through the shared flow of
+(``hidden_states_scale [H / block, T]``, the one layout ``TrtllmFp8BlockConfig.prepare_activations`` hands them in, taken as
+given and never transposed; rows and scales 16-byte aligned) or the raw bf16 rows with no scale (the class quantizes them in
+one launch with its permutation plan), the weights prepared from the experts per block (or FlashInfer's DeepSeek weight
+view taken as given), every routing input mode and every typed activation of the layer through the shared flow of
 :class:`.runner.BatchInvariantMoeRunnerBase` (the pack, the fused route + plan launch, the launch). The class is the prepared
-weights' block size, read off the view at the pack. The tactics are the ranked block-scale record pairs in both
-requantization spellings (any tactic gives the same bits); the combine is the slot-order fp32 fold (``do_finalize=True``
-only); an unsupported configuration raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of
-falling back.
+weights' block size, read off the view at the pack; the view names its pair (``quant``) and a view without it is declined
+by the layer's candidate filter. The tactics are the ranked block-scale record pairs in both requantization spellings (any
+tactic gives the same bits on every pack form); the combine is the slot-order fp32 fold (``do_finalize=True`` only); an
+unsupported configuration raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 """
 
 from __future__ import annotations
@@ -24,13 +25,12 @@ import torch
 
 from ...batch_invariant.support import unsupported
 from ..api import MoEActivationPack, MoEWeightPack
-from .runner import _TACTIC_FIELDS, MOE_BF16_ARCHS, _configs_from_tactic, _tactic
+from .api_fp8bs import MOE_FP8BS_ARCHS, VIEW_PAIR
+from .runner import _TACTIC_FIELDS, _configs_from_tactic, _tactic
 from .runner_fp8_block import PAIR_DEEPSEEK_FP8, BatchInvariantFp8BlockRunner
 from .spec_fp8bs import BLOCK as QBLOCK
 from .spec_fp8bs import CLASS, CLASS_OF
 
-#: The compute capabilities the classes are stated for (the dense block-scale GEMM class's parts).
-MOE_FP8BS_ARCHS: Tuple[Tuple[int, int], ...] = MOE_BF16_ARCHS
 #: Positions of the packed inputs: the e4m3 activations, their block scales, the expert ids, the routing weights, the two
 #: quantized weights with their block scales and the output.
 _X, _SX, _IDS, _W, _W1, _W1SF, _W2, _W2SF, _OUT = range(9)
@@ -51,7 +51,14 @@ def MoEWeightsE4M3BS_block_of(inputs: List[torch.Tensor]) -> int:
 
 
 def _configs_from_tactic_bs(t: tuple):
+    """The two records and the requantization spelling of a tactic; a tuple of another length (another class's encoding in
+    the autotuner's cache) is refused."""
     n = 2 * _TACTIC_FIELDS
+    if len(t) != n + 1:
+        raise ValueError(
+            f"{CLASS}: a tactic of {len(t)} scalars; the pair's tactics carry {n + 1} (two records and the requantization "
+            "spelling)"
+        )
     c1, c2 = _configs_from_tactic(tuple(t[:n]))
     return c1, c2, bool(t[n])
 
@@ -68,7 +75,10 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
     ROW_ALIGN = QBLOCK
     X_RULE = "an e4m3 [num_tokens, hidden_size] with its fp32 block scales (the DeepSeek pair)"
     ROW_RULE = f"a positive multiple of {QBLOCK} (whole smem stages of scale blocks of the intermediate and of both weights)"
-    SCALE_RULE = f"the fp32 block scales [hidden_size / {QBLOCK}, num_tokens] of the activations (/ 32 for the 32-wide class)"
+    SCALE_RULE = (
+        f"the fp32 block scales [hidden_size / {QBLOCK}, num_tokens] of the activations (/ 32 for the 32-wide class): the "
+        "DeepSeek layout, taken as given"
+    )
     TACTIC_TAG = (
         CLASS + "-v1"
     )  # the block's class joins the cache key at the pack (`_cache_key_extras`)
@@ -80,7 +90,29 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         self._block: int = QBLOCK
         self._fused: bool = False
 
+    # ---- support ---------------------------------------------------------------------------------------------------
+    def _check_support(self) -> None:
+        # the pack's layout flag first (a rule of the configuration alone, before the device is consulted): the fp32 block
+        # scales have one layout, so the flag names a layout the class does not take
+        if self.config.quant.swizzled_scale_factors is True:
+            raise unsupported(
+                self.CLASS,
+                "QuantConfig(swizzled_scale_factors=True)",
+                "the [hidden_size / block, num_tokens] fp32 block scales of the DeepSeek pair (swizzled_scale_factors "
+                "unset or False)",
+            )
+        super()._check_support()
+
     # ---- inputs ----------------------------------------------------------------------------------------------------
+    def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
+        """The layer's candidate filter: the shared rule (a view under the backend's key, the input geometry) and the view
+        naming this pair (``prepare_weights`` / ``from_trtllm_view`` write ``quant``); a view without the key or of another
+        pair is declined, never read as this pair's (the runner driven directly refuses it in ``pack_inputs``, naming the
+        key)."""
+        if not super().accepts(act, weights):
+            return False
+        return weights.get_view(self.backend_key).get("quant") == VIEW_PAIR
+
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
         x = act.hidden_states_q
         return (
@@ -103,9 +135,11 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
 
     def _act_tensors(self, act: MoEActivationPack) -> List[torch.Tensor]:
         """The pair's activation pack: the e4m3 rows and their fp32 block scales in the kernel's ``[H / block, T]`` layout
-        (the ``[T, H / block]`` layout taken too), and the class's shape rule on the configuration at this hidden size; or
-        the raw bf16 rows with no scale (the class quantizes them in one launch with its permutation plan: the pack
-        contract's raw-bf16 encoding of a DeepSeek fp8 backend that quantizes internally), packed with an empty scale."""
+        (the DeepSeek layout, taken as given: a ``[T, H / block]`` or any other shape is refused, never transposed; a strided
+        tensor of the layout is copied once, a placement; the empty pack takes any empty scale tensor), both 16-byte
+        aligned, and the class's shape rule on the configuration at this hidden size; or the raw bf16 rows with no scale
+        (the class quantizes them in one launch with its permutation plan: the pack contract's raw-bf16 encoding of a
+        DeepSeek fp8 backend that quantizes internally), packed with an empty scale."""
         from .api_fp8bs import check_shape_fp8bs, scale_mn_view
 
         x = act.hidden_states_q
@@ -115,29 +149,6 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
                 f"hidden_states_q {x.dtype} of rank {x.ndim}",
                 self.X_RULE + ", or the bf16 rows with no scale",
             )
-        if x.dtype == torch.bfloat16:
-            if act.hidden_states_scale is not None:
-                raise unsupported(
-                    self.CLASS,
-                    "bf16 hidden_states_q with a hidden_states_scale",
-                    "bf16 rows with no scale (the class quantizes them), or the e4m3 pair",
-                )
-            x = x.contiguous()
-            T, H = x.shape
-            if H % QBLOCK:
-                raise unsupported(self.CLASS, f"hidden size {H}", self.ROW_RULE)
-            cfg = self.config
-            check_shape_fp8bs(
-                H,
-                cfg.experts.intermediate_size,
-                cfg.routing.num_experts,
-                cfg.routing.top_k,
-                self._block,
-            )
-            return [x, x.new_empty(0, dtype=torch.float32)]
-        if act.hidden_states_scale is None:
-            raise unsupported(self.CLASS, "no hidden_states_scale", self.SCALE_RULE)
-        x = x.contiguous()
         T, H = x.shape
         if H % QBLOCK:
             raise unsupported(self.CLASS, f"hidden size {H}", self.ROW_RULE)
@@ -149,6 +160,18 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
             cfg.routing.top_k,
             self._block,
         )
+        x = x.contiguous()
+        if x.dtype == torch.bfloat16:
+            if act.hidden_states_scale is not None:
+                raise unsupported(
+                    self.CLASS,
+                    "bf16 hidden_states_q with a hidden_states_scale",
+                    "bf16 rows with no scale (the class quantizes them), or the e4m3 pair",
+                )
+            self._check_aligned(x, None)
+            return [x, x.new_empty(0, dtype=torch.float32)]
+        if act.hidden_states_scale is None:
+            raise unsupported(self.CLASS, "no hidden_states_scale", self.SCALE_RULE)
         sx = (
             scale_mn_view(
                 act.hidden_states_scale,
@@ -160,7 +183,18 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
             .t()
             .contiguous()
         )
+        self._check_aligned(x, sx)
         return [x, sx]
+
+    def _check_aligned(self, x: torch.Tensor, sx: Optional[torch.Tensor]) -> None:
+        """The rows and the scales start at 16-byte boundaries (the kernels' vector loads and TMA boxes): the base pointer,
+        which the shared stride rules do not see."""
+        if x.data_ptr() % 16 or (sx is not None and sx.data_ptr() % 16):
+            raise unsupported(
+                self.CLASS,
+                "hidden_states_q or hidden_states_scale at a storage offset that is not a multiple of 16 bytes",
+                "16-byte aligned rows and scale bytes (the kernels' vector loads and TMA boxes)",
+            )
 
     # ---- the weight view -------------------------------------------------------------------------------------------
     def _weights_from_view(self, view):
@@ -298,4 +332,4 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         return out
 
 
-__all__ = ["MOE_FP8BS_ARCHS", "BatchInvariantDeepSeekFp8Runner"]
+__all__ = ["BatchInvariantDeepSeekFp8Runner"]
