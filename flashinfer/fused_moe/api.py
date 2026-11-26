@@ -3512,16 +3512,24 @@ class BatchInvariantFp8BlockConfig:
     operands of the block-scaled step; the SM107 instruction folds 64 elements per step, the SM100 / SM103 one 32: the
     architecture is a dimension of the class, as for ``mm_mxfp8``), the activation chain is the bf16 classes' on the
     dequantised fp32 accumulators, the intermediate is quantized by the same quantizer class on the materialised bf16 row,
-    the combine is the slot-order fp32 fold. Every output bit is a function of the token's own quantized row, its
-    ``top_k`` experts and routing weights and the quantized expert weights alone. ``MoEFinalizeConfig.do_finalize`` must
-    stay ``True`` and ``use_fused_finalize`` is ignored; all three routing input modes are taken; unsupported inputs raise
-    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls back and is not a default
-    candidate.
+    the combine is the slot-order fp32 fold. The arithmetic is exact (every step of the chain correctly rounded, no SFU
+    table enters the bits; the instruction class of the part is the one architecture dimension). Every output bit is a
+    function of the token's own quantized row, its ``top_k`` experts and routing weights and the quantized expert
+    weights alone. ``MoEFinalizeConfig.do_finalize`` must stay ``True`` and ``use_fused_finalize`` is ignored; fused
+    shared experts and expert-parallel shards are refused by name; all three routing input modes are taken; unsupported
+    inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls back and is
+    not a default candidate.
 
-    Weights: ``prepare_weights`` takes the canonical bf16 ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or ``w1 [E, I, H]``
-    for the ungated activations, and ``w2 [E, H, I]``, on a CUDA device; ``hidden_size`` and ``intermediate_size`` are
-    multiples of 32. Activations: the canonical MXFP8 pack, e4m3 ``[num_tokens, H]`` with token-major UE8M0 scales
-    ``[num_tokens, H / 32]`` (the pack ``TrtllmFp8BlockConfig`` and ``CutlassMxfp8Config`` prepare).
+    Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or ``w1 [E, I, H]`` for the
+    ungated activations, and ``w2 [E, H, I]`` -- bf16 or a wider floating dtype, CPU-resident or on the device -- and
+    quantizes the experts one at a time into the pack on ``device`` (the weights' by default; a CUDA device), each
+    expert's slice moved and cast right before its quantization; ``num_local_experts`` / ``hidden_size`` /
+    ``intermediate_size``, when given, must be the weights' own; ``hidden_size`` and ``intermediate_size`` are multiples
+    of 32. Activations: the canonical MXFP8 pack, e4m3 ``[num_tokens, H]`` with the token-major UE8M0 scales
+    ``[num_tokens, H / 32]`` (the pack ``TrtllmFp8BlockConfig`` and ``CutlassMxfp8Config`` prepare) in that linear layout
+    alone, taken as given: a swizzled or flattened scale buffer, ``QuantConfig(swizzled_scale_factors=True)`` and a
+    ``per_token_scale`` are refused, rows and scale bytes are 16-byte aligned, and ``num_tokens = 0`` gives the empty
+    output. The 128x4 scale buffers the kernels read carry zero pad columns.
     """
 
     @classmethod

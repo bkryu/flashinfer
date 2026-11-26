@@ -5,13 +5,21 @@
 MXFP8 class of the part (the block scales inside the block-scaled step), the bf16 classes' chains, routing, deterministic
 permutation and slot-order combine.
 
-``MoEWeightsMXFP8.prepare`` quantizes bf16 experts per expert into the 128x4 swizzled scale layout the instruction reads;
+``MoEWeightsMXFP8.prepare`` quantizes the experts one at a time into the 128x4 swizzled scale layout the instruction reads;
 ``quantize_activations_mxfp8`` is the class's per-token activation quantization into the layer's canonical MXFP8 pack
 (e4m3 ``[T, H]`` with the token-major UE8M0 scales ``[T, H / 32]``, the pack ``TrtllmFp8BlockConfig`` and
-``CutlassMxfp8Config`` prepare); ``fused_moe_mxfp8`` runs the FFN on pre-routed tokens from that pack (the caller's bytes
-taken as given) and ``moe_ffn_mxfp8`` composes the routing. Every output bit is a function of the token's own quantized
-row, its ``k`` experts and routing weights, and the quantized expert weights: batch size, composition, row position,
-expert load and the grouped records never enter the dataflow (the specification is :mod:`.spec_mxfp8`).
+``CutlassMxfp8Config`` prepare: the linear layout alone, no swizzled buffer and no per-token scale); ``fused_moe_mxfp8``
+runs the FFN on pre-routed tokens from that pack (the caller's bytes taken as given). Every output bit is a function of
+the token's own quantized row, its ``k`` experts and routing weights, and the quantized expert weights: batch size,
+composition, row position, expert load and the grouped records never enter the dataflow (the specification is
+:mod:`.spec_mxfp8`). The arithmetic is exact: GEMM1's chain is the bf16 classes' (every step correctly rounded, no SFU
+table enters), the UE8M0 block scales are operands of the instruction and the quantizer's chain is the declared one; the
+instruction class of the part (the SM107 step folds 64 elements, the SM100 / SM103 step 32) is a dimension of the class.
+
+The 128x4 scale buffers the kernels read (the experts', the fused requantization's) carry zero pad columns where a row's
+scale columns are not a multiple of 4 (``K`` not a multiple of 128): the quantizer writes them, the fused epilogue's
+buffer is zero-filled before the launch where they exist, and GEMM2's scale boxes read them against the zero-filled tail
+of a k-tile.
 
 The expanded rows are permuted into groups padded to whole 128-row scale-factor atoms (the swizzled scale layout is affine
 only inside an atom); one scatter launch moves the e4m3 rows and re-tiles the linear scale bytes into the atoms, zero-filling

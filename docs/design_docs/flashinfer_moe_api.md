@@ -972,6 +972,12 @@ step. The tests pin the SFU tables' digest per part they run on; on a part witho
 and reports the part's digest, and the classes run unchanged (deterministic and batch-invariant on that part). The
 verification standard is in `flashinfer/batch_invariant/README.md`.
 
+The batch-invariant fp8-block backend (`BatchInvariantFp8BlockConfig`, the MXFP8×MXFP8 pair) is exact: its GEMM1 chain
+is the bf16 backend's declared sequence with every step correctly rounded, the UE8M0 block scales are operands of the
+instruction and the intermediate's requantization is the batch-invariant MXFP8 quantizer's chain, so no SFU table enters
+the bits; the one architecture dimension of its classes is the instruction class of the part (the SM107 step folds 64
+elements, the SM100 / SM103 step 32), carried by `fingerprint("fused_moe_mxfp8", ..., arch=)`.
+
 For the explicit SM100/SM103/SM107 low-token `frost_low_latency` backend, see the
 [usage, qualification and extension guide](../frost_low_latency_moe.md).
 

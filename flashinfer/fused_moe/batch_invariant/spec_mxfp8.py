@@ -11,7 +11,9 @@ chain on the dequantised fp32 accumulators (every typed activation of the layer,
 :func:`.spec.act_elem`), the intermediate is quantized by the same quantizer class on the materialised bf16 row (its
 declared second pass), GEMM2's epilogue is the plain ``cvt_bf16`` of the accumulator, and the routing and the
 slot-order combine are the bf16 classes' (:mod:`.spec`). Everything numeric is therefore already specified once; this
-module names the composition and its identifier.
+module names the composition and its identifier. The arithmetic is exact: every step of the chain is correctly rounded
+and no SFU table enters the bits (the fp4 classes' chains take the part's SFU; these do not), so the bits are a property
+of the instruction class alone.
 
 The instruction class is a dimension of the specification: the SM107 step folds 64 elements where the SM100 / SM103 step
 folds 32 (`gemm.mxfp8.kfold64` vs `gemm.mxfp8.kfold`), so the fingerprint carries the class of each GEMM by name, as
