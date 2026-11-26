@@ -2865,3 +2865,57 @@ def test_routing_constants_are_read_from_the_cache_under_graph_capture():
         names
     )  # the one constant first met inside the capture, none for the cached bias and scale
     assert torch.equal(bits(out), eager)
+
+
+# ----------------------------------------------------------------------------- the contract's rules (device-free where possible)
+
+
+def _runner(
+    quant=_QUANT, k=2, E=8, I=64, method=RoutingMethodType.Renormalize, **experts
+):
+    return BatchInvariantFp8BlockRunner(
+        MoEConfig(
+            routing=RoutingConfig(num_experts=E, top_k=k, method=method),
+            quant=quant,
+            experts=ExpertConfig(intermediate_size=I, **experts),
+            backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+        ),
+        torch.device("cuda", 0),
+    )
+
+
+def test_runner_support_state_is_initialised_at_construction():
+    """The routing term's state (``_method``, ``_grouped_other``, ``_logits_refusal``) exists from construction on the shared
+    runner base, so no reader needs a default; a refusal deferred to the from-logits call is kept as the message's
+    arguments (no exception object) and raised afresh there; the layer's protocol still orders the support check before the
+    build."""
+    import inspect
+
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.runner import BatchInvariantMoeRunnerBase
+
+    r = _runner()
+    assert type(r) is BatchInvariantMxfp8Runner
+    assert r._method is None and r._grouped_other is False
+    assert r._logits_refusal is None and r._scale is None and r._part is None
+    assert {"_method", "_grouped_other", "_logits_refusal"} <= set(vars(r))
+    for cls in (
+        BatchInvariantMoeRunnerBase,
+        BatchInvariantFp8BlockRunner,
+        BatchInvariantMxfp8Runner,
+    ):
+        assert "getattr(self, " not in inspect.getsource(cls), cls.__name__
+    deferred = _runner(k=2, E=16, method=RoutingMethodType.Llama4)
+    deferred._routing_term(deferred.config.routing, deferred.CLASS)
+    assert deferred._method is None and isinstance(deferred._logits_refusal, tuple)
+    assert "Llama4" in str(deferred._logits_refusal)
+    for _ in range(2):  # raised afresh each time, from the stored arguments
+        with pytest.raises(BatchInvariantUnsupportedError, match="Llama4"):
+            raise BatchInvariantUnsupportedError(*deferred._logits_refusal)
+    with pytest.raises(RuntimeError):
+        r.build()
+    if _supported:
+        r.check_support()
+        assert r._method is not None and r._logits_refusal is None
+        r.build()
+        assert r._part is not None and r._in_fmt is not None
