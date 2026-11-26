@@ -123,6 +123,14 @@ def bits(t: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _same_bits_or_both_nan(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Equal bits on every lane, except that a NaN lane matches a NaN lane of any payload (a NaN's payload is the part's
+    canonical, not a value of the class)."""
+    return torch.equal(torch.isnan(a), torch.isnan(b)) and torch.equal(
+        bits(a)[~torch.isnan(a)], bits(b)[~torch.isnan(b)]
+    )
+
+
 def _problem(
     T: int,
     k: int,
@@ -983,7 +991,8 @@ def _selected(counts, limit: int = 32):
 def _ladder(xq, sx, ids, weights, view, act, out=None):
     """The class composed from its own pieces, bit for bit: the dense packing, the exact block-scale fold per (selected) expert,
     the CPU chain, the quantizer's reference on the device's bf16 intermediate, the exact fold of GEMM2, the CPU conversion and
-    combine; the op's intermediates in both requantization spellings against it. Returns the reference output rows checked."""
+    combine; the op's intermediates in both requantization spellings against it (a NaN lane by its mask: the payload is the part's
+    canonical). Returns the reference output rows checked."""
     from flashinfer.fused_moe.batch_invariant import reference as R
     from flashinfer.fused_moe.batch_invariant import reference_fp8bs as RB
     from flashinfer.fused_moe.batch_invariant.api_fp8bs import (
@@ -1032,7 +1041,7 @@ def _ladder(xq, sx, ids, weights, view, act, out=None):
     )
     a_ref = RB.chain_cpu(acc1, act)
     a = im["a"].cpu()
-    assert a.shape == (Tk, I) and torch.equal(bits(a[mask]), bits(a_ref[mask])), (
+    assert a.shape == (Tk, I) and _same_bits_or_both_nan(a[mask], a_ref[mask]), (
         "gemm1",
         (a[mask] != a_ref[mask]).sum().item(),
     )
@@ -1043,12 +1052,12 @@ def _ladder(xq, sx, ids, weights, view, act, out=None):
     acc2 = _exact_acc(im["aq"], im["sa"], W.w2, W.w2_sf, counts, None, sel)
     y_ref = R.TorchF32.cvt_out(acc2, "bf16")
     y = im["y"].cpu()
-    assert torch.equal(bits(y[mask]), bits(y_ref[mask])), (
+    assert _same_bits_or_both_nan(y[mask], y_ref[mask]), (
         "gemm2",
         (y[mask] != y_ref[mask]).sum().item(),
     )
-    assert torch.equal(
-        bits(ref_out.cpu()), bits(R.combine_cpu(im["y"], im["dest"], weights))
+    assert _same_bits_or_both_nan(
+        ref_out.cpu(), R.combine_cpu(im["y"], im["dest"], weights)
     )
     outq, imq = fused_moe_fp8bs(
         xq, sx, ids, weights, W, return_intermediates=True, fuse_quant=True
@@ -2428,8 +2437,8 @@ def test_block32_layer_matches_the_class_composition(act):
     assert torch.equal(bits(y[mask]), bits(R.TorchF32.cvt_out(acc2, "bf16")[mask])), (
         "gemm2"
     )
-    assert torch.equal(
-        bits(ref_out.cpu()), bits(R.combine_cpu(im["y"], im["dest"], weights))
+    assert _same_bits_or_both_nan(
+        ref_out.cpu(), R.combine_cpu(im["y"], im["dest"], weights)
     )
     # every record of both spaces at the class (the fast clusters) gives the same bits
     ch1 = W.chain1(False)
