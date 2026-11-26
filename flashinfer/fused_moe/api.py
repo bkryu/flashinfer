@@ -3500,10 +3500,10 @@ class BatchInvariantFp8BlockConfig:
     SM107. The quantization pair of ``QuantConfig`` selects the class family, each pair keeping its own kernels, classes,
     fingerprints and pack conventions: ``QuantConfig(weight=MXFP8, activation=MXFP8)`` runs the classes ``moe.mxfp8.<act>``
     of the mode documented in ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set,
-    as the bf16 backend); the DeepSeekFp8 x DeepSeekFp8 pair (the block-scale classes) arrives with the block-scale MoE PR.
-    Another pair is not admitted by the layer (``supported_quant_variants``) and is refused by :meth:`prepare_weights` /
-    :meth:`prepare_activations` with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` naming the pairs
-    served.
+    as the bf16 backend), the pair served. Another pair is not admitted by the layer (``supported_quant_variants``) and
+    is refused by :meth:`prepare_weights` / :meth:`prepare_activations` with
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` naming the pair served; the weight view names its
+    pair (``quant``) and a view without it is declined by the layer's candidate filter.
 
     MXFP8 x MXFP8: the expert weights and the activations are MXFP8 (e4m3 values, one UE8M0 scale per 32 elements), both by
     the batch-invariant quantizer class (``mxfp8_quantize(..., batch_invariant=True)``: the experts per expert at

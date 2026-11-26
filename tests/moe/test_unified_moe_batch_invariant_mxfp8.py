@@ -758,8 +758,8 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
 
 def test_unsupported_device_and_quant_raise_before_any_kernel():
     """Constructing the backend's runner gives the pair's runner; on a CPU device it fails its support check with the mode's
-    error naming the class. A pair the backend does not serve is refused with the pairs served -- at construction and at
-    ``prepare_weights`` / ``prepare_activations``, before any kernel or quantization runs (the layer never admits it:
+    error naming the class. A pair the backend does not serve is refused with the pair served named -- at construction and
+    at ``prepare_weights`` / ``prepare_activations``, before any kernel or quantization runs (the layer never admits it:
     ``supports_quant`` is false); the pair's runner itself admits its own pair only."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
@@ -782,7 +782,9 @@ def test_unsupported_device_and_quant_raise_before_any_kernel():
         with pytest.raises(BatchInvariantUnsupportedError, match="MXFP8") as excinfo:
             BatchInvariantFp8BlockRunner(cfg, torch.device("cpu"))
         msg = str(excinfo.value)
-        assert KEY in msg and "DeepSeekFp8" in msg and quant.weight.name in msg
+        assert (
+            KEY in msg and "MXFP8, activation=MXFP8" in msg and quant.weight.name in msg
+        )
         with pytest.raises(BatchInvariantUnsupportedError, match="MXFP8"):
             BatchInvariantFp8BlockConfig.prepare_activations(
                 torch.zeros(4, 64, dtype=torch.bfloat16), quant=quant

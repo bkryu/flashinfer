@@ -3,9 +3,8 @@
 """The batch-invariant fp8-block MoE backend of the unified MoE layer (``BatchInvariantFp8BlockConfig`` ->
 ``BatchInvariantFp8BlockRunner``): the fp8 formats with block scales under one backend key, grouped as TRTLLM-Gen groups
 them (``TrtllmFp8BlockConfig`` / ``trtllm_fp8_block``). The quantization pair of the layer's ``QuantConfig`` selects the
-class family and its runner: MXFP8 x MXFP8 runs the classes ``moe.mxfp8.<act>`` (:mod:`.runner_mxfp8`); the DeepSeekFp8 x
-DeepSeekFp8 pair (the block-scale classes) arrives with the block-scale MoE PR. Every pair keeps its own kernels, classes,
-fingerprints and pack conventions: the grouping is the surface alone.
+class family and its runner: MXFP8 x MXFP8 runs the classes ``moe.mxfp8.<act>`` (:mod:`.runner_mxfp8`), the pair served.
+A pair keeps its own kernels, classes, fingerprints and pack conventions: the grouping is the surface alone.
 
 The pair runners take the shared pack / plan / launch flow of :class:`.runner.BatchInvariantMoeRunnerBase` (its reviewed
 rules: the bounds at every entry, the deferred from-logits refusal, the routed scaling factor built at construction, the
@@ -26,9 +25,8 @@ from ...batch_invariant.support import BatchInvariantUnsupportedError, unsupport
 from ..api import MoEActivationPack, MoEConfig, MoEWeightPack, QuantConfig, QuantFormat
 from .runner import BatchInvariantMoeRunnerBase
 
-#: The quantization pairs of the fp8 formats with block scales.
+#: The quantization pair served: MXFP8 experts and MXFP8 activations.
 PAIR_MXFP8 = (QuantFormat.MXFP8, QuantFormat.MXFP8)
-PAIR_DEEPSEEK_FP8 = (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8)
 
 
 def unsupported_pair(quant: QuantConfig) -> BatchInvariantUnsupportedError:
@@ -40,9 +38,8 @@ def unsupported_pair(quant: QuantConfig) -> BatchInvariantUnsupportedError:
     )
     return BatchInvariantUnsupportedError(
         f"batch_invariant=True: the fp8-block MoE backend (`{BatchInvariantFp8BlockRunner.backend_key}`) serves {served}, "
-        f"not weight={quant.weight.name}, activation={quant.activation.name}; the DeepSeekFp8 x DeepSeekFp8 pair (the "
-        "block-scale classes) arrives with the block-scale MoE PR. The batch-invariant mode never falls back to another "
-        "kernel."
+        f"not weight={quant.weight.name}, activation={quant.activation.name}. The batch-invariant mode never falls back "
+        "to another kernel."
     )
 
 
@@ -140,7 +137,6 @@ class BatchInvariantFp8BlockRunner(BatchInvariantMoeRunnerBase):
 
 
 __all__ = [
-    "PAIR_DEEPSEEK_FP8",
     "PAIR_MXFP8",
     "BatchInvariantFp8BlockRunner",
     "unsupported_pair",
