@@ -131,7 +131,6 @@ RASTER_N_ROWS = 128  # an expert spanning a whole 128-row block or more: the gro
 EPI_WARPGROUPS = (
     EPI_WARPGROUPS_BLOCKSCALED  # the block-scaled grouped body's epilogue warpgroups
 )
-PACKINGS = ("padded", "dense")
 
 
 def raster_for(rows: int) -> str:

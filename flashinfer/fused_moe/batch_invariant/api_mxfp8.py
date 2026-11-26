@@ -45,11 +45,11 @@ from .api import (
     interleave_fc1,
     launch_grid,
     permute_plan,
-    route,
 )
 from .api import padded_rows_bound as _padded_rows_bound
 from .blocks.epilogue import GroupedEpilogueBlock
 from .blocks.epilogue_mx import MxChain
+from .blocks.scheduler import MAX_E
 from .blocks.swap import PLAN_MAX_E, PLAN_MAX_SLOTS
 from .spec_mxfp8 import BLOCK, CLASS, MX_CLASSES
 
@@ -60,9 +60,6 @@ GROUP_ALIGN = 128
 #: rows it zero-fills); never stored. A 256-row cluster tile of the padded body on the dense packing is the largest box.
 DENSE_TAIL = 256
 PACKINGS = ("padded", "dense")
-#: The routed expert bound of the routing kernel (the bf16 classes' bucket); the group tables take ``MAX_E``.
-E_MAX = 1024
-K_MAX = 16
 ALIGN_E4M3 = 16  # e4m3 elements per 16-byte row: the TMA alignment of every operand
 _OUT = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
 
@@ -100,7 +97,8 @@ def check_shape_mxfp8(H: int, I: int, E: int, k: Optional[int] = None) -> None:
     * ``H`` and ``I`` positive multiples of 32: whole 32-element scale blocks of the quantized ``x`` (K = H), of the
       quantized intermediate (K = I) and of both expert weights, hence 16-byte e4m3 rows (the gate / up pairing needs
       ``I % 8``, implied);
-    * ``1 <= E <= 1024`` (the routing kernel's buckets, the group tables), ``1 <= k <= min(E, 16)``;
+    * ``1 <= E <= MAX_E`` (the routing kernel's buckets, the group tables), ``1 <= k <= min(E, MAX_TOP_K)`` (the shared
+      bounds of the MoE classes);
     * ``chunks_for(2I, H) == chunks_for(H, I) == 1`` for the MX class: the grouped classes take unsplit expert weight shapes
       (the dense class K-splits a weight only when ``K`` is very large against ``N``)."""
     if H <= 0 or I <= 0 or H % BLOCK or I % BLOCK:
@@ -109,11 +107,11 @@ def check_shape_mxfp8(H: int, I: int, E: int, k: Optional[int] = None) -> None:
             f"hidden_size {H}, intermediate_size {I}",
             f"positive multiples of {BLOCK} (whole UE8M0 scale blocks: 16-byte e4m3 rows of the activations, the intermediate and the weights)",
         )
-    if not 1 <= E <= E_MAX:
-        raise unsupported(CLASS, f"num_experts {E}", f"1 <= num_experts <= {E_MAX}")
-    if k is not None and not 1 <= k <= min(E, K_MAX):
+    if not 1 <= E <= MAX_E:
+        raise unsupported(CLASS, f"num_experts {E}", f"1 <= num_experts <= {MAX_E}")
+    if k is not None and not 1 <= k <= min(E, S.MAX_TOP_K):
         raise unsupported(
-            CLASS, f"top_k {k}", f"1 <= top_k <= min(num_experts, {K_MAX})"
+            CLASS, f"top_k {k}", f"1 <= top_k <= min(num_experts, {S.MAX_TOP_K})"
         )
     if chunks_for(2 * I, H, "mxfp8") != 1 or chunks_for(H, I, "mxfp8") != 1:
         raise unsupported(
@@ -267,10 +265,6 @@ class MoEWeightsMXFP8:
     @property
     def intermediate_size(self) -> int:
         return self.w2.shape[2]
-
-    @property
-    def n1(self) -> int:
-        return self.w1.shape[1]
 
     @property
     def chain1(self) -> MxChain:
@@ -544,8 +538,6 @@ def gather_form_ok(K: int) -> bool:
 def decode_form_ok(T: int, k: int, E: int, H: int) -> bool:
     """The decode form's shape rule: the routing's slots fit the in-kernel plan's registers (one warp's) and its membership
     masks, the pack's scale rows are whole 4-byte groups."""
-    from .blocks.swap import PLAN_MAX_E, PLAN_MAX_SLOTS
-
     return T * k <= PLAN_MAX_SLOTS and E <= PLAN_MAX_E and gather_form_ok(H)
 
 
@@ -1142,21 +1134,3 @@ def _part(device: torch.device) -> Tuple[int, str]:
     from ...gemm.batch_invariant.api import part_of
 
     return part_of(device)
-
-
-def moe_ffn_mxfp8(
-    x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-    router_logits: torch.Tensor,
-    w: MoEWeightsMXFP8,
-    top_k: int,
-    method: Union[S.RoutingMethod, str] = S.SOFTMAX_RENORM,
-    bias: Optional[torch.Tensor] = None,
-    scaling_factor: Optional[Union[float, torch.Tensor]] = None,
-    out: Optional[torch.Tensor] = None,
-    config1: Optional[Knobs] = None,
-    config2: Optional[Knobs] = None,
-    in_fmt: Optional[str] = None,
-) -> torch.Tensor:
-    """Routing (the bf16 classes' kernel) + the MXFP8 FFN."""
-    experts, weights = route(router_logits, top_k, method, bias, scaling_factor)
-    return fused_moe_mxfp8(x, experts, weights, w, out, config1, config2, in_fmt)
