@@ -5,16 +5,18 @@
 One runner for the 4-bit-weight quantization pairs, grouped as ``TrtllmFp4Config`` groups them: ``QuantConfig(weight=...,
 activation=...)`` selects the pair (:data:`PAIRS`: NVFP4 x NVFP4, the W4A4 classes ``moe.nvfp4.<act>`` and the static class
 ``moe.nvfp4.<act>.static``; MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>``), the op is :func:`.api_fp4.fused_moe_fp4` on the
-pair. The weight view and the autotuner records live under the backend's key; a pack prepared for the other pair is refused.
-A pair outside ``supported_quant_variants`` (MXFP4 x MXFP8 among them) is skipped by ``MoELayer``'s candidate filter
-(``supports_quant``) and refused by ``check_support`` and by the config's ``prepare_weights`` / ``prepare_activations``
-with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming the served pairs.
+pair; the mixed MXFP4 x MXFP8 pair (:data:`MIXED_PAIR`, the classes ``moe.mxfp4w8a.<act>``: MXFP4 experts, MXFP8 activations)
+runs on its own runner, :mod:`.runner_mxfp4w8a`, to which this one delegates. The weight view and the autotuner records live
+under the backend's key; a pack prepared for another pair is refused. A pair outside ``supported_quant_variants`` is skipped
+by ``MoELayer``'s candidate filter (``supports_quant``) and refused by ``check_support`` and by the config's
+``prepare_weights`` / ``prepare_activations`` with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming
+the served pairs.
 
 The activations come as bf16 rows (``hidden_states_q`` bf16, no scale: the pair's class quantizes them itself) or already
 quantized (``hidden_states_q`` packed uint8 ``[T, H/2]``, ``hidden_states_scale`` the block scales -- the 128x4 swizzled
 buffer of the mode's quantizer or the linear ``[T, H/block]`` layout; NVFP4 also ``per_token_scale [T]`` f32 under
-``QuantConfig(per_token_scale=True)``, unit scales when absent: the per-tensor pack of ``TrtllmFp4Config``; the MX pair has
-no per-token scale and refuses the flag). The three routing input modes of the bf16 backend, the slot-order combine (never an
+``QuantConfig(per_token_scale=True)``, unit scales when absent: the per-tensor pack of ``TrtllmFp4Config``; the MX pairs have
+no per-token scale and refuse the flag). The three routing input modes of the bf16 backend, the slot-order combine (never an
 atomic finalize), the dispatcher's ranked records as tactics (any tactic gives the same bits); an unsupported configuration
 raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 """
@@ -22,7 +24,7 @@ raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instea
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -55,15 +57,23 @@ from . import spec as S
 from .api_fp4 import MXFP4, NVFP4, Fp4Pair
 from .runner import MOE_BF16_ARCHS, _PackedInputs, routing_term
 
+if TYPE_CHECKING:
+    from .runner_mxfp4w8a import BatchInvariantMoeMxfp4w8aRunner
+
 #: The backend's key: the name of its weight view and of its autotuner records.
 BACKEND_KEY = "batch_invariant_fp4"
 #: The compute capabilities the classes are stated for (the dense 4-bit GEMM class's parts).
 MOE_FP4_ARCHS: Tuple[Tuple[int, int], ...] = MOE_BF16_ARCHS
-#: The quantization pairs the backend serves, in the order they are advertised.
+#: The quantization pairs this module's bodies serve, in the order they are advertised.
 PAIRS: Dict[Tuple[QuantFormat, QuantFormat], Fp4Pair] = {
     (QuantFormat.NVFP4, QuantFormat.NVFP4): NVFP4,
     (QuantFormat.MXFP4, QuantFormat.MXFP4): MXFP4,
 }
+#: The mixed MXFP4-weight x MXFP8-activation pair: the classes ``moe.mxfp4w8a.<act>`` of :mod:`.runner_mxfp4w8a`, served by
+#: delegation to that runner (its operand formats and bodies are that module's).
+MIXED_PAIR: Tuple[QuantFormat, QuantFormat] = (QuantFormat.MXFP4, QuantFormat.MXFP8)
+#: The pairs the backend serves, in the order they are advertised.
+SERVED_PAIRS: Tuple[Tuple[QuantFormat, QuantFormat], ...] = tuple(PAIRS) + (MIXED_PAIR,)
 #: Positions of the packed inputs: the activation rows (bf16, or packed fp4), their scale factors and per-token scales (or
 #: placeholders), the expert ids, the routing weights, the six weight tensors (the MX pair's alphas are placeholders), the
 #: output, the static class's per-expert scales (placeholders otherwise); the dense plan follows when the router made it.
@@ -100,7 +110,7 @@ def pair_name(pair: Tuple[QuantFormat, QuantFormat]) -> str:
 
 def unsupported_pair(quant: QuantConfig) -> BatchInvariantUnsupportedError:
     """The refusal of a quantization pair the fp4 backend does not serve: it names the served pairs."""
-    served = ", ".join(pair_name(p) for p in PAIRS)
+    served = ", ".join(pair_name(p) for p in SERVED_PAIRS)
     return BatchInvariantUnsupportedError(
         f"batch_invariant=True: the fp4 MoE backend `{BACKEND_KEY}` (BatchInvariantFp4Config) does not serve the "
         f"quantization weight={quant.weight.name}, activation={quant.activation.name}; it serves {served} and no other "
@@ -161,12 +171,11 @@ def _configs_from_tactic_fp4(t: tuple):
     return one(t[:TACTIC_FIELDS]), one(t[TACTIC_FIELDS : 2 * TACTIC_FIELDS])
 
 
-class BatchInvariantFp4Runner(MoERunner):
-    """The unified layer's runner for the batch-invariant fp4 MoE classes: the pair from the configuration's ``QuantConfig``,
-    the routed scale constant and the part at build, the intermediate's class from the backend config."""
+class _Fp4RunnerBase(MoERunner):
+    """What the fp4 backend's runners share: the key, the routing modes, the output format, the layer's activation classes,
+    the construction (the routed scale constant, the part, the intermediate's class field) and the class's shard refusal."""
 
     backend_key = BACKEND_KEY
-    supported_quant_variants = tuple(PAIRS)
     supported_output_formats = (QuantFormat.BF16,)
     supported_routing_modes = (
         RoutingInputMode.FromLogits,
@@ -174,10 +183,6 @@ class BatchInvariantFp4Runner(MoERunner):
         RoutingInputMode.UnpackedPrecomputed,
     )
     supported_activation_classes = _ACTIVATIONS
-    supported_activation_classes_by_quant = {pair: _ACTIVATIONS for pair in PAIRS}
-    # the NVFP4 pair consumes a pre-quantized pack's per-token scale (the class's own ``pts``) under the layer's shared
-    # contract; the MX pair has none and refuses the flag at support
-    supports_per_token_scale = True
     supports_expert_parallelism = False
 
     def __init__(self, config, device) -> None:
@@ -186,8 +191,6 @@ class BatchInvariantFp4Runner(MoERunner):
         self.device = torch.device(device)
         if self.device.index is None and self.device.type == "cuda":
             self.device = torch.device("cuda", torch.cuda.current_device())
-        # an unserved pair is refused by check_support (the layer's filter never constructs this case)
-        self._pair: Optional[Fp4Pair] = PAIRS.get(config.quant.pair)
         # exact shapes: the dispatcher's pick is a function of the token count (every tactic computes the same bits)
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
@@ -201,38 +204,106 @@ class BatchInvariantFp4Runner(MoERunner):
         cands = [c for c in config.backend if hasattr(c, "intermediate")]
         self._intermediate: str = cands[0].intermediate if cands else "per_token"
 
-    @property
-    def pair(self) -> Fp4Pair:
-        """The configured quantization pair."""
-        if self._pair is None:
-            raise unsupported_pair(self.config.quant)
-        return self._pair
-
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
         from .spec import activation_of
 
         return activation_of(self.config.activation)
 
-    def _check_experts(self) -> None:
+    def _check_experts(self, cls: str) -> None:
         """The class's rule on the expert range: the EP form is not part of this backend, so a shard is refused in the
-        class's terms (before the layer's generic shard check). The pair is known here: ``_check_support`` refuses an
-        unserved pair before this check, and the ``pair`` property refuses it again for a direct caller."""
+        class's terms (``cls``, the pair's registry class; before the layer's generic shard check)."""
         experts, routing = self.config.experts, self.config.routing
         if experts.local_expert_offset or (
             experts.local_num_experts not in (None, 0, routing.num_experts)
         ):
             raise unsupported(
-                self.pair.cls,
+                cls,
                 "expert-parallel shards (local_expert_offset / local_num_experts)",
                 "the full expert set (the class's EP form is not part of this backend)",
             )
 
+    def _build(self) -> None:
+        from ...gemm.batch_invariant.api import part_of
+
+        self._part = part_of(self.device)
+        method = self._method
+        if (
+            method is not None
+            and method.scaled
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # the routed scaling factor is a constant of the configuration: built here, at the layer's construction, so no
+            # forward (a first one under CUDA graph capture included) copies it to the device
+            self._scale = self._scale_constant()
+
+    def _scale_constant(self) -> torch.Tensor:
+        """The routed scaling factor as a one-element fp32 tensor on the runner's device: a blocking host copy outside CUDA
+        graph capture (complete before any stream reads it), a device fill (a node of that capture alone) inside one."""
+        v = self.config.routing.routed_scaling_factor
+        v = 1.0 if v is None else float(v)
+        if torch.cuda.is_current_stream_capturing():
+            return torch.full((1,), v, dtype=torch.float32, device=self.device)
+        return torch.tensor([v], dtype=torch.float32).to(self.device)
+
+    def _scale_tensor(self) -> torch.Tensor:
+        """The scale tensor the route kernel reads as given: the one built at construction; a runner built inside a capture
+        takes a fill per call until it runs outside one, which then keeps the constant."""
+        if self._scale is not None:
+            return self._scale
+        s = self._scale_constant()
+        if not torch.cuda.is_current_stream_capturing():
+            self._scale = s
+        return s
+
+
+class BatchInvariantFp4Runner(_Fp4RunnerBase):
+    """The unified layer's runner for the batch-invariant fp4 MoE classes: the pair from the configuration's ``QuantConfig``,
+    the routed scale constant and the part at build, the intermediate's class from the backend config; the mixed pair's
+    calls delegated to its own runner (:attr:`impl`)."""
+
+    supported_quant_variants = SERVED_PAIRS
+    supported_activation_classes_by_quant = {
+        pair: _ACTIVATIONS for pair in SERVED_PAIRS
+    }
+    # the NVFP4 pair consumes a pre-quantized pack's per-token scale (the class's own ``pts``) under the layer's shared
+    # contract; the MX pairs have none and refuse the flag at support
+    supports_per_token_scale = True
+
+    def __init__(self, config, device) -> None:
+        super().__init__(config, device)
+        # an unserved pair is refused by check_support (the layer's filter never constructs this case)
+        self._pair: Optional[Fp4Pair] = PAIRS.get(config.quant.pair)
+        # the mixed pair's runner: every call of this one is delegated to it
+        self._impl: Optional["BatchInvariantMoeMxfp4w8aRunner"] = None
+        if config.quant.pair == MIXED_PAIR:
+            from .runner_mxfp4w8a import BatchInvariantMoeMxfp4w8aRunner
+
+            self._impl = BatchInvariantMoeMxfp4w8aRunner(config, self.device)
+
+    @property
+    def pair(self) -> Fp4Pair:
+        """The configured quantization pair (one of :data:`PAIRS`: the mixed pair runs on :attr:`impl`)."""
+        if self._pair is None:
+            raise unsupported_pair(self.config.quant)
+        return self._pair
+
+    @property
+    def impl(self) -> "BatchInvariantMoeMxfp4w8aRunner":
+        """The mixed pair's runner (the fp4 pairs run on this one)."""
+        if self._impl is None:
+            raise AttributeError("impl: the configured pair runs on this runner")
+        return self._impl
+
+    # ---- support ---------------------------------------------------------------------------------------------------
     def _check_support(self) -> None:
+        if self._impl is not None:
+            self._impl.check_support()
+            return
         if self._pair is None:
             raise unsupported_pair(self.config.quant)
         # the class's shard refusal first, then the layer's generic rules, then the pair's
-        self._check_experts()
+        self._check_experts(self.pair.cls)
         super()._check_support()
         cfg, pair, cls = self.config, self.pair, self.pair.cls
         if not pair.scaled:
@@ -285,37 +356,10 @@ class BatchInvariantFp4Runner(MoERunner):
             )
 
     def _build(self) -> None:
-        from ...gemm.batch_invariant.api import part_of
-
-        self._part = part_of(self.device)
-        method = self._method
-        if (
-            method is not None
-            and method.scaled
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            # the routed scaling factor is a constant of the configuration: built here, at the layer's construction, so no
-            # forward (a first one under CUDA graph capture included) copies it to the device
-            self._scale = self._scale_constant()
-
-    def _scale_constant(self) -> torch.Tensor:
-        """The routed scaling factor as a one-element fp32 tensor on the runner's device: a blocking host copy outside CUDA
-        graph capture (complete before any stream reads it), a device fill (a node of that capture alone) inside one."""
-        v = self.config.routing.routed_scaling_factor
-        v = 1.0 if v is None else float(v)
-        if torch.cuda.is_current_stream_capturing():
-            return torch.full((1,), v, dtype=torch.float32, device=self.device)
-        return torch.tensor([v], dtype=torch.float32).to(self.device)
-
-    def _scale_tensor(self) -> torch.Tensor:
-        """The scale tensor the route kernel reads as given: the one built at construction; a runner built inside a capture
-        takes a fill per call until it runs outside one, which then keeps the constant."""
-        if self._scale is not None:
-            return self._scale
-        s = self._scale_constant()
-        if not torch.cuda.is_current_stream_capturing():
-            self._scale = s
-        return s
+        if self._impl is not None:
+            self._impl.build()
+            return
+        super()._build()
 
     # ---- inputs ----------------------------------------------------------------------------------------------------
     def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
@@ -332,6 +376,8 @@ class BatchInvariantFp4Runner(MoERunner):
         return "quant" in view and view.get("intermediate") == self._intermediate
 
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        if self._impl is not None:
+            return self._impl._accepts_shape(act)
         x = act.hidden_states_q
         if x.ndim != 2:
             return False
@@ -423,6 +469,8 @@ class BatchInvariantFp4Runner(MoERunner):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        if self._impl is not None:
+            return self._impl.pack_inputs(act, weights)
         self._validate_pack_contract(act)
         from .api import route
         from .api_fp4 import MoEWeightsFp4, route_plan_dual
@@ -649,6 +697,8 @@ class BatchInvariantFp4Runner(MoERunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
         self._require_built()
+        if self._impl is not None:
+            return self._impl.get_valid_tactics(inputs, profile)
         x = inputs[_X]
         r1, r2 = self._ranked(
             int(x.shape[0]), self._hidden_of(x), self._gather_form(x, inputs[_SF])
@@ -656,6 +706,8 @@ class BatchInvariantFp4Runner(MoERunner):
         return [_tactic_fp4(c1, c2) for c1 in r1 for c2 in r2]
 
     def _cache_key_extras(self) -> tuple:
+        if self._impl is not None:
+            return self._impl._cache_key_extras()
         return super()._cache_key_extras() + (
             "moe.fp4-v1",
             self.pair.name,
@@ -671,6 +723,10 @@ class BatchInvariantFp4Runner(MoERunner):
         **kwargs,
     ) -> torch.Tensor:
         self._require_built()
+        if self._impl is not None:
+            return self._impl.forward(
+                inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
+            )
         from .api_fp4 import MoEWeightsFp4, fused_moe_fp4
 
         pair = self.pair

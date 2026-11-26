@@ -204,18 +204,26 @@ def _check_grouped_operands(
     *,
     k_align: Optional[int] = None,
     n_align: Optional[int] = None,
+    w_dtype: Optional[torch.dtype] = None,
+    w_pack: int = 1,
+    w_align: Optional[int] = None,
 ) -> Tuple[int, int, int, int, int]:
     """The grouped GEMM entries' shared operand rules (``(R, K, E, N, Tk)``): ``a [R, K]`` and ``w [E, N, K]`` of the
     class's operand ``dtype``, K-contiguous and 16-byte-aligned (``align`` elements; N and K multiples of it, or of the
     class's own ``k_align`` / ``n_align`` -- a block-scaled class takes K in whole scale blocks and N at its weight-row
     rule), one K, at most ``MAX_E`` experts, ``Tk`` in ``[0, R]`` (the rows of ``out`` by default, else of ``a``),
-    ``counts`` a contiguous int32 ``[E]``."""
+    ``counts`` a contiguous int32 ``[E]``. A class whose weight is stored in another format (the mixed classes' byte-packed
+    e2m1 weight ``[E, N, K / 2]``) names it: ``w_dtype`` the stored dtype, ``w_pack`` the elements per stored element (2 for
+    two 4-bit codes per byte), ``w_align`` the stored elements per 16-byte row (``align`` by default)."""
     k_align = align if k_align is None else k_align
     n_align = align if n_align is None else n_align
-    if a.dtype != dtype or w.dtype != dtype or a.dim() != 2 or w.dim() != 3:
+    w_dtype = dtype if w_dtype is None else w_dtype
+    w_align = align if w_align is None else w_align
+    if a.dtype != dtype or w.dtype != w_dtype or a.dim() != 2 or w.dim() != 3:
         raise TypeError(f"{name} takes {kind} a [Tk, K] and w [E, N, K]")
     R, K = a.shape
-    E, N, K2 = w.shape
+    E, N, Kw = w.shape
+    K2 = Kw * w_pack
     if E > MAX_E:
         raise ValueError(f"{name}: {E} experts; the group tables hold at most {MAX_E}")
     if Tk is None:
@@ -226,9 +234,9 @@ def _check_grouped_operands(
         K != K2
         or a.stride(1) != 1
         or w.stride(2) != 1
-        or w.stride(1) != K
+        or w.stride(1) != Kw
         or a.stride(0) % align
-        or w.stride(0) % align
+        or w.stride(0) % w_align
         or K % k_align
         or N % n_align
     ):

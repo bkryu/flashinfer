@@ -3732,8 +3732,12 @@ def _fp4_pair(quant: Optional["QuantConfig"]) -> Tuple[QuantFormat, QuantFormat]
 # dense packing of the expanded rows with the scale factors at the padded atom positions and the token tile's scale rows
 # gathered by one cp.async warp follow CuTe-DSL's gathered-operand pipeline; the PDL wait / trigger placement and the
 # launch's tile bound on the persistent grid follow Prims-TS and TRTLLM-Gen; the routing, permutation, combine and the
-# ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same bits, placed as those
-# kernels place theirs.
+# ranking contract are the bf16 backend's. The MXFP4 x MXFP8 pair's fused requantization of the intermediate to MXFP8
+# inside GEMM1's epilogue (the block amax, the UE8M0 scale and the e4m3 codes of each 32-element block of the rounded
+# activation) follows the MXFP8-intermediate recipe of TRTLLM-Gen's MXFP4 x MXFP8 path and of the CUTLASS and cuDNN Frost
+# MXFP8 x MXFP4 backends, with every op the quantizer class's; its swapped decode records on the twin instruction (the e2m1
+# weight as the MMA's A operand) follow Prims-TS's swap-AB templates as the NVFP4 pair's do. Each is a placement of the
+# class's dataflow: the same bits, placed as those kernels place theirs.
 @dataclass(frozen=True)
 class BatchInvariantFp4Config:
     """The batch-invariant fp4 MoE backend of the unified layer: one backend for the 4-bit-weight quantization pairs, grouped
@@ -3742,13 +3746,14 @@ class BatchInvariantFp4Config:
     MXFP4 pair must be named (``QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP4)``). The pairs served, on SM100 / SM103 / SM107, one class
     per typed activation and parameter set as the bf16 backend, documented in ``flashinfer/batch_invariant/README.md``:
     NVFP4 x NVFP4, the W4A4 classes ``moe.nvfp4.<act>`` (NVFP4 experts with one per-tensor global scale per expert and GEMM,
-    per-token NVFP4 activations), and MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>`` (MXFP4 experts and MXFP4 activations,
-    one UE8M0 scale per 32 elements on both operands, no global and no per-token scale). A pair the backend does not serve
-    (MXFP4 x MXFP8 among them) is skipped by the layer's candidate filter and refused by ``prepare_weights`` /
+    per-token NVFP4 activations), MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>`` (MXFP4 experts and MXFP4 activations,
+    one UE8M0 scale per 32 elements on both operands, no global and no per-token scale), and MXFP4 x MXFP8, the mixed
+    classes ``moe.mxfp4w8a.<act>`` (MXFP4 experts, MXFP8 activations, UE8M0 scales per 32 elements on both). A pair the
+    backend does not serve is skipped by the layer's candidate filter and refused by ``prepare_weights`` /
     ``prepare_activations`` and by the runner with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming
     the served pairs. The kernel classes keep their registry names (``fingerprint("fused_moe_nvfp4", ...)``,
-    ``fingerprint("fused_moe_mxfp4", ...)``); the weight view carries its pair, and a pack prepared for one pair is refused by a
-    layer configured for the other.
+    ``fingerprint("fused_moe_mxfp4", ...)``, ``fingerprint("fused_moe_mxfp4w8a", ...)``); the weight view carries its pair,
+    and a pack prepared for one pair is refused by a layer configured for another.
 
     The guarantee, the routing input modes and the error contract are the bf16 backend's (:class:`BatchInvariantBf16Config`):
     a token's output bits depend on its own row, its ``top_k`` experts and routing weights and the expert weights only; the
@@ -3766,7 +3771,9 @@ class BatchInvariantFp4Config:
     division, the part's SFU primitives (``ex2.approx.ftz`` / ``rcp.approx.ftz``, measured into tables the tests pin per
     part), so the output is deterministic and batch-invariant within a family and not, in general, equal across families
     (``flashinfer/batch_invariant/README.md``: the hardware hypothesis and the pinned digests); the ReLU family and PowLU
-    have no SFU step and are the declared sequences.
+    have no SFU step and are the declared sequences, as is the whole chain of the MXFP4 x MXFP8 pair (its exponential and
+    divisions are the correctly rounded sequences of the bf16 classes, so its bits are a property of the instruction class
+    alone).
 
     Weights (NVFP4 x NVFP4): ``prepare_weights`` takes the canonical bf16 ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or
     ``[E, I, H]`` for the ungated activations, and ``w2 [E, H, I]``, and quantizes every expert with the mode's per-tensor
@@ -3797,6 +3804,20 @@ class BatchInvariantFp4Config:
     ``mxfp4_quantize(..., batch_invariant=True)`` or the linear ``[num_tokens, H / 32]`` layout) and no ``per_token_scale``
     (``QuantConfig(per_token_scale=True)`` is refused for this pair). ``intermediate`` and ``intermediate_scales`` are the NVFP4
     pair's and are refused for MXFP4.
+
+    MXFP4 x MXFP8 (the proofs are the ``MoEMxfp4w8a`` Lean module): the expert weights MXFP4 by the mode's MXFP4 quantizer
+    (``mxfp4_quantize(..., batch_invariant=True)``, per expert at preparation), the activations MXFP8 by the mode's
+    ``mxfp8_quantize`` per token (``prepare_activations``, or any producer of the canonical MXFP8 pack); the two GEMMs are
+    grouped placements of the dense batch-invariant mixed GEMM class of the part (both operands' block scales are operands
+    of the mixed-format block-scaled step; the SM107 instruction folds 64 elements per step, the SM100 / SM103 one 32 and
+    reads the e2m1 weight through the TMA's unpacking format: the architecture is a dimension of the class, as for
+    ``mm_mxfp8_mxfp4``), the activation chain is the bf16 classes' exact sequence on the dequantised fp32 accumulators, the intermediate
+    is quantized by the MXFP8 quantizer class inside GEMM1's epilogue, the combine is the slot-order fp32 fold. Weights:
+    the canonical bf16 ``w1`` / ``w2`` on a CUDA device, ``hidden_size`` and ``intermediate_size`` multiples of 32 on SM107
+    and of 128 on SM100 / SM103 (the unpacking format's 128-element runs). Activations: the canonical MXFP8 pack, e4m3
+    ``[num_tokens, H]`` with token-major UE8M0 scales ``[num_tokens, H / 32]`` (the pack ``TrtllmFp4Config`` prepares for
+    this pair, ``TrtllmFp8BlockConfig`` and ``CutlassMxfp8Config`` for theirs); no ``per_token_scale``; ``intermediate``
+    and ``intermediate_scales`` are refused as for MXFP4 x MXFP4.
     """
 
     intermediate: str = "per_token"
@@ -3832,8 +3853,9 @@ class BatchInvariantFp4Config:
         ``SwiGLU()``). NVFP4 x NVFP4: every expert quantized to NVFP4 with its own per-tensor global scale (the gate / up
         rows interleaved first for a gated activation), the 128x4 swizzled block scales and the alphas
         (``1 / global scale``); ``intermediate`` / ``intermediate_scales`` select the static-intermediate class and its
-        per-expert scales (see the class docstring). MXFP4 x MXFP4: every expert quantized to MXFP4 (one UE8M0 scale per 32
-        elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of this pair. A supplied
+        per-expert scales (see the class docstring). MXFP4 x MXFP4 and MXFP4 x MXFP8: every expert quantized to MXFP4 (one
+        UE8M0 scale per 32 elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of
+        these pairs. A supplied
         ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must agree with the weights' geometry, and
         ``intermediate_scales`` need ``intermediate="static"``: a contradiction is refused with the mode's error before any
         view is built. The experts are quantized one at a time into the preallocated pack on ``device`` (the weights' by
@@ -3842,7 +3864,7 @@ class BatchInvariantFp4Config:
         bf16 or fp32 copy of the experts)."""
         from ..batch_invariant.support import unsupported
         from .batch_invariant.api_fp4 import MoEWeightsFp4
-        from .batch_invariant.runner_fp4 import PAIRS
+        from .batch_invariant.runner_fp4 import MIXED_PAIR, PAIRS
         from .batch_invariant.spec import activation_of
 
         pair = _fp4_pair(quant)
@@ -3851,6 +3873,10 @@ class BatchInvariantFp4Config:
             raise TypeError(
                 "BatchInvariantFp4Config.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
             )
+        if pair == MIXED_PAIR:
+            from .batch_invariant.spec_mxfp4w8a import CLASS as cls
+        else:
+            cls = PAIRS[pair].cls
         E, N1, H = w1.shape
         for name, given, actual in (
             ("num_local_experts", num_local_experts, E),
@@ -3859,17 +3885,35 @@ class BatchInvariantFp4Config:
         ):
             if given is not None and int(given) != actual:
                 raise unsupported(
-                    PAIRS[pair].cls,
+                    cls,
                     f"{name} {given} with weights of {name} {actual} (w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}, "
                     f"{'gated' if chain.gated else 'ungated'} activation)",
                     "dimensions that agree with the weights' geometry (or none)",
                 )
         if intermediate_scales is not None and intermediate != "static":
             raise unsupported(
-                PAIRS[pair].cls,
+                cls,
                 f"intermediate_scales with intermediate={intermediate!r}",
                 "intermediate scales with intermediate='static' alone (the per-token class derives its scales from the rows)",
             )
+        if pair == MIXED_PAIR:
+            from .batch_invariant.api_mxfp4w8a import MoEWeightsMXFP4W8A
+
+            if intermediate != "per_token":
+                raise unsupported(
+                    cls,
+                    f"intermediate={intermediate!r}",
+                    "the intermediate quantized per 32-element block by the class itself (the static class is the NVFP4 pair's)",
+                )
+            w1 = w1.to(device=device) if device is not None else w1
+            w2 = w2.to(device=device) if device is not None else w2
+            return MoEWeightsMXFP4W8A.prepare(
+                w1.to(torch.bfloat16),
+                w2.to(torch.bfloat16),
+                gated=chain.gated,
+                act=chain.act,
+                params=chain.params,
+            ).view()
         # the move to the device and the cast to bf16 are per expert inside the preparation (no full-size copy here)
         return MoEWeightsFp4.prepare(
             PAIRS[pair],
@@ -3889,14 +3933,21 @@ class BatchInvariantFp4Config:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """The activation pack of the pair ``quant`` selects, the pair's own form
         (:meth:`~flashinfer.fused_moe.batch_invariant.api_fp4.Fp4Pair.prepare_activations`): ``quant`` defaults to the
-        NVFP4 x NVFP4 pair (``None``), and the MXFP4 x MXFP4 pair must be named (``QuantConfig(weight=QuantFormat.MXFP4,
-        activation=QuantFormat.MXFP4)``). Both served pairs: bf16
+        NVFP4 x NVFP4 pair (``None``), and the MXFP4 x MXFP4 and MXFP4 x MXFP8 pairs must be named. The fp4 pairs: bf16
         activations as given (no scale): the class's quantization (per token for NVFP4, per 32-element block for MXFP4) is
-        part of the op."""
-        from .batch_invariant.runner_fp4 import PAIRS
+        part of the op. MXFP4 x MXFP8: the canonical MXFP8 pack by the batch-invariant quantizer, e4m3 ``[T, H]`` and the
+        token-major UE8M0 scales ``[T, H / 32]`` (uint8)."""
+        from .batch_invariant.runner_fp4 import MIXED_PAIR, PAIRS
 
+        pair = _fp4_pair(quant)
+        if pair == MIXED_PAIR:
+            from .batch_invariant.api_mxfp4w8a import quantize_activations_mxfp8
+
+            return quantize_activations_mxfp8(
+                hidden_states.to(torch.bfloat16).contiguous()
+            )
         # the served pairs' table drives the form: an unserved pair was refused by _fp4_pair, a served one names its form
-        return PAIRS[_fp4_pair(quant)].prepare_activations(hidden_states)
+        return PAIRS[pair].prepare_activations(hidden_states)
 
     def __repr__(self) -> str:
         return (

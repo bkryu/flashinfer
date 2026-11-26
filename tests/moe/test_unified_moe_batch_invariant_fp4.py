@@ -41,6 +41,7 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe.api import ALL_BACKEND_CONFIGS, _DEFAULT_BACKEND
 from flashinfer.fused_moe.batch_invariant.api_fp4 import MXFP4, NVFP4, MoEWeightsFp4
 from flashinfer.fused_moe.batch_invariant.runner_fp4 import (
+    MIXED_PAIR,
     MOE_FP4_ARCHS,
     PAIRS,
     BatchInvariantFp4Runner,
@@ -228,8 +229,9 @@ def _unswizzle(pair, sf_flat, M, K):
 
 def test_backend_is_registered_and_never_a_default_candidate():
     """The fp4 config is a known backend of the layer, mapped to the fp4 runner, absent from the default candidates; the
-    runner serves the two pairs under one key (NVFP4 x NVFP4 with the per-tensor alphas and the per-token scale, MXFP4 x MXFP4
-    with the block scales alone), the three routing modes and every activation class of the layer for either pair."""
+    runner serves the two fp4 pairs under one key (NVFP4 x NVFP4 with the per-tensor alphas and the per-token scale, MXFP4 x
+    MXFP4 with the block scales alone) and the mixed MXFP4 x MXFP8 pair through its own runner, the three routing modes and
+    every activation class of the layer for every pair."""
     assert BatchInvariantFp4Config in ALL_BACKEND_CONFIGS
     assert _BACKEND_RUNNERS[BatchInvariantFp4Config] is BatchInvariantFp4Runner
     assert not any(
@@ -241,7 +243,12 @@ def test_backend_is_registered_and_never_a_default_candidate():
         if BatchInvariantFp4Config.supported(a)
     ] == [100, 103, 107]
     assert KEY == "batch_invariant_fp4" == BatchInvariantFp4Runner.backend_key
-    assert BatchInvariantFp4Runner.supported_quant_variants == (_NVFP4.pair, _MX.pair)
+    # the pairs served: the two of this suite's bodies and the mixed MXFP4 x MXFP8 pair (its own runner and suite)
+    assert BatchInvariantFp4Runner.supported_quant_variants == (
+        _NVFP4.pair,
+        _MX.pair,
+        MIXED_PAIR,
+    )
     assert {_NVFP4.pair: NVFP4, _MX.pair: MXFP4} == PAIRS
     assert NVFP4.scaled and not MXFP4.scaled and (NVFP4.block, MXFP4.block) == (16, 32)
     for q in (_NVFP4, _MX):
@@ -264,21 +271,21 @@ def test_backend_is_registered_and_never_a_default_candidate():
 def test_unserved_quant_pair_is_refused_and_names_the_served_pairs():
     """A quantization pair the fp4 backend does not serve: the layer's candidate filter skips the runner
     (``supports_quant``), and ``prepare_weights`` / ``prepare_activations`` / the runner's ``check_support`` raise the
-    mode's error naming the served pairs (no other pair, no sequencing note); both served pairs take bf16 rows as given."""
+    mode's error naming the served pairs (no other pair, no sequencing note); the fp4 pairs take bf16 rows as given."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
-    mixed = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
-    assert not BatchInvariantFp4Runner.supports_quant(mixed)
+    w4a16 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
+    assert not BatchInvariantFp4Runner.supports_quant(w4a16)
     assert not BatchInvariantFp4Runner.supports_quant(QuantConfig())
     w1 = torch.zeros(2, 64, 64, dtype=torch.bfloat16)
     w2 = torch.zeros(2, 64, 32, dtype=torch.bfloat16)
     for call in (
-        lambda: BatchInvariantFp4Config.prepare_weights(w1, w2, quant=mixed),
-        lambda: BatchInvariantFp4Config.prepare_activations(w1[0], quant=mixed),
+        lambda: BatchInvariantFp4Config.prepare_weights(w1, w2, quant=w4a16),
+        lambda: BatchInvariantFp4Config.prepare_activations(w1[0], quant=w4a16),
         lambda: BatchInvariantFp4Runner(
             MoEConfig(
                 routing=RoutingConfig(num_experts=2, top_k=1),
-                quant=mixed,
+                quant=w4a16,
                 experts=ExpertConfig(intermediate_size=32),
                 backend=BackendOptions((BatchInvariantFp4Config(),)),
             ),
@@ -288,10 +295,11 @@ def test_unserved_quant_pair_is_refused_and_names_the_served_pairs():
         with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
             call()
         msg = str(excinfo.value)
-        assert "weight=MXFP4, activation=MXFP8" in msg
+        assert "weight=MXFP4, activation=BF16" in msg
         assert "NVFP4 x NVFP4" in msg and "MXFP4 x MXFP4" in msg
-        assert "and no other pair" in msg and KEY in msg and "PR" not in msg
-    # the default pair is NVFP4 x NVFP4; either pair takes the bf16 rows as given, no scale
+        assert "MXFP4 x MXFP8" in msg and "and no other pair" in msg
+        assert KEY in msg and "PR" not in msg
+    # the default pair is NVFP4 x NVFP4; either fp4 pair takes the bf16 rows as given, no scale
     x, sf = BatchInvariantFp4Config.prepare_activations(w1[0].float())
     assert x.dtype == torch.bfloat16 and sf is None
     x, sf = BatchInvariantFp4Config.prepare_activations(torch.zeros(2, 64), quant=_MX)
@@ -4078,9 +4086,9 @@ def test_shard_refusal_names_the_configured_pairs_class(pair):
     msg = str(e.value)
     assert pair.cls in msg and "expert-parallel" in msg
     assert ("moe.mxfp4" if pair.scaled else "moe.nvfp4") not in msg
-    mixed = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    w4a16 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
     with pytest.raises(bi.BatchInvariantUnsupportedError) as e:
-        _runner(mixed, local_expert_offset=4, local_num_experts=4).check_support()
+        _runner(w4a16, local_expert_offset=4, local_num_experts=4).check_support()
     assert "does not serve" in str(e.value) and "expert-parallel" not in str(e.value)
 
 

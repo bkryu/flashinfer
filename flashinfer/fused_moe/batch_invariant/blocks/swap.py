@@ -259,6 +259,13 @@ class SwappedGroupedGemm:
             "the gather record is the block-scaled classes'",
             knobs,
         )
+        # the block-scaled gather form reads the token rows of the one-format classes (the fp4 pairs' 4-bit rows, the MXFP8
+        # classes' 8-bit rows); the mixed operand block's 8-bit tokens against its 4-bit weights take the box form
+        assert not gather or not self.operands.mixed, (
+            "the block-scaled gather form is the one-format classes'; the mixed classes read the token box",
+            knobs,
+            self.in_fmt,
+        )
         assert sf_src in ("128x4", "linear"), sf_src
         self.knobs, self.chain, self.gather, self.sf_src = knobs, chain, gather, sf_src
         self.token_tile, self.weight_tile = knobs.tile_n, knobs.tile_m
@@ -665,7 +672,7 @@ class SwappedGroupedGemm:
         dest=None,
     ):
         ops = self.operands
-        if cutlass.const_expr(rows.element_type != w.element_type):
+        if cutlass.const_expr(not ops.mixed and rows.element_type != w.element_type):
             raise TypeError(
                 f"rows and w must have one type: {rows.element_type} != {w.element_type}"
             )
@@ -674,10 +681,10 @@ class SwappedGroupedGemm:
         sfw_t = None
         self.xch_layout = self.chain.smem_layout(1, token_tile=self.token_tile)
         if cutlass.const_expr(ops.block_scaled):
-            rows = ops.view_elems(
+            rows = ops.view_tokens(
                 rows
             )  # (R, K, 1): the dense token rows, the MMA's B operand
-            w = ops.view_elems(w)  # (N, K, E): the MMA's A operand (M = N, K, L = E)
+            w = ops.view_weights(w)  # (N, K, E): the MMA's A operand (M = N, K, L = E)
             sfw_t = ops.sf_view_experts(sfw, w.shape[0], w.shape[1], w.shape[2])
             # the block-scaled plan takes the swapped record itself (its knob rule admits the narrow token tiles with the
             # swapped flag); the A ring (the weights) ends inside the sm_100 instructions' descriptor window; the stage holds
@@ -717,8 +724,16 @@ class SwappedGroupedGemm:
             st.a_smem_layout_staged,
             mode=list(range(cute.rank(st.a_smem_layout_staged) - 1)),
         )
+        # `internal_type`: the TMA's unpacking format of a sub-byte weight into the 8-bit smem container (the mixed sm_100
+        # class's e2m1 weight on the twin plan's A side); None for the one-format plans and the dense formats
         atom_w, tensor_w = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op, w, a_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
+            a_op,
+            w,
+            a_one,
+            st.mma_tiler,
+            st.tiled_mma,
+            st.cluster_layout_vmnk.shape,
+            internal_type=getattr(st, "A_TMA_INTERNAL", None),
         )
         b_one = cute.select(
             st.b_smem_layout_staged,
@@ -786,6 +801,7 @@ class SwappedGroupedGemm:
                 st.mma_tiler,
                 st.tiled_mma,
                 st.cluster_layout_vmnk.shape,
+                internal_type=getattr(st, "B_TMA_INTERNAL", None),
             )
             m_src = counts  # unread
         self.num_tma_load_bytes = (
@@ -1120,14 +1136,16 @@ class SwappedGroupedGemm:
                 )  # dense offsets; the "m-block" is the token tile
         pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
 
+        # the operand rings at the plan's container types (the mixed sm_100 class's e2m1 weight occupies a byte per element)
+        a_smem_dtype, b_smem_dtype = ops.smem_dtypes(st)
         sW = smem.allocate_tensor(
-            element_type=st.a_dtype,
+            element_type=a_smem_dtype,
             layout=a_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
         )
         sTok = smem.allocate_tensor(
-            element_type=st.b_dtype,
+            element_type=b_smem_dtype,
             layout=b_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=b_smem_layout_staged.inner,
