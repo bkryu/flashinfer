@@ -2919,3 +2919,37 @@ def test_runner_support_state_is_initialised_at_construction():
         assert r._method is not None and r._logits_refusal is None
         r.build()
         assert r._part is not None and r._in_fmt is not None
+
+
+def test_fingerprint_refuses_the_shapes_the_layer_refuses():
+    """``fingerprint("fused_moe_mxfp8", ...)`` applies the class's complete shape rule after the alignment check: an expert
+    weight shape the dense class would K-split (the layer refuses it) has no fingerprint, on either family; the bounds on
+    ``E`` and ``top_k`` keep their errors; the group dimensions of the DeepSeekV3 term are dimensions of the receipt; the
+    runners' Llama4 top-1 rule applies; the model shape keeps its receipt."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import check_shape_mxfp8
+
+    op = "fused_moe_mxfp8"
+    for H, I, k, E in ((65536, 32, 1, 1), (8192, 64, 1, 4)):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="one chunk"):
+            check_shape_mxfp8(H, I, E, k)
+        for arch in ("sm_100", "sm_107"):
+            with pytest.raises(
+                bi.BatchInvariantUnsupportedError, match="one chunk"
+            ) as e:
+                bi.fingerprint(op, H=H, I=I, top_k=k, num_experts=E, arch=arch)
+            assert "moe.mxfp8" in str(e.value)
+    with pytest.raises(ValueError, match="top_k"):
+        bi.fingerprint(op, H=2048, I=768, top_k=17, num_experts=128, arch="sm_107")
+    with pytest.raises(ValueError, match="num_experts"):
+        bi.fingerprint(op, H=2048, I=768, top_k=1, num_experts=1025, arch="sm_107")
+    with pytest.raises(ValueError, match="multiple of 32"):
+        bi.fingerprint(op, H=2064, I=768, top_k=8, num_experts=128, arch="sm_107")
+    base = dict(H=2048, I=768, top_k=8, num_experts=128, arch="sm_107")
+    assert bi.fingerprint(op, **base) == "moe-09e3cd790ad7fc25"
+    grouped = bi.fingerprint(op, method="DeepSeekV3", n_group=8, topk_group=4, **base)
+    assert grouped != bi.fingerprint(op, method="DeepSeekV3", **base)
+    with pytest.raises(ValueError, match="DeepSeekV3"):
+        bi.fingerprint(op, method="Renormalize", n_group=8, topk_group=4, **base)
+    for method in ("Llama4", RoutingMethodType.Llama4):
+        with pytest.raises(ValueError, match="Llama4 routing takes top_k = 1"):
+            bi.fingerprint(op, method=method, **dict(base, top_k=2))

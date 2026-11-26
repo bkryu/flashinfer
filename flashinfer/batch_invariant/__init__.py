@@ -520,9 +520,10 @@ def _moe_mxfp8_fingerprint(
 ) -> str:
     """The MXFP8 x MXFP8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8BlockConfig`` under
     ``QuantConfig(MXFP8, MXFP8)``: the dimensions of :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s
-    groups, the activation with its scalars and gating) plus the architecture (the instruction class of the dense MXFP8
-    GEMM: the SM107 step folds 64 elements, the SM100 / SM103 one 32; ``arch`` as for ``mm_mxfp8``, the current device by
-    default)."""
+    groups, the activation with its scalars and gating) under the class's complete shape rule (the layer's: a shape the
+    runner refuses has no receipt) plus the architecture (the instruction class of the dense MXFP8 GEMM: the SM107 step
+    folds 64 elements, the SM100 / SM103 one 32; ``arch`` as for ``mm_mxfp8``, the current device by default)."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import check_shape_mxfp8
     from flashinfer.fused_moe.batch_invariant.spec_mxfp8 import (
         BLOCK,
         spec_fingerprint_mxfp8,
@@ -547,6 +548,7 @@ def _moe_mxfp8_fingerprint(
         n_group,
         topk_group,
     )
+    check_shape_mxfp8(H, I, num_experts, top_k)
     fmt = mx_class_for("mxfp8", _mx_family(arch, "fused_moe_mxfp8"))
     return spec_fingerprint_mxfp8(
         H, I, top_k, num_experts, rm, name, params, gated, fmt
@@ -870,7 +872,7 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.mxfp8",
         ("H", "I", "top_k", "num_experts"),
         _moe_mxfp8_fingerprint,
-        ("method", "act", "params", "gated", "arch"),
+        ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
     ),
     # the MXFP4 x MXFP4 pair of the same backend (UE8M0 block scales on both operands: no global or per-token scale, no
     # static-intermediate class)
