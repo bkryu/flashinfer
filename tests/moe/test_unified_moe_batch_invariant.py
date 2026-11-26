@@ -3298,3 +3298,46 @@ def test_f32_prerouted_weights_round_in_the_combine_kernel():
     a = fused_moe(x, ids.cuda(), weights.cuda(), Wm, w_round=True)
     b = fused_moe(x, ids.cuda(), w16.float().cuda(), Wm)
     assert torch.equal(bits(a), bits(b))
+
+
+def test_pick_memos_follow_the_rankings():
+    """The runners' memoised picks and every MoE ranking memo follow the dispatcher's rank cache: a clear of the rankings (a
+    device's registered numbers, ``rank.cache_clear()``) bumps the pick generation and empties the ranking memos of every
+    class dispatcher."""
+    import importlib
+
+    from flashinfer.fused_moe.batch_invariant import runner as R
+    from flashinfer.fused_moe.batch_invariant import schedule as S_
+    from flashinfer.gemm.batch_invariant import heuristic as H
+
+    g = R.pick_generation()
+    S_.rank_grouped(7, 1536, 2048, 128, "swiglu", 212, "sm_107", 3, n_active=56)
+    assert S_._rank_grouped.cache_info().currsize >= 1
+    H.rank.cache_clear()
+    assert R.pick_generation() == g + 1
+    assert S_._rank_grouped.cache_info().currsize == 0
+    for mod, fn in (
+        ("schedule_fp4", "_rank_grouped_fp4"),
+        ("schedule_fp8bs", "_rank_grouped_fp8bs"),
+        ("schedule_mxfp8", "_rank_grouped_mx"),
+        ("schedule_mxfp4w8a", "_rank_grouped_mx"),
+    ):
+        m = importlib.import_module(f"flashinfer.fused_moe.batch_invariant.{mod}")
+        assert getattr(m, fn).cache_clear in H._RANK_DEPENDENT_CACHES, mod
+
+
+def test_lazy_names_resolve_once_and_keep_the_light_import():
+    """``LazyNames`` binds every name of its loader at the first access and serves attributes afterwards; the loaders of
+    the runners name the kernel modules, which the package's import leaves unloaded until a kernel is first needed."""
+    from flashinfer.batch_invariant.support import LazyNames
+
+    loads = []
+
+    def load():
+        loads.append(1)
+        return dict(a=1, b=2)
+
+    names = LazyNames(load)
+    assert names.b == 2 and names.a == 1 and loads == [1]
+    assert "a" in vars(names) and "b" in vars(names)
+    assert not hasattr(names, "c")
