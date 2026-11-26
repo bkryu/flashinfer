@@ -5292,3 +5292,145 @@ def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which, monke
     torch.cuda.synchronize()
     assert torch.equal(bits(out), ref)
     assert torch.equal(bits(warm_layer(act, W)), ref)
+
+
+def _fills(fn) -> int:
+    """The fill launches among the CUDA kernels of ``fn()`` (the profiler's view): a zero-fill or a host copy a form takes."""
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    names = [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    return sum(1 for n in names if "Fill" in n or "fill" in n or "Memcpy" in n)
+
+
+def _capture(layer, act, W):
+    """The layer's forward captured in a CUDA graph on a side stream after one warm call there: ``(graph, out)``."""
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        layer(act, W)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        out = layer(act, W)
+    torch.cuda.synchronize()
+    return g, out
+
+
+@needs_device
+@all_pairs
+def test_layer_forward_captured_in_every_dispatcher_form(pair):
+    """The whole layer forward under CUDA-graph capture, from logits and pre-routed, at a decode and a mid token count: every
+    form the dispatcher picks there (the fp4 pairs: the swapped decode records with the gather form where the pair's input
+    scatters in a launch of its own, the grouped records at mid; the mixed pair: the dense packing of the swapped records at
+    decode, the padded packing of the grouped records at mid, the fused requantization on both) captures (no host sync, no
+    host-side read), replays the eager bits, two replays agree, and the replay's fill launches are the eager call's (the
+    constants host-built outside the capture: no fill of a constant, no host copy inside the graph; the forms' own
+    zero-fills are counted and pinned)."""
+    from flashinfer.fused_moe.batch_invariant.schedule_fp4 import gather_form_rule
+
+    k, H, I, E = 4, 256, 128, 16
+    quant = _QUANT[pair]
+    layer = _layer(k, E, I, quant=quant)
+    W = None
+    forms = set()
+    for name, T, seed in (("decode", 4, 31), ("mid", 200, 32)):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed)
+        if W is None:
+            W = _weights(w1, w2, quant=quant)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        runner = layer.runners[0]
+        for mode, act in (
+            ("logits", _lp(pair, x, logits)),
+            ("routed", _rp(pair, x, ids.cuda(), wts.cuda())),
+        ):
+            ref = bits(layer(act, W))
+            inputs = runner.pack_inputs(act, W)
+            xq, sf = inputs[0], inputs[1]
+            if pair.mixed:
+                r1, r2 = runner._ranked(T, H)
+                form = runner._packing(T, H) + ("+swapped" if r1[0].swap_ab else "")
+            else:
+                gf = runner._gather_form(xq, sf)
+                r1, r2 = runner._ranked(T, H, gf)
+                c1 = gather_form_rule(r1[0], gf)
+                form = ("gather" if c1.gather_a else "box") + (
+                    "+swapped" if c1.swap_ab else ""
+                )
+            forms.add((name, form))
+            eager_fills = _fills(lambda: layer(act, W))
+            g, out = _capture(layer, act, W)
+            nan = float("nan")
+            for _ in range(2):
+                out.fill_(nan)
+                g.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(bits(out), ref), (pair.name, name, mode, form)
+            assert _fills(g.replay) == eager_fills, (pair.name, name, mode, form)
+            assert torch.equal(bits(layer(act, W)), ref)
+    # the forms the dispatcher picks at these shapes: the decode records swapped, the mid records grouped
+    assert any(n == "decode" and "swapped" in f for n, f in forms), forms
+    assert any(n == "mid" and "swapped" not in f for n, f in forms), forms
+    if pair.mixed:
+        assert ("decode", "dense+swapped") in forms and ("mid", "padded") in forms, (
+            forms
+        )
+
+
+@needs_device
+@all_pairs
+def test_tuned_tactic_captured_in_a_graph_replays_while_another_form_runs_eagerly(pair):
+    """A layer autotuned at a decode token count (``reset_winner`` first), its forward captured in a CUDA graph with the tuned
+    tactic: the same layer then serves another form eagerly -- the fp4 pairs a pre-quantized pack of the other scale layout
+    (the tuned gather winner replayed in its box form), the mixed pair a token count whose first picks run the other packing
+    -- and the graph replays unchanged (the tuned records, the eager bits) before, between and after those calls."""
+    from flashinfer.autotuner import autotune
+
+    k, H, I, E = 4, 256, 128, 16
+    quant = _QUANT[pair]
+    layer = _layer(k, E, I, quant=quant, tune_max=256)
+    T = 4
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=41)
+    W = _weights(w1, w2, quant=quant)
+    act = _lp(pair, x, logits)
+    layer.reset_winner()
+    with autotune(True):
+        layer(act, W)
+    ref = bits(layer(act, W))
+    g, out = _capture(layer, act, W)
+    out.fill_(float("nan"))
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    if pair.mixed:
+        x2, logits2, _, _ = _problem(200, k, H, I, E, seed=42)
+        other = _lp(pair, x2, logits2)
+    else:
+        x4, sf, pts = _quantized(x, pair=pair)
+        rows = _unswizzle(
+            pair, sf, T, H
+        )  # the linear scale layout: the other pack form
+        other = MoEActivationPack(
+            x4, rows.contiguous(), routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=logits, per_token_scale=pts if pair.scaled else None,
+        )  # fmt: skip
+        if pair.scaled:
+            layer = _layer(k, E, I, quant=_NVFP4_PTS, tune_max=256)
+            layer.reset_winner()
+            with autotune(True):
+                layer(act, W)
+            assert torch.equal(bits(layer(act, W)), ref)
+            g, out = _capture(layer, act, W)
+    ref_other = bits(layer(other, W))
+    with autotune(True):
+        assert torch.equal(bits(layer(other, W)), ref_other)
+    for _ in range(2):
+        out.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref)
+        assert torch.equal(bits(layer(other, W)), ref_other)
+    assert torch.equal(bits(layer(act, W)), ref)

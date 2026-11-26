@@ -3788,3 +3788,125 @@ def test_in_kernel_plan_bounds_are_the_host_rule():
     r._part = (204, "sm_107")
     assert r._plan_in_kernel(PLAN_MAX_SLOTS // 8, 2048)
     assert not r._plan_in_kernel(PLAN_MAX_SLOTS // 8 + 1, 2048)
+
+
+def _fills(fn) -> int:
+    """The fill launches among the CUDA kernels of ``fn()`` (the profiler's view): a zero-fill or a host copy a form takes."""
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    names = [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    return sum(1 for n in names if "Fill" in n or "fill" in n or "Memcpy" in n)
+
+
+def _capture(layer, act, W):
+    """The layer's forward captured in a CUDA graph on a side stream after one warm call there: ``(graph, out)``."""
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        layer(act, W)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        out = layer(act, W)
+    torch.cuda.synchronize()
+    return g, out
+
+
+@needs_device
+def test_layer_forward_captured_in_every_dispatcher_form():
+    """The whole layer forward under CUDA-graph capture, from logits and pre-routed, in every form the dispatcher picks: the
+    decode form (the in-kernel plan of GEMM1's gather record), the gather form with the plan launch (the slots past the
+    in-kernel plan's bound), the box form of the swapped records (a hidden size whose scale rows are not whole 4-byte
+    groups, with the fused requantization's one conditional zero-fill of its pad columns) and the grouped records on the
+    padded packing at a mid token count. Each captures (no host sync, no host-side read), replays the eager bits, two replays
+    agree, and the replay's fill launches are the eager call's and the form's own (the constants host-built outside the
+    capture: no fill of a constant, no host copy inside the graph)."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import gather_form_rule
+
+    seen = {}
+    for name, T, k, H, I, E, fills in (
+        ("decode", 4, 4, 256, 128, 16, 0),
+        ("gather", 40, 4, 256, 128, 256, 0),
+        ("box", 4, 4, 160, 96, 16, 1),
+        ("grouped", 200, 4, 256, 128, 16, 0),
+    ):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=50 + T)
+        xq, xsf = _quant(x)
+        layer, W = _layer(k, E, I), _weights(w1, w2)
+        runner = layer.runners[0]
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        for mode, act in (
+            ("logits", _logits_pack((xq, xsf), logits)),
+            ("routed", _routed_pack((xq, xsf), ids.cuda(), wts.cuda())),
+        ):
+            ref = bits(layer(act, W))
+            r1, r2 = runner._ranked(T, H)
+            path = runner._packing(T, H)
+            if runner._plan_in_kernel(T, H):
+                form = "decode"
+            elif (
+                path == "dense"
+                and gather_form_rule(r1[0], rows_per_expert(T, k, E)).gather_a
+                and F.gather_form_ok(H)
+            ):
+                form = "gather"
+            elif path == "dense":
+                form = "box"
+            else:
+                form = "grouped"
+            assert form == name, (name, mode, form, r1[0].describe(), r2[0].describe())
+            seen[(name, mode)] = form
+            eager_fills = _fills(lambda: layer(act, W))
+            assert eager_fills == fills, (name, mode, eager_fills)
+            g, out = _capture(layer, act, W)
+            nan = float("nan")
+            for _ in range(2):
+                out.fill_(nan)
+                g.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(bits(out), ref), (name, mode)
+            assert _fills(g.replay) == fills, (name, mode)
+            assert torch.equal(bits(layer(act, W)), ref)
+    assert len(seen) == 8
+
+
+@needs_device
+def test_tuned_tactic_captured_in_a_graph_replays_while_the_other_packing_runs_eagerly():
+    """A layer autotuned at a decode token count (``reset_winner`` first), its forward captured in a CUDA graph with the tuned
+    tactic: the same layer then serves a token count whose first picks run the other packing eagerly (autotuned there too),
+    and the graph replays unchanged (the tuned records, the eager bits) before, between and after those calls."""
+    from flashinfer.autotuner import autotune
+
+    k, H, I, E = 4, 256, 128, 16
+    layer = _layer(k, E, I, tune_max=256)
+    x, logits, w1, w2 = _problem(4, k, H, I, E, seed=61)
+    W = _weights(w1, w2)
+    act = _logits_pack(_quant(x), logits)
+    layer.reset_winner()
+    with autotune(True):
+        layer(act, W)
+    ref = bits(layer(act, W))
+    g, out = _capture(layer, act, W)
+    out.fill_(float("nan"))
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    x2, logits2, _, _ = _problem(200, k, H, I, E, seed=62)
+    other = _logits_pack(_quant(x2), logits2)
+    assert layer.runners[0]._packing(4, H) != layer.runners[0]._packing(200, H)
+    ref_other = bits(layer(other, W))
+    with autotune(True):
+        assert torch.equal(bits(layer(other, W)), ref_other)
+    for _ in range(2):
+        out.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref)
+        assert torch.equal(bits(layer(other, W)), ref_other)
+    assert torch.equal(bits(layer(act, W)), ref)
