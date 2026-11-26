@@ -36,9 +36,11 @@ from .spec_fp8bs import CLASS, CLASS_OF
 def _load_names() -> Dict[str, Any]:
     from .api_fp8bs import (
         MoEWeightsE4M3BS,
+        _fused_moe_fp8bs_run,
+        _gather_form,
+        _quantize_rows,
         check_aligned,
         check_shape_fp8bs,
-        fused_moe_fp8bs,
         scale_mn_view,
     )
     from .blocks.epilogue_fp8bs import GEMM2_CHAIN
@@ -49,7 +51,9 @@ def _load_names() -> Dict[str, Any]:
         MoEWeightsE4M3BS=MoEWeightsE4M3BS,
         check_aligned=check_aligned,
         check_shape_fp8bs=check_shape_fp8bs,
-        fused_moe_fp8bs=fused_moe_fp8bs,
+        fused_moe_fp8bs_run=_fused_moe_fp8bs_run,
+        gather_form=_gather_form,
+        quantize_rows=_quantize_rows,
         scale_mn_view=scale_mn_view,
         GEMM2_CHAIN=GEMM2_CHAIN,
         TOP_K=TOP_K,
@@ -325,12 +329,19 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
+        """The op on the validated pack: the bf16 rows quantized by the class first (with the plan in one launch when the
+        plan is the op's), then the launch with the records and the requantization spelling of the pick or the tactic."""
         xq, sx = x
+        T, H = xq.shape
+        if T == 0:
+            return out  # the empty output: no plan, no quantizer, no record
         if xq.dtype == torch.bfloat16:
-            sx = None  # the bf16 rows: quantized by the op (with the plan in one launch when the plan is the op's)
-        _names.fused_moe_fp8bs(
-            xq, sx, ids, wts, w, out=out, config1=c1, config2=c2, fuse_quant=self._fused, plan=plan,
-            w_round=getattr(inputs, "w_round", False),
+            xq, sx, plan = _names.quantize_rows(xq, ids, w, plan)
+        fused = self._fused
+        _names.fused_moe_fp8bs_run(
+            xq, sx, ids, wts, w, out, c1, c2, fused, _names.gather_form(c1, fused),
+            T, H, ids.shape[1], w.num_experts, w.intermediate_size,
+            plan=plan, w_round=getattr(inputs, "w_round", False),
         )  # fmt: skip
         return out
 

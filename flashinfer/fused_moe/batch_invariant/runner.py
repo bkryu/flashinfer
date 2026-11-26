@@ -69,7 +69,7 @@ _X, _IDS, _W, _W1, _W2, _OUT = range(6)
 
 
 def _load_api() -> Dict[str, Any]:
-    from .api import MoEWeights, fused_moe, route, route_plan
+    from .api import MoEWeights, _fused_moe_run, route, route_plan
     from .blocks.epilogue import GroupedChain
     from .blocks.scheduler import MAX_E
     from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
@@ -77,7 +77,7 @@ def _load_api() -> Dict[str, Any]:
 
     return dict(
         MoEWeights=MoEWeights,
-        fused_moe=fused_moe,
+        fused_moe_run=_fused_moe_run,
         route=route,
         route_plan=route_plan,
         GroupedChain=GroupedChain,
@@ -648,23 +648,24 @@ class BatchInvariantMoeRunnerBase(MoERunner):
     # ---- launch ----------------------------------------------------------------------------------------------------
     def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
         """The fused op on the packed inputs with the records ``c1`` / ``c2``; the layer's output (or its unfinalized
-        triple)."""
-        fused_moe = _api.fused_moe
+        triple). The pack validated every operand, so the op's launch runs on them directly (one validation per call)."""
+        T, H = x.shape
+        k, E, I = ids.shape[1], w.num_experts, w.intermediate_size
         if not self.config.finalize.do_finalize:
             # the layer's unfinalized triple: GEMM2's per-slot rows grouped by expert in expert order and, inside a group,
             # in token-slot order (rows past the valid ones -- a dropped slot's share -- are not written), the weights as the
             # combine would fold them (exactly widened to fp32 by the fold: the mode's dtype carries the same values) and the
             # row of every (token, slot) in the flat layout, -1 for a dropped slot; the class's slot-order fold over the
             # triple is the finalized output bit for bit (TRTLLM-Gen's rows are atomically placed and not reproducible)
-            _, im = fused_moe(
-                x, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan,
-                return_intermediates=True, finalize=False,
+            _, im = _api.fused_moe_run(
+                x, ids, wts, w, out, c1, c2, T, H, k, E, I,
+                plan=plan, return_intermediates=True, finalize=False,
             )  # fmt: skip
             weights_dtype = getattr(inputs, "weights_dtype", torch.float32)
             return [im["y"], wts.to(weights_dtype), im["dest"].reshape(-1)]
-        fused_moe(
-            x, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan,
-            w_round=getattr(inputs, "w_round", False),
+        _api.fused_moe_run(
+            x, ids, wts, w, out, c1, c2, T, H, k, E, I,
+            plan=plan, w_round=getattr(inputs, "w_round", False),
         )  # fmt: skip
         return out
 

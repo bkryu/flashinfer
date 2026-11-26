@@ -38,9 +38,10 @@ def _load_names() -> Dict[str, Any]:
     from .api_mxfp8 import (
         GROUP_ALIGN,
         MoEWeightsMXFP8,
+        _fused_moe_mxfp8_run,
+        _mx_forms,
         check_shape_mxfp8,
         decode_form_default,
-        fused_moe_mxfp8,
     )
     from .blocks.epilogue_mx import MxChain
     from .schedule import TOP_K
@@ -51,7 +52,8 @@ def _load_names() -> Dict[str, Any]:
         MoEWeightsMXFP8=MoEWeightsMXFP8,
         check_shape_mxfp8=check_shape_mxfp8,
         decode_form_default=decode_form_default,
-        fused_moe_mxfp8=fused_moe_mxfp8,
+        fused_moe_mxfp8_run=_fused_moe_mxfp8_run,
+        mx_forms=_mx_forms,
         MxChain=MxChain,
         TOP_K=TOP_K,
         GEMM2_CHAIN=GEMM2_CHAIN,
@@ -253,19 +255,26 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
+        """The op on the validated pack with the records of the pick or the tactic: the packing is the records' own (a
+        swapped record reads the dense packing, the padded body reads either); the layer keys a tuned winner by its token
+        bucket, so a tactic may replay at a token count whose first picks pack the other way -- the plan packed in the
+        first picks' form is kept where the records read it (the dual plan feeds both bodies) and dropped otherwise (the op
+        computes its own: the same integers, the same bits); GEMM1's form (the gather record, the in-kernel plan) follows
+        the op's rules at these records."""
         xq, xsf = x
-        # the packing is the records' own (a swapped record reads the dense packing, the padded body reads either): the
-        # layer keys a tuned winner by its token bucket, so a tactic may replay at a token count whose first picks pack
-        # the other way; the plan packed in the first picks' form is kept where the records read it (the dual plan feeds
-        # both bodies) and dropped otherwise (the op computes its own: the same integers, the same bits)
+        T, H = xq.shape
+        if T == 0:
+            return out  # no tokens: nothing to route, the (0, H) output as it stands
+        k, E, I = ids.shape[1], w.num_experts, w.intermediate_size
         path = _names.packing_for(c1, c2)
         if plan is not None:
             if len(plan) == 5:
                 path = "dense"
             elif path == "dense":
                 plan = None
-        _names.fused_moe_mxfp8(
-            (xq, xsf), ids, wts, w, out=out, config1=c1, config2=c2, in_fmt=self._in_fmt, plan=plan, path=path,
-            w_round=getattr(inputs, "w_round", False),
+        c1, in_kernel = _names.mx_forms(c1, c2, T, k, E, H, path, plan is not None)
+        _names.fused_moe_mxfp8_run(
+            xq, xsf, ids, wts, w, out, c1, c2, self._in_fmt or "mxfp8", path, "fused", in_kernel, T, H, k, E, I,
+            plan=plan, w_round=getattr(inputs, "w_round", False),
         )  # fmt: skip
         return out

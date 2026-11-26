@@ -31,13 +31,13 @@ CLASS = "moe.e4m3"
 
 
 def _load_names() -> Dict[str, Any]:
-    from .api_fp8 import MoEWeightsE4M3, fused_moe_fp8
+    from .api_fp8 import MoEWeightsE4M3, _fused_moe_fp8_run
     from .blocks.epilogue import GEMM2_CHAIN
     from .schedule_fp8 import gemm1_chain
 
     return dict(
         MoEWeightsE4M3=MoEWeightsE4M3,
-        fused_moe_fp8=fused_moe_fp8,
+        fused_moe_fp8_run=_fused_moe_fp8_run,
         GEMM2_CHAIN=GEMM2_CHAIN,
         gemm1_chain=gemm1_chain,
     )
@@ -117,8 +117,9 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunnerBase):
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
-        _names.fused_moe_fp8(
-            x, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan,
-            w_round=getattr(inputs, "w_round", False),
+        T, H = x.shape
+        _names.fused_moe_fp8_run(
+            x, ids, wts, w, out, c1, c2, T, H, ids.shape[1], w.num_experts, w.intermediate_size,
+            plan=plan, w_round=getattr(inputs, "w_round", False),
         )  # fmt: skip
         return out

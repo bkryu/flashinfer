@@ -65,13 +65,14 @@ def _load_names() -> Dict[str, Any]:
     from .api import route, route_plan
     from .api_fp4 import (
         GROUP_ALIGN,
+        TE_GS_INV,
         MoEWeightsFp4,
-        fused_moe_fp4,
+        _fused_moe_fp4_run,
+        _gs_inv,
         gather_form_ok,
         gather_sf_layout,
     )
-    from .api_mxfp4w8a import fused_moe_mxfp4w8a
-    from .api_mxfp8 import check_activation_pack
+    from .api_mxfp8 import _fused_moe_mxfp8_run, check_activation_pack
     from .blocks.scheduler import MAX_E
     from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
     from .schedule import TOP_K
@@ -89,11 +90,13 @@ def _load_names() -> Dict[str, Any]:
         route_plan=route_plan,
         GROUP_ALIGN=GROUP_ALIGN,
         MoEWeightsFp4=MoEWeightsFp4,
-        fused_moe_fp4=fused_moe_fp4,
-        fused_moe_mxfp4w8a=fused_moe_mxfp4w8a,
+        TE_GS_INV=TE_GS_INV,
+        fused_moe_fp4_run=_fused_moe_fp4_run,
+        gs_inv=_gs_inv,
         gather_form_ok=gather_form_ok,
         gather_sf_layout=gather_sf_layout,
         check_activation_pack=check_activation_pack,
+        fused_moe_mxfp8_run=_fused_moe_mxfp8_run,
         MAX_E=MAX_E,
         ROUTE_PLAN_MAX_SLOTS=ROUTE_PLAN_MAX_SLOTS,
         ROUTE_PLAN_MAX_TOKENS=ROUTE_PLAN_MAX_TOKENS,
@@ -876,9 +879,19 @@ class BatchInvariantFp4Runner(MoERunner):
                     path = "dense"
                 elif path == "dense":
                     plan = None
-            _names.fused_moe_mxfp4w8a(
-                (x, sf), ids, wts, w, out=out, config1=c1, config2=c2, in_fmt=self._in_fmt, plan=plan, path=path,
-                w_round=getattr(inputs, "w_round", False),
+            if T == 0:
+                return (
+                    out  # no tokens: nothing to route, the (0, H) output as it stands
+                )
+            if c1.gather_a:
+                c1 = dataclasses.replace(
+                    c1, gather_a=False
+                )  # the mixed classes read the token box: no gather form
+            # the op's launch on the validated pack (the pack proved every rule the public entry checks)
+            _names.fused_moe_mxfp8_run(
+                x, sf, ids, wts, w, out, c1, c2, self._in_fmt or pair.fmts[0], path, "fused", False,
+                T, H, ids.shape[1], w.num_experts, self.config.experts.intermediate_size,
+                plan=plan, w_round=getattr(inputs, "w_round", False),
             )  # fmt: skip
             return out
         if tactic == -1 or tactic is None:
@@ -897,18 +910,40 @@ class BatchInvariantFp4Runner(MoERunner):
             w1a if pair.scaled else None, w2a if pair.scaled else None,
             self._intermediate, gs2 if static else None, inv2 if static else None,
         )  # fmt: skip
-        # a pre-quantized pack: the empty per-token placeholder means unit scales (the per-tensor pack); the scale tensor's
-        # rank names its layout (flat: the 128x4 buffer, 2-D: the linear rows, as pack_inputs shaped it); both are the op's
-        # own placements (no fill, no re-tiling launch)
+        # the op's launch on the validated pack (the pack proved every rule the public entry checks): the bf16 rows as
+        # given (the NVFP4 pair quantizes them into the grouped layout inside the op, the MX pair here, as the public entry
+        # does), or the pre-quantized pack -- the empty per-token placeholder means unit scales (the per-tensor pack); the
+        # scale tensor's rank names its layout (flat: the 128x4 buffer, 2-D: the linear rows, as pack_inputs shaped it);
+        # both are the op's own placements (no fill, no re-tiling launch)
+        T, dev = int(x.shape[0]), x.device
+        gsi = _names.gs_inv(_names.TE_GS_INV, dev)
         if x.dtype == torch.bfloat16:
-            xin: Any = x
-        elif pair.scaled:
-            xin = (x, sf, pts if pts.numel() == x.shape[0] else None)
+            x_rows, x4, x_sf, x_pts, sf_src, unit_pts = (
+                x,
+                None,
+                None,
+                None,
+                "128x4",
+                False,
+            )
+            if not pair.scaled:
+                x4, x_sf, x_pts = pair.quantize(x_rows, gsi)
         else:
-            xin = (x, sf)
-        _names.fused_moe_fp4(
-            xin, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan,
-            round_scales=getattr(inputs, "w_round", False),
-            sf_layout=None if x.dtype == torch.bfloat16 else ("linear" if sf.ndim == 2 else "128x4"),
+            sf_src = "linear" if sf.ndim == 2 else "128x4"
+            unit_pts = not (pair.scaled and pts.numel() == T)
+            x_rows, x4, x_sf = None, x, sf.reshape(-1)
+            if not pair.scaled:
+                x_pts = None
+            elif unit_pts:
+                x_pts = _names.gs_inv(
+                    1.0, dev
+                )  # a placeholder the unit-scale scatter never reads
+            else:
+                x_pts = pts
+        in1, in2 = w.classes(self._part[1] if self._part is not None else None)
+        _names.fused_moe_fp4_run(
+            w, x_rows, x4, x_sf, x_pts, sf_src, unit_pts, ids, wts, out, c1, c2, in1, in2,
+            T, H, ids.shape[1], w.num_experts, self.config.experts.intermediate_size, gsi,
+            plan=plan, round_scales=getattr(inputs, "w_round", False),
         )  # fmt: skip
         return out

@@ -3300,12 +3300,13 @@ def test_f32_prerouted_weights_round_in_the_combine_kernel():
     assert torch.equal(bits(a), bits(b))
 
 
-def test_pick_memos_follow_the_rankings():
-    """The runners' memoised picks and every MoE ranking memo follow the dispatcher's rank cache: a clear of the rankings (a
-    device's registered numbers, ``rank.cache_clear()``) bumps the pick generation and empties the ranking memos of every
-    class dispatcher."""
+def test_pick_memos_and_launch_handles_follow_the_rankings():
+    """The runners' memoised picks, every MoE ranking memo and the launch-handle cache follow the dispatcher's rank cache:
+    a clear of the rankings (a device's registered numbers, ``rank.cache_clear()``) bumps the pick generation, empties the
+    ranking memos of every class dispatcher and forgets the handles; ``clear_kernel_cache`` is the handles' own clear."""
     import importlib
 
+    from flashinfer.fused_moe.batch_invariant import api
     from flashinfer.fused_moe.batch_invariant import runner as R
     from flashinfer.fused_moe.batch_invariant import schedule as S_
     from flashinfer.gemm.batch_invariant import heuristic as H
@@ -3313,9 +3314,14 @@ def test_pick_memos_follow_the_rankings():
     g = R.pick_generation()
     S_.rank_grouped(7, 1536, 2048, 128, "swiglu", 212, "sm_107", 3, n_active=56)
     assert S_._rank_grouped.cache_info().currsize >= 1
+    api._HANDLES[("probe",)] = None
+    api.clear_kernel_cache()
+    assert not api._HANDLES
+    api._HANDLES[("probe",)] = None
     H.rank.cache_clear()
     assert R.pick_generation() == g + 1
     assert S_._rank_grouped.cache_info().currsize == 0
+    assert not api._HANDLES
     for mod, fn in (
         ("schedule_fp4", "_rank_grouped_fp4"),
         ("schedule_fp8bs", "_rank_grouped_fp8bs"),
@@ -3341,3 +3347,60 @@ def test_lazy_names_resolve_once_and_keep_the_light_import():
     assert names.b == 2 and names.a == 1 and loads == [1]
     assert "a" in vars(names) and "b" in vars(names)
     assert not hasattr(names, "c")
+
+
+@needs_device
+def test_forward_memoises_the_pick_and_the_launch_handles():
+    """A forward after the first at a shape ranks nothing and fetches no compiled object: the runner's pick is memoised per
+    (token count, hidden size), the activation term is derived once, the two GEMM launches take cached handles keyed by
+    the indexed device, the record and the chain, and the memos empty with the rankings; the bits are the same throughout."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.runner import pick_generation
+    from flashinfer.gemm.batch_invariant.heuristic import rank
+
+    T, k, H, I, E = 5, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=77)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2)
+    runner = layer.runners[0]
+    assert isinstance(runner, BatchInvariantMoeRunner)
+    pack = _logits_pack(x, logits)
+    ref = bits(layer(pack, W))
+    assert runner._act is not None and runner._activation() is runner._act
+    api.clear_kernel_cache()
+    runner._picks.clear()
+    calls = []
+    orig = runner._ranked
+
+    def counted(*args, **kw):
+        calls.append(1)
+        return orig(*args, **kw)
+
+    runner._ranked = counted  # type: ignore[method-assign]
+    try:
+        assert torch.equal(bits(layer(pack, W)), ref)
+        assert len(calls) == 1 and (T, H) in runner._picks
+        handles = dict(api._HANDLES)
+        assert len(handles) >= 2
+        dev = torch.cuda.current_device()
+        assert all(key[0] == dev for key in handles)
+        assert torch.equal(bits(layer(pack, W)), ref)
+        assert len(calls) == 1 and handles == api._HANDLES
+        rank.cache_clear()  # the rankings' clear takes the handles with it and retires the picks (dropped at the next pick)
+        assert not api._HANDLES and runner._picks_gen != pick_generation()
+        assert torch.equal(bits(layer(pack, W)), ref)
+        assert len(calls) == 2 and api._HANDLES.keys() == handles.keys()
+    finally:
+        del runner._ranked
+    # the public op on the same records gives the same bits as the runner's launch on the validated pack
+    ids, wts = api.route(logits.cuda(), k, runner._method)
+    c1, c2 = runner._pick(T)
+    out = api.fused_moe(
+        x.cuda(),
+        ids,
+        wts,
+        api.MoEWeights.from_view(W.get_view(runner.backend_key)),
+        config1=c1,
+        config2=c2,
+    )
+    assert torch.equal(bits(out), ref)
