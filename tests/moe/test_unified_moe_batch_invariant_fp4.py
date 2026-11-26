@@ -5237,7 +5237,8 @@ def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which, monke
     nan = float("nan")
     s = torch.cuda.Stream()
     # the op's constant caches and the runner's placeholder caches, warm from the reference; the constants an eager call of
-    # this class caches (the unread scale-byte atom is the static class's GEMM2's alone)
+    # this class caches (the unread scale-byte atom is the static class's GEMM2's alone; the mixed pair's op keeps no
+    # constant of its own, the runner's placeholders alone)
     caches = (
         (api_fp4, "_GS_INV"),
         (api_fp4, "_DUMMY_SF"),
@@ -5246,9 +5247,12 @@ def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which, monke
         (runner_fp4, "_NO_PTS"),
     )
     warm = {name: getattr(mod, name) for mod, name in caches}
-    filled = {"_GS_INV", "_UNIT", "_NO_SF", "_NO_PTS"} | (
-        {"_DUMMY_SF"} if which == "static" else set()
-    )
+    if which == "mxfp4w8a":
+        filled = {"_NO_SF", "_NO_PTS"}
+    else:
+        filled = {"_GS_INV", "_UNIT", "_NO_SF", "_NO_PTS"} | (
+            {"_DUMMY_SF"} if which == "static" else set()
+        )
     assert all(warm[name] for name in filled)
 
     def isolate():

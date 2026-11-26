@@ -3829,9 +3829,10 @@ def test_layer_forward_captured_in_every_dispatcher_form():
     decode form (the in-kernel plan of GEMM1's gather record), the gather form with the plan launch (the slots past the
     in-kernel plan's bound), the box form of the swapped records (a hidden size whose scale rows are not whole 4-byte
     groups, with the fused requantization's one conditional zero-fill of its pad columns) and the grouped records on the
-    padded packing at a larger token count. Each captures (no host sync, no host-side read), replays the eager bits, two replays
-    agree, and the replay's fill launches are the eager call's and the form's own (the constants host-built outside the
-    capture: no fill of a constant, no host copy inside the graph)."""
+    padded packing at a larger token count (whose plan fills its padded ``src`` map with the dropped-slot marker: the form's one
+    fill). Each captures (no host sync, no host-side read), replays the eager bits, two replays agree, and the replay's fill
+    launches are the eager call's and the form's own (the constants host-built outside the capture: no fill of a constant,
+    no host copy inside the graph)."""
     from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
     from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
     from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import gather_form_rule
@@ -3841,7 +3842,7 @@ def test_layer_forward_captured_in_every_dispatcher_form():
         ("decode", 4, 4, 256, 128, 16, 0),
         ("gather", 40, 4, 256, 128, 256, 0),
         ("box", 4, 4, 160, 96, 16, 1),
-        ("grouped", 512, 4, 256, 128, 16, 0),
+        ("grouped", 512, 4, 256, 128, 16, 1),
     ):
         x, logits, w1, w2 = _problem(T, k, H, I, E, seed=50 + T)
         xq, xsf = _quant(x)
@@ -3898,7 +3899,7 @@ def test_tuned_tactic_captured_in_a_graph_replays_while_the_other_packing_runs_e
     from flashinfer.autotuner import autotune
 
     k, H, I, E = 4, 256, 128, 16
-    layer = _layer(k, E, I, tune_max=256)
+    layer = _layer(k, E, I, tune_max=1024)
     x, logits, w1, w2 = _problem(4, k, H, I, E, seed=61)
     W = _weights(w1, w2)
     act = _logits_pack(_quant(x), logits)
