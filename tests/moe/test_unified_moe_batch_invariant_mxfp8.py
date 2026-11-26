@@ -3503,3 +3503,169 @@ def test_tactic_of_the_other_packing_replays_with_the_bits(monkeypatch):
     for c1, c2 in pairs:
         out = runner.forward(runner.pack_inputs(pack, W), tactic=_tactic(c1, c2))
         assert torch.equal(bits(out), ref), (c1.describe(), c2.describe())
+
+
+@needs_device
+@pytest.mark.parametrize("method", ["Renormalize", "DeepSeekV3"])
+def test_runner_first_used_under_graph_capture_gives_the_eager_bits(
+    method, monkeypatch
+):
+    """A layer whose first forward runs under CUDA-graph capture with the shared constant cache empty (the route kernels'
+    absent bias and unit scale, ``api._const``: isolated from the eager reference's warm cache, so every constant of that
+    capture is a device fill of its own, as is the runner's routed scale), captured twice: the cache stays empty after
+    both captures, the second graph replays before the first, an eager call then fills the cache once per device and both
+    graphs replay again; a layer constructed inside a capture (its runner built there, the routed scale a per-call fill)
+    and forwarded in it, its scale unset and the cache empty after the capture, before any replay; and the warm-cache
+    control. Every output equals the eager bits of a layer that never saw a capture, under the softmax-renorm method (the
+    cached constants in play) and under DeepSeekV3 with a routed scaling factor and a bias (the scale constant in play)."""
+    from flashinfer.fused_moe.batch_invariant import api
+
+    T, k, H, I, E = 48, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=91)
+    xq, xsf = _quant(x)
+    rm = RoutingMethodType[method]
+    bias = (
+        (torch.randn(E, generator=torch.Generator().manual_seed(92)) * 0.1)
+        .float()
+        .cuda()
+        if rm is RoutingMethodType.DeepSeekV3
+        else None
+    )
+    kwargs = dict(routed_scaling_factor=1.75) if bias is not None else {}
+
+    def make():
+        return MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(num_experts=E, top_k=k, method=rm, **kwargs),
+                quant=_QUANT,
+                experts=ExpertConfig(intermediate_size=I),
+                activation=_SWIGLU,
+                backend=BackendOptions((BatchInvariantFp8BlockConfig(),)),
+                execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=T),
+            ),
+            device=torch.device("cuda"),
+        )
+
+    W = _weights(w1, w2)
+    act = _logits_pack((xq, xsf), logits, bias)
+    ref = bits(
+        make()(act, W)
+    )  # eager, never captured: the compile, the bits; the module cache warm
+    torch.cuda.synchronize()
+    nan = float("nan")
+    s = torch.cuda.Stream()
+    warm = api._CONST
+    scaled = bias is not None
+    assert (
+        scaled or warm
+    )  # the softmax-renorm routing reads the cached absent bias and unit scale
+
+    def captured(layer):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+            out = layer(act, W)
+        torch.cuda.synchronize()
+        return g, out
+
+    # (1) first used under capture with an empty cache: two captures, nothing cached by either, the second replayed before
+    # the first, an eager call (which caches the constants once per device), both replayed again
+    monkeypatch.setattr(api, "_CONST", {})
+    fresh = make()
+    graphs = [captured(fresh) for _ in range(2)]
+    assert not api._CONST
+    for g, out in reversed(graphs):
+        out.fill_(nan)
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref)
+    assert torch.equal(bits(fresh(act, W)), ref)
+    assert bool(api._CONST) == (not scaled)
+    for g, out in graphs:
+        out.fill_(nan)
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref)
+    # (2) constructed and first forwarded inside one capture: the runner's scale unset and the cache empty after the
+    # capture, before any replay (a replay would fill a wrongly cached capture-pool constant)
+    monkeypatch.setattr(api, "_CONST", {})
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        inside = make()
+        out = inside(act, W)
+    torch.cuda.synchronize()
+    assert inside.runners[0]._scale is None and not api._CONST
+    out.fill_(nan)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    assert inside.runners[0]._scale is None and not api._CONST
+    assert torch.equal(bits(inside(act, W)), ref)
+    assert (inside.runners[0]._scale is not None) == scaled
+    assert bool(api._CONST) == (not scaled)
+    # (3) the control: used eagerly with the warm cache, then captured
+    monkeypatch.setattr(api, "_CONST", warm)
+    warm_layer = make()
+    assert torch.equal(bits(warm_layer(act, W)), ref)
+    g, out = captured(warm_layer)
+    out.fill_(nan)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    assert torch.equal(bits(warm_layer(act, W)), ref)
+
+
+@needs_device
+def test_graphs_captured_at_two_token_counts_and_two_routing_modes_replay_interleaved():
+    """One layer, four CUDA graphs: captured at a decode and a mid token count, each from logits and from pre-routed
+    (unpacked) inputs, replayed interleaved twice with eager calls of every case between the rounds and once more back to
+    back. Every replay gives the eager bits of its own inputs (the graphs share the layer's compiled bodies, winners and
+    constant cache without interference), and the eager calls after the replays give them too."""
+    k, H, I, E = 4, 256, 128, 16
+    layer = _layer(k, E, I)
+    cases, W = {}, None
+    for name, T, seed in (("decode", 4, 21), ("mid", 200, 22)):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed)
+        if W is None:
+            W = _weights(w1, w2)
+        xq, xsf = _quant(x)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        cases[(name, "logits")] = _logits_pack((xq, xsf), logits)
+        cases[(name, "routed")] = _routed_pack((xq, xsf), ids.cuda(), wts.cuda())
+    ref = {key: bits(layer(act, W)) for key, act in cases.items()}
+    assert torch.equal(ref[("decode", "logits")], ref[("decode", "routed")])
+    assert torch.equal(ref[("mid", "logits")], ref[("mid", "routed")])
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    graphs = {}
+    for key, act in cases.items():
+        with torch.cuda.stream(s):
+            layer(act, W)  # warm on the capture stream
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            out = layer(act, W)
+        torch.cuda.synchronize()
+        graphs[key] = (g, out)
+    order = [
+        ("decode", "logits"),
+        ("mid", "routed"),
+        ("mid", "logits"),
+        ("decode", "routed"),
+    ]
+    nan = float("nan")
+    for _ in range(2):
+        for key in order:
+            g, out = graphs[key]
+            out.fill_(nan)
+            g.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(bits(out), ref[key]), key
+        for key in reversed(order):  # eager calls between the rounds
+            assert torch.equal(bits(layer(cases[key], W)), ref[key]), key
+    for key in order:  # back to back, one synchronization
+        g, out = graphs[key]
+        out.fill_(nan)
+        g.replay()
+    torch.cuda.synchronize()
+    for key in order:
+        assert torch.equal(bits(graphs[key][1]), ref[key]), key
