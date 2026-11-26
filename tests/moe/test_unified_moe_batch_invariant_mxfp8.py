@@ -2500,8 +2500,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert llama2(
         _routed_pack((xq, xsf), ids2, torch.full((8, 2), 0.5, device="cuda")), W
     ).shape == (8, H)
-    # weights on the CPU cannot be quantized by the class
-    with pytest.raises(TypeError):
+    # weights on the CPU without a destination device: the pack lives on a CUDA device (device=... moves them, one expert
+    # at a time)
+    with pytest.raises(BatchInvariantUnsupportedError, match="device"):
         BatchInvariantFp8BlockConfig.prepare_weights(
             w1.cpu(),
             w2.cpu(),
@@ -2510,6 +2511,12 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             hidden_size=H,
             intermediate_size=I,
         )
+    assert torch.equal(
+        BatchInvariantFp8BlockConfig.prepare_weights(
+            w1.cpu(), w2.cpu(), quant=_QUANT, device=torch.device("cuda")
+        )["w1"].view(torch.uint8),
+        W.get_view(KEY)["w1"].view(torch.uint8),
+    )
     # zero tokens
     out = layer(_logits_pack((xq[:0], xsf[:0]), logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
@@ -2955,3 +2962,155 @@ def test_fingerprint_refuses_the_shapes_the_layer_refuses():
     for method in ("Llama4", RoutingMethodType.Llama4):
         with pytest.raises(ValueError, match="Llama4 routing takes top_k = 1"):
             bi.fingerprint(op, method=method, **dict(base, top_k=2))
+
+
+def test_prepare_weights_rejects_dimensions_that_disagree_with_the_weights():
+    """A supplied ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must be the weights' own, for the gated
+    geometry (``I`` = half of w1's rows) and the ungated one (``I`` = w1's rows): the mode's error before any view is
+    built, naming the dimension; weights on the CPU without a destination device are refused (the pack lives on a CUDA
+    device); the consistent call and the call without dimensions give the view (on a device)."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import (
+        VIEW_PAIR,
+        MoEWeightsMXFP8,
+    )
+
+    E, I, H = 4, 32, 64
+    w1 = torch.randn(E, 2 * I, H).to(torch.bfloat16)
+    w2 = torch.randn(E, H, I).to(torch.bfloat16)
+    w1u = torch.randn(E, I, H).to(torch.bfloat16)
+    for w1_, act, kw in (
+        (w1, _SWIGLU, dict(num_local_experts=E + 1)),
+        (w1, _SWIGLU, dict(hidden_size=H // 2)),
+        (w1, _SWIGLU, dict(intermediate_size=2 * I)),
+        (w1u, ReLU2(), dict(intermediate_size=I // 2)),
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+            BatchInvariantFp8BlockConfig.prepare_weights(
+                w1_, w2, quant=_QUANT, activation=act, **kw
+            )
+        assert next(iter(kw)) in str(excinfo.value) and "moe.mxfp8" in str(
+            excinfo.value
+        )
+    with pytest.raises(TypeError):
+        BatchInvariantFp8BlockConfig.prepare_weights(w1[0], w2, quant=_QUANT)
+    with pytest.raises(TypeError):
+        MoEWeightsMXFP8.prepare(w1.to(torch.int32), w2)
+    with pytest.raises(ValueError, match="does not match"):
+        MoEWeightsMXFP8.prepare(w1, w2[:, :, : I // 2])
+    for call in (
+        lambda: MoEWeightsMXFP8.prepare(w1, w2),
+        lambda: BatchInvariantFp8BlockConfig.prepare_weights(
+            w1,
+            w2,
+            quant=_QUANT,
+            num_local_experts=E,
+            hidden_size=H,
+            intermediate_size=I,
+        ),
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError, match="device") as excinfo:
+            call()
+        assert "moe.mxfp8" in str(excinfo.value)
+    if not _supported:
+        return
+    w1, w2, w1u = w1.cuda(), w2.cuda(), w1u.cuda()
+    view = BatchInvariantFp8BlockConfig.prepare_weights(
+        w1, w2, quant=_QUANT, num_local_experts=E, hidden_size=H, intermediate_size=I
+    )
+    assert view["w1"].shape == (E, 2 * I, H) and view["gated"]
+    assert view["quant"] == VIEW_PAIR
+    assert torch.equal(
+        BatchInvariantFp8BlockConfig.prepare_weights(w1, w2, quant=_QUANT)["w2"].view(
+            torch.uint8
+        ),
+        view["w2"].view(torch.uint8),
+    )
+    view_u = BatchInvariantFp8BlockConfig.prepare_weights(
+        w1u, w2, quant=_QUANT, intermediate_size=I, activation=ReLU2()
+    )
+    assert not view_u["gated"] and view_u["w1"].shape == (E, I, H)
+
+
+@needs_device
+def test_prepare_weights_quantizes_one_expert_at_a_time_into_the_pack():
+    """The pack is preallocated and filled one expert at a time: the bits of the per-expert quantizer (the interleave of
+    every expert, each quantized into its own buffers, stacked), and a peak memory beyond the inputs bounded by the pack
+    plus a few experts' temporaries, below one full-size bf16 copy of the experts -- for contiguous weights and for a
+    strided view of them (one expert's slice is made contiguous at a time), with the same bits; and through
+    ``prepare_weights`` for CPU-resident bf16 weights moved to the device, for fp32 weights on the device and for CPU fp32
+    weights (each expert's slice is moved and cast right before its quantization, never a full-size copy), with the bits
+    of the same-device bf16 path and the same bound."""
+    from flashinfer.fused_moe.batch_invariant.api import interleave_fc1
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import (
+        MoEWeightsMXFP8,
+        quantize_mxfp8_rows,
+    )
+
+    E, I, H = 32, 512, 1024
+    _, _, w1, w2 = _problem(4, 2, H, I, E, seed=81)
+    w1i = interleave_fc1(w1)
+    q1, s1, q2, s2 = [], [], [], []
+    for e in range(E):
+        c1, f1 = quantize_mxfp8_rows(w1i[e], swizzled=True)
+        c2, f2 = quantize_mxfp8_rows(w2[e], swizzled=True)
+        q1.append(c1.view(torch.uint8))
+        s1.append(f1)
+        q2.append(c2.view(torch.uint8))
+        s2.append(f2)
+    del w1i
+    u8 = lambda t: t.view(torch.uint8)  # noqa: E731
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    W = MoEWeightsMXFP8.prepare(w1, w2)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - before
+    assert torch.equal(u8(W.w1), torch.stack(q1)) and torch.equal(
+        W.w1_sf, torch.stack(s1)
+    )
+    assert torch.equal(u8(W.w2), torch.stack(q2)) and torch.equal(
+        W.w2_sf, torch.stack(s2)
+    )
+    assert W.w1.dtype == W.w2.dtype == torch.float8_e4m3fn
+    pack = sum(t.numel() * t.element_size() for t in (W.w1, W.w1_sf, W.w2, W.w2_sf))
+    expert = (w1[0].numel() + w2[0].numel()) * w1.element_size()
+    full = (w1.numel() + w2.numel()) * w1.element_size()
+    assert pack + 8 * expert < full  # the bound separates the paths
+    assert peak <= pack + 8 * expert, (peak, pack, expert)
+    same = lambda a, b: all(  # noqa: E731
+        torch.equal(u8(t), u8(u))
+        for t, u in ((a.w1, b.w1), (a.w1_sf, b.w1_sf), (a.w2, b.w2), (a.w2_sf, b.w2_sf))
+    )
+    # a strided view of the same values (a full-tensor contiguous() would copy both weights at once)
+    w1s = w1.transpose(1, 2).contiguous().transpose(1, 2)
+    w2s = w2.transpose(1, 2).contiguous().transpose(1, 2)
+    assert not w1s.is_contiguous() and torch.equal(w1s, w1) and torch.equal(w2s, w2)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    Ws = MoEWeightsMXFP8.prepare(w1s, w2s)
+    torch.cuda.synchronize()
+    peak_s = torch.cuda.max_memory_allocated() - before
+    assert same(Ws, W)
+    assert peak_s <= pack + 8 * expert, (peak_s, pack, expert)
+    # CPU-resident bf16 weights moved to the device, fp32 weights on the device, CPU fp32 weights: through the layer's
+    # preparation with the destination device (a whole-tensor move or cast would exceed the bound)
+    assert 2 * full > pack + 8 * expert
+    for name, a, b in (
+        ("cpu bf16", w1.cpu(), w2.cpu()),
+        ("fp32", w1.float(), w2.float()),
+        ("cpu fp32", w1.cpu().float(), w2.cpu().float()),
+    ):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        view = BatchInvariantFp8BlockConfig.prepare_weights(
+            a, b, quant=_QUANT, device=torch.device("cuda")
+        )
+        torch.cuda.synchronize()
+        peak_d = torch.cuda.max_memory_allocated() - before
+        Wd = MoEWeightsMXFP8.from_view(view)
+        assert all(t.is_cuda for t in (Wd.w1, Wd.w1_sf, Wd.w2, Wd.w2_sf)), name
+        assert same(Wd, W), name
+        assert peak_d <= pack + 8 * expert, (name, peak_d, pack, expert)

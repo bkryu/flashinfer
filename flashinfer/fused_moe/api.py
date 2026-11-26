@@ -3540,24 +3540,43 @@ class BatchInvariantFp8BlockConfig:
         activation: Optional["ActivationConfig"] = None,
         device: Optional[torch.device] = None,
     ) -> Dict[str, Any]:
-        """The weight view of the pair ``quant`` selects. MXFP8 x MXFP8: the experts quantized per expert by the
-        batch-invariant MXFP8 quantizer (the gate / up rows interleaved first for a gated activation), the swizzled scale
-        buffers, and the activation's chain (``activation`` defaults to ``SwiGLU()``)."""
+        """The weight view of the pair ``quant`` selects. MXFP8 x MXFP8: the experts quantized one at a time by the
+        batch-invariant MXFP8 quantizer into the pack on ``device`` (the gate / up rows interleaved first for a gated
+        activation), the swizzled scale buffers, the pair tag and the activation's chain (``activation`` defaults to
+        ``SwiGLU()``). A supplied ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must be the weights' own
+        (the mode's error names the dimension before any view is built)."""
+        from ..batch_invariant.support import unsupported
         from .batch_invariant.runner_fp8_block import PAIR_MXFP8, unsupported_pair
 
         if quant.pair == PAIR_MXFP8:
-            from .batch_invariant.api_mxfp8 import MoEWeightsMXFP8
+            from .batch_invariant.api_mxfp8 import CLASS, MoEWeightsMXFP8
             from .batch_invariant.spec import activation_of
 
             chain = activation_of(activation if activation is not None else SwiGLU())
-            w1 = w1.to(device=device) if device is not None else w1
-            w2 = w2.to(device=device) if device is not None else w2
+            if w1.dim() != 3 or w2.dim() != 3:
+                raise TypeError(
+                    "the MXFP8 MoE classes take expert weights w1 [E, N1, H], w2 [E, H, I]"
+                )
+            E, n1, H = w1.shape
+            I = n1 // 2 if chain.gated else n1
+            for name, given, own in (
+                ("num_local_experts", num_local_experts, E),
+                ("hidden_size", hidden_size, H),
+                ("intermediate_size", intermediate_size, I),
+            ):
+                if given is not None and given != own:
+                    raise unsupported(
+                        CLASS,
+                        f"{name} {given} with weights of {own} (w1 {tuple(w1.shape)}, {'gated' if chain.gated else 'ungated'})",
+                        "the weights' own geometry (or no dimension arguments)",
+                    )
             return MoEWeightsMXFP8.prepare(
-                w1.to(torch.bfloat16),
-                w2.to(torch.bfloat16),
+                w1,
+                w2,
                 gated=chain.gated,
                 act=chain.act,
                 params=chain.params,
+                device=device,
             ).view()
         raise unsupported_pair(quant)
 

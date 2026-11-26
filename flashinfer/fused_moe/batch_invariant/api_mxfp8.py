@@ -30,7 +30,7 @@ import torch
 from ...batch_invariant.quantization.layout import padded_sf_cols as _padded_sf_cols
 from ...batch_invariant.quantization.layout import sf_numel as _sf_numel
 from ...batch_invariant.quantization.mx_api import mxfp8_quantize_batch_invariant
-from ...batch_invariant.support import compute_capability, unsupported
+from ...batch_invariant.support import check_device, compute_capability, unsupported
 from ...gemm.batch_invariant.api import sm_count_of
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.heuristic import family_of
@@ -71,6 +71,10 @@ def mx_class_of(device: torch.device) -> str:
     """The instruction class a device runs: a function of the architecture family only (``mxfp8_k64`` on SM107,
     ``mxfp8`` on SM100 / SM103), never of the shape."""
     return mx_class_for("mxfp8", family_of(compute_capability(device)))
+
+
+#: The compute capabilities the classes are stated for (the dense MXFP8 GEMM class's parts).
+MOE_MXFP8_ARCHS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3), (10, 7))
 
 
 def sf_numel(rows: int, K: int) -> int:
@@ -175,11 +179,20 @@ class MoEWeightsMXFP8:
         gated: bool = True,
         act: Optional[str] = None,
         params: Sequence[Optional[float]] = (),
+        device: Optional[torch.device] = None,
     ) -> "MoEWeightsMXFP8":
-        """Quantize bf16 experts (``fc1 [E, 2I, H]`` rows ``[up, gate]`` for a gated chain, ``[E, I, H]`` for an ungated
-        one; ``fc2 [E, H, I]``) per expert with the ``mxfp8.quant`` class into the 128x4 swizzled scale layout. The gate /
-        up interleave is a row permutation applied before the quantization (a row's block scales are the row's own).
-        ``act`` defaults to the class's default chain of the gating (``silu`` gated, ``relu2`` ungated)."""
+        """Quantize the experts (``fc1 [E, 2I, H]`` rows ``[up, gate]`` for a gated chain, ``[E, I, H]`` for an ungated
+        one; ``fc2 [E, H, I]``; bf16, or a wider floating dtype cast to bf16 one expert at a time) with the ``mxfp8.quant``
+        class into the 128x4 swizzled scale layout. The gate / up interleave is a row permutation applied before the
+        quantization (a row's block scales are the row's own). ``act`` defaults to the class's default chain of the gating
+        (``silu`` gated, ``relu2`` ungated). The pack lives on ``device`` (the weights' by default), a CUDA device of the
+        class: the experts are quantized one at a time into the preallocated pack, each expert's slice moved to the pack's
+        device and cast to bf16 right before its quantization (a same-device bf16 slice as it is), so the peak memory
+        beyond the inputs is the pack plus one expert's temporaries for CPU-resident, fp32 and strided inputs too, and
+        the bits are those of each expert quantized alone (a row's quantization is row-local)."""
+        from ...batch_invariant.quantization.mx_api import mx_quantize
+        from ...batch_invariant.quantization.mx_spec import MXFP8 as MXFP8_FORMAT
+
         act = act if act is not None else ("silu" if gated else "relu2")
         if act not in (S.ACTS if gated else S.UNGATED_ACTS):
             raise ValueError(f"no {'gated' if gated else 'ungated'} chain {act!r}")
@@ -189,29 +202,56 @@ class MoEWeightsMXFP8:
                 f"chain {act!r} takes parameters {S.ACT_PARAMS.get(act, ())}, got {key!r}"
             )
         if (
-            fc1.dtype != torch.bfloat16
-            or fc2.dtype != torch.bfloat16
+            not fc1.is_floating_point()
+            or not fc2.is_floating_point()
             or fc1.dim() != 3
             or fc2.dim() != 3
         ):
             raise TypeError(
-                "the MXFP8 MoE classes take bf16 expert weights fc1 [E, N1, H], fc2 [E, H, I]"
+                "the MXFP8 MoE classes take floating expert weights fc1 [E, N1, H], fc2 [E, H, I] (bf16, or cast to "
+                "bf16 one expert at a time)"
             )
         E, N1, H = fc1.shape
         I = N1 // 2 if gated else N1
-        if tuple(fc2.shape) != (E, H, I):
+        if tuple(fc2.shape) != (E, H, I) or (gated and N1 % 2):
             raise ValueError(
                 f"fc2 {tuple(fc2.shape)} does not match fc1 {tuple(fc1.shape)} (gated={gated})"
             )
         check_shape_mxfp8(H, I, E)
-        if not fc1.is_cuda:
-            raise TypeError(
-                "the MXFP8 MoE classes quantize the expert weights on a CUDA device"
+        dev = fc1.device if device is None else torch.device(device)
+        if dev.type != "cuda":
+            raise unsupported(
+                CLASS,
+                f"expert weights quantized on {dev}",
+                "a CUDA device for the pack (the weights' device, or device=...): the quantizer class runs there",
             )
-        w1i = fc1.contiguous() if (interleaved or not gated) else interleave_fc1(fc1)
-        w1, w1_sf = _quantize_experts(w1i)
-        w2, w2_sf = _quantize_experts(fc2.contiguous())
-        return MoEWeightsMXFP8(w1, w1_sf, w2, w2_sf, gated, act, key)
+        check_device(dev, CLASS, MOE_MXFP8_ARCHS)
+        # the pack, preallocated and filled one expert at a time: the quantizer writes every byte of its expert's rows and
+        # scale buffer (the pad columns zero), so the peak beyond the inputs and the pack is one expert's temporaries
+        w1 = torch.empty(E, N1, H, dtype=torch.uint8, device=dev)
+        w1_sf = torch.empty(E, sf_numel(N1, H), dtype=torch.uint8, device=dev)
+        w2 = torch.empty(E, H, I, dtype=torch.uint8, device=dev)
+        w2_sf = torch.empty(E, sf_numel(H, I), dtype=torch.uint8, device=dev)
+
+        def expert(w: torch.Tensor, e: int) -> torch.Tensor:
+            """Expert ``e``'s slice on the pack's device as contiguous bf16, moved and cast right before its quantization."""
+            return w[e].to(device=dev, dtype=torch.bfloat16).contiguous()
+
+        for e in range(E):
+            rows = expert(fc1, e)
+            if gated and not interleaved:
+                rows = interleave_fc1(rows.unsqueeze(0))[0]
+            mx_quantize(rows, MXFP8_FORMAT, "128x4", out=(w1[e], w1_sf[e]))
+            mx_quantize(expert(fc2, e), MXFP8_FORMAT, "128x4", out=(w2[e], w2_sf[e]))
+        return MoEWeightsMXFP8(
+            w1.view(torch.float8_e4m3fn),
+            w1_sf,
+            w2.view(torch.float8_e4m3fn),
+            w2_sf,
+            gated,
+            act,
+            key,
+        )
 
     @property
     def num_experts(self) -> int:
@@ -265,21 +305,6 @@ class MoEWeightsMXFP8:
             str(view.get("act", "silu" if gated else "relu2")),
             tuple(view.get("params", ())),  # type: ignore[arg-type]
         )
-
-
-def _quantize_experts(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``[E, N, K]`` bf16 -> (``[E, N, K]`` e4m3, ``[E, sf_numel(N, K)]`` uint8): one launch when ``N % 128 == 0`` (an
-    expert's rows fill whole scale-factor atoms, so the per-expert buffers are consecutive slices of the stacked one and
-    the bits are the per-expert quantization's: a row's quantization is row-local), else per expert."""
-    E, N, K = w.shape
-    if N % GROUP_ALIGN == 0:
-        codes, sf = quantize_mxfp8_rows(w.reshape(E * N, K), swizzled=True)
-        return codes.view(E, N, K), sf.view(E, sf_numel(N, K))
-    outs = [quantize_mxfp8_rows(w[e], swizzled=True) for e in range(E)]
-    return (
-        torch.stack([c for c, _ in outs]).contiguous(),
-        torch.stack([s for _, s in outs]).contiguous(),
-    )
 
 
 # ----------------------------------------------------------------------------- the grouped GEMM
