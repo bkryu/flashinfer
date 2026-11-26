@@ -1339,7 +1339,7 @@ class SwappedGroupedGemm:
         # the scheduler's "cluster rows" are the token tile, its "N tiles" the weight tiles
         if warp_idx == tma_warp:
             tile_sched = GroupScheduler.create(
-                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
+                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0, branchless=pr
             )
             if cutlass.const_expr(self.gather and pr):
                 ops.producer_loop("gather")(
@@ -1433,7 +1433,7 @@ class SwappedGroupedGemm:
         if cutlass.const_expr(bs):
             if warp_idx == sf_warp:
                 tile_sched = GroupScheduler.create(
-                    s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
+                    s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0, branchless=pr
                 )
                 cute.arch.griddepcontrol_wait()  # the token scale factors are the predecessor's
                 swap_sf_producer_loop(
@@ -1461,7 +1461,7 @@ class SwappedGroupedGemm:
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             tile_sched = GroupScheduler.create(
-                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
+                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0, branchless=pr
             )
             if cutlass.const_expr(bs):
                 tCtSFW = cute.make_tensor(
@@ -1527,7 +1527,7 @@ class SwappedGroupedGemm:
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             tile_sched = GroupScheduler.create(
-                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
+                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0, branchless=pr
             )
             cute.arch.griddepcontrol_wait()  # the output rows were the predecessor chain's reads
             quant_loop = self.chain.swapped_loop()

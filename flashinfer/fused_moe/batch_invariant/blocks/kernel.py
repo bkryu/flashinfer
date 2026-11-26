@@ -784,6 +784,7 @@ class GroupedBlockGemm:
                 raster_m,
                 mma_m_in_cluster,
                 cta_n_in_cluster,
+                branchless=ops.promoted,
             )
             if cutlass.const_expr(bs):
                 grouped_blockscaled_producer_loop(
@@ -878,6 +879,7 @@ class GroupedBlockGemm:
                 raster_m,
                 mma_m_in_cluster,
                 cta_n_in_cluster,
+                branchless=ops.promoted,
             )
             if cutlass.const_expr(pr):
                 ops.mma_loop_fn("grouped")(
@@ -957,6 +959,7 @@ class GroupedBlockGemm:
                 raster_m,
                 mma_m_in_cluster,
                 cta_n_in_cluster,
+                branchless=ops.promoted,
             )
             quant_loop = self.chain.grouped_loop()
             if cutlass.const_expr(pr):
