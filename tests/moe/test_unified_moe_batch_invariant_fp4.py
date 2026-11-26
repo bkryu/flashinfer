@@ -4357,7 +4357,7 @@ def test_weight_view_names_its_pair_and_a_view_without_it_is_declined(pair):
     the key -- a view without it is declined, never read as the NVFP4 pair -- the runner driven directly refuses it with the
     mode's error naming the key, and the view reader takes no default; the other pair's view stays a refusal naming the
     pair (accepted by the filter, since no candidate of the layer serves it)."""
-    T, k, H, I, E = 8, 2, 128, 64, 4
+    T, k, H, I, E = 8, 2, 128, 128, 4
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=73)
     view = BatchInvariantFp4Config.prepare_weights(
         w1, w2, quant=_QUANT[pair], activation=_SWIGLU
