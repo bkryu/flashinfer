@@ -314,8 +314,8 @@ class MoEWeightsMXFP4W8A:
         )
 
     def view(self) -> Dict[str, object]:
-        """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for this backend (tagged with its pair: the
-        fp4 backend's other pairs refuse it)."""
+        """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for this backend (tagged with its pair and
+        its intermediate class, as every view of the backend: the other pairs refuse it, a view without the keys is declined)."""
         return {
             "w1": self.w1,
             "w1_sf": self.w1_sf,
@@ -325,6 +325,7 @@ class MoEWeightsMXFP4W8A:
             "act": self.act,
             "params": self.params,
             "quant": QUANT_TAG,
+            "intermediate": "per_token",
         }
 
     @staticmethod
