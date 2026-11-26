@@ -32,6 +32,7 @@ from ...gemm.batch_invariant.heuristic import decode_sane
 from .blocks.epilogue import GroupedEpilogueBlock
 from .blocks.epilogue_mx import OUT_FMT, MxChain, bf16_twin
 from .blocks.operands import EPI_WARPGROUPS_BLOCKSCALED
+from .spec_mxfp4w8a import MX_CLASSES as MX_MIXED_CLASSES
 from .spec_mxfp8 import MX_CLASSES
 from .schedule import (
     TOP_K,
@@ -43,6 +44,9 @@ from .schedule import (
 
 #: GEMM2 of the MXFP8 classes: the dequantised accumulator converted to bf16 (the instruction class is the launch's).
 GEMM2_CHAIN = MxChain("plain", "silu", "bf16")
+#: The instruction classes the record spaces and their acceptance serve: the MXFP8 classes and the mixed MXFP4 x MXFP8 ones
+#: (the mixed dispatcher, :mod:`.schedule_mxfp4w8a`, ranks with its own terms).
+MX_SERVED = MX_CLASSES + MX_MIXED_CLASSES
 #: K elements per smem stage the swapped body admits for the MXFP8 classes: the format's one 128-byte atom of K and two atoms.
 SWAP_K_BLOCKS = (128, 256)
 
@@ -65,15 +69,16 @@ def swap_k_block_arg(in_fmt: str, K: int, k_block: Optional[int] = None) -> int:
 def can_implement_grouped_mxfp8(
     knobs: Knobs, N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str
 ) -> bool:
-    """Acceptance of the grouped body for the MXFP8 classes (`blocks.compile.can_implement_grouped_blockscaled` at the chain
-    taken as an MX chain of the instruction class ``in_fmt``): a well-formed dense record of the class's space at swizzle 1
-    (no in-cluster split, no operand swap, no B-reuse tile, no in-CTA chunk fold: the group scheduler has none of them) with
-    a block-scaled tile N, a chain with a bf16 / f16 / f32 output or the fused requantization, K a whole number of
-    32-element scale blocks (hence 16-byte e4m3 rows), 16-byte-aligned output rows (whole 32-element blocks for the fused
-    requantization), whole ``2 x GROUP`` column blocks for the gated chain, at most ``MAX_E`` experts."""
+    """Acceptance of the grouped body for the MX classes (`blocks.compile.can_implement_grouped_blockscaled` at the chain
+    taken as an MX chain of the instruction class ``in_fmt``, an MXFP8 or a mixed one): a well-formed dense record of the
+    class's space at swizzle 1 (no in-cluster split, no operand swap, no B-reuse tile, no in-CTA chunk fold: the group
+    scheduler has none of them) with a block-scaled tile N, a chain with a bf16 / f16 / f32 output or the fused
+    requantization, K a whole number of 32-element scale blocks (hence 16-byte e4m3 rows; whole granules of a mixed class),
+    16-byte-aligned output rows (whole 32-element blocks for the fused requantization), whole ``2 x GROUP`` column blocks
+    for the gated chain, at most ``MAX_E`` experts."""
     from .blocks.compile import can_implement_grouped_blockscaled
 
-    if in_fmt not in MX_CLASSES or not isinstance(chain, GroupedEpilogueBlock):
+    if in_fmt not in MX_SERVED or not isinstance(chain, GroupedEpilogueBlock):
         return False
     return can_implement_grouped_blockscaled(
         knobs, N, K, E, MxChain.of(chain, in_fmt), in_fmt
@@ -89,16 +94,18 @@ def can_implement_swapped_mxfp8(
     in_fmt: str,
     k_block: int = 0,
 ) -> bool:
-    """Acceptance of the swapped body for the MXFP8 classes (`blocks.compile.can_implement_swapped_blockscaled` at the chain
+    """Acceptance of the swapped body for the MX classes (`blocks.compile.can_implement_swapped_blockscaled` at the chain
     taken as an MX chain): a swapped record of the dense MX space at a narrow token tile (128 weight rows x 8 / 16 / 32
     tokens, 1-CTA, no cluster, swizzle 1) under the grouped body's operand rules; ``k_block`` (as `swap_k_block_arg` spells
-    it) one of `SWAP_K_BLOCKS` dividing ``K``. The body reads the dense packing only: the dense rows with the scale factors at
-    the padded positions."""
+    it) one of `SWAP_K_BLOCKS` dividing ``K`` for the MXFP8 classes (a mixed class's record carries its own stage width and
+    takes none). The body reads the dense packing only: the dense rows with the scale factors at the padded positions."""
     from .blocks.compile import can_implement_swapped_blockscaled
 
-    if in_fmt not in MX_CLASSES or not isinstance(chain, GroupedEpilogueBlock):
+    if in_fmt not in MX_SERVED or not isinstance(chain, GroupedEpilogueBlock):
         return False
-    if k_block and (k_block not in SWAP_K_BLOCKS or K % k_block):
+    if k_block and (
+        in_fmt not in MX_CLASSES or k_block not in SWAP_K_BLOCKS or K % k_block
+    ):
         return False
     return can_implement_swapped_blockscaled(
         knobs, N, K, E, MxChain.of(chain, in_fmt), in_fmt
@@ -194,13 +201,23 @@ def gather_form_rule(config1: Knobs, rows: Optional[int] = None) -> Knobs:
     return config1
 
 
-def swapped_knobs_mx() -> List[Knobs]:
-    """The swapped record space of the MXFP8 classes (:mod:`.blocks.swap`): the dense MX class's swapped 1-CTA records at the
-    narrow token tiles (128 weight rows x 8 / 16 / 32 tokens), one per tile, the same list for both instruction classes.
-    Disjoint from the grouped space (the swapped flag); the body reads the dense packing."""
+def swapped_knobs_mx(in_fmt: str = "mxfp8") -> List[Knobs]:
+    """The swapped record space of the MX classes (:mod:`.blocks.swap`): the dense MX class's swapped 1-CTA records at the
+    narrow token tiles (128 weight rows x 8 / 16 / 32 tokens), one per tile -- the same list for both MXFP8 instruction
+    classes; a mixed class's records carry the stage width the dense class gives it (``SWAP_K_BLOCK``: the sm_107 class
+    streams its e2m1 weight at a 256-element stage, a 128-byte TMA row; the sm_100 class the format's default), the record's
+    own field (the lowering's inner radix, a placement of the same fold). Disjoint from the grouped space (the swapped flag);
+    the body reads the dense packing."""
+    import dataclasses
+
+    from ...gemm.batch_invariant.generator import SWAP_K_BLOCK
     from .blocks.swap import swapped_knobs
 
-    return swapped_knobs(MX_CLASSES[0])
+    assert in_fmt in MX_SERVED, in_fmt
+    if in_fmt in MX_CLASSES:
+        return swapped_knobs(MX_CLASSES[0])
+    kb = SWAP_K_BLOCK.get(in_fmt, 0)
+    return [dataclasses.replace(k, k_block=kb) for k in swapped_knobs(in_fmt)]
 
 
 def all_valid_configs_mx(
@@ -226,7 +243,7 @@ def all_valid_configs_mx_swapped(
     """The swapped records the swapped body accepts for a weight shape, a chain and a class (the dense packing)."""
     return [
         k
-        for k in swapped_knobs_mx()
+        for k in swapped_knobs_mx(in_fmt)
         if can_implement_swapped_mxfp8(k, N, K, E, chain, in_fmt)
     ]
 

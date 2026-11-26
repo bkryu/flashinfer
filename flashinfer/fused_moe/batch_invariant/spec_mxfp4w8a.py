@@ -27,6 +27,7 @@ import hashlib
 from typing import Optional, Sequence
 
 from ...batch_invariant.quantization import mx_spec
+from ...gemm.batch_invariant.spec import k_granule
 from ...gemm.batch_invariant.spec import spec_fingerprint as gemm_fingerprint
 from .mterm import Term, TermAlgebra, fingerprint
 from .spec import SOFTMAX_RENORM, MoESpec, RoutingMethod
@@ -36,6 +37,13 @@ CLASS = "moe.mxfp4w8a"
 MX_CLASSES = ("mxfp4w8a", "mxfp4w8a_k64")
 #: Elements per UE8M0 block scale (the OCP MX block; both quantizers' and the instruction's).
 BLOCK = mx_spec.BLOCK
+
+
+def granule_of(in_fmt: str) -> int:
+    """The K granule of the class's operand rows: 32 elements on the SM107 class, 128 on the SM100 / SM103 class (the
+    TMA's unpacking format of the e2m1 operand reads whole 64-byte runs: the dense mixed class's rule)."""
+    assert in_fmt in MX_CLASSES, in_fmt
+    return max(BLOCK, k_granule(in_fmt))
 
 
 class MoEMxfp4w8aSpec(MoESpec):

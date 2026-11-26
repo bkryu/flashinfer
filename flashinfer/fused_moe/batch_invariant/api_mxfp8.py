@@ -5,6 +5,11 @@
 MXFP8 class of the part (the block scales inside the block-scaled step), the bf16 classes' chains, routing, deterministic
 permutation and slot-order combine.
 
+The mixed MXFP4-weight x MXFP8-activation classes (``moe.mxfp4w8a.<act>``, the fp4 backend's third pair) run the same
+pipeline on the byte-packed e2m1 experts of :class:`.api_fp4.MoEWeightsFp4` at the mixed instruction class of the part
+(``in_fmt`` in ``spec_mxfp4w8a.MX_CLASSES``: the K granule is the class's, the swapped body stages the record's own k-block,
+the gather and decode forms are the one-format classes'); :mod:`.api_mxfp4w8a` is their entry.
+
 ``MoEWeightsMXFP8.prepare`` quantizes the experts one at a time into the 128x4 swizzled scale layout the instruction reads;
 ``quantize_activations_mxfp8`` is the class's per-token activation quantization into the layer's canonical MXFP8 pack
 (e4m3 ``[T, H]`` with the token-major UE8M0 scales ``[T, H / 32]``, the pack ``TrtllmFp8BlockConfig`` and
@@ -59,6 +64,7 @@ from .blocks.epilogue import GroupedEpilogueBlock
 from .blocks.epilogue_mx import MxChain
 from .blocks.scheduler import MAX_E
 from .blocks.swap import PLAN_MAX_E, PLAN_MAX_SLOTS
+from .spec_mxfp4w8a import MX_CLASSES as MX_MIXED_CLASSES
 from .spec_mxfp8 import BLOCK, CLASS, MX_CLASSES
 
 #: The padded group alignment (rows): one 128x4 scale-factor atom.
@@ -69,6 +75,7 @@ GROUP_ALIGN = 128
 DENSE_TAIL = 256
 PACKINGS = ("padded", "dense")
 ALIGN_E4M3 = 16  # e4m3 elements per 16-byte row: the TMA alignment of every operand
+ALIGN_E2M1_BYTES = 16  # bytes per 16-byte row of the mixed classes' packed e2m1 weight (two codes per byte)
 _OUT = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
 
 
@@ -76,6 +83,15 @@ def mx_class_of(device: torch.device) -> str:
     """The instruction class a device runs: a function of the architecture family only (``mxfp8_k64`` on SM107,
     ``mxfp8`` on SM100 / SM103), never of the shape."""
     return mx_class_for("mxfp8", family_of(compute_capability(device)))
+
+
+def _is_mixed(in_fmt: str) -> bool:
+    """The mixed MXFP4 x MXFP8 classes (the e2m1 weight), against the MXFP8 classes."""
+    if in_fmt in MX_CLASSES:
+        return False
+    if in_fmt in MX_MIXED_CLASSES:
+        return True
+    raise ValueError(f"unknown MX instruction class {in_fmt!r}")
 
 
 #: The compute capabilities the classes are stated for (the dense MXFP8 GEMM class's parts).
@@ -151,6 +167,66 @@ def quantize_activations_mxfp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Ten
     if x.shape[1] % BLOCK:
         raise unsupported(CLASS, f"hidden_size {x.shape[1]}", f"a multiple of {BLOCK}")
     return quantize_mxfp8_rows(x.contiguous(), swizzled=False)
+
+
+def check_activation_pack(
+    x: torch.Tensor,
+    sf: Optional[torch.Tensor],
+    cls: str,
+    *,
+    sf_dtypes: Tuple[torch.dtype, ...] = (torch.uint8, torch.float8_e8m0fnu),
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The canonical MXFP8 activation pack as the runners take it, validated in the class's terms: the e4m3 rows ``[T, H]``
+    (``H`` whole scale blocks) and their token-major UE8M0 scales in the linear ``[T, H / 32]`` shape, taken as given (a
+    flattened or swizzled buffer is refused, never reshaped into rows; the empty pack takes any empty scale tensor; the
+    scale bytes typed as one of ``sf_dtypes``), both contiguous and 16-byte aligned; ``(x, sf)`` with ``sf`` as uint8."""
+    if x.dtype != torch.float8_e4m3fn or x.ndim != 2:
+        raise unsupported(
+            cls,
+            f"hidden_states_q {x.dtype} of rank {x.ndim}",
+            "the MXFP8 activation pack: an e4m3 [num_tokens, hidden_size] with its UE8M0 scales",
+        )
+    if sf is None:
+        raise unsupported(
+            cls,
+            "no hidden_states_scale",
+            f"the token-major UE8M0 scales [num_tokens, hidden_size / {BLOCK}]",
+        )
+    T, H = x.shape
+    if sf.dtype not in sf_dtypes:
+        raise unsupported(
+            cls,
+            f"hidden_states_scale {sf.dtype}",
+            "UE8M0 scale bytes ("
+            + " / ".join(str(d).replace("torch.", "") for d in sf_dtypes)
+            + ")",
+        )
+    if H % BLOCK:
+        raise unsupported(
+            cls,
+            f"hidden size {H}",
+            f"a positive multiple of {BLOCK} (whole UE8M0 scale blocks)",
+        )
+    sf = sf.view(torch.uint8)
+    if T == 0 and sf.numel() == 0:
+        sf = sf.reshape(
+            0, H // BLOCK
+        )  # the empty pack: no scale byte, whatever its shape
+    if tuple(sf.shape) != (T, H // BLOCK):
+        raise unsupported(
+            cls,
+            f"hidden_states_scale of shape {tuple(sf.shape)} for {T} rows of {H}",
+            f"the token-major [{T}, {H // BLOCK}] UE8M0 scales (the linear layout of the canonical MXFP8 pack; a "
+            "swizzled or flattened buffer is not reshaped into rows)",
+        )
+    x, sf = x.contiguous(), sf.contiguous()
+    if x.data_ptr() % 16 or sf.data_ptr() % 16:
+        raise unsupported(
+            cls,
+            "hidden_states_q or hidden_states_scale at a storage offset that is not a multiple of 16 bytes",
+            "16-byte aligned rows and scale bytes (the kernels' vector loads and TMA boxes)",
+        )
+    return x, sf
 
 
 # ----------------------------------------------------------------------------- weights
@@ -354,7 +430,9 @@ def grouped_gemm_mxfp8(
     """``out[p] = chain(a[p] @ w[e(p)].T)`` with the UE8M0 block scales applied inside the block-scaled step, on the padded
     expert segments ``counts`` (int32 ``[E]``; the rows of group ``e`` start at the exclusive prefix of the counts rounded
     up to 128): ``a [Tk_pad, K]`` e4m3, ``a_sf`` its 128x4 swizzled scales (``sf_numel(Tk_pad, K)`` bytes), ``w [E, N,
-    K]`` e4m3, ``w_sf [E, sf_numel(N, K)]``. ``chain``: a bf16 class chain (no scale) or the fused requantization chain
+    K]`` e4m3 -- or, at a mixed instruction class, ``w [E, N, K / 2]`` the byte-packed e2m1 weight (uint8, two codes per byte;
+    K in whole granules of the class, the swapped record's own k-block, no gather or decode form) -- ``w_sf [E, sf_numel(N,
+    K)]``. ``chain``: a bf16 class chain (no scale) or the fused requantization chain
     (``out_fmt == "mxfp8"``: returns ``(codes, sf)``); ``in_fmt`` the instruction class (the device's by default); ``out
     [Tk_pad, Nout]`` of the chain's dtype (rows past a group's real end are never stored). ``dense_a``: the dense packing --
     ``a`` the groups' rows back to back (any row count; the rows past the last group never stored), ``a_sf`` the scales at
@@ -379,6 +457,13 @@ def grouped_gemm_mxfp8(
         swap_k_block_arg,
     )
 
+    in_fmt = in_fmt or mx_class_of(a.device)
+    mixed = _is_mixed(in_fmt)
+    name = "grouped_gemm_mxfp4w8a" if mixed else "grouped_gemm_mxfp8"
+    if config.gather_a and mixed:
+        raise ValueError(
+            f"{name}: the gather form is the one-format classes' (the mixed classes read the token box)"
+        )
     if config.gather_a:
         return _grouped_gemm_mxfp8_gather(
             a,
@@ -399,12 +484,24 @@ def grouped_gemm_mxfp8(
         )
     if src is not None or rows is not None or in_kernel is not None:
         raise ValueError(
-            "grouped_gemm_mxfp8: src, rows and in_kernel belong to the gather record (config.gather_a)"
+            f"{name}: src, rows and in_kernel belong to the gather record (config.gather_a)"
         )
 
-    # the shared operand rules at the class's alignment: K in whole scale blocks, N at the weight-row rule, every row 16 bytes
+    # the shared operand rules at the class's alignment: K in whole scale blocks (whole granules of the mixed class), N at
+    # the weight-row rule, every row 16 bytes; the mixed classes' weight stored as two e2m1 codes per byte
+    if mixed:
+        from .spec_mxfp4w8a import granule_of
+
+        w_kw: dict = dict(
+            k_align=granule_of(in_fmt),
+            w_dtype=torch.uint8,
+            w_pack=2,
+            w_align=ALIGN_E2M1_BYTES,
+        )
+    else:
+        w_kw = dict(k_align=BLOCK)
     _, K, E, N, Tk = _check_grouped_operands(
-        "grouped_gemm_mxfp8",
+        name,
         a,
         w,
         counts,
@@ -413,12 +510,12 @@ def grouped_gemm_mxfp8(
         torch.float8_e4m3fn,
         ALIGN_E4M3,
         "e4m3",
-        k_align=BLOCK,
         n_align=8,
+        **w_kw,
     )
     if not dense_a and Tk % GROUP_ALIGN:
         raise ValueError(
-            "grouped_gemm_mxfp8: the padded rows are a multiple of the 128-row scale-factor atom"
+            f"{name}: the padded rows are a multiple of the 128-row scale-factor atom"
         )
     a_sf, w_sf = _bytes(a_sf, "a_sf").reshape(-1), _bytes(w_sf, "w_sf").reshape(-1)
     if dense_a:
@@ -426,28 +523,25 @@ def grouped_gemm_mxfp8(
             sf_rows = (a_sf.numel() // padded_sf_cols(K)) // GROUP_ALIGN * GROUP_ALIGN
         if sf_rows % GROUP_ALIGN or sf_rows < Tk:
             raise ValueError(
-                "grouped_gemm_mxfp8: the dense packing's scale rows are whole 128-row atoms covering the rows"
+                f"{name}: the dense packing's scale rows are whole 128-row atoms covering the rows"
             )
         if n_live is not None and sf_rows < padded_rows_bound(n_live, 1, E):
             raise ValueError(
-                "grouped_gemm_mxfp8: the dense packing's scale rows must cover the padded positions of the live rows "
+                f"{name}: the dense packing's scale rows must cover the padded positions of the live rows "
                 f"(at least padded_rows_bound({n_live}, 1, {E}) = {padded_rows_bound(n_live, 1, E)} rows)"
             )
     else:
         if sf_rows is not None and sf_rows != Tk:
             raise ValueError(
-                "grouped_gemm_mxfp8: the padded packing's scale rows are the operand's rows"
+                f"{name}: the padded packing's scale rows are the operand's rows"
             )
         sf_rows = Tk
     if a_sf.numel() < sf_numel(sf_rows, K) or w_sf.numel() < E * sf_numel(N, K):
         raise ValueError(
-            "grouped_gemm_mxfp8: the scale-factor buffers are smaller than the operands' 128x4 layouts"
+            f"{name}: the scale-factor buffers are smaller than the operands' 128x4 layouts"
         )
-    in_fmt = in_fmt or mx_class_of(a.device)
-    if in_fmt not in MX_CLASSES:
-        raise ValueError(f"grouped_gemm_mxfp8: unknown instruction class {in_fmt!r}")
     chain = MxChain.of(chain, in_fmt)
-    n_out = _check_grouped_chain("grouped_gemm_mxfp8", N, chain)
+    n_out = _check_grouped_chain(name, N, chain)
 
     def grid_of():
         # the persistent grid clipped to the launch's tile bound from the static sizes (``a``'s rows bound the live rows): which
@@ -457,13 +551,18 @@ def grouped_gemm_mxfp8(
     if config.swap_ab:
         if not dense_a:
             raise ValueError(
-                "grouped_gemm_mxfp8: the swapped decode body reads the dense packing (the scale factors at the padded positions)"
+                f"{name}: the swapped decode body reads the dense packing (the scale factors at the padded positions)"
             )
-        # the stage's K extent: two atoms when they divide K (`swap_k_block`; ``k_block`` overrides), a placement
-        kb = swap_k_block_arg(in_fmt, K, k_block)
+        # the stage's K extent: two atoms when they divide K (`swap_k_block`; ``k_block`` overrides), a placement; the
+        # mixed classes' swapped records carry their stage width as a field of the record (the dense class's rule)
+        kb = 0 if mixed else swap_k_block_arg(in_fmt, K, k_block)
+        if mixed and k_block:
+            raise ValueError(
+                f"{name}: the mixed classes' swapped records carry their own k-block"
+            )
         if not can_implement_swapped_mxfp8(config, N, K, E, chain, in_fmt, kb):
             raise ValueError(
-                f"grouped_gemm_mxfp8: swapped record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt}, k_block={kb or 'default'})"
+                f"{name}: swapped record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt}, k_block={kb or 'default'})"
             )
         kernel_of = lambda: get_compiled_swapped(config, chain, k_block=kb)  # noqa: E731
 
@@ -481,7 +580,7 @@ def grouped_gemm_mxfp8(
     else:
         if not can_implement_grouped_mxfp8(config, N, K, E, chain, in_fmt):
             raise ValueError(
-                f"grouped_gemm_mxfp8: record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
+                f"{name}: record {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, {in_fmt})"
             )
         kernel_of = lambda: get_compiled_grouped(  # noqa: E731
             config, chain, packing="dense" if dense_a else "padded"
@@ -503,20 +602,16 @@ def grouped_gemm_mxfp8(
         # the fused requantization: the codes and the 128x4 scale bytes of the bf16-rounded chain, written by the epilogue
         if out is not None:
             raise ValueError(
-                "grouped_gemm_mxfp8: the fused requantization allocates its two outputs"
+                f"{name}: the fused requantization allocates its two outputs"
             )
-        codes = _grouped_out(
-            "grouped_gemm_mxfp8", None, Tk, n_out, torch.uint8, a.device
-        )
+        codes = _grouped_out(name, None, Tk, n_out, torch.uint8, a.device)
         sf = _quant_sf_buffer(sf_rows, n_out, a.device)
         if Tk:
             kernel_of()(
                 *args(codes, sf)
             )  # the host rules above come before the JIT build
         return codes.view(torch.float8_e4m3fn), sf
-    out = _grouped_out(
-        "grouped_gemm_mxfp8", out, Tk, n_out, _OUT[chain.out_fmt], a.device
-    )
+    out = _grouped_out(name, out, Tk, n_out, _OUT[chain.out_fmt], a.device)
     if Tk:
         kernel_of()(*args(out))
     return out
@@ -777,7 +872,7 @@ def fused_moe_mxfp8(
     x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
-    w: MoEWeightsMXFP8,
+    w: Any,
     out: Optional[torch.Tensor] = None,
     config1: Optional[Knobs] = None,
     config2: Optional[Knobs] = None,
@@ -790,7 +885,10 @@ def fused_moe_mxfp8(
     gather: Optional[bool] = None,
     decode: Optional[bool] = None,
 ) -> Any:
-    """The MXFP8 x MXFP8 MoE FFN for pre-routed tokens: ``x`` a bf16 ``[T, H]`` (quantized here per token by the
+    """The MXFP8 x MXFP8 MoE FFN for pre-routed tokens (``w`` a :class:`MoEWeightsMXFP8`), and the mixed MXFP4 x MXFP8 FFN
+    at a mixed instruction class ``in_fmt`` (``w`` the fp4 backend's :class:`.api_fp4.MoEWeightsFp4` of the mixed pair; the
+    box form alone: ``gather`` and ``decode`` are the one-format classes'; :func:`.api_mxfp4w8a.fused_moe_mxfp4w8a` is the
+    entry): ``x`` a bf16 ``[T, H]`` (quantized here per token by the
     ``mxfp8.quant`` class) or the quantized pack ``(xq [T, H] e4m3, xsf [T, H / 32] uint8 / UE8M0)`` taken as given;
     ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` fp32; the output bf16 ``[T, H]``. ``in_fmt``
     names the instruction class (the device's by default); ``config1`` / ``config2`` the records (any record of either
@@ -821,10 +919,12 @@ def fused_moe_mxfp8(
     )
 
     H, I, E = w.hidden_size, w.intermediate_size, w.num_experts
+    mixed = getattr(w, "pair", None) is not None
+    name = "fused_moe_mxfp4w8a" if mixed else "fused_moe_mxfp8"
     if isinstance(x, torch.Tensor):
         if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != H:
             raise TypeError(
-                f"fused_moe_mxfp8: x must be a bf16 [T, {H}] or the quantized pack (xq, xsf)"
+                f"{name}: x must be a bf16 [T, {H}] or the quantized pack (xq, xsf)"
             )
         dev, T = x.device, x.shape[0]
         if T:
@@ -836,7 +936,7 @@ def fused_moe_mxfp8(
         xq, xsf = x
         dev, T = xq.device, xq.shape[0]
     if xq.dtype != torch.float8_e4m3fn or tuple(xq.shape) != (T, H):
-        raise TypeError(f"fused_moe_mxfp8: xq must be an e4m3 [T, {H}]")
+        raise TypeError(f"{name}: xq must be an e4m3 [T, {H}]")
     xsf8 = _bytes(xsf, "xsf")
     if T == 0 and xsf8.numel() == 0:
         xsf8 = xsf8.reshape(
@@ -844,12 +944,12 @@ def fused_moe_mxfp8(
         )  # the empty pack: no scale byte, whatever its shape
     if tuple(xsf8.shape) != (T, H // BLOCK) or not xsf8.is_contiguous():
         raise TypeError(
-            f"fused_moe_mxfp8: xsf must be the token-major [T, {H // BLOCK}] UE8M0 scales of the activation pack (the "
+            f"{name}: xsf must be the token-major [T, {H // BLOCK}] UE8M0 scales of the activation pack (the "
             f"linear layout; a swizzled or flattened buffer is not reshaped into rows), got {tuple(xsf8.shape)}"
         )
     # the shared fused-entry rules (the rows' alignment at the class's scale block, the ids and weights, the output)
     T, H, k, experts, scales, out = _check_fused_inputs(
-        "fused_moe_mxfp8",
+        name,
         xq,
         token_selected_experts,
         token_final_scales,
@@ -859,16 +959,31 @@ def fused_moe_mxfp8(
         BLOCK,
         "e4m3",
     )
+    cls = w.pair.cls if mixed else CLASS
     if xq.data_ptr() % 16 or xsf8.data_ptr() % 16:
         raise unsupported(
-            CLASS,
+            cls,
             "quantized rows or scale bytes at a storage offset that is not a multiple of 16 bytes",
             "16-byte aligned rows and scale bytes (the kernels' vector loads and TMA boxes)",
         )
-    check_shape_mxfp8(H, I, E, k)
-    in_fmt = in_fmt or mx_class_of(dev)
-    if in_fmt not in MX_CLASSES:
-        raise ValueError(f"fused_moe_mxfp8: unknown instruction class {in_fmt!r}")
+    if mixed:
+        from .api_mxfp4w8a import mx_class_of as mixed_class_of
+
+        in_fmt = in_fmt or mixed_class_of(dev)
+        if not _is_mixed(in_fmt):
+            raise ValueError(f"{name}: {in_fmt!r} is not a mixed instruction class")
+        # the pair's complete shape rule at the class (the granule of the part)
+        w.pair.check_shape(H, I, E, k, w.gated, in_fmt=in_fmt)
+        if gather or decode:
+            raise ValueError(
+                f"{name}: the gather and decode forms are the one-format classes' (the mixed classes read the token box)"
+            )
+        gather = decode = False
+    else:
+        check_shape_mxfp8(H, I, E, k)
+        in_fmt = in_fmt or mx_class_of(dev)
+        if _is_mixed(in_fmt):
+            raise ValueError(f"{name}: {in_fmt!r} is a mixed instruction class")
     if T == 0:  # no tokens: nothing to route, the (0, H) output as it stands
         if return_intermediates:
             return out, dict(
@@ -880,28 +995,37 @@ def fused_moe_mxfp8(
     if requant not in ("fused", "standalone"):
         raise ValueError(f"requant must be 'fused' or 'standalone', got {requant!r}")
     if config1 is None or config2 is None:
-        # the standalone requantization is a padded-path spelling: its dispatcher ranks the padded records only
+        # the standalone requantization is a padded-path spelling: its dispatcher ranks the padded records only; the mixed
+        # classes rank with their own dispatcher (the fused spelling GEMM1 runs)
         sm_count, family = _part(dev)
-        c1, c2 = default_configs_mx(
-            T,
-            k,
-            H,
-            I,
-            E,
-            w.chain1,
-            in_fmt,
-            sm_count,
-            family,
-            swap=None if (requant == "fused" and path != "padded") else False,
-        )
+        if mixed:
+            from .schedule_mxfp4w8a import default_configs_mx as default_configs_mixed
+
+            c1, c2 = default_configs_mixed(
+                T, k, H, I, E, w.chain1_quant, in_fmt, sm_count, family,
+                swap=None if (requant == "fused" and path != "padded") else False,
+            )  # fmt: skip
+        else:
+            c1, c2 = default_configs_mx(
+                T,
+                k,
+                H,
+                I,
+                E,
+                w.chain1,
+                in_fmt,
+                sm_count,
+                family,
+                swap=None if (requant == "fused" and path != "padded") else False,
+            )
         config1, config2 = config1 or c1, config2 or c2
     if path is None:
         path = packing_for(config1, config2)
     if path not in PACKINGS:
-        raise ValueError(f"fused_moe_mxfp8: unknown packing {path!r}")
+        raise ValueError(f"{name}: unknown packing {path!r}")
     if path == "padded" and (config1.swap_ab or config2.swap_ab):
         raise ValueError(
-            "fused_moe_mxfp8: a swapped record reads the dense packing (path='dense')"
+            f"{name}: a swapped record reads the dense packing (path='dense')"
         )
     if gather is None and path == "dense" and requant == "fused":
         from .schedule import rows_per_expert
@@ -910,7 +1034,7 @@ def fused_moe_mxfp8(
     elif gather:
         if not config1.swap_ab or path != "dense" or requant != "fused":
             raise ValueError(
-                "fused_moe_mxfp8: the gather form is GEMM1's swapped record on the dense packing with the fused requantization"
+                f"{name}: the gather form is GEMM1's swapped record on the dense packing with the fused requantization"
             )
         config1 = dataclasses.replace(config1, gather_a=True)
     elif gather is False:
@@ -919,7 +1043,7 @@ def fused_moe_mxfp8(
         # the pack's scale rows are not whole 4-byte groups: the box form through the scatter
         config1 = dataclasses.replace(config1, gather_a=False)
     if config2.gather_a:
-        raise ValueError("fused_moe_mxfp8: the gather form is GEMM1's")
+        raise ValueError(f"{name}: the gather form is GEMM1's")
     if decode and gather is not False:
         config1 = dataclasses.replace(
             config1, gather_a=True
@@ -935,13 +1059,13 @@ def fused_moe_mxfp8(
     )
     if decode and not decode_ok:
         raise ValueError(
-            "fused_moe_mxfp8: the decode form takes two swapped records on the dense packing with the fused requantization, "
+            f"{name}: the decode form takes two swapped records on the dense packing with the fused requantization, "
             "no precomputed plan, the gather form and a routing within the in-kernel plan's bounds"
         )
     in_kernel = bool(decode) if decode is not None else decode_ok
     if plan is not None and len(plan) != (5 if path == "dense" else 3):
         raise ValueError(
-            "fused_moe_mxfp8: the plan's form (padded: 3 tensors, dual: 5) must match the packing"
+            f"{name}: the plan's form (padded: 3 tensors, dual: 5) must match the packing"
         )
     nb, pcols = H // BLOCK, padded_sf_cols(H)
     if path == "dense":
@@ -949,9 +1073,7 @@ def fused_moe_mxfp8(
         # buffers carry DENSE_TAIL rows past the live rows so the last tiles' boxes stay inside them (never stored), the scale
         # buffers past the padded rows
         if requant != "fused":
-            raise ValueError(
-                "fused_moe_mxfp8: the dense packing runs the fused requantization"
-            )
+            raise ValueError(f"{name}: the dense packing runs the fused requantization")
         Tk = T * k
         Tk_pad = padded_rows_bound(T, k, E)
         Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
@@ -1070,6 +1192,7 @@ def fused_moe_mxfp8(
                 Tk_a=Tk_a,
                 Tk_sf=Tk_sf,
                 path=path,
+                requant=requant,
                 swap=(config1.swap_ab, config2.swap_ab),
             )
         return out
@@ -1127,6 +1250,7 @@ def fused_moe_mxfp8(
             in_fmt=in_fmt,
             Tk_pad=Tk_pad,
             path=path,
+            requant=requant,
             swap=(False, False),
         )
     return out
