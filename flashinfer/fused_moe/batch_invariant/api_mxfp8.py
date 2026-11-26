@@ -506,7 +506,7 @@ def grouped_gemm_mxfp8(
         codes = _grouped_out(
             "grouped_gemm_mxfp8", None, Tk, n_out, torch.uint8, a.device
         )
-        sf = torch.empty(sf_numel(sf_rows, n_out), dtype=torch.uint8, device=a.device)
+        sf = _quant_sf_buffer(sf_rows, n_out, a.device)
         if Tk:
             kernel_of()(
                 *args(codes, sf)
@@ -518,6 +518,15 @@ def grouped_gemm_mxfp8(
     if Tk:
         kernel_of()(*args(out))
     return out
+
+
+def _quant_sf_buffer(sf_rows: int, n_out: int, device: torch.device) -> torch.Tensor:
+    """The fused requantization's 128x4 scale buffer of ``(sf_rows, n_out)``: zero-filled where a row's scale columns leave
+    pad columns in their last 4-byte group (``n_out`` not a multiple of 128) -- the epilogue stores a row's real scale
+    columns only, and GEMM2's scale boxes read the pad columns against the zero-filled tail of its k-tile -- and
+    uninitialised otherwise (every byte of a live row is stored; the padding rows are row-local)."""
+    alloc = torch.zeros if padded_sf_cols(n_out) != n_out // BLOCK else torch.empty
+    return alloc(sf_numel(sf_rows, n_out), dtype=torch.uint8, device=device)
 
 
 def gather_form_ok(K: int) -> bool:
@@ -696,7 +705,7 @@ def _grouped_gemm_mxfp8_gather(
         codes = _grouped_out(
             "grouped_gemm_mxfp8", None, rows, n_out, torch.uint8, a.device
         )
-        sf = torch.empty(sf_numel(sf_rows, n_out), dtype=torch.uint8, device=a.device)
+        sf = _quant_sf_buffer(sf_rows, n_out, a.device)
         if rows and T:
             kernel_of()(*args(codes, sf))
         return codes.view(torch.float8_e4m3fn), sf

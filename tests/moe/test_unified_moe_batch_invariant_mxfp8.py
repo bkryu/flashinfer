@@ -3301,3 +3301,86 @@ def test_scale_rows_of_another_shape_are_refused_and_the_empty_pack_runs():
         )  # fmt: skip
         assert layer(act, W_pack).shape == (0, H)
         assert layer(_logits_pack((x0, sf0), logits[:0]), W_pack).shape == (0, H)
+
+
+@needs_device
+@pytest.mark.parametrize("I", [96, 160])
+def test_narrow_intermediate_scale_tails_under_a_poisoned_allocator(I, monkeypatch):
+    """At ``I % 128 != 0`` the intermediate's scale rows end in a 4-byte group with pad columns that no epilogue stores
+    (the fused requantization stores a row's real scale columns), and GEMM2's scale boxes read them against the
+    zero-filled tail of the k-tile: with the caching allocator's blocks pre-filled with e4m3 / bf16 NaN patterns and every
+    ``torch.empty`` of the run filled with the pattern as well, the layer at a mid token count (the dispatcher's packing)
+    and the op's forms at a decode count -- the padded body with the fused and the standalone requantization, the swapped
+    records in the box, gather and decode forms -- are finite and equal a clean run's bits, each other's on their tokens
+    (batch invariance) and the class's composition."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.api import route
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import default_configs_mx
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    k, H, E, T, Td = 4, 256, 16, 64, 3
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=70 + I, adversarial=True)
+    xq, xsf = _quant(x)
+    layer, W = _layer(k, E, I), _weights(w1, w2)
+    Wq = F.MoEWeightsMXFP8.from_view(W.get_view(KEY))
+    ids, wts = route(logits, k)
+    sm, fam = F._part(xq.device)
+    fmt = F.mx_class_of(xq.device)
+    s1, s2 = default_configs_mx(Td, k, H, I, E, Wq.chain1, fmt, sm, fam, swap=True)
+    p1, p2 = default_configs_mx(T, k, H, I, E, Wq.chain1, fmt, sm, fam, swap=False)
+    act = _logits_pack((xq, xsf), logits)
+    dec = ((xq[:Td], xsf[:Td]), ids[:Td], wts[:Td], Wq)
+    runs = {
+        "layer": lambda: layer(act, W),
+        "padded fused": lambda: F.fused_moe_mxfp8(
+            (xq, xsf), ids, wts, Wq, config1=p1, config2=p2, path="padded"
+        ),
+        "padded standalone": lambda: F.fused_moe_mxfp8(
+            (xq, xsf),
+            ids,
+            wts,
+            Wq,
+            config1=p1,
+            config2=p2,
+            path="padded",
+            requant="standalone",
+        ),  # fmt: skip
+        "swapped box": lambda: F.fused_moe_mxfp8(
+            *dec, config1=s1, config2=s2, gather=False, decode=False
+        ),
+        "swapped gather": lambda: F.fused_moe_mxfp8(
+            *dec, config1=s1, config2=s2, gather=True, decode=False
+        ),
+        "decode": lambda: F.fused_moe_mxfp8(*dec, config1=s1, config2=s2, decode=True),
+    }
+    for run in runs.values():
+        run()  # the compile and the winner, outside the poisoned runs
+    _poison_allocator(0x00)
+    ref = {name: run() for name, run in runs.items()}
+    for name, out in ref.items():
+        assert torch.isfinite(out.float()).all(), name
+    assert torch.equal(bits(ref["layer"]), bits(ref["padded fused"]))
+    assert torch.equal(bits(ref["layer"]), bits(ref["padded standalone"]))
+    for name in ("swapped box", "swapped gather", "decode"):
+        assert torch.equal(bits(ref[name]), bits(ref["layer"])[:Td]), name
+    ids_r, wts_r = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    comp = _reference_ffn(
+        xq, xsf, ids_r.cuda(), wts_r.cuda(), w1, w2, activation_of(_SWIGLU)
+    )
+    assert torch.equal(bits(ref["layer"].cpu()), bits(comp))
+    empty = torch.empty
+    byte = 0x00
+
+    def poisoned_empty(*args, **kwargs):
+        t = empty(*args, **kwargs)
+        if t.is_cuda and t.numel():
+            t.flatten().view(torch.uint8).fill_(byte)
+        return t
+
+    monkeypatch.setattr(torch, "empty", poisoned_empty)
+    for byte in (0xFF, 0x7F):
+        _poison_allocator(byte)
+        for name, run in runs.items():
+            out = run()
+            assert torch.isfinite(out.float()).all(), (name, I, hex(byte))
+            assert torch.equal(bits(out), bits(ref[name])), (name, I, hex(byte))
