@@ -243,9 +243,9 @@ def _routed_pack(
 
 
 def test_backend_is_registered_and_never_a_default_candidate():
-    """The config is a known backend of the layer, mapped to the fp8-block runner, absent from the default candidates; the
-    runner serves both block-scaled fp8 pairs (the DeepSeek pair by this pair's runner), declares the three routing modes
-    and every activation class of the layer (the bf16 runner's); a pair it does not serve is not admitted."""
+    """The backend's registration, modes, activation classes and default-candidate rule are the MXFP8 suite's; here the pair's
+    own facts: the backend serves both block-scaled fp8 pairs and constructs this pair's runner for the DeepSeek pair, which
+    admits that pair alone; the kernel-class registry names the class."""
     assert BatchInvariantFp8BlockConfig in ALL_BACKEND_CONFIGS
     assert (
         _BACKEND_RUNNERS[BatchInvariantFp8BlockConfig] is BatchInvariantFp8BlockRunner
@@ -253,17 +253,7 @@ def test_backend_is_registered_and_never_a_default_candidate():
     assert not any(
         isinstance(c, BatchInvariantFp8BlockConfig) for c in _DEFAULT_BACKEND.candidates
     )
-    assert [
-        a
-        for a in (89, 90, 100, 103, 107, 110, 120, 121)
-        if BatchInvariantFp8BlockConfig.supported(a)
-    ] == [100, 103, 107]
     assert issubclass(BatchInvariantDeepSeekFp8Runner, BatchInvariantFp8BlockRunner)
-    assert (
-        BatchInvariantFp8BlockRunner.backend_key
-        == "batch_invariant_fp8_block"
-        != BatchInvariantMoeRunner.backend_key
-    )
     assert BatchInvariantFp8BlockRunner.supported_quant_variants == (
         (QuantFormat.MXFP8, QuantFormat.MXFP8),
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
@@ -275,13 +265,8 @@ def test_backend_is_registered_and_never_a_default_candidate():
     )
     assert BatchInvariantFp8BlockRunner.supports_quant(QUANT)
     assert not BatchInvariantFp8BlockRunner.supports_quant(QuantConfig())
-    assert set(BatchInvariantFp8BlockRunner.supported_routing_modes) == {
-        RoutingInputMode.FromLogits,
-        RoutingInputMode.PackedPrecomputed,
-        RoutingInputMode.UnpackedPrecomputed,
-    }
     assert (
-        set(BatchInvariantFp8BlockRunner.supported_activation_classes)
+        set(BatchInvariantDeepSeekFp8Runner.supported_activation_classes)
         == set(BatchInvariantMoeRunner.supported_activation_classes)
         == {
             SwiGLU,
@@ -297,7 +282,6 @@ def test_backend_is_registered_and_never_a_default_candidate():
             SiLU,
         }
     )
-    assert repr(BatchInvariantFp8BlockConfig()) == "BatchInvariantFp8BlockConfig()"
     assert (
         "fused_moe_fp8bs" in bi.CLASSES
         and bi.class_name("fused_moe_fp8bs") == "moe.e4m3bs"

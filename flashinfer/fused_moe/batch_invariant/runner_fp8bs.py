@@ -43,13 +43,6 @@ def _tactic_bs(c1, c2, fused: bool) -> tuple:
     return _tactic(c1, c2) + (int(bool(fused)),)
 
 
-def MoEWeightsE4M3BS_block_of(inputs: List[torch.Tensor]) -> int:
-    """The scale block size of the packed inputs' weights (``w1`` and its scales)."""
-    from .api_fp8bs import MoEWeightsE4M3BS
-
-    return MoEWeightsE4M3BS.block_of(inputs[_W1], inputs[_W1SF])
-
-
 def _configs_from_tactic_bs(t: tuple):
     """The two records and the requantization spelling of a tactic; a tuple of another length (another class's encoding in
     the autotuner's cache) is refused."""
@@ -140,7 +133,7 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         aligned, and the class's shape rule on the configuration at this hidden size; or the raw bf16 rows with no scale
         (the class quantizes them in one launch with its permutation plan: the pack contract's raw-bf16 encoding of a
         DeepSeek fp8 backend that quantizes internally), packed with an empty scale."""
-        from .api_fp8bs import check_shape_fp8bs, scale_mn_view
+        from .api_fp8bs import check_aligned, check_shape_fp8bs, scale_mn_view
 
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype not in (self.X_DTYPE, torch.bfloat16):
@@ -168,7 +161,7 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
                     "bf16 hidden_states_q with a hidden_states_scale",
                     "bf16 rows with no scale (the class quantizes them), or the e4m3 pair",
                 )
-            self._check_aligned(x, None)
+            check_aligned(self._block, x, None)
             return [x, x.new_empty(0, dtype=torch.float32)]
         if act.hidden_states_scale is None:
             raise unsupported(self.CLASS, "no hidden_states_scale", self.SCALE_RULE)
@@ -183,18 +176,8 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
             .t()
             .contiguous()
         )
-        self._check_aligned(x, sx)
+        check_aligned(self._block, x, sx)
         return [x, sx]
-
-    def _check_aligned(self, x: torch.Tensor, sx: Optional[torch.Tensor]) -> None:
-        """The rows and the scales start at 16-byte boundaries (the kernels' vector loads and TMA boxes): the base pointer,
-        which the shared stride rules do not see."""
-        if x.data_ptr() % 16 or (sx is not None and sx.data_ptr() % 16):
-            raise unsupported(
-                self.CLASS,
-                "hidden_states_q or hidden_states_scale at a storage offset that is not a multiple of 16 bytes",
-                "16-byte aligned rows and scale bytes (the kernels' vector loads and TMA boxes)",
-            )
 
     # ---- the weight view -------------------------------------------------------------------------------------------
     def _weights_from_view(self, view):
@@ -291,9 +274,11 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
         """The ranked record pairs of both requantization spellings, the dispatcher's spelling first (every tactic computes
         the class)."""
+        from .api_fp8bs import MoEWeightsE4M3BS
+
         self._require_built()
         self._hidden = int(inputs[_X].shape[1])
-        self._block = MoEWeightsE4M3BS_block_of(inputs)
+        self._block = MoEWeightsE4M3BS.block_of(inputs[_W1], inputs[_W1SF])
         T = int(inputs[_X].shape[0])
         default_fused = self._fused_default(T)
         out: List[Any] = []

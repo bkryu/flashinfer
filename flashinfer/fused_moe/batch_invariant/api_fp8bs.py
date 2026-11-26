@@ -65,7 +65,7 @@ MOE_FP8BS_ARCHS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3), (10, 7))
 VIEW_PAIR = "deepseek_fp8"
 TAIL_ROWS = 256  # rows past the live rows of every packed buffer: the largest cluster tile's TMA box stays in bounds
 _OUT_DTYPE = {"bf16": torch.bfloat16, "f32": torch.float32}
-_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "f16"}
+_DTYPE_STR = {torch.bfloat16: "bf16"}  # the quantizer's input: the layer's bf16 rows
 SCALE_LAYOUTS = ("MN", "K")
 #: Below this many warps per SM the quantizer's launch is latency-bound: more warps share a row (empirical; a placement).
 ROW_WARPS_PER_SM_SMALL = 16
@@ -93,12 +93,10 @@ def quant_warps_per_row(
 
 
 def _check_quant_input(x: torch.Tensor, block: int) -> Tuple[int, int]:
-    """The quantizer's input rule: a 2-D bf16 / f16 tensor with 16-byte-aligned contiguous rows, ``K`` whole blocks."""
+    """The quantizer's input rule: a 2-D bf16 tensor with 16-byte-aligned contiguous rows, ``K`` whole blocks."""
     if x.dim() != 2 or x.dtype not in _DTYPE_STR:
         raise unsupported(
-            "fp8bs.quant",
-            f"input {tuple(x.shape)} of {x.dtype}",
-            "a 2-D bf16 / f16 tensor",
+            "fp8bs.quant", f"input {tuple(x.shape)} of {x.dtype}", "a 2-D bf16 tensor"
         )
     if block not in BLOCKS:
         raise unsupported(
@@ -175,7 +173,7 @@ def fp8_block_quantize(
     enable_pdl: bool = True,
     block: int = QBLOCK,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(q [M, K] float8_e4m3fn, s fp32)`` of ``x [M, K]`` (bf16 / f16, 16-byte-aligned rows, ``K`` a whole number of
+    """``(q [M, K] float8_e4m3fn, s fp32)`` of ``x [M, K]`` (bf16, 16-byte-aligned rows, ``K`` a whole number of
     ``block``-element blocks; ``block`` 128, or 32 for the ``moe.e4m3bs32`` classes): per block ``s = fmaxc(div(amax |x|, 448),
     1e-12)``, ``q = cvt.rn.satfinite.e4m3(mul(x, div(1, s)))``. ``s`` is ``[K / block, M]`` (``"MN"``, FlashInfer's DeepSeek
     activation layout) or ``[M, K / block]`` (``"K"``). ``out = (q, s)`` writes into the caller's tensors (``s`` in the requested
@@ -716,9 +714,9 @@ def grouped_gemm_fp8bs(
     return (out, sfo) if quant else out
 
 
-def _check_aligned(block: int, x: torch.Tensor, sx: Optional[torch.Tensor]) -> None:
+def check_aligned(block: int, x: torch.Tensor, sx: Optional[torch.Tensor]) -> None:
     """The rows and the scales start at 16-byte boundaries (the kernels' vector loads and TMA boxes): the base pointer, not
-    only the strides, which the shared entry rules check."""
+    only the strides, which the shared entry rules check; the op's and the runner's one rule."""
     if x.data_ptr() % 16 or (sx is not None and sx.data_ptr() % 16):
         raise unsupported(
             CLASS_OF[block],
@@ -744,8 +742,8 @@ def fused_moe_fp8bs(
     w_round: bool = False,
 ):
     """The block-scale fp8 MoE FFN for pre-routed tokens: ``xq [T, H]`` e4m3 with ``sx`` its block scales (``[H / block, T]``,
-    the DeepSeek layout as given; rows and scales 16-byte aligned) -- or the bf16 / f16 activations themselves with ``sx =
-    None``: the class quantizes them by its own chain,
+    the DeepSeek layout as given; rows and scales 16-byte aligned) -- or the bf16 activations themselves with ``sx = None``:
+    the class quantizes them by its own chain,
     in one launch with the permutation plan (:func:`fp8_block_quantize_plan`) --, ``token_selected_experts [T, k]`` int32,
     ``token_final_scales [T, k]`` fp32; ``out[t] = sum_r w[t, r] * y_r``
     with the class's chains and rounding (:mod:`.spec_fp8bs`), the ``k`` slots folded in slot order in fp32 and converted once.
@@ -763,11 +761,11 @@ def fused_moe_fp8bs(
     from .schedule_fp8bs import default_configs_fp8bs, fused_quant_default
 
     if xq.dtype in _DTYPE_STR:
-        # bf16 / f16 activations: the class quantizes them itself -- with the dense plan in one launch when the plan is this
+        # bf16 activations: the class quantizes them itself -- with the dense plan in one launch when the plan is this
         # call's (the pre-routed form), by the standalone quantizer when the plan is given (the routed form's route + plan)
         if sx is not None:
             raise ValueError(
-                "fused_moe_fp8bs: bf16 / f16 activations take no hidden_states_scale (the class quantizes them)"
+                "fused_moe_fp8bs: bf16 activations take no hidden_states_scale (the class quantizes them)"
             )
         T0, _, _, _, _, out = _check_fused_inputs(
             "fused_moe_fp8bs",
@@ -780,7 +778,7 @@ def fused_moe_fp8bs(
             8,
             _DTYPE_STR[xq.dtype],
         )
-        _check_aligned(w.block, xq, None)
+        check_aligned(w.block, xq, None)
         if T0 == 0:
             return out  # the empty output: no plan, no quantizer, no record
         if plan is None:
@@ -809,7 +807,7 @@ def fused_moe_fp8bs(
     sx_kt = scale_mn_view(
         sx, KB, T, "hidden_states_scale", block
     ).t()  # as [KB, T] (a view; the gather reads its strides)
-    _check_aligned(block, xq, sx_kt)
+    check_aligned(block, xq, sx_kt)
     if T == 0:
         return out  # the empty output: no record is consulted
     if fuse_quant is None:
@@ -954,6 +952,7 @@ __all__ = [
     "TAIL_ROWS",
     "VIEW_PAIR",
     "MoEWeightsE4M3BS",
+    "check_aligned",
     "check_block_scales",
     "check_shape_fp8bs",
     "fp8_block_quantize",
