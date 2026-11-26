@@ -499,9 +499,10 @@ def _moe_mxfp4w8a_fingerprint(
     instruction class of the dense mixed GEMM: the SM107 step folds 64 elements, the SM100 / SM103 one 32 and reads the
     e2m1 weight in 128-element runs, so H and I are multiples of 128 there; ``arch`` as for ``mm_mxfp8_mxfp4``, the current
     device by default)."""
-    from flashinfer.fused_moe.batch_invariant.api_mxfp4w8a import granule_of
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import MXFP4W8A, check_shape_fp4
     from flashinfer.fused_moe.batch_invariant.spec_mxfp4w8a import (
         BLOCK,
+        granule_of,
         spec_fingerprint_mxfp4w8a,
     )
 
@@ -526,6 +527,8 @@ def _moe_mxfp4w8a_fingerprint(
         n_group,
         topk_group,
     )
+    # the class's complete shape rule at the part's class (the layer's): a shape the runner refuses has no fingerprint
+    check_shape_fp4(MXFP4W8A, H, I, num_experts, top_k, bool(gated), fmt)
     return spec_fingerprint_mxfp4w8a(
         H, I, top_k, num_experts, rm, name, params, gated, fmt
     )

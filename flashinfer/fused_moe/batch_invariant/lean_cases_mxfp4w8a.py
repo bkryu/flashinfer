@@ -5,8 +5,8 @@ cases.
 
 The file couples the Lean model (``lean/BIKernels/MoEMxfp4w8a.lean``) to :mod:`.spec_mxfp4w8a`: the GEMM1 chains of the class
 (the bf16 classes' terms on the accumulators) and its GEMM2 conversion as kernel-``decide`` theorems and
-``moemxfp4w8aconformance`` lines, and the grouped record space (``schedule_mxfp4w8a.grouped_knobs_mx``: one list for both
-instruction classes) with its membership in both verified dense mixed spaces of ``Cases.lean`` and the tile-result
+``moemxfp4w8aconformance`` lines, and the grouped record space (the MX dispatcher's ``grouped_knobs_mx`` at the mixed classes:
+one list for both) with its membership in both verified dense mixed spaces of ``Cases.lean`` and the tile-result
 invariance over it on both classes, all decided by the kernel (no ``native_decide``: the file adds nothing to the axiom
 policy). A regenerated file that differs from the committed one fails the device-free test
 (``tests/batch_invariant/test_moe_mxfp4w8a_lean.py``), which needs no Lean toolchain.

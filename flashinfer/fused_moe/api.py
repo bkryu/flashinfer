@@ -3864,7 +3864,7 @@ class BatchInvariantFp4Config:
         bf16 or fp32 copy of the experts)."""
         from ..batch_invariant.support import unsupported
         from .batch_invariant.api_fp4 import MoEWeightsFp4
-        from .batch_invariant.runner_fp4 import MIXED_PAIR, PAIRS
+        from .batch_invariant.runner_fp4 import PAIRS
         from .batch_invariant.spec import activation_of
 
         pair = _fp4_pair(quant)
@@ -3873,10 +3873,7 @@ class BatchInvariantFp4Config:
             raise TypeError(
                 "BatchInvariantFp4Config.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
             )
-        if pair == MIXED_PAIR:
-            from .batch_invariant.spec_mxfp4w8a import CLASS as cls
-        else:
-            cls = PAIRS[pair].cls
+        cls = PAIRS[pair].cls
         E, N1, H = w1.shape
         for name, given, actual in (
             ("num_local_experts", num_local_experts, E),
@@ -3896,24 +3893,6 @@ class BatchInvariantFp4Config:
                 f"intermediate_scales with intermediate={intermediate!r}",
                 "intermediate scales with intermediate='static' alone (the per-token class derives its scales from the rows)",
             )
-        if pair == MIXED_PAIR:
-            from .batch_invariant.api_mxfp4w8a import MoEWeightsMXFP4W8A
-
-            if intermediate != "per_token":
-                raise unsupported(
-                    cls,
-                    f"intermediate={intermediate!r}",
-                    "the intermediate quantized per 32-element block by the class itself (the static class is the NVFP4 pair's)",
-                )
-            w1 = w1.to(device=device) if device is not None else w1
-            w2 = w2.to(device=device) if device is not None else w2
-            return MoEWeightsMXFP4W8A.prepare(
-                w1.to(torch.bfloat16),
-                w2.to(torch.bfloat16),
-                gated=chain.gated,
-                act=chain.act,
-                params=chain.params,
-            ).view()
         # the move to the device and the cast to bf16 are per expert inside the preparation (no full-size copy here)
         return MoEWeightsFp4.prepare(
             PAIRS[pair],
@@ -3937,17 +3916,10 @@ class BatchInvariantFp4Config:
         activations as given (no scale): the class's quantization (per token for NVFP4, per 32-element block for MXFP4) is
         part of the op. MXFP4 x MXFP8: the canonical MXFP8 pack by the batch-invariant quantizer, e4m3 ``[T, H]`` and the
         token-major UE8M0 scales ``[T, H / 32]`` (uint8)."""
-        from .batch_invariant.runner_fp4 import MIXED_PAIR, PAIRS
+        from .batch_invariant.runner_fp4 import PAIRS
 
-        pair = _fp4_pair(quant)
-        if pair == MIXED_PAIR:
-            from .batch_invariant.api_mxfp4w8a import quantize_activations_mxfp8
-
-            return quantize_activations_mxfp8(
-                hidden_states.to(torch.bfloat16).contiguous()
-            )
         # the served pairs' table drives the form: an unserved pair was refused by _fp4_pair, a served one names its form
-        return PAIRS[pair].prepare_activations(hidden_states)
+        return PAIRS[_fp4_pair(quant)].prepare_activations(hidden_states)
 
     def __repr__(self) -> str:
         return (
