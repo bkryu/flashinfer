@@ -32,12 +32,14 @@ from ....batch_invariant import jit
 from ....gemm.batch_invariant.blocks.operands import ALIGN, IN_DT, OUT_DT
 from ....gemm.batch_invariant.generator import TILES_N, Knobs
 from ....gemm.batch_invariant.spec import (
+    A_ELEM_BITS_OF,
     BLOCK_K,
+    B_ELEM_BITS_OF,
     BLOCK_SCALED,
-    ELEM_BITS_OF,
     SF_ATOM_KBLOCKS,
     SF_ATOM_ROWS,
     SF_VEC,
+    k_granule,
 )
 from .epilogue import (
     GROUP,
@@ -111,8 +113,9 @@ def _is_promoted(chain: GroupedEpilogueBlock) -> TypeGuard[Fp8BsChain]:
 
 def blockscaled_k_align(in_fmt: str) -> int:
     """The K alignment of a block-scaled format's operands: whole scale blocks of whole 16-byte rows (two NVFP4 blocks of 16
-    per 16 bytes, one MX block of 32 e4m3 elements)."""
-    return max(ALIGN[in_fmt], SF_VEC[in_fmt])
+    per 16 bytes, one MX block of 32 e4m3 elements) and whole K granules of the dense class (the sm_100 mixed class's e2m1
+    weight is unpacked by the TMA in 128-element runs: ``spec.k_granule``)."""
+    return max(ALIGN[in_fmt], SF_VEC[in_fmt], k_granule(in_fmt))
 
 
 def kernel_name(
@@ -282,16 +285,28 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
         )  # the padded rows (pts, scale factors)
         sym_r = cute.sym_int(32)
         sym_n = cute.sym_int(32, divisibility=8)
-        if ELEM_BITS_OF[chain.in_fmt] == 4:
-            # the byte-packed 4-bit operands (two elements per byte, K / 2 bytes per row)
-            elem_dt, sym_kd, sdiv = cutlass.Uint8, cute.sym_int(32, divisibility=16), 16
+        k_al = blockscaled_k_align(chain.in_fmt)
+
+        def operand_fake(bits: int):
+            """The element type, the symbolic K extent and the stride divisibility of an operand of ``bits`` per element: the
+            byte-packed 4-bit operands (two elements per byte, K / 2 bytes per row, K in whole 16-byte rows of both operands),
+            the 8-bit formats as given (K in whole scale blocks and K granules, 16-byte rows)."""
+            if bits == 4:
+                return (
+                    cutlass.Uint8,
+                    cute.sym_int(32, divisibility=max(16, k_al // 2)),
+                    max(16, k_al // 2),
+                )
+            return in_dt, cute.sym_int(32, divisibility=k_al), al
+
+        # the token operand (A: the rows) and the weight operand (B) at their own element widths: the one-format classes
+        # share one width and one symbolic K (the compiled object's assumption, as before the mixed classes); the mixed
+        # classes' tokens are e4m3 and their weights byte-packed e2m1, each with its own symbol
+        a_dt, sym_kd, a_div = operand_fake(A_ELEM_BITS_OF[chain.in_fmt])
+        if A_ELEM_BITS_OF[chain.in_fmt] == B_ELEM_BITS_OF[chain.in_fmt]:
+            b_dt, sym_kd_b, b_div = a_dt, sym_kd, a_div
         else:
-            # the 8-bit element formats as given: K in whole scale blocks, 16-byte rows
-            elem_dt, sym_kd, sdiv = (
-                in_dt,
-                cute.sym_int(32, divisibility=blockscaled_k_align(chain.in_fmt)),
-                al,
-            )
+            b_dt, sym_kd_b, b_div = operand_fake(B_ELEM_BITS_OF[chain.in_fmt])
 
         def flat(div):
             return cute.runtime.make_fake_tensor(
@@ -303,12 +318,12 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
 
         def packed3(sym_rows):
             return cute.runtime.make_fake_tensor(
-                elem_dt,
+                a_dt,
                 (sym_rows, sym_kd, 1),
                 (
-                    cute.sym_int64(divisibility=sdiv),
+                    cute.sym_int64(divisibility=a_div),
                     1,
-                    cute.sym_int64(divisibility=sdiv),
+                    cute.sym_int64(divisibility=a_div),
                 ),
                 assumed_align=16,
             )
@@ -316,9 +331,9 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
         f["a"] = packed3(sym_m)
         f["rows"] = packed3(sym_r)
         f["b"] = cute.runtime.make_fake_tensor(
-            elem_dt,
-            (sym_n, sym_kd, sym_e),
-            (cute.sym_int64(divisibility=sdiv), 1, cute.sym_int64(divisibility=sdiv)),
+            b_dt,
+            (sym_n, sym_kd_b, sym_e),
+            (cute.sym_int64(divisibility=b_div), 1, cute.sym_int64(divisibility=b_div)),
             assumed_align=16,
         )
         f["sfa"], f["sfb"] = flat(SF_BUFFER_DIVISIBILITY), flat(SF_BUFFER_DIVISIBILITY)
@@ -536,13 +551,20 @@ def swapped_kernel_name(
     names the object beside the chain; the bf16 gather form (the token box gathered from the unpermuted rows) appends ``_gather``
     (the block-scaled gather record carries its own suffix), the linear scale source ``_sflin``; a block-scaled body's stage of
     ``k_block`` elements of K (the MXFP8 classes' two-atom stage) appends ``_kb<k_block>``; an epilogue over several warpgroups
-    (the chains on the shared swapped epilogue at the wider token tiles) ``_e<W>``."""
+    (the chains on the shared swapped epilogue at the wider token tiles) ``_e<W>``; the in-kernel plan ``_ikp``. The scale
+    source is the gather form's: the box form reads the 128x4 buffer alone, so ``sf_src="linear"`` with a box record is
+    refused (two objects under one name otherwise)."""
     chain = as_chain(chain, out_fmt)
+    if sf_src == "linear" and not (gather or cfg.gather_a):
+        raise ValueError(
+            "sf_src='linear' is the gather form's scale source (gather=True or a record with gather_a); the box form "
+            "reads the 128x4 scale buffer"
+        )
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     return jit.sanitize_symbol_name(
         f"swapped_{fmt_tag(chain.in_fmt)}_{chain.describe()}_{knobs.describe()}"
         + ("_gather" if gather else "")
-        + ("_sflin" if (gather or cfg.gather_a) and sf_src == "linear" else "")
+        + ("_sflin" if sf_src == "linear" else "")
         + (f"_kb{k_block}" if k_block else "")
         + ("_ikp" if plan_in_kernel else "")
         + (
@@ -836,16 +858,17 @@ def get_compiled_swapped(
     chain = as_chain(chain, out_fmt)
     assert is_swapped_record(cfg, chain.in_fmt), (cfg, chain.in_fmt)
     assert sf_src in ("128x4", "linear"), sf_src
+    name = swapped_kernel_name(
+        cfg,
+        chain,
+        gather=gather,
+        k_block=k_block,
+        sf_src=sf_src,
+        plan_in_kernel=plan_in_kernel,
+    )  # refuses the box form with the linear source
     return jit.build_and_load(
         MODULE,
-        swapped_kernel_name(
-            cfg,
-            chain,
-            gather=gather,
-            k_block=k_block,
-            sf_src=sf_src,
-            plan_in_kernel=plan_in_kernel,
-        ),
+        name,
         compile_swapped_fn(cfg, chain, gather, k_block, sf_src, plan_in_kernel),
     )
 

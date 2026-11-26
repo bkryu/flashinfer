@@ -48,7 +48,7 @@ from typing import Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass import Float32, Int32, Int64, Uint8, Uint32
+from cutlass import Boolean, Float32, Int32, Int64, Uint8, Uint32
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
@@ -76,6 +76,7 @@ from ....batch_invariant.quantization.mx_spec import (
 from ....batch_invariant.fp_interface.exact import f32_bits
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
 from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS
+from ..spec_mxfp4w8a import MX_CLASSES as MX_MIXED_CLASSES
 from ..spec_mxfp8 import MX_CLASSES
 from .epilogue import (
     GROUP,
@@ -99,6 +100,10 @@ BAR_EPI_XCH = 8  # named barrier ids BAR_EPI_XCH + warpgroup pair (the staged st
 # The accumulator a dead lane or dead token column computes its (never stored) chain on: a normal operand through the chain's
 # exact division and the block scale's reciprocal, where a dead row's zero or arbitrary accumulators take the slow sequences.
 DEAD_ACC = 1.0
+#: The chains whose per-column epilogue cost is the block-amax butterfly rather than the chain (no transcendental, no
+#: division): the swapped fused requantization keeps the straight-line form for them, where the columns' butterflies
+#: interleave; the other chains skip the dead token columns (the chain dominates).
+CHEAP_ACTS = ("relu2", "relu", "identity")
 
 
 def xch_layout(epi_warpgroups: int):
@@ -143,8 +148,9 @@ class MxChain(GroupedEpilogueBlock):
     format (``bf16`` / ``f16`` / ``f32``: the bf16 chain's conversion through the shared loops; ``mxfp8``: the fused
     requantization of the bf16-rounded chain, the codes and the 128x4 block scales through the loops of this module) and
     the instruction class the operands run on (``in_fmt``: the operand block's key, not part of the chain's name -- the
-    compiled object carries it separately). The accumulators are dequantised by the instruction's block scales, so the
-    chain takes no scale operands. ``describe()`` names the chain as the bf16 classes name theirs."""
+    compiled object carries it separately; the MXFP8 classes' or the mixed MXFP4-weight x MXFP8-activation classes', whose
+    GEMM1 requantises the same way). The accumulators are dequantised by the instruction's block scales, so the chain takes
+    no scale operands. ``describe()`` names the chain as the bf16 classes name theirs."""
 
     kind: str = "plain"
     act: str = "silu"
@@ -154,7 +160,7 @@ class MxChain(GroupedEpilogueBlock):
 
     def __post_init__(self):
         assert self.kind in KINDS and self.out_fmt in MX_OUT_FMTS, self
-        assert self.in_fmt in MX_CLASSES, self
+        assert self.in_fmt in MX_CLASSES or self.in_fmt in MX_MIXED_CLASSES, self
         assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
         if self.kind == "glu" and self.out_fmt not in ("bf16", OUT_FMT):
             raise AssertionError(
@@ -484,7 +490,9 @@ def swapped_epilogue_quant_loop(
     tokens); thread ``t`` of an epilogue warpgroup holds weight row ``t`` of the tile and the token columns of its subtile
     (``subtile``: this warpgroup's one subtile of the tile when several warpgroups split the token columns, the accumulator
     released once every warp has arrived; None: one warpgroup takes every subtile). A token column past the group's rows is
-    never stored, so its chain and reduction are skipped (a warp-uniform region). Gated
+    never stored, so its chain and reduction are skipped (a warp-uniform region) in a subtile with dead columns; a subtile
+    whose columns are all live, and every subtile of the ReLU family (``CHEAP_ACTS``: the per-column cost is the butterfly,
+    which interleaves), runs every column straight-line. Gated
     chain: the gate accumulators come from lane ``+8`` (``shfl.sync.down``), the up lanes (row % 16 < 8) own output
     column ``(row // 16) * 8 + row % 8`` of the tile's ``weight_tile / 2`` outputs, so a block of 32 output columns is
     the 16 up lanes of warp ``2q`` and the 16 of warp ``2q + 1``: the block amax is the in-warp butterfly (xor 1, 2, 4
@@ -538,6 +546,7 @@ def swapped_epilogue_quant_loop(
     cols = [
         n - offs[0][1] for _, n in offs
     ]  # the register's token column inside the subtile
+    span = max(cols) + 1  # the subtile's token columns
     outs_per_tile = weight_tile // 2 if pair else weight_tile
     blocks_per_tile = outs_per_tile // BLOCK
     tTR_rAcc = cute.make_rmem_tensor(frag.shape, ACC_DTYPE)
@@ -599,13 +608,20 @@ def swapped_epilogue_quant_loop(
             leader = store_ok & (
                 (out_loc % Int32(BLOCK)) == Int32(0)
             )  # the block's first column stores its scale byte
-            # the chain and the block amax (the in-warp butterfly) of every live token column; a token column past the group's
-            # end is never stored, so its chain is skipped -- a warp-uniform region: every lane of the warpgroup holds the same
-            # column, so the shuffles below see every lane; a dead column keeps a benign constant for the quantizer's division
-            for v in cutlass.range_constexpr(nv):
-                yf = Float32(DEAD_ACC)
-                leaf = Float32(DEAD_ACC)
-                if col0 + Int32(cols[v]) < rows_left:
+            # the chain and the block amax (the in-warp butterfly) of the token columns. The dead-column skip pays where the
+            # per-column cost is the chain itself: a subtile with a column past the group's end (never stored) computes the live
+            # columns only -- a warp-uniform region: every lane of the warpgroup holds the same column, so the shuffles inside
+            # see every lane; a dead column keeps a benign constant for the quantizer's division. A subtile whose columns are
+            # all live, and every subtile of the ReLU family (CHEAP_ACTS: the butterflies interleave), runs every column
+            # straight-line.
+            if cutlass.const_expr(chain.act in CHEAP_ACTS):
+                full = Boolean(True)
+            else:
+                full = (
+                    col0 + Int32(span)
+                ) <= rows_left  # every token column of the subtile is a live token
+            if full:
+                for v in cutlass.range_constexpr(nv):
                     g = None
                     if cutlass.const_expr(pair):
                         g = cute.arch.shuffle_sync_down(tTR_rAcc[v], offset=8)
@@ -626,8 +642,39 @@ def swapped_epilogue_quant_loop(
                             leaf = d.combine(
                                 fp, leaf, cute.arch.shuffle_sync_bfly(leaf, offset=m)
                             )
-                ys[v] = yf
-                am[v] = leaf
+                    ys[v] = yf
+                    am[v] = leaf
+            else:
+                for v in cutlass.range_constexpr(nv):
+                    yf = Float32(DEAD_ACC)
+                    leaf = Float32(DEAD_ACC)
+                    if col0 + Int32(cols[v]) < rows_left:
+                        g = None
+                        if cutlass.const_expr(pair):
+                            g = cute.arch.shuffle_sync_down(tTR_rAcc[v], offset=8)
+                        yb = twin.elem(MoeF32, tTR_rAcc[v], g)
+                        yf = yb.to(Float32)
+                        leaf = leaf_value(fp, yf)
+                        if cutlass.const_expr(pair):
+                            lf = Float32(0.0)
+                            if is_up:
+                                lf = leaf
+                            leaf = lf
+                            for m in (1, 2, 4, 16):
+                                leaf = d.combine(
+                                    fp,
+                                    leaf,
+                                    cute.arch.shuffle_sync_bfly(leaf, offset=m),
+                                )
+                        else:
+                            for m in (1, 2, 4, 8, 16):
+                                leaf = d.combine(
+                                    fp,
+                                    leaf,
+                                    cute.arch.shuffle_sync_bfly(leaf, offset=m),
+                                )
+                    ys[v] = yf
+                    am[v] = leaf
             if cutlass.const_expr(pair):
                 # the partner warp's half of the block's amax (one named barrier per warpgroup and subtile)
                 if lane == Int32(0):

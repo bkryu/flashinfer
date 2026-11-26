@@ -286,6 +286,13 @@ class SwappedGroupedGemm:
             "the gather record is the block-scaled classes'",
             knobs,
         )
+        # the block-scaled gather form reads the token rows of the one-format classes (the fp4 pairs' 4-bit rows, the MXFP8
+        # classes' 8-bit rows); the mixed operand block's 8-bit tokens against its 4-bit weights take the box form
+        assert not gather or not self.operands.mixed, (
+            "the block-scaled gather form is the one-format classes'; the mixed classes read the token box",
+            knobs,
+            self.in_fmt,
+        )
         # the fused requantization's code stores need the permuted rows' positions the box form carries
         assert not (gather and self.operands.promoted and chain.quant), (
             "the block-scale fp8 gather form takes the bf16 / f32 chains; the fused requantization reads the box form",
@@ -318,13 +325,6 @@ class SwappedGroupedGemm:
         self.mma_warp = len(self.epilogue_warps) + (1 if bs else 0)
         self.tma_warp = self.mma_warp + 1
         self.threads = 32 * (self.tma_warp + 1)
-        # the box form reads the group counts before its wait (the kernel body): a placement that triggers before its wait
-        # would let this grid launch before the plan completed (pdl.BOX_FORM_TRIGGERS)
-        assert gather or pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS, (
-            "the swapped box form reads the plan's counts before its PDL wait: it compiles under the trigger placements "
-            f"{pdl.BOX_FORM_TRIGGERS} only",
-            pdl.TRIGGER,
-        )
 
     @cute.jit
     def __call__(
@@ -740,7 +740,7 @@ class SwappedGroupedGemm:
         dest=None,
     ):
         ops = self.operands
-        if cutlass.const_expr(rows.element_type != w.element_type):
+        if cutlass.const_expr(not ops.mixed and rows.element_type != w.element_type):
             raise TypeError(
                 f"rows and w must have one type: {rows.element_type} != {w.element_type}"
             )
@@ -749,10 +749,10 @@ class SwappedGroupedGemm:
         sfw_t = None
         self.xch_layout = self.chain.smem_layout(1, token_tile=self.token_tile)
         if cutlass.const_expr(ops.block_scaled):
-            rows = ops.view_elems(
+            rows = ops.view_tokens(
                 rows
             )  # (R, K, 1): the dense token rows, the MMA's B operand
-            w = ops.view_elems(w)  # (N, K, E): the MMA's A operand (M = N, K, L = E)
+            w = ops.view_weights(w)  # (N, K, E): the MMA's A operand (M = N, K, L = E)
             sfw_t = ops.sf_view_experts(sfw, w.shape[0], w.shape[1], w.shape[2])
             # the block-scaled plan takes the swapped record itself (its knob rule admits the narrow token tiles with the
             # swapped flag); the A ring (the weights) ends inside the sm_100 instructions' descriptor window; the stage holds
@@ -792,8 +792,16 @@ class SwappedGroupedGemm:
             st.a_smem_layout_staged,
             mode=list(range(cute.rank(st.a_smem_layout_staged) - 1)),
         )
+        # `internal_type`: the TMA's unpacking format of a sub-byte weight into the 8-bit smem container (the mixed sm_100
+        # class's e2m1 weight on the twin plan's A side); None for the one-format plans and the dense formats
         atom_w, tensor_w = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op, w, a_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
+            a_op,
+            w,
+            a_one,
+            st.mma_tiler,
+            st.tiled_mma,
+            st.cluster_layout_vmnk.shape,
+            internal_type=getattr(st, "A_TMA_INTERNAL", None),
         )
         b_one = cute.select(
             st.b_smem_layout_staged,
@@ -861,6 +869,7 @@ class SwappedGroupedGemm:
                 st.mma_tiler,
                 st.tiled_mma,
                 st.cluster_layout_vmnk.shape,
+                internal_type=getattr(st, "B_TMA_INTERNAL", None),
             )
             m_src = counts  # unread
         self.num_tma_load_bytes = (
@@ -978,10 +987,9 @@ class SwappedGroupedGemm:
             if cutlass.const_expr(bs):
                 cpasync.prefetch_descriptor(tma_atom_sfw)
         # programmatic dependent launch: every warp waits for the preceding grid before the group tables (the tables read
-        # ``counts``, the predecessor chain's writes: a no-op when nothing before triggered early, and the rule that no kernel
-        # of the chain triggers before its own wait -- ``pdl.BOX_FORM_TRIGGERS``, asserted at the builder -- is the margin);
-        # the producer waits once more before its first read of the predecessor's output (the token rows), the epilogue
-        # before its first store; the trigger placement is the chain's (``pdl.TRIGGER``).
+        # ``counts``, the predecessor chain's writes); the producer waits once more before its first read of the
+        # predecessor's output (the token rows), the epilogue before its first store; the trigger placement is the chain's
+        # (``pdl.TRIGGER``: the early site right after the wait, the late site after the producer's tile loop).
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
@@ -1153,6 +1161,7 @@ class SwappedGroupedGemm:
             s_src = storage.plan_src.get_tensor(cute.make_layout((PLAN_MAX_SLOTS,)))
         src_t = s_src if cutlass.const_expr(bs and self.plan_in_kernel) else mSrc
         cute.arch.griddepcontrol_wait()  # the tables read the predecessor chain's counts (or its ids)
+        pdl.trigger_early()  # the early placement's site: right after the wait, as in the grouped body
         if cutlass.const_expr(bs):
             # the three tables in one scan on the scale-factor warp (idle until its first tile) while the allocator warp issues
             # the TMEM allocation: the two longest legs of the prologue overlap instead of running back to back
@@ -1231,14 +1240,16 @@ class SwappedGroupedGemm:
                 )  # dense offsets; the "m-block" is the token tile
         pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
 
+        # the operand rings at the plan's container types (the mixed sm_100 class's e2m1 weight occupies a byte per element)
+        a_smem_dtype, b_smem_dtype = ops.smem_dtypes(st)
         sW = smem.allocate_tensor(
-            element_type=st.a_dtype,
+            element_type=a_smem_dtype,
             layout=a_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
         )
         sTok = smem.allocate_tensor(
-            element_type=st.b_dtype,
+            element_type=b_smem_dtype,
             layout=b_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=b_smem_layout_staged.inner,

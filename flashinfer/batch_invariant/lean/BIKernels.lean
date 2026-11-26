@@ -31,6 +31,8 @@ import BIKernels.MoEFp8Bs
 import BIKernels.MoEFp8BsCases
 import BIKernels.MoEMxfp8
 import BIKernels.MoEMxfp8Cases
+import BIKernels.MoEMxfp4w8a
+import BIKernels.MoEMxfp4w8aCases
 import BIKernels.NVFP4MegaMoE
 import BIKernels.NVFP4MegaMoECases
 import BIKernels.MXFP4MegaMoE

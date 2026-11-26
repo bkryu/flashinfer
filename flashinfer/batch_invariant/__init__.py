@@ -92,12 +92,31 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int, causal: Optional[bool] = None) -> str:
+def _attention_fingerprint(
+    head_dim: int,
+    causal: Optional[bool] = None,
+    lse_base: Optional[str] = None,
+    sinks: bool = False,
+) -> str:
     """The attention class at ``head_dim`` under a mask mode; ``None`` is the causal class (the decode wrapper's
-    ``is_causal=None``), never a truth value."""
-    from ..attention.batch_invariant.spec import spec_fingerprint
+    ``is_causal=None``), never a truth value. ``lse_base`` / ``sinks`` name the class's LSE and sink members, which
+    exist in both modes with a receipt each."""
+    from ..attention.batch_invariant.spec import (
+        lse_fingerprint,
+        sink_fingerprint,
+        spec_fingerprint,
+    )
 
-    return spec_fingerprint(head_dim, causal=True if causal is None else bool(causal))
+    if not isinstance(sinks, bool):
+        raise ValueError(
+            f"sinks names the sink member of the class: True or False, got {sinks!r}"
+        )
+    causal = True if causal is None else bool(causal)
+    if lse_base is not None:
+        return lse_fingerprint(head_dim, lse_base, sinks, causal=causal)
+    if sinks:
+        return sink_fingerprint(head_dim, causal=causal)
+    return spec_fingerprint(head_dim, causal=causal)
 
 
 #: The prefill wrappers' ``plan()`` defaults to ``causal=False``, which runs the non-causal class: their receipt has no
@@ -207,7 +226,7 @@ def _moe_class_terms(
     ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its scalars are the class's parameters),
     ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS``
     with ``params`` (and ``gated`` for the names in both tables). The receipt names a class some layer can build: the
-    runners' bounds and group rule apply here as ``ValueError``.
+    runners' bounds, group rule and Llama4 top-1 rule apply here as ``ValueError``.
     """
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
@@ -231,6 +250,12 @@ def _moe_class_terms(
                 f"the batch-invariant MoE classes do not implement routing method {method!r}"
             )
         rm = spec.METHOD_OF_FLASHINFER[method]
+        if method is RoutingMethodType.Llama4 and top_k != 1:
+            # the runner's rule (`runner.routing_term`): the method is the top-1 of the logits with its sigmoid as the weight
+            raise ValueError(
+                f"fingerprint({op!r}): Llama4 routing takes top_k = 1 (the top-1 of the logits with its sigmoid as the "
+                f"weight; TopKSigmoid for top_k {top_k})"
+            )
     elif isinstance(method, str):
         rm = spec.method_named(method)
     elif isinstance(method, spec.RoutingMethod):
@@ -358,9 +383,15 @@ def _moe_nvfp4_fingerprint(
     dimensions of :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars
     and gating) under the same bounds; ``arch`` (an architecture family, a compute capability or a device; the current CUDA
     device by default) selects the instruction class of each expert weight shape (the sm_107 K = 128 step on SM107 for the
-    unsplit shapes, the K = 64 step elsewhere): the architecture is a dimension of the class; ``intermediate`` the
+    unsplit shapes, the K = 64 step elsewhere): the architecture family is a dimension of the class (SM100 and SM103 are one
+    family); ``intermediate`` the
     intermediate's quantization class (``per_token`` / ``static``)."""
-    from flashinfer.fused_moe.batch_invariant.api_fp4 import ALIGN_FP4, expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        ALIGN_FP4,
+        NVFP4,
+        check_shape_fp4,
+        expert_classes,
+    )
     from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import spec_fingerprint_nvfp4
 
     for dim, value in (("H", H), ("I", I)):
@@ -380,6 +411,8 @@ def _moe_nvfp4_fingerprint(
         n_group,
         topk_group,
     )
+    # the class's complete shape rule (the layer's): a shape the runner refuses has no fingerprint
+    check_shape_fp4(NVFP4, H, I, num_experts, top_k, bool(gated))
     family = _mx_family(arch, "fused_moe_nvfp4")
     return spec_fingerprint_nvfp4(
         H,
@@ -467,7 +500,11 @@ def _moe_mxfp4_fingerprint(
     ``arch`` (an architecture family, a compute capability or a device; the current CUDA device by default) selects the
     instruction class of the expert GEMMs (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere): the architecture is
     a dimension of the class."""
-    from flashinfer.fused_moe.batch_invariant.api_fp4 import ALIGN_FP4
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        ALIGN_FP4,
+        MXFP4,
+        check_shape_fp4,
+    )
     from flashinfer.fused_moe.batch_invariant.spec_mxfp4 import (
         expert_classes_mx,
         spec_fingerprint_mxfp4,
@@ -490,9 +527,64 @@ def _moe_mxfp4_fingerprint(
         n_group,
         topk_group,
     )
+    # the class's complete shape rule (the layer's): a shape the runner refuses has no fingerprint
+    check_shape_fp4(MXFP4, H, I, num_experts, top_k, bool(gated))
     family = _mx_family(arch, "fused_moe_mxfp4")
     return spec_fingerprint_mxfp4(
         H, I, top_k, num_experts, rm, name, params, gated, expert_classes_mx(family)
+    )
+
+
+def _moe_mxfp4w8a_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    arch=None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The mixed MXFP4-weight x MXFP8-activation MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the
+    MXFP4 x MXFP8 pair): the dimensions of :func:`_moe_class_terms` under the same bounds plus the architecture (the
+    instruction class of the dense mixed GEMM: the SM107 step folds 64 elements, the SM100 / SM103 one 32 and reads the
+    e2m1 weight in 128-element runs, so H and I are multiples of 128 there; ``arch`` as for ``mm_mxfp8_mxfp4``, the current
+    device by default)."""
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import MXFP4W8A, check_shape_fp4
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp4w8a import (
+        BLOCK,
+        granule_of,
+        spec_fingerprint_mxfp4w8a,
+    )
+
+    from ..gemm.batch_invariant.schedule import mx_class_for
+
+    fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "fused_moe_mxfp4w8a"))
+    gran = granule_of(fmt)
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % gran:
+            raise ValueError(
+                f"fingerprint('fused_moe_mxfp4w8a'): {dim} {value} must be a positive multiple of {gran} on the {fmt} "
+                f"class (whole UE8M0 scale blocks of {BLOCK}; whole 128-element runs of the e2m1 weight on SM100 / SM103)"
+            )
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_mxfp4w8a",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
+    # the class's complete shape rule at the part's class (the layer's): a shape the runner refuses has no fingerprint
+    check_shape_fp4(MXFP4W8A, H, I, num_experts, top_k, bool(gated), fmt)
+    return spec_fingerprint_mxfp4w8a(
+        H, I, top_k, num_experts, rm, name, params, gated, fmt
     )
 
 
@@ -535,9 +627,10 @@ def _moe_mxfp8_fingerprint(
 ) -> str:
     """The MXFP8 x MXFP8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8BlockConfig`` under
     ``QuantConfig(MXFP8, MXFP8)``: the dimensions of :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s
-    groups, the activation with its scalars and gating) plus the architecture (the instruction class of the dense MXFP8
-    GEMM: the SM107 step folds 64 elements, the SM100 / SM103 one 32; ``arch`` as for ``mm_mxfp8``, the current device by
-    default)."""
+    groups, the activation with its scalars and gating) under the class's complete shape rule (the layer's: a shape the
+    runner refuses has no receipt) plus the architecture (the instruction class of the dense MXFP8 GEMM: the SM107 step
+    folds 64 elements, the SM100 / SM103 one 32; ``arch`` as for ``mm_mxfp8``, the current device by default)."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import check_shape_mxfp8
     from flashinfer.fused_moe.batch_invariant.spec_mxfp8 import (
         BLOCK,
         spec_fingerprint_mxfp8,
@@ -562,6 +655,7 @@ def _moe_mxfp8_fingerprint(
         n_group,
         topk_group,
     )
+    check_shape_mxfp8(H, I, num_experts, top_k)
     fmt = mx_class_for("mxfp8", _mx_family(arch, "fused_moe_mxfp8"))
     return spec_fingerprint_mxfp8(
         H, I, top_k, num_experts, rm, name, params, gated, fmt
@@ -829,20 +923,27 @@ CLASSES: Dict[str, ClassInfo] = {
     # on its KV position, its head and the window alone, under the non-causal class (`causal=False`) on its request's key count
     # and its head alone; prefill and decode (and the paged and ragged KV layouts) are one class per mode. The mode is a fixed
     # dimension of the prefill wrappers' receipt (their plan() defaults to the non-causal class) and optional for the decode
-    # wrapper, whose default (a single token per request, or `is_causal=None`) is the causal class
+    # wrapper, whose default (a single token per request, or `is_causal=None`) is the causal class. `lse_base` names the
+    # class's LSE member (`return_lse=True`), a receipt of its own per head dim, mode and base; `sinks=True` names the sink
+    # member (a call with attention sinks), with its own output and LSE receipts in each mode
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint, ("causal",)
+        "attention.bf16",
+        ("head_dim",),
+        _attention_fingerprint,
+        ("causal", "lse_base", "sinks"),
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
         "attention.bf16",
         ("head_dim", "causal"),
         _attention_fingerprint,
+        ("lse_base", "sinks"),
         note=_PREFILL_CAUSAL_NOTE,
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16",
         ("head_dim", "causal"),
         _attention_fingerprint,
+        ("lse_base", "sinks"),
         note=_PREFILL_CAUSAL_NOTE,
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
@@ -895,7 +996,7 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.mxfp8",
         ("H", "I", "top_k", "num_experts"),
         _moe_mxfp8_fingerprint,
-        ("method", "act", "params", "gated", "arch"),
+        ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
     ),
     # the MXFP4 x MXFP4 pair of the same backend (UE8M0 block scales on both operands: no global or per-token scale, no
     # static-intermediate class)
@@ -903,6 +1004,14 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.mxfp4",
         ("H", "I", "top_k", "num_experts"),
         _moe_mxfp4_fingerprint,
+        ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
+    ),
+    # the unified MoE layer with `BatchInvariantFp4Config` (the MXFP4 x MXFP8 pair): the bf16 classes' dimensions plus the
+    # architecture (the instruction class of the dense mixed MXFP4 x MXFP8 GEMM, as for mm_mxfp8_mxfp4)
+    "fused_moe_mxfp4w8a": ClassInfo(
+        "moe.mxfp4w8a",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_mxfp4w8a_fingerprint,
         ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
     ),
 }
@@ -1006,7 +1115,15 @@ def fingerprint(op: str, **dims) -> str:
     optional: omitted or ``None`` is the causal class, as ``is_causal=None`` is in its ``plan()``, and a single-token decode
     step is the causal class whatever ``is_causal`` says. The sliding window (``window_left``) is a per-call input of the
     causal class, like the KV position: the receipt is the digest of the class's no-window sample row and covers windowed
-    calls too.
+    calls too. The optional ``lse_base`` (``"log2"`` or ``"ln"``) names the LSE member the wrappers return with
+    ``return_lse=True`` -- ``add.rn(mul.rn(m, c), lg2.approx.ftz(l))`` of the row's final maximum and sum, times
+    ``fp32(ln 2)`` in base e -- with its own receipt per head dim, mode and base; the receipt without it is the attention
+    output's and does not depend on whether the LSE is requested. The optional ``sinks=True`` names the sink member, the
+    class of a call with attention sinks (one more merge per row, of its final state with a virtual key of the head's sink
+    logit: ``attn-bf16-d<D>-sink-...``, and with ``lse_base`` the LSE that includes the sink); the sink values are per-call
+    inputs, and the receipts without ``sinks`` are those of calls without sinks. Both members exist in both mask modes;
+    the mode precedes the members in the name (``attn-bf16-d<D>-nc-lse-<base>-...``, ``attn-bf16-d<D>-nc-sink-...``,
+    ``attn-bf16-d<D>-nc-sink-lse-<base>-...``).
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
@@ -1030,6 +1147,10 @@ def fingerprint(op: str, **dims) -> str:
     'kda-bf16-c16-engine-...'
     >>> fingerprint("fused_moe_fp8", H=2048, I=768, top_k=8, num_experts=128)  # doctest: +SKIP
     'moe-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, lse_base="ln")  # doctest: +SKIP
+    'attn-bf16-d128-lse-ln-...'
+    >>> fingerprint("BatchDecodeWithPagedKVCacheWrapper", head_dim=64, sinks=True)  # doctest: +SKIP
+    'attn-bf16-d64-sink-...'
 
     ``fused_moe_fp8`` takes the dimensions of ``fused_moe`` for the fp8 per-tensor classes ``moe.e4m3.<act>`` behind
     ``BatchInvariantFp8PerTensorConfig``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the

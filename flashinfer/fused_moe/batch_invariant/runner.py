@@ -216,6 +216,11 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
         self._scale: Optional[torch.Tensor] = None
+        # the routing term's state, set by _check_support (`_method` None: no from-logits class; a deferred refusal's
+        # message, raised afresh at every from-logits call: no exception object, hence no traceback, is kept)
+        self._method: Optional[Any] = None
+        self._grouped_other: bool = False
+        self._logits_refusal: Optional[Tuple[Any, ...]] = None
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
@@ -299,17 +304,18 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         """``_method`` / ``_grouped_other`` from :func:`routing_term`; a refusal (a group shape or a Llama4 top-k outside the
         term) is deferred to a from-logits call (``_logits_refusal``), since the pre-routed modes never consult the method:
         a layer that only ever receives pre-routed ids builds under any ``RoutingConfig``."""
-        self._logits_refusal: Optional[BatchInvariantUnsupportedError] = None
+        self._logits_refusal = None
         try:
             self._method, self._grouped_other = routing_term(routing, cls)
         except BatchInvariantUnsupportedError as e:
-            self._method, self._grouped_other, self._logits_refusal = None, False, e
+            self._method, self._grouped_other = None, False
+            self._logits_refusal = tuple(e.args)
 
     def _build(self) -> None:
         from ...gemm.batch_invariant.api import part_of
 
         self._part = part_of(self.device)
-        method = getattr(self, "_method", None)
+        method = self._method
         if (
             method is not None
             and method.scaled
@@ -445,7 +451,7 @@ class BatchInvariantMoeRunnerBase(MoERunner):
             _validate_logits_inputs(act, T, E, type(self).__name__)
             # the group-limited selection is a term of the DeepSeekV3 method; with another method the groups have no
             # meaning in this module (with pre-routed ids the group structure never enters the computation)
-            if getattr(self, "_grouped_other", False):
+            if self._grouped_other:
                 raise unsupported(
                     cls,
                     f"expert groups (n_group / topk_group) with {cfg.routing.method!r} from logits",
@@ -453,9 +459,8 @@ class BatchInvariantMoeRunnerBase(MoERunner):
                 )
             if self._method is None:
                 # the refusal deferred at construction (the pre-routed modes never consulted it), else no term
-                refusal = getattr(self, "_logits_refusal", None)
-                if refusal is not None:
-                    raise refusal
+                if self._logits_refusal is not None:
+                    raise BatchInvariantUnsupportedError(*self._logits_refusal)
                 raise unsupported(
                     cls,
                     f"routing method {cfg.routing.method!r} from logits",
