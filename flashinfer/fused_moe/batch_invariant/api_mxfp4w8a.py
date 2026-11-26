@@ -25,6 +25,7 @@ from ...batch_invariant.support import compute_capability
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.heuristic import family_of
 from ...gemm.batch_invariant.schedule import mx_class_for
+from .api_mxfp8 import DENSE_TAIL, GROUP_ALIGN, PACKINGS, _part
 from .api_mxfp8 import fused_moe_mxfp8, grouped_gemm_mxfp8
 from .blocks.epilogue import GroupedEpilogueBlock
 from .spec_mxfp4w8a import BLOCK, CLASS, MX_CLASSES, granule_of
@@ -32,12 +33,16 @@ from .spec_mxfp4w8a import BLOCK, CLASS, MX_CLASSES, granule_of
 __all__ = [
     "BLOCK",
     "CLASS",
+    "DENSE_TAIL",
+    "GROUP_ALIGN",
     "MX_CLASSES",
+    "PACKINGS",
     "expert_classes_mixed",
     "fused_moe_mxfp4w8a",
     "granule_of",
     "grouped_gemm_mxfp4w8a",
     "mx_class_of",
+    "_part",
 ]
 
 
