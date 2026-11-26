@@ -411,7 +411,7 @@ def compile_grouped_fn(
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one grouped specialisation."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         f = _fakes(chain, packing)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
@@ -434,6 +434,7 @@ def compile_grouped_fn(
                         grid,
                         stream_fake,
                         options="--enable-tvm-ffi",
+                        **compile_options,
                     )
                 return cute.compile(
                     body.block_scaled_plain,
@@ -447,6 +448,7 @@ def compile_grouped_fn(
                     grid,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             if chain.needs_aux:
                 return cute.compile(
@@ -464,6 +466,7 @@ def compile_grouped_fn(
                     grid,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             return cute.compile(
                 body.block_scaled,
@@ -478,6 +481,7 @@ def compile_grouped_fn(
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         entry = body.with_scales if chain.scale_operands else body
         return cute.compile(
@@ -490,6 +494,7 @@ def compile_grouped_fn(
             grid,
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return compile_fn
@@ -631,7 +636,7 @@ def compile_swapped_fn(
     chains ``kernel(rows3, sfa, w3, sfw, out2, [out_sf,] counts, grid)`` with the stage ``k_block`` elements of K wide when
     given."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         f = _fakes(chain)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
@@ -665,6 +670,7 @@ def compile_swapped_fn(
                         grid,
                         stream_fake,
                         options="--enable-tvm-ffi",
+                        **compile_options,
                     )
                 if chain.quant:
                     return cute.compile(
@@ -681,6 +687,7 @@ def compile_swapped_fn(
                         grid,
                         stream_fake,
                         options="--enable-tvm-ffi",
+                        **compile_options,
                     )
                 return cute.compile(
                     body.block_scaled_plain_gathered,
@@ -695,6 +702,7 @@ def compile_swapped_fn(
                     grid,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             if chain.needs_aux:
                 return cute.compile(
@@ -714,6 +722,7 @@ def compile_swapped_fn(
                     grid,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             return cute.compile(
                 body.block_scaled_gathered,
@@ -730,6 +739,7 @@ def compile_swapped_fn(
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         if _is_promoted(chain) and gather:
             # the block-scale fp8 gather form: the unpermuted rows and scales through the plan's map (the bf16 / f32 chains)
@@ -746,6 +756,7 @@ def compile_swapped_fn(
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         if _is_block_scaled(chain) or _is_promoted(chain):
             if isinstance(chain, (MxChain, Mxfp4Chain)) or _is_promoted(chain):
@@ -763,6 +774,7 @@ def compile_swapped_fn(
                         grid,
                         stream_fake,
                         options="--enable-tvm-ffi",
+                        **compile_options,
                     )
                 return cute.compile(
                     body.block_scaled_plain,
@@ -775,6 +787,7 @@ def compile_swapped_fn(
                     grid,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             if chain.needs_aux:
                 return cute.compile(
@@ -792,6 +805,7 @@ def compile_swapped_fn(
                     grid,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             return cute.compile(
                 body.block_scaled,
@@ -806,6 +820,7 @@ def compile_swapped_fn(
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         if gather:
             return cute.compile(
@@ -819,6 +834,7 @@ def compile_swapped_fn(
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         entry = body.with_scales if chain.scale_operands else body
         return cute.compile(
@@ -831,6 +847,7 @@ def compile_swapped_fn(
             grid,
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return compile_fn
