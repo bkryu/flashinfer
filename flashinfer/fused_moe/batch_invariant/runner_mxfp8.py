@@ -236,10 +236,19 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
     # ---- launch ----------------------------------------------------------------------------------------------------
     def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
         from .api_mxfp8 import fused_moe_mxfp8
+        from .schedule_mxfp8 import packing_for
 
         xq, xsf = x
-        # the packing follows the first picks at this token count (the plan, when given, was built in its form); a tactic
-        # of the padded packing is a pair of dense records, one of the dense packing any pair
+        # the packing is the records' own (a swapped record reads the dense packing, the padded body reads either): the
+        # layer keys a tuned winner by its token bucket, so a tactic may replay at a token count whose first picks pack
+        # the other way; the plan packed in the first picks' form is kept where the records read it (the dual plan feeds
+        # both bodies) and dropped otherwise (the op computes its own: the same integers, the same bits)
+        path = packing_for(c1, c2)
+        if plan is not None:
+            if len(plan) == 5:
+                path = "dense"
+            elif path == "dense":
+                plan = None
         fused_moe_mxfp8(
             (xq, xsf),
             ids,
@@ -250,7 +259,7 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
             config2=c2,
             in_fmt=self._in_fmt,
             plan=plan,
-            path=self._packing(int(xq.shape[0]), int(xq.shape[1])),
+            path=path,
             w_round=getattr(inputs, "w_round", False),
         )
         return out

@@ -3447,3 +3447,59 @@ def test_grouped_gemm_refuses_scale_rows_below_the_padded_bound_before_any_launc
         call(src=None, rows=8, in_kernel=(ids, n_live, dest))
     with pytest.raises(ValueError, match="padded positions"):
         call(src=None, sf_rows=short, in_kernel=(ids, n_live, dest))
+
+
+@needs_device
+def test_tactic_of_the_other_packing_replays_with_the_bits(monkeypatch):
+    """The layer keys a tuned winner by its token bucket, routing mode and candidates, so a tactic may replay on a pack
+    whose plan was built for the other packing: on the padded plan (the padded body's first picks), on the dual plan and
+    in the decode form (no plan), each forced on the runner's plan hooks so the check does not depend on which records the
+    part's ranking places, a swapped pair, a dense pair and the mixed pairs (built from the record spaces) give the layer's
+    eager bits -- the records' own packing, the plan kept where the records read it and recomputed otherwise; then the
+    ranking's own form at this token count with every pair."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import MoEWeightsMXFP8
+    from flashinfer.fused_moe.batch_invariant.runner import (
+        _configs_from_tactic,
+        _tactic,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        GEMM2_CHAIN,
+        can_implement_grouped_mxfp8,
+        grouped_knobs_mx,
+        swapped_knobs_mx,
+    )
+
+    T, k, H, I, E = 16, 8, 256, 128, 128
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=503, adversarial=True)
+    layer, W = _layer(k, E, I, tune_max=16), _weights(w1, w2)
+    runner = layer.runners[0]
+    Wq = MoEWeightsMXFP8.from_view(W.get_view(KEY))
+    pack = _logits_pack(x, logits)
+    ref = bits(layer(pack, W))
+    fmt = runner._in_fmt
+    dense = next(
+        c
+        for c in grouped_knobs_mx(fmt)
+        if can_implement_grouped_mxfp8(c, 2 * I, H, E, Wq.chain1, fmt)
+        and can_implement_grouped_mxfp8(c, H, I, E, GEMM2_CHAIN, fmt)
+    )
+    box = swapped_knobs_mx()[0]
+    pairs = ((box, box), (dense, dense), (box, dense), (dense, box))
+    forms = {
+        "padded": (False, dict(align=128), 3),
+        "dual": (False, dict(dual=True, pad_align=128), 5),
+        "decode": (True, {}, 0),
+    }
+    for name, (in_kernel, plan_form, n_plan) in forms.items():
+        monkeypatch.setattr(runner, "_plan_in_kernel", lambda T_, H_, v=in_kernel: v)
+        monkeypatch.setattr(runner, "_plan_form", lambda T_, H_, f=plan_form: f)
+        assert len(runner.pack_inputs(pack, W)) - 9 == n_plan, name
+        for c1, c2 in pairs:
+            t = _tactic(c1, c2)
+            assert _configs_from_tactic(t) == (c1, c2)
+            out = runner.forward(runner.pack_inputs(pack, W), tactic=t)
+            assert torch.equal(bits(out), ref), (name, c1.describe(), c2.describe())
+    monkeypatch.undo()
+    for c1, c2 in pairs:
+        out = runner.forward(runner.pack_inputs(pack, W), tactic=_tactic(c1, c2))
+        assert torch.equal(bits(out), ref), (c1.describe(), c2.describe())
