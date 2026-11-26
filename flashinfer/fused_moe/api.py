@@ -3813,11 +3813,14 @@ class BatchInvariantFp4Config:
     reads the e2m1 weight through the TMA's unpacking format: the architecture is a dimension of the class, as for
     ``mm_mxfp8_mxfp4``), the activation chain is the bf16 classes' exact sequence on the dequantised fp32 accumulators, the intermediate
     is quantized by the MXFP8 quantizer class inside GEMM1's epilogue, the combine is the slot-order fp32 fold. Weights:
-    the canonical bf16 ``w1`` / ``w2`` on a CUDA device, ``hidden_size`` and ``intermediate_size`` multiples of 32 on SM107
-    and of 128 on SM100 / SM103 (the unpacking format's 128-element runs). Activations: the canonical MXFP8 pack, e4m3
-    ``[num_tokens, H]`` with token-major UE8M0 scales ``[num_tokens, H / 32]`` (the pack ``TrtllmFp4Config`` prepares for
-    this pair, ``TrtllmFp8BlockConfig`` and ``CutlassMxfp8Config`` for theirs); no ``per_token_scale``; ``intermediate``
-    and ``intermediate_scales`` are refused as for MXFP4 x MXFP4.
+    the canonical ``w1`` / ``w2`` layouts above, quantized per expert by the MXFP4 quantizer as for MXFP4 x MXFP4 (the same
+    preparation: a CUDA pack device, the experts moved and cast one at a time), ``hidden_size`` and ``intermediate_size``
+    multiples of 32 on SM107 and of 128 on SM100 / SM103 (the unpacking format's 128-element runs). Activations: the
+    canonical MXFP8 pack, e4m3 ``[num_tokens, H]`` with token-major UE8M0 scales ``[num_tokens, H / 32]`` (uint8,
+    ``float8_e8m0fnu`` or the e4m3-typed carrier of the pack ``TrtllmFp4Config`` prepares for this pair; the linear layout
+    alone, taken as given); no ``per_token_scale``; ``intermediate`` and ``intermediate_scales`` are refused as for MXFP4 x
+    MXFP4. The layer's forward captures in a CUDA graph and replays the eager bits (the constants are host-built outside
+    a capture).
     """
 
     intermediate: str = "per_token"
