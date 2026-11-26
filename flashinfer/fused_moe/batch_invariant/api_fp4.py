@@ -36,7 +36,12 @@ from ...gemm.batch_invariant.schedule import chunks_for, fp4_class_for
 from ...gemm.batch_invariant.spec import MX_MIXED_FMTS, MXFP4_FMTS, NVFP4_FMTS
 from . import spec as S
 from .api import interleave_fc1, padded_rows_bound, permute_plan, route
-from .blocks.epilogue import MXFP4_GEMM2_CHAIN, GroupedChain, Mxfp4Chain, W4A4Chain
+from .blocks.epilogue import (
+    MXFP4_GEMM2_CHAIN,
+    GroupedEpilogueBlock,
+    Mxfp4Chain,
+    W4A4Chain,
+)
 from .blocks.epilogue_mx import MxChain
 from .schedule import launch_tile_bound
 from .spec_mxfp4 import CLASS as MX_CLASS
@@ -169,7 +174,7 @@ MXFP4W8A = Fp4Pair(
 PAIRS_BY_NAME: Dict[str, Fp4Pair] = {p.name: p for p in (NVFP4, MXFP4, MXFP4W8A)}
 
 
-def pair_of(chain: GroupedChain) -> Fp4Pair:
+def pair_of(chain: GroupedEpilogueBlock) -> Fp4Pair:
     """The pair of a block-scaled chain block (its class)."""
     if isinstance(chain, Mxfp4Chain):
         return MXFP4
