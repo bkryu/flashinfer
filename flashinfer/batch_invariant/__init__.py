@@ -207,7 +207,7 @@ def _moe_class_terms(
     ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its scalars are the class's parameters),
     ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS``
     with ``params`` (and ``gated`` for the names in both tables). The receipt names a class some layer can build: the
-    runners' bounds and group rule apply here as ``ValueError``.
+    runners' bounds, group rule and Llama4 top-1 rule apply here as ``ValueError``.
     """
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
@@ -231,6 +231,12 @@ def _moe_class_terms(
                 f"the batch-invariant MoE classes do not implement routing method {method!r}"
             )
         rm = spec.METHOD_OF_FLASHINFER[method]
+        if method is RoutingMethodType.Llama4 and top_k != 1:
+            # the runner's rule (`runner.routing_term`): the method is the top-1 of the logits with its sigmoid as the weight
+            raise ValueError(
+                f"fingerprint({op!r}): Llama4 routing takes top_k = 1 (the top-1 of the logits with its sigmoid as the "
+                f"weight; TopKSigmoid for top_k {top_k})"
+            )
     elif isinstance(method, str):
         rm = spec.method_named(method)
     elif isinstance(method, spec.RoutingMethod):
@@ -358,9 +364,15 @@ def _moe_nvfp4_fingerprint(
     dimensions of :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars
     and gating) under the same bounds; ``arch`` (an architecture family, a compute capability or a device; the current CUDA
     device by default) selects the instruction class of each expert weight shape (the sm_107 K = 128 step on SM107 for the
-    unsplit shapes, the K = 64 step elsewhere): the architecture is a dimension of the class; ``intermediate`` the
+    unsplit shapes, the K = 64 step elsewhere): the architecture family is a dimension of the class (SM100 and SM103 are one
+    family); ``intermediate`` the
     intermediate's quantization class (``per_token`` / ``static``)."""
-    from flashinfer.fused_moe.batch_invariant.api_fp4 import ALIGN_FP4, expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        ALIGN_FP4,
+        NVFP4,
+        check_shape_fp4,
+        expert_classes,
+    )
     from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import spec_fingerprint_nvfp4
 
     for dim, value in (("H", H), ("I", I)):
@@ -380,6 +392,8 @@ def _moe_nvfp4_fingerprint(
         n_group,
         topk_group,
     )
+    # the class's complete shape rule (the layer's): a shape the runner refuses has no fingerprint
+    check_shape_fp4(NVFP4, H, I, num_experts, top_k, bool(gated))
     family = _mx_family(arch, "fused_moe_nvfp4")
     return spec_fingerprint_nvfp4(
         H,
@@ -413,7 +427,11 @@ def _moe_mxfp4_fingerprint(
     ``arch`` (an architecture family, a compute capability or a device; the current CUDA device by default) selects the
     instruction class of the expert GEMMs (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere): the architecture is
     a dimension of the class."""
-    from flashinfer.fused_moe.batch_invariant.api_fp4 import ALIGN_FP4
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        ALIGN_FP4,
+        MXFP4,
+        check_shape_fp4,
+    )
     from flashinfer.fused_moe.batch_invariant.spec_mxfp4 import (
         expert_classes_mx,
         spec_fingerprint_mxfp4,
@@ -436,6 +454,8 @@ def _moe_mxfp4_fingerprint(
         n_group,
         topk_group,
     )
+    # the class's complete shape rule (the layer's): a shape the runner refuses has no fingerprint
+    check_shape_fp4(MXFP4, H, I, num_experts, top_k, bool(gated))
     family = _mx_family(arch, "fused_moe_mxfp4")
     return spec_fingerprint_mxfp4(
         H, I, top_k, num_experts, rm, name, params, gated, expert_classes_mx(family)

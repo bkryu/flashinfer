@@ -70,17 +70,28 @@ class SfuEvalKernel:
                 mY[i] = rcp_approx_ftz(x)
 
 
-_KERNELS: Dict[int, Callable[..., None]] = {}
+_KERNELS: Dict[Tuple[int, str], Callable[..., None]] = {}
 
 
-def _eval(which: int, x: torch.Tensor) -> torch.Tensor:
-    """The device's ``ex2`` (0) or ``rcp`` (1) of every element of the float32 tensor ``x``."""
+def _kernel_key(which: int, device: torch.device) -> Tuple[int, str]:
+    """The in-process key of an evaluation kernel: the primitive and the device's architecture family (the compiled object
+    is the family's, as :func:`tables_for` keys the tables), so one process evaluating two parts never reuses the other
+    part's callable."""
+    from ...gemm.batch_invariant.api import part_of
+
+    return which, part_of(device)[1]
+
+
+def _kernel(which: int, device: torch.device) -> Callable[..., None]:
+    """The evaluation kernel of the primitive ``which`` for ``device``'s architecture family, built and loaded with
+    ``device`` current: the JIT cache's artifact directory and the compiled object's target are the current device's
+    (:mod:`flashinfer.jit.cute_dsl_core`), so a tensor on a device that is not current never files the current device's
+    object under its own family's key."""
     from ..jit import build_and_load
 
-    assert x.dtype == torch.float32 and x.is_cuda and x.is_contiguous(), x
-    y = torch.empty_like(x)
-    key = which
-    if key not in _KERNELS:
+    key = _kernel_key(which, device)
+    kernel = _KERNELS.get(key)
+    if kernel is None:
         name = "sfu_ex2" if which == 0 else "sfu_rcp"
 
         def compile_fn():
@@ -100,8 +111,21 @@ def _eval(which: int, x: torch.Tensor) -> torch.Tensor:
                 options="--enable-tvm-ffi",
             )
 
-        _KERNELS[key] = build_and_load("batch_invariant_sfu", name, compile_fn)
-    _KERNELS[key](x.view(-1), y.view(-1), x.numel())
+        with torch.cuda.device(device):
+            kernel = _KERNELS[key] = build_and_load(
+                "batch_invariant_sfu", name, compile_fn
+            )
+    return kernel
+
+
+def _eval(which: int, x: torch.Tensor) -> torch.Tensor:
+    """The device's ``ex2`` (0) or ``rcp`` (1) of every element of the float32 tensor ``x``, its kernel built and launched
+    with ``x``'s device current."""
+    assert x.dtype == torch.float32 and x.is_cuda and x.is_contiguous(), x
+    y = torch.empty_like(x)
+    kernel = _kernel(which, x.device)
+    with torch.cuda.device(x.device):
+        kernel(x.view(-1), y.view(-1), x.numel())
     return y
 
 

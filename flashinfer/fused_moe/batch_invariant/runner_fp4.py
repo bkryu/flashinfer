@@ -6,9 +6,9 @@ One runner for the 4-bit-weight quantization pairs, grouped as ``TrtllmFp4Config
 activation=...)`` selects the pair (:data:`PAIRS`: NVFP4 x NVFP4, the W4A4 classes ``moe.nvfp4.<act>`` and the static class
 ``moe.nvfp4.<act>.static``; MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>``), the op is :func:`.api_fp4.fused_moe_fp4` on the
 pair. The weight view and the autotuner records live under the backend's key; a pack prepared for the other pair is refused.
-MXFP4 x MXFP8 arrives with the mixed MoE PR. A pair outside ``supported_quant_variants`` is skipped by ``MoELayer``'s
-candidate filter (``supports_quant``) and refused by ``check_support`` and by the config's ``prepare_weights`` /
-``prepare_activations`` with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming the served pairs.
+A pair outside ``supported_quant_variants`` (MXFP4 x MXFP8 among them) is skipped by ``MoELayer``'s candidate filter
+(``supports_quant``) and refused by ``check_support`` and by the config's ``prepare_weights`` / ``prepare_activations``
+with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming the served pairs.
 
 The activations come as bf16 rows (``hidden_states_q`` bf16, no scale: the pair's class quantizes them itself) or already
 quantized (``hidden_states_q`` packed uint8 ``[T, H/2]``, ``hidden_states_scale`` the block scales -- the 128x4 swizzled
@@ -21,6 +21,7 @@ raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instea
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -50,8 +51,9 @@ from ..api import (
     SwiGLUStep,
 )
 from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
+from . import spec as S
 from .api_fp4 import MXFP4, NVFP4, Fp4Pair
-from .runner import MOE_BF16_ARCHS, routing_term
+from .runner import MOE_BF16_ARCHS, _PackedInputs, routing_term
 
 #: The backend's key: the name of its weight view and of its autotuner records.
 BACKEND_KEY = "batch_invariant_fp4"
@@ -62,16 +64,16 @@ PAIRS: Dict[Tuple[QuantFormat, QuantFormat], Fp4Pair] = {
     (QuantFormat.NVFP4, QuantFormat.NVFP4): NVFP4,
     (QuantFormat.MXFP4, QuantFormat.MXFP4): MXFP4,
 }
-#: The pairs of the group that a later PR of the series brings (named by the refusal).
-PENDING_PAIRS = "MXFP4 x MXFP8 arrives with the mixed MoE PR"
 #: Positions of the packed inputs: the activation rows (bf16, or packed fp4), their scale factors and per-token scales (or
 #: placeholders), the expert ids, the routing weights, the six weight tensors (the MX pair's alphas are placeholders), the
 #: output, the static class's per-expert scales (placeholders otherwise); the dense plan follows when the router made it.
 _X, _SF, _PTS, _IDS, _W, _W1, _W1SF, _W1A, _W2, _W2SF, _W2A, _OUT, _GS2, _INV2 = range(
     14
 )
+#: Plan tensors after the ids and weights in the packed inputs (``route_plan_dual``'s outputs, appended by construction in
+#: ``pack_inputs``) and scalars per record in the tactic tuple (``_tactic_fp4``'s); both pinned to the builders by the suite.
 _PLAN_LEN = 5
-TACTIC_FIELDS = 8  # scalars per record in the tactic tuple
+TACTIC_FIELDS = 8
 
 #: The layer's typed activations, every one a class of either pair.
 _ACTIVATIONS = (
@@ -87,7 +89,9 @@ _ACTIVATIONS = (
     ReLU,
     SiLU,
 )
-_NO_SCALES: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+#: The placeholder scale operands per indexed device (the op's constant rule, :func:`~.api_fp4._const`).
+_NO_SF: Dict[str, torch.Tensor] = {}
+_NO_PTS: Dict[str, torch.Tensor] = {}
 
 
 def pair_name(pair: Tuple[QuantFormat, QuantFormat]) -> str:
@@ -95,29 +99,29 @@ def pair_name(pair: Tuple[QuantFormat, QuantFormat]) -> str:
 
 
 def unsupported_pair(quant: QuantConfig) -> BatchInvariantUnsupportedError:
-    """The refusal of a quantization pair the fp4 backend does not serve: it names the served pairs (and the pending ones)."""
+    """The refusal of a quantization pair the fp4 backend does not serve: it names the served pairs."""
     served = ", ".join(pair_name(p) for p in PAIRS)
-    pending = f"; {PENDING_PAIRS}" if PENDING_PAIRS else ""
     return BatchInvariantUnsupportedError(
         f"batch_invariant=True: the fp4 MoE backend `{BACKEND_KEY}` (BatchInvariantFp4Config) does not serve the "
-        f"quantization weight={quant.weight.name}, activation={quant.activation.name}; it serves {served}{pending}. "
-        "The batch-invariant mode never falls back to another kernel; call without batch_invariant=True to use the "
+        f"quantization weight={quant.weight.name}, activation={quant.activation.name}; it serves {served} and no other "
+        "pair. The batch-invariant mode never falls back to another kernel; call without batch_invariant=True to use the "
         "regular backends."
     )
 
 
 def _no_scales(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The placeholder scale operands (never read), one pair per device so a call launches no fill: a 1-byte scale buffer
-    and an empty f32 vector. The empty vector also marks a pre-quantized NVFP4 pack without per-token scales (the per-tensor
-    pack of the TRTLLM backends: unit scales, nothing to read or fill) and stands for the MX pair's absent alphas."""
-    key = str(device)
-    t = _NO_SCALES.get(key)
-    if t is None:
-        t = _NO_SCALES[key] = (
-            torch.empty(1, dtype=torch.uint8, device=device),
-            torch.empty(0, dtype=torch.float32, device=device),
-        )
-    return t
+    """The placeholder scale operands (never read): a 1-byte scale buffer and an empty f32 vector, cached per indexed device
+    as the op's constants are (:func:`~.api_fp4._const`: a blocking host copy outside CUDA graph capture; under capture an
+    allocation of that capture alone, never cached, so a capture's private pool serves no eager call). The empty vector also
+    marks a pre-quantized NVFP4 pack without per-token scales (the per-tensor pack of the TRTLLM backends: unit scales,
+    nothing to read or fill) and stands for the MX pair's absent alphas."""
+    from .api_fp4 import _const, _device_key
+
+    key = _device_key(device)
+    return (
+        _const(_NO_SF, key, lambda d: torch.zeros(1, dtype=torch.uint8, device=d), device),
+        _const(_NO_PTS, key, lambda d: torch.empty(0, dtype=torch.float32, device=d), device),
+    )  # fmt: skip
 
 
 def _tactic_fp4(c1, c2) -> tuple:
@@ -180,7 +184,6 @@ class BatchInvariantFp4Runner(MoERunner):
         super().__init__()
         self.config = config
         self.device = torch.device(device)
-        self._round_scales = False
         if self.device.index is None and self.device.type == "cuda":
             self.device = torch.device("cuda", torch.cuda.current_device())
         # an unserved pair is refused by check_support (the layer's filter never constructs this case)
@@ -189,6 +192,11 @@ class BatchInvariantFp4Runner(MoERunner):
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
         self._scale: Optional[torch.Tensor] = None
+        # the routing term's state, set by _check_support (`_method` None: no from-logits class; a deferred refusal's
+        # message, raised afresh at every from-logits call: no exception object, hence no traceback, is kept)
+        self._method: Optional[S.RoutingMethod] = None
+        self._grouped_other: bool = False
+        self._logits_refusal: Optional[Tuple[Any, ...]] = None
         # the intermediate's class (`per_token` / `static`): the bound backend config's field
         cands = [c for c in config.backend if hasattr(c, "intermediate")]
         self._intermediate: str = cands[0].intermediate if cands else "per_token"
@@ -208,13 +216,14 @@ class BatchInvariantFp4Runner(MoERunner):
 
     def _check_experts(self) -> None:
         """The class's rule on the expert range: the EP form is not part of this backend, so a shard is refused in the
-        class's terms (before the layer's generic shard check)."""
+        class's terms (before the layer's generic shard check). The pair is known here: ``_check_support`` refuses an
+        unserved pair before this check, and the ``pair`` property refuses it again for a direct caller."""
         experts, routing = self.config.experts, self.config.routing
         if experts.local_expert_offset or (
             experts.local_num_experts not in (None, 0, routing.num_experts)
         ):
             raise unsupported(
-                self.pair.cls if self._pair is not None else "moe.nvfp4",
+                self.pair.cls,
                 "expert-parallel shards (local_expert_offset / local_num_experts)",
                 "the full expert set (the class's EP form is not part of this backend)",
             )
@@ -260,7 +269,14 @@ class BatchInvariantFp4Runner(MoERunner):
         pair.check_shape(
             None, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
         )
-        self._method, self._grouped_other = routing_term(routing, cls)
+        # a routing term the from-logits mode has no class for (Llama4 beyond top-1, a group shape outside the rule) is
+        # refused at a from-logits call, not here: the pre-routed modes never consult it (the bf16 runner's rule)
+        self._logits_refusal = None
+        try:
+            self._method, self._grouped_other = routing_term(routing, cls)
+        except BatchInvariantUnsupportedError as e:
+            self._method, self._grouped_other = None, False
+            self._logits_refusal = tuple(e.args)
         if not cfg.finalize.do_finalize:
             raise unsupported(
                 cls,
@@ -272,7 +288,7 @@ class BatchInvariantFp4Runner(MoERunner):
         from ...gemm.batch_invariant.api import part_of
 
         self._part = part_of(self.device)
-        method = getattr(self, "_method", None)
+        method = self._method
         if (
             method is not None
             and method.scaled
@@ -302,6 +318,19 @@ class BatchInvariantFp4Runner(MoERunner):
         return s
 
     # ---- inputs ----------------------------------------------------------------------------------------------------
+    def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
+        """The layer's candidate filter: the shared rule (a view under the backend's key, the input geometry) and the view's
+        intermediate class being this candidate's -- the two fp4 candidates of a layer share the view key, so a view prepared
+        for the other class is the other candidate's pack and is declined here (the runner driven directly refuses it in
+        ``pack_inputs``); a view of another pair stays a refusal, since no candidate of the layer serves it. The view names
+        its pair and its class (``prepare_weights`` writes ``quant`` and ``intermediate`` for both pairs); a view without
+        either key is declined, never read as the NVFP4 pair or the per-token class (``pack_inputs`` names the missing
+        key)."""
+        if not super().accepts(act, weights):
+            return False
+        view = weights.get_view(self.backend_key)
+        return "quant" in view and view.get("intermediate") == self._intermediate
+
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
         x = act.hidden_states_q
         if x.ndim != 2:
@@ -317,10 +346,16 @@ class BatchInvariantFp4Runner(MoERunner):
     def _activation_scales(
         self, act: MoEActivationPack, T: int, H: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """The pre-quantized pack's scale factors (the flat 128x4 swizzled buffer, or the linear ``[T, H/block]`` bytes, which
-        the op's scatter re-tiles itself) and, for the NVFP4 pair, its per-token scales (the layer's shared contract admits
-        them under ``QuantConfig(per_token_scale=True)``; the empty placeholder for a pack without them: unit scales, nothing
-        to fill)."""
+        """The pre-quantized pack's scale factors -- the 128x4 swizzled buffer of the mode's quantizer, returned flat, or the
+        linear ``[T, H/block]`` bytes, returned 2-D (the op's scatter re-tiles them itself): the rank names the layout to
+        ``forward`` -- and, for the NVFP4 pair, its per-token scales (the layer's shared contract admits them under
+        ``QuantConfig(per_token_scale=True)``; the empty placeholder for a pack without them: unit scales, nothing to fill).
+        The layout is ``QuantConfig(swizzled_scale_factors)``'s when set (``True``: the swizzled buffer, 2-D as the quantizer
+        returns it or flattened; ``False``: the linear layout); unset, the shape names it where it can, and a 2-D
+        ``[T, H/block]`` tensor at a row count that is a multiple of 128 (the quantizer's buffer has that shape too) is
+        refused (:func:`~.api_fp4.gather_sf_layout`)."""
+        from .api_fp4 import gather_sf_layout
+
         pair, cls = self.pair, self.pair.cls
         sf = act.hidden_states_scale
         if sf is None:
@@ -338,12 +373,14 @@ class BatchInvariantFp4Runner(MoERunner):
                 f"hidden_states_scale of dtype {sf.dtype}",
                 f"uint8 or {sf_dtype} scale bytes",
             )
-        if (
-            sf.ndim == 2
-            and tuple(sf.shape) == (T, H // pair.block)
-            and sf.is_contiguous()
-        ):
-            sf_flat = sf  # the linear layout: the op's scatter assembles the 128x4 atoms from the rows
+        flag = self.config.quant.swizzled_scale_factors
+        named = None if flag is None else ("128x4" if flag else "linear")
+        # the one layout rule; a tensor named linear with another shape is refused there
+        layout = gather_sf_layout(sf, T, H, pair.block, named, cls)
+        if layout == "linear":
+            sf_flat = (
+                sf.contiguous()
+            )  # the op's scatter assembles the 128x4 atoms from the rows
         elif sf.numel() >= pair.sf_numel(T, H) and (
             sf.is_contiguous() or (sf.ndim == 2 and sf.t().is_contiguous())
         ):
@@ -354,6 +391,12 @@ class BatchInvariantFp4Runner(MoERunner):
                 f"hidden_states_scale of shape {tuple(sf.shape)}",
                 f"the 128x4 swizzled buffer of the mode's quantizer ({pair.sf_numel(T, H)} bytes) or the linear "
                 f"[{T}, {H // pair.block}] layout",
+            )
+        if sf_flat.data_ptr() % 16:
+            raise unsupported(
+                cls,
+                "hidden_states_scale at a storage offset that is not a multiple of 16 bytes",
+                "16-byte aligned scale bytes (the kernels' vector loads and TMA boxes)",
             )
         pts = act.per_token_scale
         if pts is None:
@@ -386,7 +429,7 @@ class BatchInvariantFp4Runner(MoERunner):
 
         cfg, pair, cls = self.config, self.pair, self.pair.cls
         plan: List[torch.Tensor] = []
-        self._round_scales = False
+        w_round = False  # bound to the pack (the bf16 runner's rule): a later pack never changes an earlier one's rounding
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype not in (torch.bfloat16, torch.uint8):
             raise unsupported(
@@ -395,16 +438,34 @@ class BatchInvariantFp4Runner(MoERunner):
                 "bf16 [num_tokens, hidden_size] rows, or packed fp4 uint8 [num_tokens, hidden_size / 2] with their scales",
             )
         x = x.contiguous()
+        if x.data_ptr() % 16:
+            raise unsupported(
+                cls,
+                "hidden_states_q at a storage offset that is not a multiple of 16 bytes",
+                "16-byte aligned rows (the kernels' vector loads and TMA boxes)",
+            )
         T = x.shape[0]
         H = self._hidden_of(x)
         k, E = cfg.routing.top_k, cfg.routing.num_experts
         view = weights.get_view(self.backend_key)
-        if view.get("quant", "nvfp4") != pair.name:
+        if "quant" not in view:
+            raise unsupported(
+                cls,
+                "a weight view without its quantization pair (no `quant` key)",
+                "the view of BatchInvariantFp4Config.prepare_weights, which names the pair for both pairs",
+            )
+        if view["quant"] != pair.name:
             raise unsupported(
                 cls,
                 "weights prepared for another pair of the fp4 backend",
                 f"weights from BatchInvariantFp4Config.prepare_weights(..., quant=QuantConfig(weight={pair.name.upper()}, "
                 f"activation={pair.name.upper()}))",
+            )
+        if "intermediate" not in view:
+            raise unsupported(
+                cls,
+                "a weight view without its intermediate class (no `intermediate` key)",
+                "the view of BatchInvariantFp4Config.prepare_weights, which names the class for both pairs",
             )
         w = MoEWeightsFp4.from_view(view)
         if (
@@ -453,6 +514,9 @@ class BatchInvariantFp4Runner(MoERunner):
                     "the groups with DeepSeekV3, or pre-routed ids",
                 )
             if self._method is None:
+                # the refusal deferred at construction (the pre-routed modes never consulted it), else no term
+                if self._logits_refusal is not None:
+                    raise BatchInvariantUnsupportedError(*self._logits_refusal)
                 raise unsupported(
                     cls,
                     f"routing method {cfg.routing.method!r} from logits",
@@ -474,11 +538,11 @@ class BatchInvariantFp4Runner(MoERunner):
                 and T * k <= ROUTE_PLAN_MAX_SLOTS
                 and E <= MAX_E
             ):
-                # routing and the dense packing's dual plan in one launch (a placement: the same bits and integers)
-                ids, wts, counts, dest, src, dest_pad, pos_pad = route_plan_dual(
+                # routing and the dense packing's dual plan in one launch (a placement: the same bits and integers); the
+                # plan tensors follow the ids and weights as the builder returns them
+                ids, wts, *plan = route_plan_dual(
                     act.routing_logits, k, self._method, bias, scale
                 )
-                plan = [counts, dest, src, dest_pad, pos_pad]
             else:
                 ids, wts = route(act.routing_logits, k, self._method, bias, scale)
         else:
@@ -494,7 +558,7 @@ class BatchInvariantFp4Runner(MoERunner):
             wts = act.topk_weights
             # the packed word carries the weight as bf16: the rounded weights are the inputs -- f32 weights are rounded by
             # the combine itself (no host passes over the slots), bf16 weights widen exactly
-            self._round_scales = (
+            w_round = (
                 mode is RoutingInputMode.PackedPrecomputed
                 and wts.dtype != torch.bfloat16
             )
@@ -505,11 +569,13 @@ class BatchInvariantFp4Runner(MoERunner):
         def opt(t):
             return t if t is not None else none
 
-        return [
+        packed = _PackedInputs([
             x, sf, pts, ids, wts,
             w.w1, w.w1_sf, opt(w.w1_alpha), w.w2, w.w2_sf, opt(w.w2_alpha),
             out, opt(w.gs2), opt(w.inv2),
-        ] + plan  # fmt: skip
+        ] + plan)  # fmt: skip
+        packed.w_round = w_round
+        return packed
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _scatter_launch(self, x: torch.Tensor) -> bool:
@@ -517,10 +583,22 @@ class BatchInvariantFp4Runner(MoERunner):
         the MX pair (whose quantizer stores the class's layout); a bf16 NVFP4 input's quantizer scatters in its own pass."""
         return x.dtype != torch.bfloat16 or not self.pair.scaled
 
-    def _ranked(
-        self, T: int, H: int, scatter_launch: bool = False
-    ) -> Tuple[list, list]:
-        """The ranked records of both GEMMs (the tactic space's head); with ``scatter_launch`` GEMM1's list carries the
+    def _gather_form(self, x: torch.Tensor, sf: torch.Tensor) -> bool:
+        """Whether GEMM1's narrow swapped record takes its gather form for this pack: the box form would scatter in a launch
+        of its own (:meth:`_scatter_launch`) and the pack's scale layout admits the form (a linear layout's rows as whole
+        4-byte groups: :func:`~.api_fp4.gather_form_ok`; the 128x4 buffer always). The records handed to the op are then
+        the pack's own, so the op never has to fall back from a record the runner chose."""
+        from .api_fp4 import gather_form_ok
+
+        if not self._scatter_launch(x):
+            return False
+        linear = x.dtype != torch.bfloat16 and sf.ndim == 2
+        return gather_form_ok(
+            self._hidden_of(x), "linear" if linear else "128x4", self.pair.block
+        )
+
+    def _ranked(self, T: int, H: int, gather_form: bool = False) -> Tuple[list, list]:
+        """The ranked records of both GEMMs (the tactic space's head); with ``gather_form`` GEMM1's list carries the
         gather-form twin the structural rule places (:func:`~.schedule_fp4.gather_form_rule`)."""
         from .api_fp4 import MoEWeightsFp4
         from .schedule_fp4 import (
@@ -562,7 +640,7 @@ class BatchInvariantFp4Runner(MoERunner):
                 rows, n1, H, E, chain1, in1, sm_count, family, TOP_K_FP4, n_active=n_act
             )
         )
-        twins = [gather_form_rule(c, scatter_launch) for c in r1]
+        twins = [gather_form_rule(c, gather_form) for c in r1]
         r1 += [t for t in twins if t.gather_a and t not in r1]
         r2 = rank_grouped_fp4(
             rows, H, I, E, chain2, in2, sm_count, family, TOP_K_FP4, n_active=n_act
@@ -573,7 +651,7 @@ class BatchInvariantFp4Runner(MoERunner):
         self._require_built()
         x = inputs[_X]
         r1, r2 = self._ranked(
-            int(x.shape[0]), self._hidden_of(x), self._scatter_launch(x)
+            int(x.shape[0]), self._hidden_of(x), self._gather_form(x, inputs[_SF])
         )
         return [_tactic_fp4(c1, c2) for c1 in r1 for c2 in r2]
 
@@ -606,10 +684,15 @@ class BatchInvariantFp4Runner(MoERunner):
         if tactic == -1 or tactic is None:
             from .schedule_fp4 import gather_form_rule
 
-            r1, r2 = self._ranked(int(x.shape[0]), H, self._scatter_launch(x))
-            c1, c2 = gather_form_rule(r1[0], self._scatter_launch(x)), r2[0]
+            gather_form = self._gather_form(x, sf)
+            r1, r2 = self._ranked(int(x.shape[0]), H, gather_form)
+            c1, c2 = gather_form_rule(r1[0], gather_form), r2[0]
         else:
             c1, c2 = _configs_from_tactic_fp4(tuple(tactic))
+            if c1.gather_a and not self._gather_form(x, sf):
+                # a tuned winner replayed on a pack whose scale layout the gather form cannot copy (the layer keys its
+                # winners by token bucket, not by layout): the record's box form, a placement of the same bits
+                c1 = dataclasses.replace(c1, gather_a=False)
         a = self._activation()
         static = pair.scaled and self._intermediate == "static"
         w = MoEWeightsFp4(
@@ -617,8 +700,9 @@ class BatchInvariantFp4Runner(MoERunner):
             w1a if pair.scaled else None, w2a if pair.scaled else None,
             self._intermediate, gs2 if static else None, inv2 if static else None,
         )  # fmt: skip
-        # a pre-quantized pack: the empty per-token placeholder means unit scales (the per-tensor pack), the 2-D scale tensor
-        # the linear layout; both are the op's own placements (no fill, no re-tiling launch)
+        # a pre-quantized pack: the empty per-token placeholder means unit scales (the per-tensor pack); the scale tensor's
+        # rank names its layout (flat: the 128x4 buffer, 2-D: the linear rows, as pack_inputs shaped it); both are the op's
+        # own placements (no fill, no re-tiling launch)
         if x.dtype == torch.bfloat16:
             xin: Any = x
         elif pair.scaled:
@@ -634,6 +718,9 @@ class BatchInvariantFp4Runner(MoERunner):
             config1=c1,
             config2=c2,
             plan=plan,
-            round_scales=self._round_scales,
+            round_scales=getattr(inputs, "w_round", False),
+            sf_layout=None
+            if x.dtype == torch.bfloat16
+            else ("linear" if sf.ndim == 2 else "128x4"),
         )
         return out

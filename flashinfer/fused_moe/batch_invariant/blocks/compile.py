@@ -456,13 +456,20 @@ def swapped_kernel_name(
     names the object beside the chain; the bf16 gather form (the token box gathered from the unpermuted rows) appends ``_gather``
     (the block-scaled gather record carries its own suffix), the linear scale source ``_sflin``; a block-scaled body's stage of
     ``k_block`` elements of K (the MXFP8 classes' two-atom stage) appends ``_kb<k_block>``; an epilogue over several warpgroups
-    (the chains on the shared swapped epilogue at the wider token tiles) ``_e<W>``."""
+    (the chains on the shared swapped epilogue at the wider token tiles) ``_e<W>``; the in-kernel plan ``_ikp``. The scale
+    source is the gather form's: the box form reads the 128x4 buffer alone, so ``sf_src="linear"`` with a box record is
+    refused (two objects under one name otherwise)."""
     chain = as_chain(chain, out_fmt)
+    if sf_src == "linear" and not (gather or cfg.gather_a):
+        raise ValueError(
+            "sf_src='linear' is the gather form's scale source (gather=True or a record with gather_a); the box form "
+            "reads the 128x4 scale buffer"
+        )
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     return jit.sanitize_symbol_name(
         f"swapped_{fmt_tag(chain.in_fmt)}_{chain.describe()}_{knobs.describe()}"
         + ("_gather" if gather else "")
-        + ("_sflin" if (gather or cfg.gather_a) and sf_src == "linear" else "")
+        + ("_sflin" if sf_src == "linear" else "")
         + (f"_kb{k_block}" if k_block else "")
         + ("_ikp" if plan_in_kernel else "")
         + (
@@ -738,16 +745,17 @@ def get_compiled_swapped(
     chain = as_chain(chain, out_fmt)
     assert is_swapped_record(cfg, chain.in_fmt), (cfg, chain.in_fmt)
     assert sf_src in ("128x4", "linear"), sf_src
+    name = swapped_kernel_name(
+        cfg,
+        chain,
+        gather=gather,
+        k_block=k_block,
+        sf_src=sf_src,
+        plan_in_kernel=plan_in_kernel,
+    )  # refuses the box form with the linear source
     return jit.build_and_load(
         MODULE,
-        swapped_kernel_name(
-            cfg,
-            chain,
-            gather=gather,
-            k_block=k_block,
-            sf_src=sf_src,
-            plan_in_kernel=plan_in_kernel,
-        ),
+        name,
         compile_swapped_fn(cfg, chain, gather, k_block, sf_src, plan_in_kernel),
     )
 
