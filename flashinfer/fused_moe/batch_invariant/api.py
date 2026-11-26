@@ -783,9 +783,10 @@ def swapped_pads(config1: Knobs, config2: Knobs) -> Tuple[int, int]:
     )
 
 
-def padded_rows_bound(T: int, k: int, E: int, align: int) -> int:
+def padded_rows_bound(T: int, k: int, E: int, align: int = 128) -> int:
     """An upper bound of the padded expanded row count ``sum_e roundup(counts[e], align)`` from the static sizes alone (no
-    device read, so CUDA-graph safe): every active expert pads at most ``align - 1`` rows."""
+    device read, so CUDA-graph safe): every active expert pads at most ``align - 1`` rows; ``align`` defaults to the
+    block-scaled classes' 128-row scale-factor atom (the one bound every class takes)."""
     n = T * k
     if n == 0:
         return 0

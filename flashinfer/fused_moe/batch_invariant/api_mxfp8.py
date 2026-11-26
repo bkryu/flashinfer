@@ -54,7 +54,7 @@ from .api import (
     launch_grid,
     permute_plan,
 )
-from .api import padded_rows_bound as _padded_rows_bound
+from .api import padded_rows_bound
 from .blocks.epilogue import GroupedEpilogueBlock
 from .blocks.epilogue_mx import MxChain
 from .blocks.scheduler import MAX_E
@@ -89,12 +89,6 @@ def sf_numel(rows: int, K: int) -> int:
 
 def padded_sf_cols(K: int) -> int:
     return _padded_sf_cols(K, BLOCK, "128x4")
-
-
-def padded_rows_bound(T: int, k: int, E: int, align: int = GROUP_ALIGN) -> int:
-    """An upper bound of the padded expanded row count ``sum_e roundup(counts[e], align)`` that does not read the device
-    (CUDA-graph safe): every active expert pads at most ``align - 1`` rows (the shared bound at the class's alignment)."""
-    return _padded_rows_bound(T, k, E, align)
 
 
 def check_shape_mxfp8(H: int, I: int, E: int, k: Optional[int] = None) -> None:

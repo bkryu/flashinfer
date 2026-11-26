@@ -3744,3 +3744,25 @@ def test_pack_layout_and_tactic_fields_are_pinned():
         dual=True, pad_align=128
     )  # one row per expert: the swapped records
     assert r._plan_in_kernel(1, 2048) and not r._plan_in_kernel(16384, 2048)
+
+
+def test_padded_rows_bound_is_the_one_shared_function():
+    """One ``padded_rows_bound`` (``api.py``): the fp4 and the MX modules import it (no twin definition), and its integers
+    at the classes' 128-row alignment are the fp4 module's former closed form over a grid of token counts, slot counts and
+    expert counts (an empty routing bounds to zero)."""
+    from flashinfer.fused_moe.batch_invariant import api, api_fp4, api_mxfp8
+
+    assert api_fp4.padded_rows_bound is api.padded_rows_bound
+    assert api_mxfp8.padded_rows_bound is api.padded_rows_bound
+    assert not hasattr(api_mxfp8, "_padded_rows_bound")
+    for T in range(0, 258):
+        for k in range(1, 9):
+            for E in (1, 8, 128, 1024):
+                n = T * k + 127 * min(E, T * k)
+                former = -(-n // 128) * 128
+                assert (
+                    api.padded_rows_bound(T, k, E)
+                    == former
+                    == api.padded_rows_bound(T, k, E, 128)
+                )
+    assert api.padded_rows_bound(0, 8, 128) == 0

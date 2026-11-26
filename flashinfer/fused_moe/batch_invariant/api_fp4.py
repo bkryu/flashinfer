@@ -33,7 +33,7 @@ from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.schedule import chunks_for, fp4_class_for
 from ...gemm.batch_invariant.spec import MXFP4_FMTS, NVFP4_FMTS
 from . import spec as S
-from .api import interleave_fc1, permute_plan, route
+from .api import interleave_fc1, padded_rows_bound, permute_plan, route
 from .blocks.epilogue import MXFP4_GEMM2_CHAIN, GroupedChain, Mxfp4Chain, W4A4Chain
 from .schedule import launch_tile_bound
 from .spec_mxfp4 import CLASS as MX_CLASS
@@ -944,51 +944,17 @@ def _grouped_gemm_fp4_gather(
     return out
 
 
-def padded_rows_bound(T: int, k: int, E: int, align: int = GROUP_ALIGN) -> int:
-    """An upper bound of the padded expanded row count ``sum_e roundup(counts[e], align)`` that does not read the device
-    (CUDA-graph safe): every active expert pads at most ``align - 1`` rows."""
-    n = T * k + (align - 1) * min(E, T * k)
-    return -(-n // align) * align
-
-
 def permute_plan_dual(
     experts: torch.Tensor, E: int, pad_align: int = GROUP_ALIGN
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``(counts [E], dest [T, k], src [Tk], dest_pad [T, k], pos_pad [Tk])``: the dense plan (:func:`.api.permute_plan`)
-    plus the positions with the groups padded to ``pad_align`` rows (``dest_pad[i]``) and the padded position of every dense
-    row (``pos_pad[p]``): the dense packing's row map (A rows dense, scale factors and row scales at the padded positions)."""
-    from .api import PLAN_MULTI_MIN_N
-    from .permute import (
-        PLAN_BLOCK,
-        get_compiled_plan,
-        get_compiled_plan_multi,
-        plan_threads,
+    """``(counts [E], dest [T, k], src [Tk], dest_pad [T, k], pos_pad [Tk])``: the dense plan plus the positions with the
+    groups padded to ``pad_align`` rows (``dest_pad[i]``) and the padded position of every dense row (``pos_pad[p]``): the
+    dense packing's row map (A rows dense, scale factors and row scales at the padded positions) -- the shared plan's dual
+    form (:func:`.api.permute_plan` with ``dual=True``)."""
+    counts, dest, src, dest_pad, pos_pad = permute_plan(
+        experts, E, dual=True, pad_align=pad_align
     )
-
-    T, k = experts.shape
-    n = T * k
-    dev = experts.device
-    dest = torch.empty(n, dtype=torch.int32, device=dev)
-    src = torch.empty(n, dtype=torch.int32, device=dev)
-    dest_pad = torch.empty(n, dtype=torch.int32, device=dev)
-    pos_pad = torch.empty(n, dtype=torch.int32, device=dev)
-    counts = torch.empty(E, dtype=torch.int32, device=dev)
-    flat = experts.reshape(-1)
-    if not flat.is_contiguous() or flat.dtype != torch.int32:
-        raise TypeError("permute_plan_dual: experts must be a contiguous int32 [T, k]")
-    if n == 0:
-        counts.zero_()
-    elif n >= PLAN_MULTI_MIN_N:
-        nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
-        hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
-        get_compiled_plan_multi(1, True, pad_align)(
-            flat, counts, dest, src, dest_pad, pos_pad, hist_blk, n, E, nb
-        )
-    else:
-        get_compiled_plan(1, True, pad_align, plan_threads(n))(
-            flat, counts, dest, src, dest_pad, pos_pad, n, E
-        )
-    return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
+    return counts, dest, src, dest_pad, pos_pad
 
 
 _GS_INV: Dict[
