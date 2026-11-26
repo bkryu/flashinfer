@@ -3114,3 +3114,44 @@ def test_prepare_weights_quantizes_one_expert_at_a_time_into_the_pack():
         assert all(t.is_cuda for t in (Wd.w1, Wd.w1_sf, Wd.w2, Wd.w2_sf)), name
         assert same(Wd, W), name
         assert peak_d <= pack + 8 * expert, (name, peak_d, pack, expert)
+
+
+@needs_device
+def test_weight_view_names_its_pair_and_a_view_without_it_is_declined():
+    """``prepare_weights`` writes the pair into the view (``quant``); the runner's candidate filter requires it -- a view
+    without the key or of another pair is declined, never read as this pair's -- the runner driven directly refuses it with
+    the mode's error naming the key, and the view reader takes no default."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import (
+        VIEW_PAIR,
+        MoEWeightsMXFP8,
+    )
+
+    T, k, H, I, E = 8, 2, 128, 64, 4
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=73)
+    view = BatchInvariantFp8BlockConfig.prepare_weights(
+        w1, w2, quant=_QUANT, activation=_SWIGLU
+    )
+    assert view["quant"] == VIEW_PAIR == "mxfp8"
+    assert MoEWeightsMXFP8.prepare(w1, w2).view()["quant"] == VIEW_PAIR
+    layer = _layer(k, E, I)
+    runner = layer.runners[0]
+    act = _logits_pack(x, logits)
+    pack = MoEWeightPack({})
+    pack.prepare_for(KEY, view)
+    assert runner.accepts(act, pack)
+    ref = bits(layer(act, pack))
+    for bad in (
+        {kk: v for kk, v in view.items() if kk != "quant"},
+        dict(view, quant="deepseek_fp8"),
+    ):
+        other = MoEWeightPack({})
+        other.prepare_for(KEY, bad)
+        assert not runner.accepts(act, other)
+        with pytest.raises(NotImplementedError):
+            layer(act, other)
+        with pytest.raises(BatchInvariantUnsupportedError, match="quant"):
+            runner.pack_inputs(act, other)
+        with pytest.raises(BatchInvariantUnsupportedError, match="quant"):
+            MoEWeightsMXFP8.from_view(other.get_view(KEY))
+    assert torch.equal(bits(layer(act, pack)), ref)

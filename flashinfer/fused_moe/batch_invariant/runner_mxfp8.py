@@ -25,15 +25,10 @@ from typing import List, Optional, Tuple
 import torch
 
 from ...batch_invariant.support import unsupported
-from ..api import MoEActivationPack
+from ..api import MoEActivationPack, MoEWeightPack
+from .api_mxfp8 import MOE_MXFP8_ARCHS, VIEW_PAIR
 from .runner_fp8_block import PAIR_MXFP8, BatchInvariantFp8BlockRunner
 from .spec_mxfp8 import BLOCK, CLASS
-
-#: The compute capabilities the classes are stated for (the dense MXFP8 GEMM class's parts).
-MOE_MXFP8_ARCHS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3), (10, 7))
-#: Positions of the packed inputs: the quantized activations and their scales, the expert ids, the routing weights, the
-#: two weights with their scales and the output.
-_XQ, _XSF, _IDS, _W, _W1, _W1SF, _W2, _W2SF, _OUT = range(9)
 
 
 class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
@@ -63,6 +58,14 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         self._in_fmt = mx_class_of(self.device)
 
     # ---- inputs ----------------------------------------------------------------------------------------------------
+    def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
+        """The layer's candidate filter: the shared rule (a view under the backend's key, the input geometry) and the view
+        naming this pair (``prepare_weights`` writes ``quant``); a view without the key or of another pair is declined,
+        never read as this pair's (the runner driven directly refuses it in ``pack_inputs``, naming the key)."""
+        if not super().accepts(act, weights):
+            return False
+        return weights.get_view(self.backend_key).get("quant") == VIEW_PAIR
+
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
         x = act.hidden_states_q
         return (
@@ -137,6 +140,7 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
 
     # ---- the weight view -------------------------------------------------------------------------------------------
     def _weights_from_view(self, view):
+        """The view as the kernels consume it; a view without this pair's tag is refused by name (``from_view``)."""
         from .api_mxfp8 import MoEWeightsMXFP8
 
         return MoEWeightsMXFP8.from_view(view)

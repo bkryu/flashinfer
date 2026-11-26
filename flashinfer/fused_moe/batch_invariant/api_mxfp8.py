@@ -155,6 +155,9 @@ def quantize_activations_mxfp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Ten
 
 # ----------------------------------------------------------------------------- weights
 
+#: The weight view's pair tag (``quant``): the fp8-block backend's views share one key, so a view names its pair.
+VIEW_PAIR = "mxfp8"
+
 
 @dataclass
 class MoEWeightsMXFP8:
@@ -282,8 +285,10 @@ class MoEWeightsMXFP8:
         return MxChain("glu" if self.gated else "act", self.act, "mxfp8", self.params)
 
     def view(self) -> Dict[str, object]:
-        """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for this backend."""
+        """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for the backend (``quant`` names the pair:
+        the backend's views share one key)."""
         return {
+            "quant": VIEW_PAIR,
             "w1": self.w1,
             "w1_sf": self.w1_sf,
             "w2": self.w2,
@@ -295,6 +300,17 @@ class MoEWeightsMXFP8:
 
     @staticmethod
     def from_view(view: Dict[str, object]) -> "MoEWeightsMXFP8":
+        """The weights of a view :meth:`view` wrote; the pair is read from its ``quant`` key, never assumed."""
+        pair = view.get("quant")
+        if pair != VIEW_PAIR:
+            raise unsupported(
+                CLASS,
+                "a weight view without its quantization pair (no `quant` key)"
+                if pair is None
+                else f"a weight view of the pair {pair!r}",
+                "the view of BatchInvariantFp8BlockConfig.prepare_weights(..., quant=QuantConfig(weight=MXFP8, "
+                f"activation=MXFP8)), which names the pair (`quant` = {VIEW_PAIR!r})",
+            )
         gated = bool(view.get("gated", True))
         return MoEWeightsMXFP8(
             view["w1"],  # type: ignore[arg-type]
