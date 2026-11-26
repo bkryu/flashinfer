@@ -220,10 +220,14 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
                 )
             return in_dt, cute.sym_int(32, divisibility=k_al), al
 
-        # the token operand (A: the rows) and the weight operand (B) at their own element widths (the one-format classes
-        # share one; the mixed classes' tokens are e4m3 and their weights byte-packed e2m1)
+        # the token operand (A: the rows) and the weight operand (B) at their own element widths: the one-format classes
+        # share one width and one symbolic K (the compiled object's assumption, as before the mixed classes); the mixed
+        # classes' tokens are e4m3 and their weights byte-packed e2m1, each with its own symbol
         a_dt, sym_kd, a_div = operand_fake(A_ELEM_BITS_OF[chain.in_fmt])
-        b_dt, sym_kd_b, b_div = operand_fake(B_ELEM_BITS_OF[chain.in_fmt])
+        if A_ELEM_BITS_OF[chain.in_fmt] == B_ELEM_BITS_OF[chain.in_fmt]:
+            b_dt, sym_kd_b, b_div = a_dt, sym_kd, a_div
+        else:
+            b_dt, sym_kd_b, b_div = operand_fake(B_ELEM_BITS_OF[chain.in_fmt])
 
         def flat(div):
             return cute.runtime.make_fake_tensor(
