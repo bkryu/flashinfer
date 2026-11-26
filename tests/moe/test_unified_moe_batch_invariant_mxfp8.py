@@ -3766,3 +3766,25 @@ def test_padded_rows_bound_is_the_one_shared_function():
                     == api.padded_rows_bound(T, k, E, 128)
                 )
     assert api.padded_rows_bound(0, 8, 128) == 0
+
+
+def test_in_kernel_plan_bounds_are_the_host_rule():
+    """The decode form's in-kernel plan holds ``PLAN_MAX_SLOTS`` slots and ``PLAN_MAX_E`` experts: the runner's rule takes
+    the form just below each bound and the plan launch just above it (the ranking picking the swapped records at one row
+    per expert on either side), device-free at the nominal part."""
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import (
+        PLAN_MAX_E,
+        PLAN_MAX_SLOTS,
+    )
+
+    r = _runner(k=1, E=PLAN_MAX_E)
+    r._part = (204, "sm_107")
+    assert r._plan_in_kernel(PLAN_MAX_SLOTS, 2048)
+    assert not r._plan_in_kernel(PLAN_MAX_SLOTS + 1, 2048)
+    r = _runner(k=1, E=PLAN_MAX_E + 1)
+    r._part = (204, "sm_107")
+    assert not r._plan_in_kernel(1, 2048)
+    r = _runner(k=8, E=PLAN_MAX_E // 2)
+    r._part = (204, "sm_107")
+    assert r._plan_in_kernel(PLAN_MAX_SLOTS // 8, 2048)
+    assert not r._plan_in_kernel(PLAN_MAX_SLOTS // 8 + 1, 2048)
